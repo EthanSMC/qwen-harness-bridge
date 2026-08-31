@@ -101,6 +101,57 @@ describe("job protocol", () => {
     ).toThrow();
   });
 
+  it("rejects malformed RFC 3339 offsets", () => {
+    const receipt = {
+      job_id: crypto.randomUUID(),
+      short_id: "QH-7M2P",
+      status: "queued" as const,
+      connector_status: "online" as const,
+      accepted_at: "2026-09-01T08:00:00+08:00",
+      expires_at: "2026-09-02T08:00:00+08:00",
+    };
+    expect(() =>
+      JobReceiptSchema.parse({
+        ...receipt,
+        accepted_at: "2026-09-01T08:00:00+0800",
+      }),
+    ).toThrow();
+  });
+
+  it("rejects impossible RFC 3339 offsets", () => {
+    const receipt = {
+      job_id: crypto.randomUUID(),
+      short_id: "QH-7M2P",
+      status: "queued" as const,
+      connector_status: "online" as const,
+      accepted_at: "2026-09-01T08:00:00+08:00",
+      expires_at: "2026-09-02T08:00:00+08:00",
+    };
+    expect(() =>
+      JobReceiptSchema.parse({
+        ...receipt,
+        accepted_at: "2026-09-01T08:00:00+99:99",
+      }),
+    ).toThrow();
+  });
+
+  it("rejects invalid RFC 3339 calendar dates", () => {
+    const receipt = {
+      job_id: crypto.randomUUID(),
+      short_id: "QH-7M2P",
+      status: "queued" as const,
+      connector_status: "online" as const,
+      accepted_at: "2026-09-01T08:00:00+08:00",
+      expires_at: "2026-09-02T08:00:00+08:00",
+    };
+    expect(() =>
+      JobReceiptSchema.parse({
+        ...receipt,
+        accepted_at: "2026-02-30T08:00:00+08:00",
+      }),
+    ).toThrow();
+  });
+
   it("parses a bounded job summary", () => {
     const value = JobSummarySchema.parse({
       short_id: "QH-7M2P",

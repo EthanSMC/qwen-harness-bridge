@@ -18,7 +18,38 @@ export const RepositoryIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{1,49}$/);
 
 export const ShortJobIdSchema = z.string().regex(/^QH-[A-Z0-9]{4}$/);
 
-const Rfc3339TimestampSchema = z.string().datetime({ offset: true });
+const RFC3339_TIMESTAMP_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.\d+)?(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
+
+const isLeapYear = (year: number): boolean =>
+  year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+
+const daysInMonth = (year: number, month: number): number => {
+  if (month === 2) {
+    return isLeapYear(year) ? 29 : 28;
+  }
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
+};
+
+const isValidRfc3339Timestamp = (value: string): boolean => {
+  const match = value.match(RFC3339_TIMESTAMP_PATTERN);
+  if (match === null) {
+    return false;
+  }
+
+  const [, yearText, monthText, dayText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+
+  return (
+    month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth(year, month)
+  );
+};
+
+const Rfc3339TimestampSchema = z
+  .string()
+  .refine(isValidRfc3339Timestamp, "Invalid RFC 3339 timestamp");
 
 const boundedUtf8Text = (maxBytes: number) =>
   z
