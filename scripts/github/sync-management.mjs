@@ -7,6 +7,7 @@ const json = (args, input) => JSON.parse(execFileSync("gh", args, {
   cwd: root,
   encoding: "utf8",
   input: input === undefined ? undefined : JSON.stringify(input),
+  stdio: ["pipe", "pipe", "pipe"],
 }).trim() || "null");
 const api = (path, method = "GET", body) => json([
   "api", path, "--method", method, ...(body === undefined ? [] : ["--input", "-"]),
@@ -74,15 +75,32 @@ for (const definition of planDefinitions) {
   }
 }
 
-api(`repos/${repo}/branches/main/protection`, "PUT", {
-  required_status_checks: { strict: true, contexts: ["governance"] },
-  enforce_admins: false,
-  required_pull_request_reviews: null,
-  restrictions: null,
-  required_linear_history: true,
-  allow_force_pushes: false,
-  allow_deletions: false,
-  required_conversation_resolution: true,
-});
+let protectionStatus = "enabled";
+try {
+  api(`repos/${repo}/branches/main/protection`, "PUT", {
+    required_status_checks: { strict: true, contexts: ["governance"] },
+    enforce_admins: false,
+    required_pull_request_reviews: null,
+    restrictions: null,
+    required_linear_history: true,
+    allow_force_pushes: false,
+    allow_deletions: false,
+    required_conversation_resolution: true,
+  });
+} catch (error) {
+  const detail = `${error.stderr ?? ""}${error.stdout ?? ""}${error.message ?? ""}`;
+  if (!detail.includes("Upgrade to GitHub Pro or make this repository public")) throw error;
+  protectionStatus = "unavailable on current private-repository plan";
+  const marker = "<!-- qhb-governance:private-branch-protection -->";
+  const body = `${marker}\n\nGitHub rejected the main branch-protection API with HTTP 403 because this private repository is on a plan that does not include the feature. The repository must remain private; do not make it public as a workaround.\n\nCurrent mitigations:\n\n- [x] Governance workflow runs on pull request and main push.\n- [x] CODEOWNERS, pull-request template, issue-driven workflow, and no-force-push policy are documented.\n- [ ] Upgrade the GitHub plan or move the private repository to an organization plan that supports branch protection.\n- [ ] Rerun \`node scripts/github/sync-management.mjs\`.\n- [ ] Verify required \`governance\` status, linear history, no force push/deletion, and conversation resolution.\n`;
+  const existing = existingIssues.find((issue) => issue.body?.includes(marker));
+  const payload = {
+    title: "[Governance] Enable main protection for the private repository",
+    body,
+    labels: ["type:docs", "area:operations", "priority:p2", "risk:medium"],
+  };
+  if (existing) api(`repos/${repo}/issues/${existing.number}`, "PATCH", payload);
+  else api(`repos/${repo}/issues`, "POST", payload);
+}
 
-console.log(`Synchronized ${labels.length} labels, ${desiredMilestones.length} milestones, 34 plan issues, and main protection for ${repo}.`);
+console.log(`Synchronized ${labels.length} managed labels, ${desiredMilestones.length} milestones, 34 plan issues; main protection: ${protectionStatus}.`);

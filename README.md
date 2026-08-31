@@ -40,10 +40,11 @@ Implementation is issue-driven. Each numbered task in the five plans maps to one
 
 Repository governance is defined in [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [.github/](.github/). `node scripts/github/verify-planning.mjs` validates the planning baseline; `node scripts/github/sync-management.mjs` synchronizes labels, milestones, implementation issues, and main-branch protection after the private GitHub repository exists.
 
+The current remote-management snapshot and private-repository branch-protection limitation are recorded in [docs/github/repository-status.md](docs/github/repository-status.md).
+
 ## Current status
 
 - Product/system Spec: approved.
 - Five implementation plans: complete.
 - Runtime implementation: not started.
 - Stable public availability: none; target is a single-owner private beta.
-
