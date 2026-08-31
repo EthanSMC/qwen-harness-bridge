@@ -1,0 +1,47 @@
+name: Implementation task
+description: Implement one task from an approved plan
+title: "[Implementation] "
+labels:
+  - "type:feature"
+body:
+  - type: input
+    id: plan
+    attributes:
+      label: Plan and task
+      description: Link the exact approved implementation-plan task.
+      placeholder: docs/superpowers/plans/...md#task-n
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: State the concrete outcome and consumed/produced interfaces.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: List exact commands and expected results from the plan.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risk and rollback
+      description: Cover security, privacy, protocol, migration, stable/RTC boundary, and rollback as applicable.
+    validations:
+      required: true
+  - type: checkboxes
+    id: done
+    attributes:
+      label: Definition of done
+      options:
+        - label: Failing test exists before behavior change.
+          required: true
+        - label: Relevant automated checks pass.
+          required: true
+        - label: Documentation and acceptance evidence are current.
+          required: true
+

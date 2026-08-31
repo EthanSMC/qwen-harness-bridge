@@ -1,0 +1,45 @@
+name: Bug report
+description: Report a reproducible non-security defect
+title: "[Bug] "
+labels:
+  - "type:bug"
+body:
+  - type: markdown
+    attributes:
+      value: Do not include credentials, raw prompts/logs, source bodies, private paths, or security vulnerabilities.
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Use redacted identifiers and safe fixtures.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: rtc
+    attributes:
+      label: RTC mode
+      options:
+        - Disabled
+        - Enabled
+        - Not applicable
+    validations:
+      required: true
+

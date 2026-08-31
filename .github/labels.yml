@@ -1,0 +1,21 @@
+labels:
+  - { name: "type:feature", color: "1f883d", description: "New product or engineering capability" }
+  - { name: "type:bug", color: "d1242f", description: "Reproducible non-security defect" }
+  - { name: "type:test", color: "8250df", description: "Test or acceptance evidence" }
+  - { name: "type:docs", color: "0969da", description: "Documentation or decision record" }
+  - { name: "type:security", color: "b60205", description: "Security hardening without vulnerability detail" }
+  - { name: "area:protocol", color: "54aeff", description: "Shared MCP or Connector protocol" }
+  - { name: "area:control-plane", color: "54aeff", description: "Cloud Control Plane" }
+  - { name: "area:connector", color: "54aeff", description: "Outbound Mac Connector" }
+  - { name: "area:harness", color: "54aeff", description: "DeepSeek Harness integration" }
+  - { name: "area:qwen-skill", color: "54aeff", description: "Qwen Skill and glasses UX" }
+  - { name: "area:rtc", color: "54aeff", description: "Experimental RTC live mode" }
+  - { name: "area:operations", color: "54aeff", description: "Reliability and operations" }
+  - { name: "area:release", color: "54aeff", description: "Versioning and release evidence" }
+  - { name: "priority:p0", color: "b60205", description: "Release blocker or critical boundary" }
+  - { name: "priority:p1", color: "d93f0b", description: "Required for current milestone" }
+  - { name: "priority:p2", color: "fbca04", description: "Important but not current blocker" }
+  - { name: "risk:low", color: "0e8a16", description: "Low change risk" }
+  - { name: "risk:medium", color: "fbca04", description: "Material behavior or operational risk" }
+  - { name: "risk:high", color: "b60205", description: "Security, data, protocol, or release-critical risk" }
+

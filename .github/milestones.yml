@@ -1,0 +1,8 @@
+milestones:
+  - { key: M0, title: "M0 — v0.1.0 Product and technical baseline", description: "Repository, schemas, state machine, seven MCP tools, and fake Connector end-to-end." }
+  - { key: M1, title: "M1 — v0.2.0 Async Harness task loop", description: "Real Harness plugin, outbound Connector, local policy, approvals, and session restore." }
+  - { key: M2, title: "M2 — v0.3.0 Glasses UI and approvals", description: "Private Skill, native task UI, safe mutations, sandbox, and physical-device acceptance." }
+  - { key: M3, title: "M3 — v0.4.0 Reliability and security", description: "Reconciliation, threat tests, telemetry, restore, CI, and rollback." }
+  - { key: M4, title: "M4 — v0.5.0 Experimental RTC", description: "Feature-gated live RTC/ASR/SSE path with ten-cycle device acceptance." }
+  - { key: M5, title: "M5 — v1.0.0 Stable private beta", description: "Stable suite with RTC disabled, seven-day dogfood, restore and rollback evidence." }
+

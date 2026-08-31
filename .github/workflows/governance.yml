@@ -1,0 +1,26 @@
+name: Governance
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: governance-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  governance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Verify planning and repository governance
+        run: node scripts/github/verify-planning.mjs
+      - name: Check whitespace errors
+        run: git diff --check HEAD^
+
