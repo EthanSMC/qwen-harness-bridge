@@ -18,15 +18,34 @@ export const RepositoryIdSchema = z.string().regex(/^[a-z0-9][a-z0-9-]{1,49}$/);
 
 export const ShortJobIdSchema = z.string().regex(/^QH-[A-Z0-9]{4}$/);
 
+const Rfc3339TimestampSchema = z.string().datetime({ offset: true });
+
+const boundedUtf8Text = (maxBytes: number) =>
+  z
+    .string()
+    .trim()
+    .min(1)
+    .superRefine((value, context) => {
+      if (new TextEncoder().encode(value).byteLength > maxBytes) {
+        context.addIssue({
+          code: z.ZodIssueCode.too_big,
+          inclusive: true,
+          maximum: maxBytes,
+          message: `String must contain at most ${maxBytes} UTF-8 bytes`,
+          type: "string",
+        });
+      }
+    });
+
 export const JobSummarySchema = z
   .object({
     short_id: ShortJobIdSchema,
-    title: z.string().trim().min(1).max(40),
+    title: boundedUtf8Text(40),
     status: JobStatusSchema,
-    current_stage: z.string().trim().min(1).max(36),
+    current_stage: boundedUtf8Text(36),
     freshness: ConnectorHealthSchema,
     unread_terminal: z.boolean(),
-    updated_at: z.string().datetime(),
+    updated_at: Rfc3339TimestampSchema,
   })
   .strict();
 
@@ -34,7 +53,7 @@ export const SubmitTaskInputSchema = z
   .object({
     client_request_id: z.string().uuid(),
     repository_id: RepositoryIdSchema,
-    request: z.string().trim().min(1).max(4000),
+    request: boundedUtf8Text(4000),
     mode: z.enum(["normal", "read_only"]).default("normal"),
   })
   .strict();
@@ -45,8 +64,8 @@ export const JobReceiptSchema = z
     short_id: ShortJobIdSchema,
     status: z.literal("queued"),
     connector_status: z.enum(["online", "offline"]),
-    accepted_at: z.string().datetime(),
-    expires_at: z.string().datetime(),
+    accepted_at: Rfc3339TimestampSchema,
+    expires_at: Rfc3339TimestampSchema,
   })
   .strict();
 
