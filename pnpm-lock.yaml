@@ -18,6 +18,12 @@ importers:
         specifier: ^3.2.4
         version: 3.2.7
 
+  apps/control-plane:
+    dependencies:
+      '@qhb/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
+
   packages/protocol:
     dependencies:
       zod:
