@@ -22,3 +22,23 @@
 仓库级 Biome 检查仍受基线 `scripts/github/*.mjs` 格式问题和 Biome schema 2.5.11/CLI 2.2.2 不匹配影响；本轮未修改无关文件。
 
 提交：本报告随 Task 2 Fix Round 1 commit 一并提交。
+
+# Task 2 Fix Round 2
+
+## Reviewer P2 closure
+
+- 已关闭 reviewer P2：`SafeEventPayloadSchema` 递归检查所有对象和数组的自有属性名，包含 non-enumerable `toJSON`；因此 `JSON.stringify` 无法通过自定义序列化器把未审查字段带入云端。
+- 未在 discriminated union option 上引入 `ZodEffects`；现有合法 JSON payload 和 union 构造保持不变。
+
+## 改动
+
+- 在 `packages/protocol/src/connector.ts` 增加自有 `toJSON` 安全边界检查。
+- 在 `packages/protocol/src/connector.test.ts` 增加普通对象和数组上的 non-enumerable `toJSON` 拒绝回归测试。
+
+## 验证
+
+- `./node_modules/.bin/vitest run packages/protocol/src/connector.test.ts`：12/12 passed。
+- `./node_modules/.bin/vitest run`：31/31 passed。
+- `./node_modules/.bin/tsc -p packages/protocol/tsconfig.json --noEmit`：passed。
+- `./node_modules/.bin/tsc -p apps/control-plane/tsconfig.json --noEmit`：passed。
+- changed-file `./node_modules/.bin/biome check packages/protocol/src/connector.ts packages/protocol/src/connector.test.ts`：passed。

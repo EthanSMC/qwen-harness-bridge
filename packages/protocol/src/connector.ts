@@ -143,6 +143,8 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> => {
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
 };
+const hasOwnToJSON = (value: object): boolean =>
+  Object.getOwnPropertyNames(value).includes("toJSON");
 
 const utf8Encoder = new TextEncoder();
 const jsonByteLength = (value: unknown): number =>
@@ -255,6 +257,10 @@ const SafeEventPayloadSchema = z
         return;
       }
       activeObjects.add(value);
+
+      if (hasOwnToJSON(value)) {
+        addIssue(path, "Event payload must not contain own toJSON properties");
+      }
 
       if (Array.isArray(value)) {
         addStructuralBytes(1);

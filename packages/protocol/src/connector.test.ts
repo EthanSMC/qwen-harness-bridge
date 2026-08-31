@@ -614,6 +614,38 @@ describe("connector envelope", () => {
     ).toThrow();
   });
 
+  it("rejects non-enumerable toJSON properties on objects and arrays", () => {
+    const base = {
+      job_id: ids.job,
+      attempt: 1,
+      event_type: "progress",
+      source: "harness",
+    };
+    const objectWithHiddenToJSON = { safe: "ok" };
+    Object.defineProperty(objectWithHiddenToJSON, "toJSON", {
+      value: () => ({ leaked: "unreviewed" }),
+      enumerable: false,
+    });
+    const arrayWithHiddenToJSON = ["ok"];
+    Object.defineProperty(arrayWithHiddenToJSON, "toJSON", {
+      value: () => ({ leaked: "unreviewed" }),
+      enumerable: false,
+    });
+
+    expect(() =>
+      JobEventPayloadSchema.parse({
+        ...base,
+        payload: { nested: objectWithHiddenToJSON },
+      }),
+    ).toThrow();
+    expect(() =>
+      JobEventPayloadSchema.parse({
+        ...base,
+        payload: { nested: arrayWithHiddenToJSON },
+      }),
+    ).toThrow();
+  });
+
   it("enforces event payload size and nesting boundaries", () => {
     const base = {
       job_id: ids.job,
