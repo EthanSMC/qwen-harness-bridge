@@ -4,9 +4,17 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@qhb/protocol": "workspace:*"
+    "@qhb/protocol": "workspace:*",
+    "drizzle-orm": "^0.44.5",
+    "postgres": "^3.4.7",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.4"
   }
 }
