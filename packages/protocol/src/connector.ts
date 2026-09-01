@@ -2,8 +2,16 @@ import { z } from "zod";
 import { RepositoryIdSchema } from "./job.js";
 
 const UuidSchema = z.string().uuid();
-const PositiveIntegerSchema = z.number().int().min(1);
-const NonNegativeIntegerSchema = z.number().int().nonnegative();
+const PositiveIntegerSchema = z
+  .number()
+  .int()
+  .min(1)
+  .max(Number.MAX_SAFE_INTEGER);
+const NonNegativeIntegerSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .max(Number.MAX_SAFE_INTEGER);
 
 export const INVALID_SEQUENCE_ERROR = "INVALID_SEQUENCE";
 export const INVALID_SEQUENCE_ORDER_ERROR = "INVALID_SEQUENCE_ORDER";
@@ -58,31 +66,127 @@ const boundedUtf8Text = (maxBytes: number) =>
       }
     });
 
+const RFC3339_TIMESTAMP_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.(\d+))?(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/;
+
+const isLeapYear = (year: number): boolean =>
+  year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+
+const daysInMonth = (year: number, month: number): number => {
+  if (month === 2) {
+    return isLeapYear(year) ? 29 : 28;
+  }
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
+};
+
+const isValidRfc3339CalendarDate = (value: string): boolean => {
+  const match = value.match(RFC3339_TIMESTAMP_PATTERN);
+  if (match === null) {
+    return false;
+  }
+
+  const [, yearText, monthText, dayText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  return (
+    month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth(year, month)
+  );
+};
+
 const Rfc3339TimestampSchema = z
   .string()
-  .regex(
-    /^(\d{4})-(\d{2})-(\d{2})T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.\d+)?(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/,
-    "Invalid RFC 3339 timestamp",
-  )
-  .refine((value) => {
-    const [, yearText, monthText, dayText] =
-      value.match(/^(\d{4})-(\d{2})-(\d{2})T/) ?? [];
-    if (
-      yearText === undefined ||
-      monthText === undefined ||
-      dayText === undefined
-    ) {
-      return false;
-    }
+  .regex(RFC3339_TIMESTAMP_PATTERN, "Invalid RFC 3339 timestamp")
+  .refine(isValidRfc3339CalendarDate, "Invalid RFC 3339 calendar date");
 
-    const year = Number(yearText);
-    const month = Number(monthText);
-    const day = Number(dayText);
-    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-    const daysInMonth =
-      month === 2 ? (leap ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
-    return month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth;
-  }, "Invalid RFC 3339 calendar date");
+type ParsedRfc3339Instant = {
+  wholeSeconds: number;
+  fraction: string;
+};
+
+// Returns days relative to 1970-01-01 in the proleptic Gregorian calendar.
+const daysFromUnixEpoch = (
+  year: number,
+  month: number,
+  day: number,
+): number => {
+  const adjustedYear = year - (month <= 2 ? 1 : 0);
+  const era = Math.floor(adjustedYear / 400);
+  const yearOfEra = adjustedYear - era * 400;
+  const monthOfYear = month + (month > 2 ? -3 : 9);
+  const dayOfYear = Math.floor((153 * monthOfYear + 2) / 5) + day - 1;
+  const dayOfEra =
+    yearOfEra * 365 +
+    Math.floor(yearOfEra / 4) -
+    Math.floor(yearOfEra / 100) +
+    dayOfYear;
+  return era * 146097 + dayOfEra - 719468;
+};
+
+const parseRfc3339Instant = (value: string): ParsedRfc3339Instant | null => {
+  const match = value.match(RFC3339_TIMESTAMP_PATTERN);
+  if (match === null) {
+    return null;
+  }
+
+  const [
+    ,
+    yearText,
+    monthText,
+    dayText,
+    hourText,
+    minuteText,
+    secondText,
+    fraction,
+    timezone,
+  ] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) {
+    return null;
+  }
+
+  const localSeconds =
+    daysFromUnixEpoch(year, month, day) * 86400 +
+    Number(hourText) * 3600 +
+    Number(minuteText) * 60 +
+    Number(secondText);
+  const offsetSeconds =
+    timezone === "Z"
+      ? 0
+      : (timezone[0] === "+" ? 1 : -1) *
+        (Number(timezone.slice(1, 3)) * 3600 +
+          Number(timezone.slice(4, 6)) * 60);
+
+  return {
+    wholeSeconds: localSeconds - offsetSeconds,
+    fraction: fraction ?? "",
+  };
+};
+
+const compareRfc3339Instants = (left: string, right: string): number | null => {
+  const leftInstant = parseRfc3339Instant(left);
+  const rightInstant = parseRfc3339Instant(right);
+  if (leftInstant === null || rightInstant === null) {
+    return null;
+  }
+
+  if (leftInstant.wholeSeconds !== rightInstant.wholeSeconds) {
+    return leftInstant.wholeSeconds < rightInstant.wholeSeconds ? -1 : 1;
+  }
+
+  const fractionLength = Math.max(
+    leftInstant.fraction.length,
+    rightInstant.fraction.length,
+  );
+  const leftFraction = leftInstant.fraction.padEnd(fractionLength, "0");
+  const rightFraction = rightInstant.fraction.padEnd(fractionLength, "0");
+  if (leftFraction === rightFraction) {
+    return 0;
+  }
+  return leftFraction < rightFraction ? -1 : 1;
+};
 
 const ConnectorIdSchema = UuidSchema;
 const AttemptSchema = PositiveIntegerSchema;
@@ -462,7 +566,10 @@ const enforceExpiry = <T extends z.ZodTypeAny>(schema: T) =>
       sent_at: string;
     };
     if (
-      Date.parse(envelopeValue.expires_at) <= Date.parse(envelopeValue.sent_at)
+      compareRfc3339Instants(
+        envelopeValue.expires_at,
+        envelopeValue.sent_at,
+      ) !== 1
     ) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -486,7 +593,7 @@ const enforceApprovalPayloadExpiry = <T extends z.ZodTypeAny>(schema: T) =>
       return;
     }
 
-    if (Date.parse(value.payload.expires_at) <= Date.parse(value.sent_at)) {
+    if (compareRfc3339Instants(value.payload.expires_at, value.sent_at) !== 1) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["payload", "expires_at"],

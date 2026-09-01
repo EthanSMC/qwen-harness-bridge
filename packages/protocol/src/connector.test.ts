@@ -77,6 +77,106 @@ describe("connector envelope", () => {
     ).toThrow();
   });
 
+  it("accepts safe integer boundaries and rejects unsafe integer values", () => {
+    const maxSafeInteger = Number.MAX_SAFE_INTEGER;
+    const unsafeInteger = maxSafeInteger + 1;
+
+    expect(
+      EnvelopeSchema.parse({
+        ...commonEnvelope,
+        sequence: maxSafeInteger,
+        type: "ack",
+        payload: { sequence: maxSafeInteger },
+      }),
+    ).toMatchObject({ sequence: maxSafeInteger });
+    expect(() =>
+      EnvelopeSchema.parse({
+        ...commonEnvelope,
+        sequence: unsafeInteger,
+        type: "ack",
+        payload: { sequence: 1 },
+      }),
+    ).toThrow();
+    expect(() =>
+      EnvelopeSchema.parse({
+        ...commonEnvelope,
+        type: "ack",
+        payload: { sequence: unsafeInteger },
+      }),
+    ).toThrow();
+
+    expect(
+      JobClaimPayloadSchema.parse({
+        job_id: ids.job,
+        attempt: maxSafeInteger,
+        lease_id: ids.lease,
+      }),
+    ).toMatchObject({ attempt: maxSafeInteger });
+    expect(() =>
+      JobClaimPayloadSchema.parse({
+        job_id: ids.job,
+        attempt: unsafeInteger,
+        lease_id: ids.lease,
+      }),
+    ).toThrow();
+
+    expect(
+      ApprovalDecisionPayloadSchema.parse({
+        approval_id: ids.approval,
+        job_id: ids.job,
+        attempt: maxSafeInteger,
+        job_revision: maxSafeInteger,
+        action_fingerprint: validActionFingerprint,
+        decision: "approve",
+      }),
+    ).toMatchObject({
+      attempt: maxSafeInteger,
+      job_revision: maxSafeInteger,
+    });
+    expect(() =>
+      ApprovalDecisionPayloadSchema.parse({
+        approval_id: ids.approval,
+        job_id: ids.job,
+        attempt: unsafeInteger,
+        job_revision: maxSafeInteger,
+        action_fingerprint: validActionFingerprint,
+        decision: "approve",
+      }),
+    ).toThrow();
+    expect(() =>
+      ApprovalDecisionPayloadSchema.parse({
+        approval_id: ids.approval,
+        job_id: ids.job,
+        attempt: maxSafeInteger,
+        job_revision: unsafeInteger,
+        action_fingerprint: validActionFingerprint,
+        decision: "approve",
+      }),
+    ).toThrow();
+
+    expect(
+      ConnectorHelloPayloadSchema.parse({
+        connector_id: ids.connector,
+        last_server_sequence: maxSafeInteger,
+        last_client_sequence: maxSafeInteger,
+      }),
+    ).toMatchObject({
+      last_server_sequence: maxSafeInteger,
+      last_client_sequence: maxSafeInteger,
+    });
+    expect(() =>
+      ConnectorHelloPayloadSchema.parse({
+        connector_id: ids.connector,
+        last_server_sequence: unsafeInteger,
+      }),
+    ).toThrow();
+
+    expect(() => new SequenceCursor(unsafeInteger)).toThrow();
+    const cursor = new SequenceCursor(maxSafeInteger - 1);
+    expect(cursor.accept(maxSafeInteger)).toBe("accepted");
+    expect(() => cursor.accept(unsafeInteger)).toThrow();
+  });
+
   it("accepts the versioned client and server message unions", () => {
     expect(
       ConnectorClientMessageSchema.parse({
@@ -288,6 +388,62 @@ describe("connector envelope", () => {
         },
       }),
     ).toThrow();
+
+    expect(
+      EnvelopeSchema.parse({
+        ...commonEnvelope,
+        sent_at: "2026-09-01T00:00:00.0001Z",
+        expires_at: "2026-09-01T00:00:00.0002Z",
+        type: "ack",
+        payload: { sequence: 1 },
+      }).expires_at,
+    ).toBe("2026-09-01T00:00:00.0002Z");
+    expect(
+      EnvelopeSchema.parse({
+        ...commonEnvelope,
+        sent_at: "2026-09-02T00:00:00.0001+08:00",
+        expires_at: "2026-09-01T16:00:00.0002Z",
+        type: "ack",
+        payload: { sequence: 1 },
+      }).expires_at,
+    ).toBe("2026-09-01T16:00:00.0002Z");
+    for (const [sent_at, expires_at] of [
+      ["2026-09-01T00:00:00.0001Z", "2026-09-01T00:00:00.0001Z"],
+      ["2026-09-01T00:00:00.0002Z", "2026-09-01T00:00:00.0001Z"],
+    ]) {
+      expect(() =>
+        EnvelopeSchema.parse({
+          ...commonEnvelope,
+          sent_at,
+          expires_at,
+          type: "ack",
+          payload: { sequence: 1 },
+        }),
+      ).toThrow();
+    }
+
+    expect(
+      ConnectorClientMessageSchema.parse({
+        ...approval,
+        sent_at: "2026-09-01T08:00:00.0001+08:00",
+        payload: {
+          ...approval.payload,
+          expires_at: "2026-09-01T00:00:00.0002Z",
+        },
+      }).type,
+    ).toBe("approval.requested");
+    for (const expires_at of [
+      "2026-09-01T00:00:00.0001Z",
+      "2026-09-01T00:00:00.0000Z",
+    ]) {
+      expect(() =>
+        ConnectorClientMessageSchema.parse({
+          ...approval,
+          sent_at: "2026-09-01T08:00:00.0001+08:00",
+          payload: { ...approval.payload, expires_at },
+        }),
+      ).toThrow();
+    }
   });
 
   it("accepts only canonical SHA-256 action fingerprints", () => {

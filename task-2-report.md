@@ -42,3 +42,24 @@
 - `./node_modules/.bin/tsc -p packages/protocol/tsconfig.json --noEmit`：passed。
 - `./node_modules/.bin/tsc -p apps/control-plane/tsconfig.json --noEmit`：passed。
 - changed-file `./node_modules/.bin/biome check packages/protocol/src/connector.ts packages/protocol/src/connector.test.ts`：passed。
+
+# Task 2 Fix Round 3
+
+## 改动
+
+- 将 `PositiveIntegerSchema` 和 `NonNegativeIntegerSchema` 的上界收紧为 `Number.MAX_SAFE_INTEGER`，使 envelope/message/job/attempt/sequence 等字段与 `SequenceCursor` 使用同一 safe-integer 边界。
+- 保留 RFC3339 任意长度 fractional seconds 合法性；approval expiry 改为解析完整日期、时区 offset 和 fraction 后进行精确 instant 比较，不再依赖 `Date.parse` 的毫秒精度。
+- 增加 `MAX_SAFE_INTEGER` 通过、`MAX_SAFE_INTEGER + 1` 拒绝、任意长度小数精度、Z/offset、日期换日、等值/逆序 envelope expiry，以及 `approval.requested` nested expiry 回归测试。
+- 保留现有安全 payload、sha256 fingerprint、SequenceCursor/state machine 和 governance merge 改动。
+
+## 验证
+
+- `./node_modules/.bin/vitest run`：32/32 passed。
+- `./node_modules/.bin/tsc -p packages/protocol/tsconfig.json --noEmit`：passed。
+- `./node_modules/.bin/tsc -p apps/control-plane/tsconfig.json --noEmit`：passed。
+- `node --test scripts/github/verify-pr-review-state.test.mjs scripts/github/verify-pr-review-evidence.test.mjs`：37/37 passed。
+- `node scripts/github/verify-planning.mjs`：passed，verified 17 files / 34 implementation tasks。
+- `for file in scripts/github/*.mjs; do node --check "$file"; done`：passed。
+- `git diff --check`：passed。
+
+注：`pnpm typecheck` 在本机被 pnpm 10.15.1 registry signature 校验拦截，未进入编译；已使用同一仓库本地 `tsc` 对两个 strict tsconfig 完成验证。
