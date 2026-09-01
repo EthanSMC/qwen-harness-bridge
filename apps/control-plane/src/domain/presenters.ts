@@ -5,6 +5,7 @@ const MAX_TITLE_CODE_POINTS = 40;
 const MAX_STAGE_CODE_POINTS = 36;
 const MAX_DETAIL_CODE_POINTS = 600;
 const MAX_SPOKEN_CODE_POINTS = 120;
+const MAX_ARTIFACT_URL_BYTES = 2048;
 
 export type RepositoryDisplay = {
   displayName?: string | null;
@@ -143,20 +144,136 @@ const boundedText = (
   return maxBytes === undefined ? truncated : truncateUtf8(truncated, maxBytes);
 };
 
+const RAW_LOG_PREFIX =
+  /^\s*(?:\[\s*)?raw(?:[-_\s]+connector)?[-_\s]+logs?(?:\s*\])?\s*(?::|=|-)?/iu;
+const AUTHORIZATION_ASSIGNMENT =
+  /\bauthorization\b\s*[:=]\s*(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|bearer\s+[^\s,;]+|[^\s,;]+)/giu;
+const SECRET_ASSIGNMENT =
+  /\b(api[-_\s]?key|token|credential|password|secret)\b\s*[:=]\s*(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;]+)/giu;
+const BEARER_TOKEN =
+  /\bbearer\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[A-Za-z0-9._~+/-]+=*)/giu;
+
+const redactSensitiveValues = (value: string): string => {
+  if (RAW_LOG_PREFIX.test(value)) return "[redacted raw log]";
+  return value
+    .replace(AUTHORIZATION_ASSIGNMENT, "Authorization=[redacted]")
+    .replace(SECRET_ASSIGNMENT, (_match, key: string) => `${key}=[redacted]`)
+    .replace(BEARER_TOKEN, "Bearer [redacted]");
+};
+
+const quotePairs: Readonly<Record<string, string>> = {
+  '"': '"',
+  "'": "'",
+  "“": "”",
+  "‘": "’",
+};
+
+const PATH_BOUNDARIES = new Set([
+  "(",
+  '"',
+  "'",
+  "`",
+  "[",
+  "]",
+  "{",
+  "}",
+  "（",
+  "【",
+  "=",
+  ":",
+]);
+
+const isPathBoundary = (value: string | undefined): boolean =>
+  value === undefined || /\s/u.test(value) || PATH_BOUNDARIES.has(value);
+
+const hasWebSchemeBefore = (value: string, index: number): boolean =>
+  /https?:$/iu.test(value.slice(Math.max(0, index - 8), index));
+
+const absolutePathStart = (value: string, index: number): boolean => {
+  if (!isPathBoundary(value[index - 1])) return false;
+  const current = value[index];
+  const next = value[index + 1];
+  const afterNext = value[index + 2];
+  if (current === "/") {
+    return !hasWebSchemeBefore(value, index);
+  }
+  if (current === "\\" && next === "\\") return true;
+  return (
+    current !== undefined &&
+    /^[A-Za-z]$/.test(current) &&
+    next === ":" &&
+    (afterNext === "/" || afterNext === "\\")
+  );
+};
+
+/**
+ * Free text has no reliable path grammar. Once an unquoted absolute path is
+ * detected, redact to the end of that line; quoted paths redact through their
+ * closing quote. This deliberately favours confidentiality over preserving a
+ * potentially ambiguous suffix and covers Unicode and whitespace segments.
+ */
+const redactAbsolutePathText = (value: string): string => {
+  let output = "";
+  let cursor = 0;
+  while (cursor < value.length) {
+    if (!absolutePathStart(value, cursor)) {
+      output += value[cursor];
+      cursor += 1;
+      continue;
+    }
+
+    output += "[redacted path]";
+    const openingQuote = value[cursor - 1];
+    const closingQuote =
+      openingQuote === undefined ? undefined : quotePairs[openingQuote];
+    if (closingQuote !== undefined) {
+      const closingIndex = value.indexOf(closingQuote, cursor);
+      cursor = closingIndex < 0 ? value.length : closingIndex;
+      continue;
+    }
+
+    const lineBreak = value.indexOf("\n", cursor);
+    cursor = lineBreak < 0 ? value.length : lineBreak;
+  }
+  return output;
+};
+
+const publicFreeText = (
+  value: string | null | undefined,
+  maxCodePoints: number,
+  maxBytes?: number,
+): string =>
+  boundedText(
+    redactAbsolutePathText(redactSensitiveValues(value?.trim() || "")),
+    maxCodePoints,
+    maxBytes,
+  );
+
 const safeTitle = (value: string | null | undefined): string =>
-  boundedText(value, MAX_TITLE_CODE_POINTS, 40) || "Untitled task";
+  publicFreeText(value, MAX_TITLE_CODE_POINTS, 40) || "Untitled task";
 
 const safeStage = (value: string | null | undefined): string =>
-  boundedText(value, MAX_STAGE_CODE_POINTS, 36) || "Unknown stage";
+  publicFreeText(value, MAX_STAGE_CODE_POINTS, 36) || "Unknown stage";
 
 const safeDetail = (value: string | null | undefined): string =>
-  boundedText(value, MAX_DETAIL_CODE_POINTS);
+  publicFreeText(value, MAX_DETAIL_CODE_POINTS);
 
 const isAbsolutePath = (value: string): boolean =>
   value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
 
 const normalizePath = (value: string): string =>
   value.replaceAll("\\", "/").replace(/^\.\//, "");
+
+const safeRepositoryRelativePath = (value: string): string | null => {
+  const segments = value.split("/");
+  return value.length > 0 &&
+    !value.startsWith("/") &&
+    segments.every(
+      (segment) => segment.length > 0 && segment !== "." && segment !== "..",
+    )
+    ? value
+    : null;
+};
 
 const relativeRepositoryPath = (
   value: string,
@@ -175,34 +292,11 @@ const relativeRepositoryPath = (
       return null;
     }
     const relative = normalized.slice(canonical.length).replace(/^\/+/, "");
-    return relative.length === 0 ? "." : relative;
+    return safeRepositoryRelativePath(relative);
   }
 
-  if (
-    normalized.length === 0 ||
-    normalized === ".." ||
-    normalized.startsWith("../") ||
-    normalized.includes("/../") ||
-    normalized.startsWith("/")
-  ) {
-    return null;
-  }
-  return normalized;
+  return safeRepositoryRelativePath(normalized);
 };
-
-const pathToken =
-  /(?:\/[A-Za-z0-9._~+@%=-]+)+(?:\/[A-Za-z0-9._~+@%=-]+)*|[A-Za-z]:[\\/][^\s"'<>]+/g;
-
-const redactAbsolutePaths = (
-  value: string,
-  repository: RepositoryDisplay,
-): string =>
-  value.replace(pathToken, (token) => {
-    const clean = token.replace(/[),.;:!?]+$/, "");
-    if (!isAbsolutePath(clean)) return token;
-    const relative = relativeRepositoryPath(clean, repository);
-    return relative ?? "[redacted path]";
-  });
 
 const publicChangedFiles = (
   values: unknown,
@@ -223,14 +317,14 @@ const publicEvent = (
   const payload = event.payload ?? {};
   const output: PublicTaskDetail["recent_events"][number] = {
     sequence: event.sequence,
-    type: boundedText(event.type, 64) || "event",
+    type: publicFreeText(event.type, 64) || "event",
     created_at: asDate(event.createdAt),
   };
 
   const stage = payload.stage ?? payload.current_stage;
   if (typeof stage === "string") output.current_stage = safeStage(stage);
   if (typeof payload.detail === "string") {
-    output.detail = safeDetail(redactAbsolutePaths(payload.detail, repository));
+    output.detail = safeDetail(payload.detail);
   }
   const changedFiles = publicChangedFiles(payload.changed_files, repository);
   if (changedFiles.length > 0) output.changed_files = changedFiles;
@@ -242,9 +336,9 @@ const publicApproval = (approval: PresentableApproval): PublicApproval => ({
   ...(approval.jobId === undefined ? {} : { job_id: approval.jobId }),
   job_short_id: boundedText(approval.jobShortId, 7) || "unknown",
   job_revision: approval.jobRevision,
-  action_summary: safeDetail(redactAbsolutePaths(approval.actionSummary, {})),
-  impact_summary: safeDetail(redactAbsolutePaths(approval.impactSummary, {})),
-  risk_class: boundedText(approval.riskClass, 64) || "unknown",
+  action_summary: safeDetail(approval.actionSummary),
+  impact_summary: safeDetail(approval.impactSummary),
+  risk_class: publicFreeText(approval.riskClass, 64) || "unknown",
   expires_at: asDate(approval.expiresAt),
 });
 
@@ -282,9 +376,7 @@ export const presentJobDetail = (input: {
         ? input.terminalSummary.summary
         : null;
   const terminalSummary =
-    terminalText === null
-      ? null
-      : safeDetail(redactAbsolutePaths(terminalText, repository));
+    terminalText === null ? null : safeDetail(terminalText);
   const eventText = recentEvents
     .flatMap((event) => [event.current_stage, event.detail])
     .filter((value): value is string => typeof value === "string")
@@ -297,7 +389,7 @@ export const presentJobDetail = (input: {
     job_id: input.job.jobId,
     title,
     repository:
-      boundedText(repository.displayName, 120) ||
+      publicFreeText(repository.displayName, 120) ||
       input.job.repositoryId ||
       "Unknown repository",
     status: input.job.status,
@@ -318,24 +410,89 @@ export const presentPendingApprovals = (
   approvals: readonly PresentableApproval[],
 ): PublicApproval[] => approvals.slice(0, MAX_ITEMS).map(publicApproval);
 
+/**
+ * Artifact hosts are intentionally not allowlisted because no host policy is
+ * configured. Instead, fail closed on every URL feature that can carry hidden
+ * authority or credentials and publish only plain, bounded HTTPS URLs.
+ */
+const publicArtifactUrl = (raw: string): string | null => {
+  const value = raw.trim();
+  const hasControlOrWhitespace = Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    return codePoint <= 0x20 || codePoint === 0x7f;
+  });
+  if (
+    value.length === 0 ||
+    value !== raw ||
+    new TextEncoder().encode(value).byteLength > MAX_ARTIFACT_URL_BYTES ||
+    Array.from(value).length > MAX_ARTIFACT_URL_BYTES ||
+    hasControlOrWhitespace ||
+    /%(?![0-9a-f]{2})/iu.test(value) ||
+    value.includes("?") ||
+    value.includes("#")
+  ) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.hostname.length === 0 ||
+      parsed.username.length > 0 ||
+      parsed.password.length > 0 ||
+      parsed.search.length > 0 ||
+      parsed.hash.length > 0
+    ) {
+      return null;
+    }
+    const normalized = parsed.toString();
+    return new TextEncoder().encode(normalized).byteLength <=
+      MAX_ARTIFACT_URL_BYTES
+      ? normalized
+      : null;
+  } catch {
+    return null;
+  }
+};
+
+const publicMediaType = (value: string): string => {
+  const normalized = value.trim().toLowerCase();
+  return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(normalized)
+    ? normalized
+    : "application/octet-stream";
+};
+
+const publicArtifacts = (
+  artifacts: PresentableResult["artifacts"],
+): PublicTaskResult["artifacts"] => {
+  const output: PublicTaskResult["artifacts"] = [];
+  for (const artifact of artifacts.slice(0, MAX_ITEMS * 5)) {
+    const url = publicArtifactUrl(artifact.url);
+    if (url === null) continue;
+    output.push({
+      name: publicFreeText(artifact.name, 120) || "artifact",
+      media_type: publicMediaType(artifact.mediaType),
+      url,
+    });
+    if (output.length === MAX_ITEMS) break;
+  }
+  return output;
+};
+
 export const presentTaskResult = (
   result: PresentableResult,
   repository: RepositoryDisplay = {},
 ): PublicTaskResult => ({
   ...(result.jobId === undefined ? {} : { job_id: result.jobId }),
-  summary: boundedText(result.summary, MAX_SPOKEN_CODE_POINTS),
+  summary: publicFreeText(result.summary, MAX_SPOKEN_CODE_POINTS),
   changed_files: publicChangedFiles(result.changedFiles, repository),
   tests: {
     passed: result.tests.passed,
     failed: result.tests.failed,
-    summary: boundedText(result.tests.summary, MAX_SPOKEN_CODE_POINTS),
+    summary: publicFreeText(result.tests.summary, MAX_SPOKEN_CODE_POINTS),
   },
-  artifacts: result.artifacts.slice(0, MAX_ITEMS).map((artifact) => ({
-    name: boundedText(artifact.name, 120) || "artifact",
-    media_type:
-      boundedText(artifact.mediaType, 120) || "application/octet-stream",
-    url: boundedText(artifact.url, 2048),
-  })),
+  artifacts: publicArtifacts(result.artifacts),
   acknowledged_at:
     result.acknowledgedAt === null ? null : asDate(result.acknowledgedAt),
 });

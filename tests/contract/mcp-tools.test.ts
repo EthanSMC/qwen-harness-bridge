@@ -59,6 +59,7 @@ const TASK_SUMMARY = {
 const LIST_RESULT = { tasks: [TASK_SUMMARY] };
 const DETAIL_RESULT = {
   job_id: JOB_ID,
+  title: "登录测试",
   repository: "Novelty Studio",
   status: "queued" as const,
   current_stage: "排队",
@@ -67,6 +68,7 @@ const DETAIL_RESULT = {
   pending_approval: null,
   terminal_summary: null,
   revision: 0,
+  text: "登录测试 排队",
 };
 const CANCEL_RESULT = {
   job_id: JOB_ID,
@@ -107,7 +109,7 @@ type FakeCoordinator = {
 };
 
 function fakeCoordinator(
-  overrides: Partial<Pick<FakeCoordinator, "get">> = {},
+  overrides: Partial<Pick<FakeCoordinator, "get" | "submit">> = {},
 ): FakeCoordinator {
   const calls: RecordedCall[] = [];
   const record = (method: string, owner: unknown, input: unknown): void => {
@@ -116,10 +118,15 @@ function fakeCoordinator(
 
   return {
     calls,
-    submit: async (owner, input) => {
-      record("submit", owner, input);
-      return SUBMIT_RESULT;
-    },
+    submit: overrides.submit
+      ? async (owner, input) => {
+          record("submit", owner, input);
+          return overrides.submit?.(owner, input);
+        }
+      : async (owner, input) => {
+          record("submit", owner, input);
+          return SUBMIT_RESULT;
+        },
     list: async (owner, input) => {
       record("list", owner, input);
       return LIST_RESULT.tasks;
@@ -207,8 +214,51 @@ describe("MCP public tool contract", () => {
       for (const tool of result.tools) {
         expect(tool.inputSchema.type).toBe("object");
         expect(tool.inputSchema.additionalProperties).toBe(false);
-        expect(tool.outputSchema).toMatchObject({ type: "object" });
+        expect(tool.outputSchema).toMatchObject({
+          type: "object",
+          additionalProperties: false,
+        });
       }
+    } finally {
+      await closeConnection(connection);
+    }
+  });
+
+  it("advertises exact bounded output object shapes", async () => {
+    const connection = await connectedClient(fakeCoordinator());
+    try {
+      const tools = asToolMap((await connection.client.listTools()).tools);
+      expect(tools.get("submit_task")?.outputSchema?.required).toEqual([
+        "job_id",
+        "short_id",
+        "status",
+        "connector_status",
+        "accepted_at",
+        "expires_at",
+      ]);
+      expect(
+        tools.get("list_tasks")?.outputSchema?.properties?.tasks,
+      ).toMatchObject({ type: "array", maxItems: 5 });
+      expect(
+        tools.get("get_task")?.outputSchema?.properties?.recent_events,
+      ).toMatchObject({ type: "array", maxItems: 5 });
+      expect(
+        tools.get("list_pending_approvals")?.outputSchema?.properties
+          ?.approvals,
+      ).toMatchObject({ type: "array", maxItems: 5 });
+      expect(
+        tools.get("get_task_result")?.outputSchema?.properties?.artifacts,
+      ).toMatchObject({ type: "array", maxItems: 5 });
+      expect(tools.get("cancel_task")?.outputSchema?.required).toEqual([
+        "job_id",
+        "status",
+        "revision",
+      ]);
+      expect(tools.get("decide_approval")?.outputSchema?.required).toEqual([
+        "approval_id",
+        "decision",
+        "revision",
+      ]);
     } finally {
       await closeConnection(connection);
     }
@@ -449,6 +499,51 @@ describe("MCP public tool contract", () => {
       });
       expect(performance.now() - started).toBeLessThan(2000);
       expect(result.structuredContent).toMatchObject({ status: "queued" });
+    } finally {
+      await closeConnection(connection);
+    }
+  });
+
+  it("fails a blocked coordinator call before the two-second server budget", async () => {
+    const coordinator = fakeCoordinator({
+      submit: async () => new Promise(() => undefined),
+    });
+    const connection = await connectedClient(coordinator);
+    try {
+      const started = performance.now();
+      const result = await connection.client.callTool({
+        name: "submit_task",
+        arguments: VALID_SUBMIT,
+      });
+      expect(performance.now() - started).toBeLessThan(2000);
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        error: { code: "TASK_TIMEOUT" },
+      });
+    } finally {
+      await closeConnection(connection);
+    }
+  });
+
+  it("fails closed on deeply nested unexpected coordinator output", async () => {
+    let nested: Record<string, unknown> = {
+      credential: "do-not-return-this-secret",
+      path: "/Users/secret/private.key",
+    };
+    for (let depth = 0; depth < 12; depth += 1) nested = { child: nested };
+    const coordinator = fakeCoordinator({
+      get: async () => ({ ...DETAIL_RESULT, debug: nested }),
+    });
+    const connection = await connectedClient(coordinator);
+    try {
+      const result = await connection.client.callTool({
+        name: "get_task",
+        arguments: { job_id: JOB_ID },
+      });
+      const serialized = JSON.stringify(result);
+      expect(result.isError).toBe(true);
+      expect(serialized).not.toContain("do-not-return-this-secret");
+      expect(serialized).not.toContain("/Users/secret");
     } finally {
       await closeConnection(connection);
     }

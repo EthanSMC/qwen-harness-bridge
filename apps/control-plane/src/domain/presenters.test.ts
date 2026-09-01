@@ -187,6 +187,230 @@ describe("presenters", () => {
     assertNoUnpairedSurrogates(result.summary);
   });
 
+  it("publishes only bounded HTTPS artifact URLs without credentials or URL metadata", () => {
+    const result = presentTaskResult({
+      summary: "Report ready",
+      changedFiles: [],
+      tests: { passed: 1, failed: 0, summary: "1 passed" },
+      artifacts: [
+        {
+          name: "HTTP report",
+          mediaType: "text/html",
+          url: "http://example.test/report",
+        },
+        {
+          name: "Local report",
+          mediaType: "text/html",
+          url: "file:///private/reports/result.html",
+        },
+        {
+          name: "Inline report",
+          mediaType: "text/html",
+          url: "data:text/html,secret",
+        },
+        {
+          name: "Credential report",
+          mediaType: "text/html",
+          url: "https://reader:password@example.test/report",
+        },
+        {
+          name: "Signed report",
+          mediaType: "text/html",
+          url: "https://example.test/report?X-Amz-Credential=credential&X-Amz-Signature=secret",
+        },
+        {
+          name: "Fragment report",
+          mediaType: "text/html",
+          url: "https://example.test/report#token",
+        },
+        {
+          name: "Absolute local report",
+          mediaType: "text/html",
+          url: "/private/reports/result.html",
+        },
+        {
+          name: "Malformed report",
+          mediaType: "text/html",
+          url: "not a URL",
+        },
+        {
+          name: "Malformed percent report",
+          mediaType: "text/html",
+          url: "https://example.test/%ZZ",
+        },
+        {
+          name: "Oversized report",
+          mediaType: "text/html",
+          url: `https://example.test/${"a".repeat(2050)}`,
+        },
+        {
+          name: "Public report",
+          mediaType: "text/html",
+          url: "https://example.test/report",
+        },
+      ],
+      acknowledgedAt: new Date(now),
+    });
+
+    expect(result.artifacts).toEqual([
+      {
+        name: "Public report",
+        media_type: "text/html",
+        url: "https://example.test/report",
+      },
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(
+      /reader|password|X-Amz|credential|secret|file:|data:|\/private/,
+    );
+  });
+
+  it("redacts secrets and raw logs from every public free-text field", () => {
+    const detail = presentJobDetail({
+      job: job(),
+      repository,
+      events: [
+        {
+          sequence: 1,
+          type: "progress",
+          payload: {
+            detail:
+              "Deploying token=event-token credential=event-credential Authorization: Bearer auth-token",
+            log: "raw log: password=ignored-log-password",
+            request: "secret=ignored-request-secret",
+          },
+          createdAt: new Date(now),
+        },
+        {
+          sequence: 2,
+          type: "progress",
+          payload: {
+            detail:
+              "RAW-LOG: credential=raw-log-credential internal stack trace",
+          },
+          createdAt: new Date(now),
+        },
+      ],
+      pendingApproval: null,
+      terminalSummary:
+        "Completed password=terminal-password secret=terminal-secret Bearer terminal-bearer",
+    });
+    const approvals = presentPendingApprovals([
+      {
+        approvalId: "22222222-2222-4222-8222-222222222222",
+        jobShortId: "QH-7M2P",
+        jobRevision: 3,
+        actionSummary:
+          "Install dependency api-key=approval-api-key credential=approval-credential",
+        impactSummary:
+          "raw log: password=approval-log-password internal details",
+        riskClass: "approval_required",
+        expiresAt: new Date("2026-09-01T00:05:00.000Z"),
+      },
+    ]);
+    const result = presentTaskResult({
+      summary: "Ordinary success token=result-token",
+      changedFiles: [],
+      tests: {
+        passed: 12,
+        failed: 0,
+        summary: "12 passed Authorization=Bearer test-bearer",
+      },
+      artifacts: [
+        {
+          name: "Public report credential=artifact-credential",
+          mediaType: "credential=artifact-media-secret",
+          url: "https://example.test/report",
+        },
+      ],
+      acknowledgedAt: new Date(now),
+    });
+
+    const serialized = JSON.stringify({ detail, approvals, result });
+    expect(serialized).not.toMatch(
+      /event-token|event-credential|auth-token|ignored-log-password|ignored-request-secret|raw-log-credential|terminal-password|terminal-secret|terminal-bearer|approval-api-key|approval-credential|approval-log-password|result-token|test-bearer|artifact-credential|artifact-media-secret/,
+    );
+    expect(result.artifacts[0]?.media_type).toBe("application/octet-stream");
+    expect(serialized).not.toContain("internal stack trace");
+    expect(serialized).not.toContain("internal details");
+    expect(serialized).toContain("Ordinary success");
+    expect(serialized).toContain("12 passed");
+    expect(serialized).toContain("Install dependency");
+    expect(serialized).toContain("[redacted");
+  });
+
+  it("fails closed for Unicode, spaced, quoted, and Windows absolute paths", () => {
+    const detail = presentJobDetail({
+      job: job(),
+      repository,
+      events: [
+        {
+          sequence: 1,
+          type: "progress",
+          payload: {
+            detail: '读取 "/Users/张三/Novelty Studio/秘密 文件.txt" 后继续',
+          },
+          createdAt: new Date(now),
+        },
+        {
+          sequence: 2,
+          type: "progress",
+          payload: {
+            detail: "打开 C:\\Users\\张三\\Novelty Studio\\密钥 文件.txt",
+          },
+          createdAt: new Date(now),
+        },
+      ],
+      pendingApproval: null,
+      terminalSummary: "Copied /Volumes/团队 资料/秘密 文件.txt",
+    });
+    const approvals = presentPendingApprovals([
+      {
+        approvalId: "22222222-2222-4222-8222-222222222222",
+        jobShortId: "QH-7M2P",
+        jobRevision: 3,
+        actionSummary:
+          "Review '/private/项目 空间/隐藏 配置.env' before approval",
+        impactSummary: "Writes \\\\server\\团队 资料\\机密 文件.txt",
+        riskClass: "approval_required",
+        expiresAt: new Date("2026-09-01T00:05:00.000Z"),
+      },
+    ]);
+    const result = presentTaskResult(
+      {
+        summary: "Finished at /tmp/构建 输出/报告 文件.txt",
+        changedFiles: [
+          "/Users/alice/Repositories/novelty-studio/文档/设计 稿.md",
+          "/Users/alice/Repositories/novelty-studio/../other/secret.txt",
+          "/private/其他 用户/秘密 文件.txt",
+          "C:\\Users\\张三\\private.key",
+        ],
+        tests: {
+          passed: 1,
+          failed: 0,
+          summary: 'Read "D:\\Build Output\\测试 日志.txt"',
+        },
+        artifacts: [
+          {
+            name: "Report /private/构建 输出/报告.html",
+            mediaType: "text/html",
+            url: "https://example.test/report",
+          },
+        ],
+        acknowledgedAt: new Date(now),
+      },
+      repository,
+    );
+
+    const serialized = JSON.stringify({ detail, approvals, result });
+    expect(result.changed_files).toEqual(["文档/设计 稿.md"]);
+    expect(serialized).not.toMatch(
+      /\/Users\/张三|\/Volumes\/团队|\/private\/项目|\\\\server|C:\\\\Users|D:\\\\Build|\/tmp\/构建|\/private\/构建|秘密 文件|密钥 文件|机密 文件|测试 日志/,
+    );
+    expect(serialized).toContain("读取");
+    expect(serialized).toContain("后继续");
+    expect(serialized).toContain("[redacted path]");
+  });
+
   it("truncates arbitrary Unicode text without producing lone surrogates", () => {
     const value = truncateUnicode("😀中文🚦".repeat(100), 40);
 

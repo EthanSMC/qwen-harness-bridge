@@ -1,5 +1,12 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js";
+import {
+  Aes256GcmEncryptor,
+  JobCoordinator,
+} from "../../apps/control-plane/src/domain/job-coordinator.js";
+import { createMcpServer } from "../../apps/control-plane/src/mcp/server.js";
 import { createTestDatabase, type TestDatabase } from "./support/postgres.js";
 
 const db = createTestDatabase();
@@ -1222,5 +1229,49 @@ describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
       acknowledged_at: null,
       unread_terminal: true,
     });
+  });
+
+  it("submits through the real coordinator and PostgreSQL seam within two seconds", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    await seedJobDependencies(db, { ownerId, repositoryId });
+    const coordinator = new JobCoordinator({
+      repository,
+      encryptor: new Aes256GcmEncryptor(new Uint8Array(32).fill(7)),
+      now: () => new Date(),
+    });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+    const server = createMcpServer({ coordinator, ownerId });
+    const client = new Client({
+      name: "qhb-postgres-timing-client",
+      version: "1.0.0",
+    });
+
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const started = performance.now();
+      const result = await client.callTool({
+        name: "submit_task",
+        arguments: {
+          client_request_id: crypto.randomUUID(),
+          repository_id: repositoryId,
+          request: "Run the PostgreSQL integration checks",
+          mode: "normal",
+        },
+      });
+
+      expect(performance.now() - started).toBeLessThan(2000);
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        status: "queued",
+        connector_status: "offline",
+      });
+    } finally {
+      await client.close();
+      await server.close();
+    }
   });
 });

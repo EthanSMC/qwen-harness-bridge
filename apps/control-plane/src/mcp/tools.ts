@@ -9,6 +9,9 @@ import {
   GetTaskInputSchema,
   type GetTaskResultInput,
   GetTaskResultInputSchema,
+  JobReceiptSchema,
+  JobStatusSchema,
+  JobSummarySchema,
   type ListPendingApprovalsInput,
   ListPendingApprovalsInputSchema,
   type ListTasksInput,
@@ -43,7 +46,6 @@ export type McpCoordinator = Readonly<{
   ): Promise<unknown>;
 }>;
 
-const PUBLIC_OBJECT_SCHEMA = z.object({}).passthrough();
 const SubmitTaskMcpInputSchema = SubmitTaskInputSchema.extend({
   request: z
     .string()
@@ -55,10 +57,98 @@ const SubmitTaskMcpInputSchema = SubmitTaskInputSchema.extend({
       "Request must contain at most 4000 UTF-8 bytes",
     ),
 });
+const PublicTimestampSchema = z.string().min(1).max(64);
+const PublicPathSchema = z.string().min(1).max(512);
+const PublicApprovalSchema = z
+  .object({
+    approval_id: z.string().uuid(),
+    job_id: z.string().uuid().optional(),
+    job_short_id: z.string().min(1).max(7),
+    job_revision: z.number().int().nonnegative(),
+    action_summary: z.string().max(600),
+    impact_summary: z.string().max(600),
+    risk_class: z.string().min(1).max(64),
+    expires_at: PublicTimestampSchema,
+  })
+  .strict();
+const PublicEventSchema = z
+  .object({
+    sequence: z.number().int().positive(),
+    type: z.string().min(1).max(64),
+    current_stage: z.string().min(1).max(36).optional(),
+    detail: z.string().max(600).optional(),
+    changed_files: z.array(PublicPathSchema).max(5).optional(),
+    created_at: PublicTimestampSchema,
+  })
+  .strict();
+const SubmitTaskOutputSchema = JobReceiptSchema;
+const ListTasksOutputSchema = z
+  .object({ tasks: z.array(JobSummarySchema).max(5) })
+  .strict();
+const GetTaskOutputSchema = z
+  .object({
+    job_id: z.string().uuid(),
+    title: z.string().min(1).max(40),
+    repository: z.string().min(1).max(120),
+    status: JobStatusSchema,
+    current_stage: z.string().min(1).max(36),
+    freshness: z.enum(["fresh", "stale", "offline"]),
+    revision: z.number().int().nonnegative(),
+    text: z.string().max(600),
+    recent_events: z.array(PublicEventSchema).max(5),
+    pending_approval: PublicApprovalSchema.nullable(),
+    terminal_summary: z.string().max(600).nullable(),
+  })
+  .strict();
+const CancelTaskOutputSchema = z
+  .object({
+    job_id: z.string().uuid(),
+    status: JobStatusSchema,
+    revision: z.number().int().nonnegative(),
+  })
+  .strict();
+const ListApprovalsOutputSchema = z
+  .object({ approvals: z.array(PublicApprovalSchema).max(5) })
+  .strict();
+const DecideApprovalOutputSchema = z
+  .object({
+    approval_id: z.string().uuid(),
+    job_id: z.string().uuid().optional(),
+    decision: z.enum(["approve", "reject"]),
+    revision: z.number().int().nonnegative(),
+  })
+  .strict();
+const GetTaskResultOutputSchema = z
+  .object({
+    job_id: z.string().uuid(),
+    summary: z.string().max(120),
+    changed_files: z.array(PublicPathSchema).max(5),
+    tests: z
+      .object({
+        passed: z.number().int().nonnegative(),
+        failed: z.number().int().nonnegative(),
+        summary: z.string().max(120),
+      })
+      .strict(),
+    artifacts: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1).max(120),
+            media_type: z.string().min(1).max(120),
+            url: z.string().url().max(2048),
+          })
+          .strict(),
+      )
+      .max(5),
+    acknowledged_at: PublicTimestampSchema,
+  })
+  .strict();
 const MAX_PUBLIC_TEXT_CODE_POINTS = 600;
+const TOOL_DEADLINE_MS = 1_500;
 const INTERNAL_FIELD_PATTERN =
   /(?:request|prompt|raw[_-]?log|logs?|ciphertext|digest|credentials?|(?:harness|agent|session|database|connector|internal)[_-]?id)$/i;
-const ABSOLUTE_PATH_PATTERN = /^(?:[A-Za-z]:[\\/]|\/)/;
+const ABSOLUTE_PATH_PATTERN = /^(?:file:|[A-Za-z]:[\\/]|\/)/i;
 
 const truncateUnicode = (value: string, limit: number): string =>
   Array.from(value).slice(0, limit).join("");
@@ -72,7 +162,10 @@ const sanitizePublicValue = (value: unknown, depth = 0): unknown => {
       ? "[redacted path]"
       : truncateUnicode(value, MAX_PUBLIC_TEXT_CODE_POINTS);
   }
-  if (depth > 8 || value === null || typeof value !== "object") {
+  if (depth > 8) {
+    return "[redacted]";
+  }
+  if (value === null || typeof value !== "object") {
     return value;
   }
   if (Array.isArray(value)) {
@@ -140,7 +233,20 @@ const execute = async (
   }
 
   try {
-    return success(await invoke(owner, parsed.data));
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(
+        () => reject({ code: "TASK_TIMEOUT" }),
+        TOOL_DEADLINE_MS,
+      );
+    });
+    try {
+      return success(
+        await Promise.race([invoke(owner, parsed.data), deadline]),
+      );
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
   } catch (error) {
     return failure(stableErrorCode(error));
   }
@@ -148,20 +254,22 @@ const execute = async (
 
 type ToolSchema = z.ZodTypeAny;
 
-const register = <T extends ToolSchema>(
+const register = <TInput extends ToolSchema, TOutput extends ToolSchema>(
   server: McpServer,
   name: string,
-  schema: T,
+  inputSchema: TInput,
+  outputSchema: TOutput,
   owner: McpOwnerContext,
-  invoke: (owner: McpOwnerContext, input: z.infer<T>) => Promise<unknown>,
+  invoke: (owner: McpOwnerContext, input: z.infer<TInput>) => Promise<unknown>,
 ): void => {
   server.registerTool(
     name,
     {
-      inputSchema: schema,
-      outputSchema: PUBLIC_OBJECT_SCHEMA,
+      inputSchema,
+      outputSchema,
     },
-    (async (args: z.infer<T>) => execute(schema, args, owner, invoke)) as never,
+    (async (args: z.infer<TInput>) =>
+      execute(inputSchema, args, owner, invoke)) as never,
   );
 };
 
@@ -174,6 +282,7 @@ export function registerMcpTools(
     server,
     "submit_task",
     SubmitTaskMcpInputSchema,
+    SubmitTaskOutputSchema,
     owner,
     (boundOwner, input) => coordinator.submit(boundOwner, input),
   );
@@ -181,18 +290,25 @@ export function registerMcpTools(
     server,
     "list_tasks",
     ListTasksInputSchema,
+    ListTasksOutputSchema,
     owner,
     async (boundOwner, input) => ({
       tasks: await coordinator.list(boundOwner, input),
     }),
   );
-  register(server, "get_task", GetTaskInputSchema, owner, (boundOwner, input) =>
-    coordinator.get(boundOwner, input),
+  register(
+    server,
+    "get_task",
+    GetTaskInputSchema,
+    GetTaskOutputSchema,
+    owner,
+    (boundOwner, input) => coordinator.get(boundOwner, input),
   );
   register(
     server,
     "cancel_task",
     CancelTaskInputSchema,
+    CancelTaskOutputSchema,
     owner,
     (boundOwner, input) => coordinator.cancel(boundOwner, input),
   );
@@ -200,6 +316,7 @@ export function registerMcpTools(
     server,
     "list_pending_approvals",
     ListPendingApprovalsInputSchema,
+    ListApprovalsOutputSchema,
     owner,
     async (boundOwner, input) => ({
       approvals: await coordinator.listApprovals(boundOwner, input),
@@ -209,6 +326,7 @@ export function registerMcpTools(
     server,
     "decide_approval",
     DecideApprovalInputSchema,
+    DecideApprovalOutputSchema,
     owner,
     (boundOwner, input) => coordinator.decideApproval(boundOwner, input),
   );
@@ -216,6 +334,7 @@ export function registerMcpTools(
     server,
     "get_task_result",
     GetTaskResultInputSchema,
+    GetTaskResultOutputSchema,
     owner,
     (boundOwner, input) => coordinator.getResult(boundOwner, input),
   );
