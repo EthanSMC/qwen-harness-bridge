@@ -13,6 +13,7 @@ import {
 import { describe, expect, it } from "vitest";
 import { DomainError } from "../../apps/control-plane/src/domain/errors.js";
 import { createMcpServer } from "../../apps/control-plane/src/mcp/server.js";
+import { sanitizePublicValue } from "../../apps/control-plane/src/mcp/tools.js";
 
 const OWNER_ID = "owner-contract";
 const JOB_ID = "00000000-0000-4000-8000-000000000001";
@@ -109,7 +110,9 @@ type FakeCoordinator = {
 };
 
 function fakeCoordinator(
-  overrides: Partial<Pick<FakeCoordinator, "get" | "submit">> = {},
+  overrides: Partial<
+    Pick<FakeCoordinator, "get" | "submit" | "decideApproval">
+  > = {},
 ): FakeCoordinator {
   const calls: RecordedCall[] = [];
   const record = (method: string, owner: unknown, input: unknown): void => {
@@ -148,10 +151,15 @@ function fakeCoordinator(
       record("listApprovals", owner, input);
       return APPROVAL_LIST_RESULT.approvals;
     },
-    decideApproval: async (owner, input) => {
-      record("decideApproval", owner, input);
-      return DECISION_RESULT;
-    },
+    decideApproval: overrides.decideApproval
+      ? async (owner, input) => {
+          record("decideApproval", owner, input);
+          return overrides.decideApproval?.(owner, input);
+        }
+      : async (owner, input) => {
+          record("decideApproval", owner, input);
+          return DECISION_RESULT;
+        },
     getResult: async (owner, input) => {
       record("getResult", owner, input);
       return TASK_RESULT_OUTPUT;
@@ -545,6 +553,87 @@ describe("MCP public tool contract", () => {
       expect(serialized).not.toContain("do-not-return-this-secret");
       expect(serialized).not.toContain("/Users/secret");
     } finally {
+      await closeConnection(connection);
+    }
+  });
+
+  it("recursively redacts sensitive keys, secret values, paths, and bounds output", () => {
+    const value = {
+      password: "nested-password",
+      token: "nested-token",
+      secret: "nested-secret",
+      api_key: "nested-api-key",
+      harness_agent_id: "internal-agent-id",
+      path: "/Users/secret/private.key",
+      nested: {
+        credentials: {
+          password: "deep-password",
+          token: "deep-token",
+        },
+        text: "password=deep-text-password token=deep-text-token",
+      },
+      items: Array.from({ length: 8 }, (_, index) => ({ index })),
+    };
+
+    const sanitized = sanitizePublicValue(value);
+    const serialized = JSON.stringify(sanitized);
+    expect(serialized).not.toContain("nested-password");
+    expect(serialized).not.toContain("nested-token");
+    expect(serialized).not.toContain("nested-secret");
+    expect(serialized).not.toContain("nested-api-key");
+    expect(serialized).not.toContain("internal-agent-id");
+    expect(serialized).not.toContain("/Users/secret");
+    expect(serialized).not.toContain("deep-password");
+    expect(serialized).not.toContain("deep-text-password");
+    expect((sanitized as { items: unknown[] }).items).toHaveLength(5);
+  });
+
+  it("allows an identical decide_approval retry after the first call times out", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let markFirstDecisionPersisted!: () => void;
+    const firstDecisionPersisted = new Promise<void>((resolve) => {
+      markFirstDecisionPersisted = resolve;
+    });
+    let persisted = false;
+    const coordinator = fakeCoordinator({
+      decideApproval: async () => {
+        if (!persisted) {
+          await pending;
+          persisted = true;
+          markFirstDecisionPersisted();
+        }
+        return DECISION_RESULT;
+      },
+    });
+    const connection = await connectedClient(coordinator);
+    const decision = {
+      name: "decide_approval" as const,
+      arguments: {
+        approval_id: APPROVAL_ID,
+        decision: "approve" as const,
+        expected_job_revision: 1,
+      },
+    };
+    try {
+      const first = await connection.client.callTool(decision);
+      expect(first.isError).toBe(true);
+      expect(first.structuredContent).toMatchObject({
+        error: { code: "TASK_TIMEOUT" },
+      });
+
+      setTimeout(release, 50);
+      await firstDecisionPersisted;
+      const retry = await connection.client.callTool(decision);
+      expect(retry.isError).not.toBe(true);
+      expect(retry.structuredContent).toEqual(DECISION_RESULT);
+      expect(
+        coordinator.calls.filter((call) => call.method === "decideApproval"),
+      ).toHaveLength(2);
+    } finally {
+      release();
       await closeConnection(connection);
     }
   });

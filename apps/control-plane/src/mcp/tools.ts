@@ -147,8 +147,13 @@ const GetTaskResultOutputSchema = z
 const MAX_PUBLIC_TEXT_CODE_POINTS = 600;
 const TOOL_DEADLINE_MS = 1_500;
 const INTERNAL_FIELD_PATTERN =
-  /(?:request|prompt|raw[_-]?log|logs?|ciphertext|digest|credentials?|(?:harness|agent|session|database|connector|internal)[_-]?id)$/i;
+  /(?:request|prompt|raw[_-]?log|logs?|ciphertext|digest|credentials?|password|token|secret|api[_-]?key|(?:harness|agent|session|database|connector|internal)[_-]?id)/i;
 const ABSOLUTE_PATH_PATTERN = /^(?:file:|[A-Za-z]:[\\/]|\/)/i;
+const ABSOLUTE_PATH_TEXT_PATTERN =
+  /(?:file:|\/(?:Users|private|home|var)\/)[^\s,;]*/giu;
+const SENSITIVE_TEXT_PATTERN =
+  /\b(api[_-]?key|token|credential|password|secret)\b\s*[:=]\s*(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;]+)/giu;
+const BEARER_TEXT_PATTERN = /\bBearer\s+[^\s,;]+/gu;
 
 const truncateUnicode = (value: string, limit: number): string =>
   Array.from(value).slice(0, limit).join("");
@@ -156,11 +161,20 @@ const truncateUnicode = (value: string, limit: number): string =>
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const sanitizePublicValue = (value: unknown, depth = 0): unknown => {
+const redactSensitiveText = (value: string): string =>
+  value
+    .replace(SENSITIVE_TEXT_PATTERN, "$1=[redacted]")
+    .replace(BEARER_TEXT_PATTERN, "Bearer [redacted]")
+    .replace(ABSOLUTE_PATH_TEXT_PATTERN, "[redacted path]");
+
+export const sanitizePublicValue = (value: unknown, depth = 0): unknown => {
   if (typeof value === "string") {
     return ABSOLUTE_PATH_PATTERN.test(value)
       ? "[redacted path]"
-      : truncateUnicode(value, MAX_PUBLIC_TEXT_CODE_POINTS);
+      : truncateUnicode(
+          redactSensitiveText(value),
+          MAX_PUBLIC_TEXT_CODE_POINTS,
+        );
   }
   if (depth > 8) {
     return "[redacted]";
@@ -242,7 +256,10 @@ const execute = async (
     });
     try {
       return success(
-        await Promise.race([invoke(owner, parsed.data), deadline]),
+        await Promise.race([
+          Promise.resolve().then(() => invoke(owner, parsed.data)),
+          deadline,
+        ]),
       );
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);

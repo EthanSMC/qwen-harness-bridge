@@ -6,6 +6,9 @@ const MAX_STAGE_CODE_POINTS = 36;
 const MAX_DETAIL_CODE_POINTS = 600;
 const MAX_SPOKEN_CODE_POINTS = 120;
 const MAX_ARTIFACT_URL_BYTES = 2048;
+const MAX_STRUCTURED_TEXT_BYTES = 8_192;
+const MAX_STRUCTURED_DEPTH = 8;
+const MAX_STRUCTURED_ITEMS = 25;
 
 export type RepositoryDisplay = {
   displayName?: string | null;
@@ -146,19 +149,100 @@ const boundedText = (
 
 const RAW_LOG_PREFIX =
   /^\s*(?:\[\s*)?raw(?:[-_\s]+connector)?[-_\s]+logs?(?:\s*\])?\s*(?::|=|-)?/iu;
+const SENSITIVE_KEY =
+  /(?:password|token|secret|api[-_]?key|credential|authorization|bearer|raw[-_]?log)/iu;
 const AUTHORIZATION_ASSIGNMENT =
-  /\bauthorization\b\s*[:=]\s*(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|bearer\s+[^\s,;]+|[^\s,;]+)/giu;
+  /(["']?)(authorization)\1\s*([:=])\s*("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|bearer\s+[^\s,;}\]]+|[^\s,;}\]]+)/giu;
 const SECRET_ASSIGNMENT =
-  /\b(api[-_\s]?key|token|credential|password|secret)\b\s*[:=]\s*(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;]+)/giu;
+  /(["']?)(api[-_\s]?key|token|credential|password|secret)\1\s*([:=])\s*("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
 const BEARER_TOKEN =
-  /\bbearer\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[A-Za-z0-9._~+/-]+=*)/giu;
+  /\bbearer\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
+
+const redactedAssignment = (
+  _match: string,
+  quote: string,
+  key: string,
+  separator: string,
+  rawValue: string,
+): string => {
+  const value = rawValue.startsWith('"')
+    ? '"[redacted]"'
+    : rawValue.startsWith("'")
+      ? "'[redacted]'"
+      : "[redacted]";
+  return `${quote}${key}${quote}${separator}${value}`;
+};
 
 const redactSensitiveValues = (value: string): string => {
   if (RAW_LOG_PREFIX.test(value)) return "[redacted raw log]";
   return value
-    .replace(AUTHORIZATION_ASSIGNMENT, "Authorization=[redacted]")
-    .replace(SECRET_ASSIGNMENT, (_match, key: string) => `${key}=[redacted]`)
+    .replace(AUTHORIZATION_ASSIGNMENT, redactedAssignment)
+    .replace(SECRET_ASSIGNMENT, redactedAssignment)
     .replace(BEARER_TOKEN, "Bearer [redacted]");
+};
+
+type RedactedStructuredValue = { value: unknown; changed: boolean };
+
+const redactStructuredValue = (
+  value: unknown,
+  depth = 0,
+): RedactedStructuredValue => {
+  if (typeof value === "string") {
+    const redacted = redactSensitiveValues(value);
+    return { value: redacted, changed: redacted !== value };
+  }
+  if (depth > MAX_STRUCTURED_DEPTH) {
+    return { value: "[redacted]", changed: true };
+  }
+  if (Array.isArray(value)) {
+    let changed = value.length > MAX_STRUCTURED_ITEMS;
+    const redacted = value.slice(0, MAX_STRUCTURED_ITEMS).map((item) => {
+      const result = redactStructuredValue(item, depth + 1);
+      changed ||= result.changed;
+      return result.value;
+    });
+    if (value.length > MAX_STRUCTURED_ITEMS) redacted.push("[redacted]");
+    return { value: redacted, changed };
+  }
+  if (typeof value !== "object" || value === null) {
+    return { value, changed: false };
+  }
+
+  let changed = false;
+  const redacted: Record<string, unknown> = {};
+  const entries = Object.entries(value);
+  for (const [key, item] of entries.slice(0, MAX_STRUCTURED_ITEMS)) {
+    if (SENSITIVE_KEY.test(key)) {
+      redacted[key] = "[redacted]";
+      changed = true;
+      continue;
+    }
+    const result = redactStructuredValue(item, depth + 1);
+    redacted[key] = result.value;
+    changed ||= result.changed;
+  }
+  if (entries.length > MAX_STRUCTURED_ITEMS) {
+    redacted._truncated = "[redacted]";
+    changed = true;
+  }
+  return { value: redacted, changed };
+};
+
+const redactStructuredSensitiveText = (value: string): string => {
+  const trimmed = value.trim();
+  if (
+    new TextEncoder().encode(trimmed).byteLength <= MAX_STRUCTURED_TEXT_BYTES &&
+    (trimmed.startsWith("{") || trimmed.startsWith("["))
+  ) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      const result = redactStructuredValue(parsed);
+      if (result.changed) return JSON.stringify(result.value);
+    } catch {
+      // Fall through to the assignment redactor for JSON-like text.
+    }
+  }
+  return redactSensitiveValues(value);
 };
 
 const quotePairs: Readonly<Record<string, string>> = {
@@ -177,6 +261,10 @@ const PATH_BOUNDARIES = new Set([
   "]",
   "{",
   "}",
+  "“",
+  "”",
+  "‘",
+  "’",
   "（",
   "【",
   "=",
@@ -244,7 +332,7 @@ const publicFreeText = (
   maxBytes?: number,
 ): string =>
   boundedText(
-    redactAbsolutePathText(redactSensitiveValues(value?.trim() || "")),
+    redactAbsolutePathText(redactStructuredSensitiveText(value?.trim() || "")),
     maxCodePoints,
     maxBytes,
   );
@@ -307,6 +395,8 @@ const publicChangedFiles = (
     .filter((value): value is string => typeof value === "string")
     .map((value) => relativeRepositoryPath(value, repository))
     .filter((value): value is string => value !== null)
+    .map((value) => truncateUtf8(truncateUnicode(value, 512), 2048))
+    .filter((value) => value.length > 0)
     .slice(0, MAX_ITEMS);
 };
 
@@ -458,7 +548,9 @@ const publicArtifactUrl = (raw: string): string | null => {
 
 const publicMediaType = (value: string): string => {
   const normalized = value.trim().toLowerCase();
-  return /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(normalized)
+  return Array.from(normalized).length <= 120 &&
+    new TextEncoder().encode(normalized).byteLength <= 120 &&
+    /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(normalized)
     ? normalized
     : "application/octet-stream";
 };

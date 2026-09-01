@@ -338,6 +338,91 @@ describe("presenters", () => {
     expect(serialized).toContain("[redacted");
   });
 
+  it("redacts nested JSON-like sensitive keys and values while preserving ordinary text", () => {
+    const detail = presentJobDetail({
+      job: job(),
+      repository,
+      events: [
+        {
+          sequence: 1,
+          type: "progress",
+          payload: {
+            detail: JSON.stringify({
+              metadata: {
+                Password: "nested-password",
+                API_KEY: "nested-api-key",
+                headers: { Authorization: "Bearer nested-bearer" },
+                "raw-log": "raw log: nested-raw-secret",
+              },
+              message: "ordinary event summary",
+            }),
+          },
+          createdAt: new Date(now),
+        },
+      ],
+      pendingApproval: null,
+      terminalSummary: JSON.stringify({
+        outcome: "ordinary terminal summary",
+        nested: { secret: "nested-terminal-secret" },
+      }),
+    });
+    const approvals = presentPendingApprovals([
+      {
+        approvalId: "22222222-2222-4222-8222-222222222222",
+        jobShortId: "QH-7M2P",
+        jobRevision: 3,
+        actionSummary: JSON.stringify({
+          action: "ordinary approval action",
+          credentials: { token: "nested-approval-token" },
+        }),
+        impactSummary: JSON.stringify({
+          impact: "ordinary approval impact",
+          nested: { credential: "nested-approval-credential" },
+        }),
+        riskClass: "approval_required",
+        expiresAt: new Date("2026-09-01T00:05:00.000Z"),
+      },
+    ]);
+    const result = presentTaskResult({
+      summary: JSON.stringify({
+        summary: "ordinary result summary",
+        details: { authorization: "Bearer nested-result-bearer" },
+      }),
+      changedFiles: [],
+      tests: {
+        passed: 1,
+        failed: 0,
+        summary: JSON.stringify({
+          summary: "ordinary test summary",
+          secret: "nested-test-secret",
+        }),
+      },
+      artifacts: [
+        {
+          name: JSON.stringify({
+            label: "ordinary artifact name",
+            raw_log: "raw log: nested-artifact-secret",
+          }),
+          mediaType: "text/html",
+          url: "https://example.test/report",
+        },
+      ],
+      acknowledgedAt: new Date(now),
+    });
+
+    const serialized = JSON.stringify({ detail, approvals, result });
+    expect(serialized).not.toMatch(
+      /nested-password|nested-api-key|nested-bearer|nested-raw-secret|nested-terminal-secret|nested-approval-token|nested-approval-credential|nested-result-bearer|nested-test-secret|nested-artifact-secret/,
+    );
+    expect(serialized).toContain("ordinary event summary");
+    expect(serialized).toContain("ordinary terminal summary");
+    expect(serialized).toContain("ordinary approval action");
+    expect(serialized).toContain("ordinary approval impact");
+    expect(serialized).toContain("ordinary result summary");
+    expect(serialized).toContain("ordinary test summary");
+    expect(serialized).toContain("ordinary artifact name");
+  });
+
   it("fails closed for Unicode, spaced, quoted, and Windows absolute paths", () => {
     const detail = presentJobDetail({
       job: job(),
@@ -359,6 +444,14 @@ describe("presenters", () => {
           },
           createdAt: new Date(now),
         },
+        {
+          sequence: 3,
+          type: "progress",
+          payload: {
+            detail: "读取 “/Users/张三/带 空格/秘密.txt” 后完成",
+          },
+          createdAt: new Date(now),
+        },
       ],
       pendingApproval: null,
       terminalSummary: "Copied /Volumes/团队 资料/秘密 文件.txt",
@@ -370,7 +463,8 @@ describe("presenters", () => {
         jobRevision: 3,
         actionSummary:
           "Review '/private/项目 空间/隐藏 配置.env' before approval",
-        impactSummary: "Writes \\\\server\\团队 资料\\机密 文件.txt",
+        impactSummary:
+          "Writes ‘C:\\Users\\张三\\团队 资料\\机密 文件.txt’ safely",
         riskClass: "approval_required",
         expiresAt: new Date("2026-09-01T00:05:00.000Z"),
       },
@@ -409,6 +503,44 @@ describe("presenters", () => {
     expect(serialized).toContain("读取");
     expect(serialized).toContain("后继续");
     expect(serialized).toContain("[redacted path]");
+  });
+
+  it("bounds changed-file code points and falls back for invalid or oversized MIME types", () => {
+    const result = presentTaskResult(
+      {
+        summary: "Completed",
+        changedFiles: [
+          `/Users/alice/Repositories/novelty-studio/${"文".repeat(600)}.ts`,
+        ],
+        tests: { passed: 1, failed: 0, summary: "1 passed" },
+        artifacts: [
+          {
+            name: "Report",
+            mediaType: `${"a".repeat(121)}/plain`,
+            url: "https://example.test/report",
+          },
+          {
+            name: "Report 2",
+            mediaType: "text/html; credential=secret",
+            url: "https://example.test/report-2",
+          },
+        ],
+        acknowledgedAt: new Date(now),
+      },
+      repository,
+    );
+
+    expect(result.changed_files).toHaveLength(1);
+    expect(
+      Array.from(result.changed_files[0] ?? "").length,
+    ).toBeLessThanOrEqual(512);
+    expect(
+      new TextEncoder().encode(result.changed_files[0] ?? "").byteLength,
+    ).toBeLessThanOrEqual(2048);
+    expect(result.artifacts.map((artifact) => artifact.media_type)).toEqual([
+      "application/octet-stream",
+      "application/octet-stream",
+    ]);
   });
 
   it("truncates arbitrary Unicode text without producing lone surrogates", () => {

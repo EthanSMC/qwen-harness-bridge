@@ -1047,14 +1047,32 @@ export class JobRepository {
         throw new JobRepositoryError("NOT_FOUND", "Approval not found");
       }
 
+      const task4 = input.ownerId !== undefined;
       if (approval.decision !== null) {
+        const sameDecision = approval.decision === input.decision;
+        const sameFingerprint =
+          input.actionFingerprint === undefined ||
+          input.actionFingerprint === approval.actionFingerprint;
+        if (
+          task4 &&
+          sameDecision &&
+          sameFingerprint &&
+          approval.jobRevision === input.expectedJobRevision
+        ) {
+          return toApprovalRecord(approval, job.ownerId, job.shortId);
+        }
+        if (task4) {
+          throw new JobRepositoryError(
+            "APPROVAL_MISMATCH",
+            "The approval no longer matches the requested decision",
+          );
+        }
         throw new JobRepositoryError(
           "APPROVAL_ALREADY_DECIDED",
           "The approval already has a decision",
         );
       }
       const now = input.now ?? new Date();
-      const task4 = input.ownerId !== undefined;
       if (approval.expiresAt.getTime() <= now.getTime()) {
         throw new JobRepositoryError(
           "APPROVAL_EXPIRED",

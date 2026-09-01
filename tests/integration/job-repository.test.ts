@@ -1117,7 +1117,7 @@ describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
         expectedJobRevision: fixture.jobRevision,
         actionFingerprint: fixture.actionFingerprint,
       }),
-      "APPROVAL_ALREADY_DECIDED",
+      "APPROVAL_MISMATCH",
     );
     const messages = await db.query<{
       sequence: number;
@@ -1140,6 +1140,58 @@ describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
         decision: "approve",
       },
     });
+  });
+
+  it("returns an exact owner-scoped approval retry without a second outbox command", async () => {
+    const repository = new JobRepository(db.client);
+    const connectorId = crypto.randomUUID();
+    const { job, fixture } = await prepareApproval(
+      repository,
+      db,
+      new Date(Date.now() + 5 * 60_000),
+    );
+    await seedConnector(db, connectorId, job.ownerId);
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, attempt = $2 WHERE id = $3",
+      [connectorId, 1, job.jobId],
+    );
+
+    const input = {
+      ownerId: job.ownerId,
+      approvalId: fixture.approvalId,
+      decision: "approve" as const,
+      expectedJobRevision: fixture.jobRevision,
+      actionFingerprint: fixture.actionFingerprint,
+    };
+    const [first, repeated] = await Promise.all([
+      repository.recordApprovalDecision(input),
+      repository.recordApprovalDecision(input),
+    ]);
+
+    expect(repeated).toMatchObject({
+      approvalId: first.approvalId,
+      decision: first.decision,
+      actionFingerprint: fixture.actionFingerprint,
+    });
+    await expectCode(
+      repository.recordApprovalDecision({
+        ...input,
+        actionFingerprint: SHA256_B,
+      }),
+      "APPROVAL_MISMATCH",
+    );
+    await expectCode(
+      repository.recordApprovalDecision({
+        ...input,
+        expectedJobRevision: input.expectedJobRevision + 1,
+      }),
+      "APPROVAL_MISMATCH",
+    );
+    const messages = await db.query(
+      "SELECT id FROM connector_messages WHERE connector_id = $1 AND direction = 'server'",
+      [connectorId],
+    );
+    expect(messages.rows).toHaveLength(1);
   });
 
   it("rolls back an approval update when the required connector outbox cannot be written", async () => {
