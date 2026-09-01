@@ -4,10 +4,12 @@ import { assertTransition, TERMINAL_JOB_STATES } from "../domain/job-state.js";
 import type { Database } from "./client.js";
 import {
   approvals,
+  connectorMessages,
   connectors,
   idempotencyRecords,
   jobEvents,
   jobs,
+  repositoryPolicies,
 } from "./schema.js";
 
 type JobRow = typeof jobs.$inferSelect;
@@ -72,6 +74,7 @@ export type JobRecord = {
   title: string | null;
   summary: Record<string, unknown> | null;
   unreadTerminal: boolean;
+  acknowledgedAt: Date | null;
   acceptedAt: Date;
   expiresAt: Date;
   requestDeleteAt: Date | null;
@@ -105,6 +108,29 @@ export type ListJobsInput = {
   ownerId: string;
   limit?: number;
   status?: JobStatus;
+  unreadOnly?: boolean;
+};
+
+export type RepositoryPolicyRecord = {
+  id: string;
+  ownerId: string;
+  displayName: string;
+  canonicalPath: string;
+  allowedActionClasses: string[];
+  approvalTimeoutMinutes: number;
+  runtimeTimeoutSeconds: number;
+  maxConcurrency: number;
+  enabled: boolean;
+};
+
+export type ConnectorHealth = "fresh" | "stale" | "offline";
+
+export type CancelJobInput = {
+  ownerId: string;
+  jobId: string;
+  expectedRevision: number;
+  reason?: string;
+  now?: Date;
 };
 
 export type ClaimOfferInput = {
@@ -119,11 +145,17 @@ export type RecordApprovalDecisionInput = {
   approvalId: string;
   decision: ApprovalDecision;
   expectedJobRevision: number;
+  ownerId?: string;
+  actionFingerprint?: string;
+  expectedAttempt?: number;
+  now?: Date;
 };
 
 export type ApprovalRecord = {
   approvalId: string;
   jobId: string;
+  ownerId?: string;
+  jobShortId?: string;
   attempt: number;
   jobRevision: number;
   actionSummary: string;
@@ -135,6 +167,23 @@ export type ApprovalRecord = {
   decidedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
+};
+
+export type JobResultRecord = {
+  jobId: string;
+  summary: string;
+  changedFiles: string[];
+  tests: {
+    passed: number;
+    failed: number;
+    summary: string;
+  };
+  artifacts: Array<{
+    name: string;
+    mediaType: string;
+    url: string;
+  }>;
+  acknowledgedAt: Date;
 };
 
 const MAX_LIST_LIMIT = 5;
@@ -173,6 +222,7 @@ const toJobRecord = (row: JobRow): JobRecord => ({
   title: row.title,
   summary: row.summary,
   unreadTerminal: row.unreadTerminal,
+  acknowledgedAt: row.acknowledgedAt,
   acceptedAt: row.acceptedAt,
   expiresAt: row.expiresAt,
   requestDeleteAt: row.requestDeleteAt,
@@ -194,9 +244,15 @@ const toEventRecord = (row: JobEventRow): JobEventRecord => ({
   createdAt: row.createdAt,
 });
 
-const toApprovalRecord = (row: ApprovalRow): ApprovalRecord => ({
+const toApprovalRecord = (
+  row: ApprovalRow,
+  ownerId?: string,
+  jobShortId?: string,
+): ApprovalRecord => ({
   approvalId: row.id,
   jobId: row.jobId,
+  ...(ownerId === undefined ? {} : { ownerId }),
+  ...(jobShortId === undefined ? {} : { jobShortId }),
   attempt: row.attempt,
   jobRevision: row.jobRevision,
   actionSummary: row.actionSummary,
@@ -210,16 +266,160 @@ const toApprovalRecord = (row: ApprovalRow): ApprovalRecord => ({
   updatedAt: row.updatedAt,
 });
 
+const toRepositoryPolicyRecord = (
+  row: typeof repositoryPolicies.$inferSelect,
+): RepositoryPolicyRecord => ({
+  id: row.id,
+  ownerId: row.ownerId,
+  displayName: row.displayName,
+  canonicalPath: row.canonicalPath,
+  allowedActionClasses: row.allowedActionClasses,
+  approvalTimeoutMinutes: row.approvalTimeoutMinutes,
+  runtimeTimeoutSeconds: row.runtimeTimeoutSeconds,
+  maxConcurrency: row.maxConcurrency,
+  enabled: row.enabled,
+});
+
+const asRecord = (value: unknown): Record<string, unknown> | null =>
+  value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+
+const asStringArray = (value: unknown): string[] =>
+  Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+
+const toJobResultRecord = (row: JobRow): JobResultRecord | null => {
+  const summary = asRecord(row.summary);
+  if (summary === null || row.acknowledgedAt === null) {
+    return null;
+  }
+  const testSummary = asRecord(summary.tests);
+  const artifacts = Array.isArray(summary.artifacts)
+    ? summary.artifacts.flatMap((artifact) => {
+        const value = asRecord(artifact);
+        const mediaType =
+          typeof value?.mediaType === "string"
+            ? value.mediaType
+            : typeof value?.media_type === "string"
+              ? value.media_type
+              : null;
+        if (
+          value === null ||
+          typeof value.name !== "string" ||
+          mediaType === null ||
+          typeof value.url !== "string"
+        ) {
+          return [];
+        }
+        return [
+          {
+            name: value.name,
+            mediaType,
+            url: value.url,
+          },
+        ];
+      })
+    : [];
+  return {
+    jobId: row.id,
+    summary: typeof summary.summary === "string" ? summary.summary : "",
+    changedFiles: asStringArray(summary.changed_files ?? summary.changedFiles),
+    tests: {
+      passed:
+        testSummary !== null && typeof testSummary.passed === "number"
+          ? testSummary.passed
+          : 0,
+      failed:
+        testSummary !== null && typeof testSummary.failed === "number"
+          ? testSummary.failed
+          : 0,
+      summary:
+        testSummary !== null && typeof testSummary.summary === "string"
+          ? testSummary.summary
+          : "",
+    },
+    artifacts,
+    acknowledgedAt: row.acknowledgedAt,
+  };
+};
+
 const readJob = async (
   database: QueryDatabase,
   jobId: string,
+  ownerId?: string,
 ): Promise<JobRow | undefined> => {
-  const rows = await database
-    .select()
-    .from(jobs)
-    .where(eq(jobs.id, jobId))
-    .limit(1);
+  const condition =
+    ownerId === undefined
+      ? eq(jobs.id, jobId)
+      : and(eq(jobs.id, jobId), eq(jobs.ownerId, ownerId));
+  const rows = await database.select().from(jobs).where(condition).limit(1);
   return rows[0];
+};
+
+const isTerminal = (status: JobStatus): boolean =>
+  TERMINAL_JOB_STATES.has(status);
+
+type ConnectorCommandType = "job.cancel" | "approval.decision";
+
+const enqueueServerCommand = async (
+  database: QueryDatabase,
+  ownerId: string,
+  connectorId: string,
+  type: ConnectorCommandType,
+  payload: Record<string, unknown>,
+  expiresAt: Date,
+): Promise<void> => {
+  const connectorRows = await database
+    .select()
+    .from(connectors)
+    .where(eq(connectors.id, connectorId))
+    .for("update");
+  const connector = connectorRows[0];
+  if (connector === undefined || connector.ownerId !== ownerId) {
+    throw new JobRepositoryError(
+      "CONNECTOR_OWNER_MISMATCH",
+      "The connector is not owned by the job owner",
+    );
+  }
+
+  const sequence = connector.lastServerSequence + 1;
+  if (!Number.isSafeInteger(sequence) || sequence < 1) {
+    throw new JobRepositoryError(
+      "INVALID_EVENT",
+      "The connector server sequence is invalid",
+    );
+  }
+
+  const updatedConnectors = await database
+    .update(connectors)
+    .set({
+      lastServerSequence: sequence,
+      updatedAt: sql`now()`,
+    })
+    .where(
+      and(
+        eq(connectors.id, connectorId),
+        eq(connectors.lastServerSequence, connector.lastServerSequence),
+      ),
+    )
+    .returning({ lastServerSequence: connectors.lastServerSequence });
+  if (updatedConnectors[0]?.lastServerSequence !== sequence) {
+    throw new JobRepositoryError(
+      "REVISION_CONFLICT",
+      "The connector server sequence is stale",
+    );
+  }
+
+  await database.insert(connectorMessages).values({
+    connectorId,
+    direction: "server",
+    sequence,
+    type,
+    payload,
+    expiresAt,
+  });
 };
 
 const nextEventSequence = async (
@@ -286,6 +486,38 @@ export class JobRepository {
 
   constructor(database: Database) {
     this.#db = database;
+  }
+
+  async getRepositoryPolicy(
+    ownerId: string,
+    repositoryId: string,
+  ): Promise<RepositoryPolicyRecord | null> {
+    const rows = await this.#db
+      .select()
+      .from(repositoryPolicies)
+      .where(
+        and(
+          eq(repositoryPolicies.ownerId, ownerId),
+          eq(repositoryPolicies.id, repositoryId),
+        ),
+      )
+      .limit(1);
+    const row = rows[0];
+    return row === undefined ? null : toRepositoryPolicyRecord(row);
+  }
+
+  async getConnectorHealth(ownerId: string): Promise<ConnectorHealth> {
+    const rows = await this.#db
+      .select({ health: connectors.health })
+      .from(connectors)
+      .where(eq(connectors.ownerId, ownerId));
+    if (rows.some((row) => row.health === "fresh")) {
+      return "fresh";
+    }
+    if (rows.some((row) => row.health === "stale")) {
+      return "stale";
+    }
+    return "offline";
   }
 
   async createIdempotent(input: CreateIdempotentInput): Promise<JobRecord> {
@@ -404,8 +636,14 @@ export class JobRepository {
     });
   }
 
-  async get(jobId: string): Promise<JobRecord | null> {
-    const row = await readJob(this.#db, jobId);
+  async get(jobId: string): Promise<JobRecord | null>;
+  async get(ownerId: string, jobId: string): Promise<JobRecord | null>;
+  async get(first: string, second?: string): Promise<JobRecord | null> {
+    const row = await readJob(
+      this.#db,
+      second ?? first,
+      second === undefined ? undefined : first,
+    );
     return row === undefined ? null : toJobRecord(row);
   }
 
@@ -418,26 +656,120 @@ export class JobRepository {
       );
     }
 
-    const condition =
-      input.status === undefined
-        ? eq(jobs.ownerId, input.ownerId)
-        : and(eq(jobs.ownerId, input.ownerId), eq(jobs.status, input.status));
+    const conditions = [eq(jobs.ownerId, input.ownerId)];
+    if (input.status !== undefined) {
+      conditions.push(eq(jobs.status, input.status));
+    }
+    if (input.unreadOnly === true) {
+      conditions.push(eq(jobs.unreadTerminal, true));
+    }
     const rows = await this.#db
       .select()
       .from(jobs)
-      .where(condition)
+      .where(and(...conditions))
       .orderBy(desc(jobs.updatedAt), asc(jobs.id))
       .limit(limit);
     return rows.map(toJobRecord);
   }
 
-  async events(jobId: string): Promise<JobEventRecord[]> {
-    const rows = await this.#db
-      .select()
+  async events(jobId: string): Promise<JobEventRecord[]>;
+  async events(
+    ownerId: string,
+    jobId: string,
+    limit?: number,
+  ): Promise<JobEventRecord[]>;
+  async events(
+    first: string,
+    second?: string,
+    requestedLimit = MAX_LIST_LIMIT,
+  ): Promise<JobEventRecord[]> {
+    const legacyUnboundedRead = second === undefined;
+    const ownerId = second === undefined ? undefined : first;
+    const jobId = second ?? first;
+    const limit = requestedLimit;
+    if (
+      !legacyUnboundedRead &&
+      (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIST_LIMIT)
+    ) {
+      throw new JobRepositoryError(
+        "INVALID_LIMIT",
+        "Event list limit must be between 1 and 5",
+      );
+    }
+    const condition =
+      ownerId === undefined
+        ? eq(jobEvents.jobId, jobId)
+        : and(eq(jobEvents.jobId, jobId), eq(jobs.ownerId, ownerId));
+    const query = this.#db
+      .select({ event: jobEvents })
       .from(jobEvents)
-      .where(eq(jobEvents.jobId, jobId))
-      .orderBy(asc(jobEvents.sequence));
-    return rows.map(toEventRecord);
+      .innerJoin(jobs, eq(jobEvents.jobId, jobs.id))
+      .where(condition)
+      .orderBy(desc(jobEvents.sequence));
+    const rows = legacyUnboundedRead ? await query : await query.limit(limit);
+    return rows.map((row) => toEventRecord(row.event)).reverse();
+  }
+
+  async listPendingApprovals(
+    ownerId: string,
+    limit = MAX_LIST_LIMIT,
+    now = new Date(),
+  ): Promise<ApprovalRecord[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIST_LIMIT) {
+      throw new JobRepositoryError(
+        "INVALID_LIMIT",
+        "Approval list limit must be between 1 and 5",
+      );
+    }
+    const rows = await this.#db
+      .select({
+        approval: approvals,
+        ownerId: jobs.ownerId,
+        jobShortId: jobs.shortId,
+      })
+      .from(approvals)
+      .innerJoin(jobs, eq(approvals.jobId, jobs.id))
+      .where(
+        and(
+          eq(jobs.ownerId, ownerId),
+          isNull(approvals.decision),
+          gt(approvals.expiresAt, now),
+        ),
+      )
+      .orderBy(asc(approvals.expiresAt), asc(approvals.createdAt))
+      .limit(limit);
+    return rows.map((row) =>
+      toApprovalRecord(row.approval, row.ownerId, row.jobShortId),
+    );
+  }
+
+  async getPendingApproval(
+    ownerId: string,
+    jobId: string,
+    now = new Date(),
+  ): Promise<ApprovalRecord | null> {
+    const rows = await this.#db
+      .select({
+        approval: approvals,
+        ownerId: jobs.ownerId,
+        jobShortId: jobs.shortId,
+      })
+      .from(approvals)
+      .innerJoin(jobs, eq(approvals.jobId, jobs.id))
+      .where(
+        and(
+          eq(jobs.ownerId, ownerId),
+          eq(jobs.id, jobId),
+          isNull(approvals.decision),
+          gt(approvals.expiresAt, now),
+        ),
+      )
+      .orderBy(desc(approvals.createdAt))
+      .limit(1);
+    const row = rows[0];
+    return row === undefined
+      ? null
+      : toApprovalRecord(row.approval, row.ownerId, row.jobShortId);
   }
 
   async transitionAndAppend(
@@ -497,6 +829,126 @@ export class JobRepository {
       }
 
       await appendEvent(tx, jobId, await nextEventSequence(tx, jobId), event);
+      return toJobRecord(updated);
+    });
+  }
+
+  async cancelAtomically(input: CancelJobInput): Promise<JobRecord> {
+    if (
+      !Number.isSafeInteger(input.expectedRevision) ||
+      input.expectedRevision < 0
+    ) {
+      throw new JobRepositoryError(
+        "REVISION_CONFLICT",
+        "The job revision is invalid",
+      );
+    }
+    const reason = input.reason?.trim() || "user requested";
+    if (reason.length > 400) {
+      throw new JobRepositoryError(
+        "INVALID_EVENT",
+        "Cancellation reason is too long",
+      );
+    }
+
+    return this.#db.transaction(async (tx) => {
+      const lockedRows = await tx
+        .select()
+        .from(jobs)
+        .where(and(eq(jobs.id, input.jobId), eq(jobs.ownerId, input.ownerId)))
+        .for("update");
+      const current = lockedRows[0];
+      if (current === undefined) {
+        throw new JobRepositoryError("NOT_FOUND", "Job not found");
+      }
+
+      // Cancellation is intentionally idempotent when its own transition has
+      // already won, including retries carrying the original revision.
+      if (current.status === "cancelling" || current.status === "cancelled") {
+        return toJobRecord(current);
+      }
+      if (isTerminal(current.status)) {
+        return toJobRecord(current);
+      }
+      if (current.revision !== input.expectedRevision) {
+        throw new JobRepositoryError(
+          "REVISION_CONFLICT",
+          "The job revision is stale",
+        );
+      }
+
+      const immediate =
+        current.status === "queued" || current.status === "dispatched";
+      const nextStatus: JobStatus = immediate ? "cancelled" : "cancelling";
+      assertTransition(current.status, nextStatus);
+      const updatedRows = await tx
+        .update(jobs)
+        .set({
+          status: nextStatus,
+          currentStage: nextStatus,
+          revision: sql`${jobs.revision} + 1`,
+          updatedAt: sql`now()`,
+          ...(immediate
+            ? {
+                terminalAt: sql`coalesce(${jobs.terminalAt}, now())`,
+                requestDeleteAt: sql`coalesce(${jobs.requestDeleteAt}, now() + interval '24 hours')`,
+                unreadTerminal: true,
+              }
+            : {}),
+        })
+        .where(
+          and(
+            eq(jobs.id, input.jobId),
+            eq(jobs.ownerId, input.ownerId),
+            eq(jobs.revision, input.expectedRevision),
+          ),
+        )
+        .returning();
+      const updated = updatedRows[0];
+      if (updated === undefined) {
+        throw new JobRepositoryError(
+          "REVISION_CONFLICT",
+          "The job revision is stale",
+        );
+      }
+
+      await appendEvent(
+        tx,
+        input.jobId,
+        await nextEventSequence(tx, input.jobId),
+        {
+          type: immediate ? "job.cancelled" : "job.cancelling",
+          payload: {
+            job_id: input.jobId,
+            reason,
+            revision: updated.revision,
+          },
+        },
+      );
+
+      if (!immediate) {
+        if (updated.connectorId === null) {
+          throw new JobRepositoryError(
+            "CONNECTOR_OWNER_MISMATCH",
+            "A running job has no connector for cancellation",
+          );
+        }
+        await enqueueServerCommand(
+          tx,
+          input.ownerId,
+          updated.connectorId,
+          "job.cancel",
+          {
+            job_id: updated.id,
+            attempt: updated.attempt,
+            job_revision: updated.revision,
+            reason,
+            nonce: crypto.randomUUID(),
+          },
+          updated.expiresAt,
+        );
+      }
+
       return toJobRecord(updated);
     });
   }
@@ -572,36 +1024,58 @@ export class JobRepository {
     input: RecordApprovalDecisionInput,
   ): Promise<ApprovalRecord> {
     return this.#db.transaction(async (tx) => {
-      const lockedRows = await tx
-        .select({ approval: approvals, job: jobs })
+      const approvalRows = await tx
+        .select()
         .from(approvals)
-        .innerJoin(jobs, eq(approvals.jobId, jobs.id))
         .where(eq(approvals.id, input.approvalId))
         .for("update");
-      const locked = lockedRows[0];
-      if (locked === undefined) {
+      const approval = approvalRows[0];
+      if (approval === undefined) {
         throw new JobRepositoryError("NOT_FOUND", "Approval not found");
       }
 
-      if (locked.approval.decision !== null) {
+      const jobRows = await tx
+        .select()
+        .from(jobs)
+        .where(eq(jobs.id, approval.jobId))
+        .for("update");
+      const job = jobRows[0];
+      if (
+        job === undefined ||
+        (input.ownerId !== undefined && job.ownerId !== input.ownerId)
+      ) {
+        throw new JobRepositoryError("NOT_FOUND", "Approval not found");
+      }
+
+      if (approval.decision !== null) {
         throw new JobRepositoryError(
           "APPROVAL_ALREADY_DECIDED",
           "The approval already has a decision",
         );
       }
-      if (locked.approval.expiresAt.getTime() <= Date.now()) {
+      const now = input.now ?? new Date();
+      const task4 = input.ownerId !== undefined;
+      if (approval.expiresAt.getTime() <= now.getTime()) {
         throw new JobRepositoryError(
           "APPROVAL_EXPIRED",
           "The approval has expired",
         );
       }
       if (
-        locked.approval.jobRevision !== input.expectedJobRevision ||
-        locked.job.revision !== input.expectedJobRevision
+        approval.jobRevision !== input.expectedJobRevision ||
+        job.revision !== input.expectedJobRevision ||
+        (task4 && job.status !== "waiting_approval") ||
+        (task4 && job.attempt !== approval.attempt) ||
+        (task4 &&
+          input.expectedAttempt !== undefined &&
+          input.expectedAttempt !== approval.attempt) ||
+        (task4 &&
+          input.actionFingerprint !== undefined &&
+          input.actionFingerprint !== approval.actionFingerprint)
       ) {
         throw new JobRepositoryError(
           "APPROVAL_MISMATCH",
-          "The approval and job revisions do not match",
+          "The approval and job state do not match",
         );
       }
 
@@ -616,7 +1090,7 @@ export class JobRepository {
           and(
             eq(approvals.id, input.approvalId),
             isNull(approvals.decision),
-            gt(approvals.expiresAt, sql`now()`),
+            gt(approvals.expiresAt, now),
             eq(approvals.jobRevision, input.expectedJobRevision),
           ),
         )
@@ -628,7 +1102,79 @@ export class JobRepository {
           "The approval expired before it could be decided",
         );
       }
-      return toApprovalRecord(updated);
+
+      // The owner-bearing form is the Task 4 atomic operation. The legacy
+      // overload remains persistence-compatible with Task 3 callers, which
+      // had no Connector command port and therefore only recorded a decision.
+      if (input.ownerId !== undefined) {
+        if (job.connectorId === null) {
+          throw new JobRepositoryError(
+            "CONNECTOR_OWNER_MISMATCH",
+            "The approval job has no Connector",
+          );
+        }
+        await appendEvent(tx, job.id, await nextEventSequence(tx, job.id), {
+          type: "approval.decided",
+          payload: {
+            approval_id: updated.id,
+            decision: updated.decision,
+            attempt: updated.attempt,
+            job_revision: updated.jobRevision,
+          },
+        });
+        await enqueueServerCommand(
+          tx,
+          input.ownerId,
+          job.connectorId,
+          "approval.decision",
+          {
+            approval_id: updated.id,
+            job_id: job.id,
+            attempt: updated.attempt,
+            job_revision: updated.jobRevision,
+            action_fingerprint: updated.actionFingerprint,
+            decision: updated.decision,
+          },
+          updated.expiresAt,
+        );
+      }
+
+      return toApprovalRecord(updated, job.ownerId, job.shortId);
+    });
+  }
+
+  async acknowledgeResult(
+    ownerId: string,
+    jobId: string,
+  ): Promise<JobResultRecord | null> {
+    return this.#db.transaction(async (tx) => {
+      const lockedRows = await tx
+        .select()
+        .from(jobs)
+        .where(and(eq(jobs.id, jobId), eq(jobs.ownerId, ownerId)))
+        .for("update");
+      const current = lockedRows[0];
+      if (
+        current === undefined ||
+        !isTerminal(current.status) ||
+        asRecord(current.summary) === null
+      ) {
+        return null;
+      }
+
+      let acknowledged = current;
+      if (current.acknowledgedAt === null) {
+        const updatedRows = await tx
+          .update(jobs)
+          .set({
+            acknowledgedAt: sql`now()`,
+            unreadTerminal: false,
+          })
+          .where(and(eq(jobs.id, jobId), isNull(jobs.acknowledgedAt)))
+          .returning();
+        acknowledged = updatedRows[0] ?? current;
+      }
+      return toJobResultRecord(acknowledged);
     });
   }
 }

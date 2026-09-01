@@ -260,6 +260,7 @@ describe("JobRepository schema", () => {
     expect(byName.has("expires_at")).toBe(true);
     expect(byName.has("request_delete_at")).toBe(true);
     expect(byName.has("retention_delete_at")).toBe(true);
+    expect(byName.has("acknowledged_at")).toBe(true);
 
     const revision = byName.get("revision");
     expect(revision).toMatchObject({
@@ -824,5 +825,402 @@ describe("JobRepository approval decisions", () => {
       [fixture.approvalId],
     );
     expect(stored.rows[0]?.decision).toBeNull();
+  });
+});
+
+describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
+  it("reads policies and connector health only inside the authenticated owner scope", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const otherOwnerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const connectorId = crypto.randomUUID();
+
+    await seedJobDependencies(db, { ownerId, repositoryId });
+    await seedJobDependencies(db, {
+      ownerId: otherOwnerId,
+      repositoryId: `${repositoryId}-other`,
+    });
+    await seedConnector(db, connectorId, ownerId);
+    await db.query(
+      "UPDATE connectors SET health = 'fresh', last_heartbeat_at = now() WHERE id = $1",
+      [connectorId],
+    );
+
+    await expect(
+      repository.getRepositoryPolicy(ownerId, repositoryId),
+    ).resolves.toMatchObject({
+      id: repositoryId,
+      ownerId,
+      enabled: true,
+    });
+    await expect(
+      repository.getRepositoryPolicy(otherOwnerId, repositoryId),
+    ).resolves.toBeNull();
+    await expect(repository.getConnectorHealth(ownerId)).resolves.toBe("fresh");
+    await expect(repository.getConnectorHealth(otherOwnerId)).resolves.toBe(
+      "offline",
+    );
+  });
+
+  it("applies owner, unread, status, and five-item bounds to reads", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const jobs = [];
+    for (let index = 0; index < 7; index += 1) {
+      jobs.push(
+        await createJob(repository, {
+          ownerId,
+          repositoryId,
+          requestDigest: index % 2 === 0 ? SHA256_A : SHA256_B,
+        }),
+      );
+    }
+    await db.query(
+      "UPDATE jobs SET unread_terminal = (id = ANY($1::uuid[])), status = CASE WHEN id = ANY($1::uuid[]) THEN 'succeeded'::job_status ELSE status END WHERE owner_id = $2",
+      [[jobs[0]?.jobId, jobs[1]?.jobId], ownerId],
+    );
+
+    const unread = await repository.list({
+      ownerId,
+      unreadOnly: true,
+      limit: 5,
+    });
+    expect(unread).toHaveLength(2);
+    expect(unread.every((job) => job.ownerId === ownerId)).toBe(true);
+    expect(unread.every((job) => job.unreadTerminal)).toBe(true);
+    await expect(
+      repository.list({ ownerId: crypto.randomUUID(), limit: 5 }),
+    ).resolves.toEqual([]);
+  });
+
+  it("returns only the recent five owner-scoped events and pending approvals", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const job = await createJob(repository, { ownerId, repositoryId });
+    for (let sequence = 1; sequence <= 8; sequence += 1) {
+      await db.query(
+        "INSERT INTO job_events (job_id, sequence, event_type, payload) VALUES ($1, $2, 'progress', $3::jsonb)",
+        [job.jobId, sequence, JSON.stringify({ sequence })],
+      );
+    }
+
+    const events = await repository.events(ownerId, job.jobId, 5);
+    expect(events.map((item) => item.sequence)).toEqual([4, 5, 6, 7, 8]);
+    const legacyEvents = await repository.events(job.jobId);
+    expect(legacyEvents.map((item) => item.sequence)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8,
+    ]);
+    await expect(
+      repository.events(crypto.randomUUID(), job.jobId, 5),
+    ).resolves.toEqual([]);
+
+    const approvalJobs = await Promise.all(
+      Array.from({ length: 6 }, () =>
+        createJob(repository, { ownerId, repositoryId }),
+      ),
+    );
+    const approvalIds: string[] = [];
+    for (const approvalJob of approvalJobs) {
+      const approvalId = crypto.randomUUID();
+      approvalIds.push(approvalId);
+      await insertApproval(db, {
+        approvalId,
+        jobId: approvalJob.jobId,
+        ownerId,
+        jobRevision: approvalJob.revision,
+        expiresAt: new Date(Date.now() + 5 * 60_000),
+        actionFingerprint: SHA256_A,
+      });
+    }
+    await insertApproval(db, {
+      approvalId: crypto.randomUUID(),
+      jobId: job.jobId,
+      ownerId,
+      jobRevision: job.revision,
+      expiresAt: new Date(Date.now() - 1_000),
+      actionFingerprint: SHA256_A,
+    });
+
+    const approvals = await repository.listPendingApprovals(
+      ownerId,
+      5,
+      new Date(),
+    );
+    expect(approvals).toHaveLength(5);
+    expect(approvals.every((approval) => approval.decision === null)).toBe(
+      true,
+    );
+    await expect(
+      repository.getPendingApproval(
+        ownerId,
+        approvalJobs[5]?.jobId as string,
+        new Date(),
+      ),
+    ).resolves.toMatchObject({ approvalId: approvalIds[5] });
+    await expect(
+      repository.listPendingApprovals(crypto.randomUUID(), 5, new Date()),
+    ).resolves.toEqual([]);
+  });
+
+  it("cancels queued work idempotently without creating a connector message", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const job = await createJob(repository, { ownerId, repositoryId });
+
+    const first = await repository.cancelAtomically({
+      ownerId,
+      jobId: job.jobId,
+      expectedRevision: job.revision,
+    });
+    const repeated = await repository.cancelAtomically({
+      ownerId,
+      jobId: job.jobId,
+      expectedRevision: job.revision,
+    });
+
+    expect(first).toMatchObject({ status: "cancelled", revision: 1 });
+    expect(repeated).toMatchObject({ status: "cancelled", revision: 1 });
+    const messages = await db.query(
+      "SELECT id FROM connector_messages WHERE payload->>'job_id' = $1",
+      [job.jobId],
+    );
+    expect(messages.rows).toEqual([]);
+  });
+
+  it("moves running work to cancelling and allocates one locked server sequence", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const connectorId = crypto.randomUUID();
+    const job = await createJob(repository, { ownerId, repositoryId });
+    await seedConnector(db, connectorId, ownerId);
+    await repository.transitionAndAppend(
+      job.jobId,
+      job.revision,
+      "dispatched",
+      event("job.dispatched"),
+    );
+    const running = await repository.transitionAndAppend(
+      job.jobId,
+      1,
+      "running",
+      event("job.running"),
+    );
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, attempt = 2 WHERE id = $2",
+      [connectorId, job.jobId],
+    );
+
+    const first = await repository.cancelAtomically({
+      ownerId,
+      jobId: job.jobId,
+      expectedRevision: running.revision,
+    });
+    const repeated = await repository.cancelAtomically({
+      ownerId,
+      jobId: job.jobId,
+      expectedRevision: running.revision,
+    });
+    expect(first).toMatchObject({ status: "cancelling", revision: 3 });
+    expect(repeated).toMatchObject({ status: "cancelling", revision: 3 });
+
+    const messages = await db.query<{
+      sequence: number;
+      type: string;
+      payload: { job_id: string; attempt: number; job_revision: number };
+    }>(
+      "SELECT sequence, type, payload FROM connector_messages WHERE connector_id = $1 AND direction = 'server'",
+      [connectorId],
+    );
+    expect(messages.rows).toHaveLength(1);
+    expect(messages.rows[0]).toMatchObject({
+      sequence: "1",
+      type: "job.cancel",
+      payload: { job_id: job.jobId, attempt: 2, job_revision: 3 },
+    });
+    const connector = await db.query<{ last_server_sequence: number }>(
+      "SELECT last_server_sequence FROM connectors WHERE id = $1",
+      [connectorId],
+    );
+    expect(Number(connector.rows[0]?.last_server_sequence)).toBe(1);
+  });
+
+  it("rejects a stale active cancellation and owner mismatch without writes", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const job = await createJob(repository, { ownerId, repositoryId });
+
+    await expectCode(
+      repository.cancelAtomically({
+        ownerId,
+        jobId: job.jobId,
+        expectedRevision: job.revision + 1,
+      }),
+      "REVISION_CONFLICT",
+    );
+    await expectCode(
+      repository.cancelAtomically({
+        ownerId: crypto.randomUUID(),
+        jobId: job.jobId,
+        expectedRevision: job.revision,
+      }),
+      "NOT_FOUND",
+    );
+    await expect(repository.get(ownerId, job.jobId)).resolves.toMatchObject({
+      status: "queued",
+      revision: 0,
+    });
+  });
+
+  it("commits the first owner-scoped approval decision and its outbox command together", async () => {
+    const repository = new JobRepository(db.client);
+    const connectorId = crypto.randomUUID();
+    const { job, fixture } = await prepareApproval(
+      repository,
+      db,
+      new Date(Date.now() + 5 * 60_000),
+    );
+    await seedConnector(db, connectorId, job.ownerId);
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, attempt = $2 WHERE id = $3",
+      [connectorId, 1, job.jobId],
+    );
+
+    const first = await repository.recordApprovalDecision({
+      ownerId: job.ownerId,
+      approvalId: fixture.approvalId,
+      decision: "approve",
+      expectedJobRevision: fixture.jobRevision,
+      actionFingerprint: fixture.actionFingerprint,
+    });
+    expect(first).toMatchObject({
+      approvalId: fixture.approvalId,
+      decision: "approve",
+    });
+    await expectCode(
+      repository.recordApprovalDecision({
+        ownerId: job.ownerId,
+        approvalId: fixture.approvalId,
+        decision: "reject",
+        expectedJobRevision: fixture.jobRevision,
+        actionFingerprint: fixture.actionFingerprint,
+      }),
+      "APPROVAL_ALREADY_DECIDED",
+    );
+    const messages = await db.query<{
+      sequence: number;
+      type: string;
+      payload: Record<string, unknown>;
+    }>(
+      "SELECT sequence, type, payload FROM connector_messages WHERE connector_id = $1 AND direction = 'server'",
+      [connectorId],
+    );
+    expect(messages.rows).toHaveLength(1);
+    expect(messages.rows[0]).toMatchObject({
+      sequence: "1",
+      type: "approval.decision",
+      payload: {
+        approval_id: fixture.approvalId,
+        job_id: fixture.jobId,
+        attempt: 1,
+        job_revision: fixture.jobRevision,
+        action_fingerprint: fixture.actionFingerprint,
+        decision: "approve",
+      },
+    });
+  });
+
+  it("rolls back an approval update when the required connector outbox cannot be written", async () => {
+    const repository = new JobRepository(db.client);
+    const { job, fixture } = await prepareApproval(
+      repository,
+      db,
+      new Date(Date.now() + 5 * 60_000),
+    );
+    await db.query("UPDATE jobs SET attempt = $1 WHERE id = $2", [
+      1,
+      job.jobId,
+    ]);
+
+    await expectCode(
+      repository.recordApprovalDecision({
+        ownerId: job.ownerId,
+        approvalId: fixture.approvalId,
+        decision: "approve",
+        expectedJobRevision: fixture.jobRevision,
+        actionFingerprint: fixture.actionFingerprint,
+      }),
+      "CONNECTOR_OWNER_MISMATCH",
+    );
+    const stored = await db.query<{ decision: string | null }>(
+      "SELECT decision FROM approvals WHERE id = $1",
+      [fixture.approvalId],
+    );
+    expect(stored.rows[0]?.decision).toBeNull();
+  });
+
+  it("acknowledges a terminal result once and returns the persisted timestamp on retry", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const job = await createJob(repository, { ownerId, repositoryId });
+    await db.query(
+      "UPDATE jobs SET status = 'succeeded', terminal_at = now(), unread_terminal = true, summary = $1::jsonb WHERE id = $2",
+      [
+        JSON.stringify({
+          summary: "All checks passed",
+          changed_files: ["src/index.ts"],
+          tests: { passed: 8, failed: 0, summary: "8 passed" },
+          artifacts: [],
+        }),
+        job.jobId,
+      ],
+    );
+
+    const first = await repository.acknowledgeResult(ownerId, job.jobId);
+    const second = await repository.acknowledgeResult(ownerId, job.jobId);
+    expect(first?.acknowledgedAt).toBeInstanceOf(Date);
+    expect(second?.acknowledgedAt?.getTime()).toBe(
+      first?.acknowledgedAt?.getTime(),
+    );
+    expect(second?.summary).toBe("All checks passed");
+    const stored = await db.query<{
+      acknowledged_at: string;
+      unread_terminal: boolean;
+    }>("SELECT acknowledged_at, unread_terminal FROM jobs WHERE id = $1", [
+      job.jobId,
+    ]);
+    expect(stored.rows[0]?.acknowledged_at).toBeTruthy();
+    expect(stored.rows[0]?.unread_terminal).toBe(false);
+    await expect(
+      repository.acknowledgeResult(crypto.randomUUID(), job.jobId),
+    ).resolves.toBeNull();
+
+    const missingResult = await createJob(repository, {
+      ownerId,
+      repositoryId,
+    });
+    await db.query(
+      "UPDATE jobs SET status = 'failed', terminal_at = now(), unread_terminal = true WHERE id = $1",
+      [missingResult.jobId],
+    );
+    await expect(
+      repository.acknowledgeResult(ownerId, missingResult.jobId),
+    ).resolves.toBeNull();
+    const unacknowledged = await db.query<{
+      acknowledged_at: string | null;
+      unread_terminal: boolean;
+    }>("SELECT acknowledged_at, unread_terminal FROM jobs WHERE id = $1", [
+      missingResult.jobId,
+    ]);
+    expect(unacknowledged.rows[0]).toEqual({
+      acknowledged_at: null,
+      unread_terminal: true,
+    });
   });
 });

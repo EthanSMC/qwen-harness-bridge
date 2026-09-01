@@ -9,4 +9,13 @@ export default defineWorkspace([
       include: ["tests/integration/job-repository.test.ts"],
     },
   },
+  {
+    test: {
+      name: "contract",
+      include: [
+        "tests/contract/mcp-tools.test.ts",
+        "tests/contract/mcp-auth.test.ts",
+      ],
+    },
+  },
 ]);
