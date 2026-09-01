@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "@qhb/protocol": ["../../packages/protocol/src/index.ts"]
+    },
+    "types": ["vitest/globals"]
+  },
+  "include": ["src/**/*.ts"]
+}
