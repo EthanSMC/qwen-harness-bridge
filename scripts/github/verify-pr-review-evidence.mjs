@@ -238,6 +238,17 @@ const verifyWorkflowRun = (run, runId, repository, pullRequest) => {
   }
 };
 
+const verifyStaticCheck = (checkRunsPayload, headSha) => {
+  const checkRuns = requireArray(requireObject(checkRunsPayload, "current head check-runs API response").check_runs, "current head check runs");
+  const staticCheck = checkRuns.find((checkRun) => checkRun.name === "static"
+    && checkRun.head_sha === headSha
+    && checkRun.app?.slug === "github-actions");
+  if (!staticCheck) throw new Error("current head is missing the GitHub Actions static check");
+  if (staticCheck.status !== "completed" || staticCheck.conclusion !== "success") {
+    throw new Error(`GitHub Actions static check must be completed/success; received ${staticCheck.status ?? "missing"}/${staticCheck.conclusion ?? "missing"}`);
+  }
+};
+
 const latestReviewFor = (reviews, reviewerLogin) => reviews
   .filter((review) => normalizedIdentity(review.user?.login ?? "") === normalizedIdentity(reviewerLogin))
   .sort((left, right) => {
@@ -246,21 +257,23 @@ const latestReviewFor = (reviews, reviewerLogin) => reviews
     return rightTime - leftTime;
   })[0];
 
-export async function validatePullRequestState({ event, token, repository, runId, fetchImpl = globalThis.fetch }) {
+export async function validatePullRequestState({ event, token, repository, runId, staticResult, fetchImpl = globalThis.fetch }) {
   requiredValue(token, "GITHUB_TOKEN");
   requiredValue(repository, "GITHUB_REPOSITORY");
   if (!/^[^/]+\/[^/]+$/.test(repository)) throw new Error("GITHUB_REPOSITORY must be owner/name");
   requiredPositiveNumber(runId, "GITHUB_RUN_ID");
+  if (staticResult !== "success") throw new Error(`needs.static.result must be exactly success; received ${staticResult ?? "missing"}`);
   const eventPullRequest = pullRequestFromEvent(event, repository);
-  const bodyResult = validatePullRequestBody(event.pull_request.body, { authorLogin: eventPullRequest.authorLogin });
+  const currentPullRequest = await apiJson(fetchImpl, repository, `/pulls/${eventPullRequest.number}`, token);
+  verifyPullRequestApiState(eventPullRequest, currentPullRequest, repository);
+  if (event.pull_request.body !== currentPullRequest.body) throw new Error("event pull_request.body is stale and does not match the current PR body");
+  const bodyResult = validatePullRequestBody(currentPullRequest.body, { authorLogin: eventPullRequest.authorLogin });
   const expectedCommitRange = `${eventPullRequest.base.sha}..${eventPullRequest.head.sha}`;
   requireEqual(bodyResult.fields.commitRange, expectedCommitRange, "reviewed commit range");
   validateCurrentChecksUrl(bodyResult.fields.ciEvidence, repository, eventPullRequest.number);
-
-  const currentPullRequest = await apiJson(fetchImpl, repository, `/pulls/${eventPullRequest.number}`, token);
-  verifyPullRequestApiState(eventPullRequest, currentPullRequest, repository);
   const currentRun = await apiJson(fetchImpl, repository, `/actions/runs/${runId}`, token);
   verifyWorkflowRun(currentRun, runId, repository, eventPullRequest);
+  verifyStaticCheck(await apiJson(fetchImpl, repository, `/commits/${eventPullRequest.head.sha}/check-runs?per_page=100`, token), eventPullRequest.head.sha);
   const collaborators = requireArray(await apiJson(fetchImpl, repository, "/collaborators?affiliation=direct&per_page=100", token), "direct collaborators");
   const eligible = eligibleCollaborators(collaborators, eventPullRequest.authorLogin);
 
@@ -347,6 +360,7 @@ export async function main(options = {}) {
   const token = config.token ?? process.env.GITHUB_TOKEN;
   const repository = config.repository ?? process.env.GITHUB_REPOSITORY;
   const runId = config.runId ?? process.env.GITHUB_RUN_ID;
+  const staticResult = config.staticResult ?? process.env.GITHUB_STATIC_RESULT;
   requiredValue(eventPath, "GITHUB_EVENT_PATH");
   let event;
   try {
@@ -354,7 +368,7 @@ export async function main(options = {}) {
   } catch (error) {
     throw new Error(`Unable to parse GITHUB_EVENT_PATH: ${error.message}`);
   }
-  const result = await validatePullRequestState({ event, token, repository, runId, fetchImpl: config.fetchImpl ?? globalThis.fetch });
+  const result = await validatePullRequestState({ event, token, repository, runId, staticResult, fetchImpl: config.fetchImpl ?? globalThis.fetch });
   console.log(`Review evidence verified: ${result.mode} mode; PR #${result.pullRequestNumber} head ${result.headSha} matches current GitHub state.`);
   return result;
 }

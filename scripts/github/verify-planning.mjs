@@ -54,6 +54,10 @@ const requireGovernanceField = (file, pattern, message) => {
   if (!pattern.test(contents.get(file))) throw new Error(`${file} governance gate is missing ${message}`);
 };
 
+const requireSourceField = (source, file, pattern, message) => {
+  if (!pattern.test(source)) throw new Error(`${file} governance gate is missing ${message}`);
+};
+
 const prTemplate = ".github/pull_request_template.md";
 for (const [pattern, message] of [
   [/Do not check both boxes/, "the prohibition on selecting both review modes"],
@@ -135,7 +139,24 @@ for (const [pattern, message] of [
   [/node --test scripts\/github\/verify-pr-review-evidence\.test\.mjs scripts\/github\/verify-pr-review-state\.test\.mjs/, "the review evidence node:test commands"],
   [/needs: static/, "the final gate dependency on static"],
   [/name: governance/, "the final governance job name"],
+  [/if: always\(\)/, "the always-running final gate"],
+  [/GITHUB_STATIC_RESULT:\s*\$\{\{\s*needs\.static\.result\s*\}\}/, "the static result passed to the live validator"],
   [/if: github\.event_name == 'pull_request'/, "the PR-only live state gate condition"],
 ]) requireGovernanceField(workflow, pattern, message);
+
+for (const [pattern, message] of [
+  [/branch protection is not enabled/, "the explicit disabled branch-protection state"],
+  [/review paths above are documented process controls only/, "the documented-process-only review-path boundary"],
+  [/must not be represented as enabled/, "the prohibition on claiming branch protection is enabled"],
+]) requireGovernanceField(repositoryStatus, pattern, message);
+
+const reviewEvidenceScript = readFileSync(resolve(root, "scripts/github/verify-pr-review-evidence.mjs"), "utf8");
+for (const [pattern, message] of [
+  [/needs\.static\.result must be exactly success/, "strict success validation for needs.static.result"],
+  [/\/commits\/\$\{eventPullRequest\.head\.sha\}\/check-runs/, "current-head Checks API query"],
+  [/status !== "completed"/, "completed check-run validation"],
+  [/conclusion !== "success"/, "successful check-run conclusion validation"],
+  [/currentPullRequest\.body/, "current PR body authority"],
+]) requireSourceField(reviewEvidenceScript, "scripts/github/verify-pr-review-evidence.mjs", pattern, message);
 
 console.log(`Planning baseline verified: ${files.length} files, ${taskCount} implementation tasks.`);

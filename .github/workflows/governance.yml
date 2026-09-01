@@ -40,7 +40,7 @@ jobs:
   governance:
     name: governance
     needs: static
-    if: github.event_name == 'pull_request'
+    if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -48,9 +48,11 @@ jobs:
         with:
           fetch-depth: 2
       - name: Verify live pull-request review state
+        if: github.event_name == 'pull_request'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_STATIC_RESULT: ${{ needs.static.result }}
         run: node scripts/github/verify-pr-review-evidence.mjs

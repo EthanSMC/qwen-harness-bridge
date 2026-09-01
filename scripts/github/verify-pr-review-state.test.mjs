@@ -58,6 +58,7 @@ const pullRequestFor = (overrides = {}) => ({
   user: { login: AUTHOR },
   base: { ref: "main", sha: BASE_SHA, repo: { full_name: REPOSITORY } },
   head: { ref: "feature/37", sha: HEAD_SHA, repo: { full_name: REPOSITORY } },
+  body: bodyFor(),
   ...overrides,
 });
 
@@ -81,6 +82,14 @@ const reviewsFor = ({ reviewer = "eligible-reviewer", state = "APPROVED", commit
   submitted_at: "2026-09-01T01:00:00Z",
 }];
 
+const checkRunsFor = ({ status = "completed", conclusion = "success", includeStatic = true } = {}) => ({
+  total_count: includeStatic ? 2 : 1,
+  check_runs: [
+    ...(includeStatic ? [{ name: "static", head_sha: HEAD_SHA, status, conclusion, app: { slug: "github-actions" } }] : []),
+    { name: "governance", head_sha: HEAD_SHA, status: "in_progress", conclusion: null, app: { slug: "github-actions" } },
+  ],
+});
+
 const fixtureFetch = (fixtures, calls = []) => async (url, options) => {
   const parsed = new URL(url);
   const key = `${parsed.pathname}${parsed.search}`;
@@ -92,18 +101,20 @@ const fixtureFetch = (fixtures, calls = []) => async (url, options) => {
   return { ok: true, status: 200, json: async () => fixture };
 };
 
-const fixturesFor = ({ secondReviewer = false, reviews } = {}) => ({
-  [`/repos/${REPOSITORY}/pulls/${PR_NUMBER}`]: pullRequestFor(),
+const fixturesFor = ({ secondReviewer = false, reviews, pullRequest, checkRuns = checkRunsFor() } = {}) => ({
+  [`/repos/${REPOSITORY}/pulls/${PR_NUMBER}`]: pullRequest ?? pullRequestFor(),
   [`/repos/${REPOSITORY}/actions/runs/${RUN_ID}`]: runFor(),
+  [`/repos/${REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100`]: checkRuns,
   [`/repos/${REPOSITORY}/collaborators?affiliation=direct&per_page=100`]: collaboratorsFor({ secondReviewer }),
   ...(reviews === undefined ? {} : { [`/repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100`]: reviews }),
 });
 
-const stateFor = (event, fixtures) => validatePullRequestState({
+const stateFor = (event, fixtures, { staticResult = "success" } = {}) => validatePullRequestState({
   event,
   token: TOKEN,
   repository: REPOSITORY,
   runId: RUN_ID,
+  staticResult,
   fetchImpl: fixtureFetch(fixtures),
 });
 
@@ -124,7 +135,11 @@ test("accepts formal mode with a current-head approval from the specified eligib
     }),
   });
 
-  const result = await stateFor(event, fixturesFor({ secondReviewer: true, reviews: reviewsFor() }));
+  const result = await stateFor(event, fixturesFor({
+    secondReviewer: true,
+    reviews: reviewsFor(),
+    pullRequest: pullRequestFor({ body: event.pull_request.body }),
+  }));
 
   assert.equal(result.mode, "formal");
 });
@@ -132,7 +147,47 @@ test("accepts formal mode with a current-head approval from the specified eligib
 test("rejects a CI evidence URL for another PR", async () => {
   const event = eventFor({ body: bodyFor({ ciEvidence: `https://github.com/${REPOSITORY}/pull/99/checks` }) });
 
-  await assert.rejects(stateFor(event, fixturesFor()), /current PR checks URL|PR checks URL/i);
+  await assert.rejects(stateFor(event, fixturesFor({ pullRequest: pullRequestFor({ body: event.pull_request.body }) })), /current PR checks URL|PR checks URL/i);
+});
+
+test("rejects a stale event body when the current PR body differs", async () => {
+  const event = eventFor({ body: bodyFor().replace("- Findings: None", "- Findings: stale event snapshot") });
+
+  await assert.rejects(stateFor(event, fixturesFor()), /event.*body.*stale|body.*mismatch/i);
+});
+
+test("rejects an invalid current PR body even when the event body was valid", async () => {
+  const invalidBody = bodyFor().replace(
+    "- [ ] Formal GitHub review",
+    "- [x] Formal GitHub review",
+  );
+
+  await assert.rejects(
+    stateFor(eventFor({ body: invalidBody }), fixturesFor({ pullRequest: pullRequestFor({ body: invalidBody }) })),
+    /exactly one review mode/i,
+  );
+});
+
+test("rejects static failure, cancellation, or skip before live state can pass", async (t) => {
+  for (const staticResult of ["failure", "cancelled", "skipped"]) {
+    await t.test(staticResult, async () => {
+      await assert.rejects(stateFor(eventFor(), fixturesFor(), { staticResult }), /static.*success/i);
+    });
+  }
+});
+
+test("rejects a missing or non-success current-head static check", async (t) => {
+  const cases = [
+    ["missing", checkRunsFor({ includeStatic: false })],
+    ["pending", checkRunsFor({ status: "in_progress", conclusion: null })],
+    ["failure", checkRunsFor({ status: "completed", conclusion: "failure" })],
+    ["cancelled", checkRunsFor({ status: "completed", conclusion: "cancelled" })],
+  ];
+  for (const [name, checkRuns] of cases) {
+    await t.test(name, async () => {
+      await assert.rejects(stateFor(eventFor(), fixturesFor({ checkRuns })), /static.*check|completed.*success/i);
+    });
+  }
 });
 
 test("rejects an event/API head mismatch", async () => {
@@ -164,7 +219,11 @@ test("rejects formal mode with a stale approval", async () => {
   });
 
   await assert.rejects(
-    stateFor(event, fixturesFor({ secondReviewer: true, reviews: reviewsFor({ commitId: "old-head" }) })),
+    stateFor(event, fixturesFor({
+      secondReviewer: true,
+      reviews: reviewsFor({ commitId: "old-head" }),
+      pullRequest: pullRequestFor({ body: event.pull_request.body }),
+    })),
     /current head|APPROVED.*current/i,
   );
 });
@@ -181,7 +240,11 @@ test("rejects formal mode when the approval belongs to another reviewer", async 
   });
 
   await assert.rejects(
-    stateFor(event, fixturesFor({ secondReviewer: true, reviews: reviewsFor({ reviewer: "other-reviewer" }) })),
+    stateFor(event, fixturesFor({
+      secondReviewer: true,
+      reviews: reviewsFor({ reviewer: "other-reviewer" }),
+      pullRequest: pullRequestFor({ body: event.pull_request.body }),
+    })),
     /specified reviewer|reviewer.*eligible|APPROVED/i,
   );
 });
@@ -198,7 +261,11 @@ test("rejects formal mode without an approval", async () => {
   });
 
   await assert.rejects(
-    stateFor(event, fixturesFor({ secondReviewer: true, reviews: reviewsFor({ state: "COMMENTED" }) })),
+    stateFor(event, fixturesFor({
+      secondReviewer: true,
+      reviews: reviewsFor({ state: "COMMENTED" }),
+      pullRequest: pullRequestFor({ body: event.pull_request.body }),
+    })),
     /APPROVED.*current head|current-head.*approval/i,
   );
 });
