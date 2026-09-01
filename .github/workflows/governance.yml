@@ -2,6 +2,11 @@ name: Governance
 
 on:
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
   push:
     branches:
       - main
@@ -23,5 +28,11 @@ jobs:
           fetch-depth: 2
       - name: Verify planning and repository governance
         run: node scripts/github/verify-planning.mjs
+      - name: Verify pull-request review evidence
+        if: github.event_name == 'pull_request'
+        run: node scripts/github/verify-pr-review-evidence.mjs
+      - name: Test pull-request review evidence validator
+        if: always() && github.event_name == 'pull_request'
+        run: node --test scripts/github/verify-pr-review-evidence.test.mjs
       - name: Check whitespace errors
         run: git diff --check HEAD^

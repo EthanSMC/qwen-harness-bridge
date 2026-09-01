@@ -19,7 +19,7 @@
 
 ### Mode-specific evidence (complete only for the selected mode)
 
-- Formal review URL (required for formal mode):
+- Formal GitHub review URL (required for formal mode):
 - Formal reviewer GitHub identity (required for formal mode):
 - Solo eligibility evidence URL or repository-status reference (required for solo mode):
 - Solo eligibility verification date (required for solo mode):
@@ -39,7 +39,7 @@
 - Findings:
 - Fix rounds:
 - Final verdict: PASS / FAIL
-- CI run URL(s) and required-check results:
+- CI run URL(s) / PR checks URL(s) and required-check results (controller re-verifies GitHub checks API before merge):
 
 ## Verification
 

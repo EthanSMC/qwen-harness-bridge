@@ -16,9 +16,11 @@ const governance = [
   "SECURITY.md",
   "CHANGELOG.md",
   ".github/CODEOWNERS",
+  ".github/workflows/governance.yml",
   ".github/pull_request_template.md",
   ".github/labels.yml",
   ".github/milestones.yml",
+  "docs/github/repository-status.md",
 ];
 const syncManagement = "scripts/github/sync-management.mjs";
 
@@ -58,7 +60,7 @@ for (const [pattern, message] of [
   [/Review mode \(check exactly one\)/, "an explicit mutually-exclusive review mode selector"],
   [/Formal GitHub review/, "the formal GitHub review mode"],
   [/Solo-maintainer fallback/, "the solo-maintainer fallback mode"],
-  [/Formal review URL \(required for formal mode\)/, "the formal review URL field"],
+  [/Formal GitHub review URL \(required for formal mode\)/, "the formal GitHub review URL field"],
   [/Formal reviewer GitHub identity \(required for formal mode\)/, "the formal reviewer identity field"],
   [/Solo eligibility evidence URL or repository-status reference \(required for solo mode\)/, "the solo eligibility evidence field"],
   [/Implementer agent ID:/, "the implementer agent ID field"],
@@ -69,7 +71,7 @@ for (const [pattern, message] of [
   [/Findings:/, "the findings field"],
   [/Fix rounds:/, "the fix-rounds field"],
   [/Final verdict: PASS \/ FAIL/, "the final-verdict field"],
-  [/CI run URL\(s\) and required-check results:/, "the CI run URL field"],
+  [/CI run URL\(s\) \/ PR checks URL\(s\) and required-check results/, "the CI or PR checks URL field"],
   [/Exactly one review mode is selected/, "the exactly-one-mode checklist gate"],
 ]) requireGovernanceField(prTemplate, pattern, message);
 
@@ -82,17 +84,53 @@ for (const [pattern, message] of [
 ]) requireGovernanceField("CONTRIBUTING.md", pattern, message);
 
 for (const [pattern, message] of [
-  [/required_pull_request_reviews:\s*\{/, "a non-null required_pull_request_reviews object"],
+  [/collaborators\?affiliation=direct&per_page=100/, "the direct-collaborator query"],
+  [/role_name/, "collaborator role eligibility"],
+  [/permissions\.(?:admin|maintain|push)/, "collaborator permission eligibility"],
+  [/login\.toLowerCase\(\) !== ownerLogin/, "exclusion of the repository owner"],
+  [/eligibleReviewers\.length > 0/, "distinct eligible reviewer detection"],
+  [/const reviewMode = eligibleReviewers\.length > 0 \? "formal" : "solo";/, "conditional formal/solo mode selection"],
+  [/const requiredPullRequestReviews = reviewMode === "formal" \? formalReviewRequirements : null;/, "conditional formal review payload"],
+  [/required_pull_request_reviews: requiredPullRequestReviews/, "the conditional required_pull_request_reviews payload"],
   [/dismiss_stale_reviews:\s*true/, "dismiss_stale_reviews=true"],
   [/require_last_push_approval:\s*true/, "require_last_push_approval=true"],
   [/enforce_admins:\s*true/, "enforce_admins=true"],
+  [/required_approving_review_count:\s*1/, "required_approving_review_count=1 in formal mode"],
+  [/Review mode selected: \$\{reviewMode\}/, "the selected review-mode log"],
 ]) requireGovernanceField(syncManagement, pattern, message);
-if (/required_pull_request_reviews:\s*null/.test(contents.get(syncManagement))) {
-  throw new Error(`${syncManagement} governance gate must not set required_pull_request_reviews to null`);
-}
 const approvalCount = contents.get(syncManagement).match(/required_approving_review_count:\s*(\d+)/);
 if (!approvalCount || Number(approvalCount[1]) < 1) {
   throw new Error(`${syncManagement} governance gate must require at least one approving review`);
 }
+
+const repositoryStatus = "docs/github/repository-status.md";
+for (const [pattern, message] of [
+  [/Verified on 2026-09-01/, "the collaborator evidence verification date"],
+  [/EthanSMC\/qwen-harness-bridge/, "the repository identity"],
+  [/GET \/repos\/EthanSMC\/qwen-harness-bridge\/collaborators/, "the collaborator API endpoint"],
+  [/returned only `EthanSMC`/, "the only-EthanSMC collaborator result"],
+  [/PR `#36`/, "the PR #36 reference"],
+  [/github\.com\/EthanSMC\/qwen-harness-bridge\/pull\/36/, "the PR #36 URL reference"],
+  [/author=EthanSMC/, "the PR #36 author evidence"],
+  [/reviewRequests=\[\]/, "the empty reviewRequests state"],
+  [/latestReviews=\[\]/, "the empty latestReviews state"],
+  [/reviewDecision=""/, "the empty reviewDecision state"],
+  [/Re-run the collaborator and PR review-state checks immediately before changing or relying on the selected mode|Any collaborator membership, role, or permission change is a mandatory re-verification trigger/, "the collaborator-change re-verification rule"],
+  [/before relying on the solo fallback/, "the pre-fallback re-verification rule"],
+  [/controller.*GitHub checks API|GitHub checks API.*before merge/i, "the controller-side checks API boundary"],
+]) requireGovernanceField(repositoryStatus, pattern, message);
+
+const workflow = ".github/workflows/governance.yml";
+for (const [pattern, message] of [
+  [/pull_request:[\s\S]*?types:/, "the explicit pull-request event types"],
+  [/\n\s*- opened\b/, "the opened pull-request trigger"],
+  [/\n\s*- synchronize\b/, "the synchronize pull-request trigger"],
+  [/\n\s*- reopened\b/, "the reopened pull-request trigger"],
+  [/\n\s*- edited\b/, "the edited pull-request trigger"],
+  [/node scripts\/github\/verify-pr-review-evidence\.mjs/, "the actual pull-request body validator command"],
+  [/node --test scripts\/github\/verify-pr-review-evidence\.test\.mjs/, "the review evidence node:test command"],
+  [/if: always\(\) && github\.event_name == 'pull_request'/, "the always-run PR test condition"],
+  [/if: github\.event_name == 'pull_request'/, "the PR-only validator condition"],
+]) requireGovernanceField(workflow, pattern, message);
 
 console.log(`Planning baseline verified: ${files.length} files, ${taskCount} implementation tasks.`);

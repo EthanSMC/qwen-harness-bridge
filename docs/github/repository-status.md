@@ -16,10 +16,12 @@ Verified on 2026-09-01 against [EthanSMC/qwen-harness-bridge](https://github.com
 ## Review gate status
 
 - Solo-fallback eligibility evidence (verified 2026-09-01): repository `EthanSMC/qwen-harness-bridge`; collaborator endpoint `GET /repos/EthanSMC/qwen-harness-bridge/collaborators` returned only `EthanSMC`, with `role_name=admin` and `admin/maintain/push/pull/triage` permissions. No distinct eligible GitHub reviewer account was present in that response.
-- PR review-state evidence (verified 2026-09-01): PR `#36` in `EthanSMC/qwen-harness-bridge`, queried via `GET /repos/EthanSMC/qwen-harness-bridge/pulls/36` and its review-state fields, had `author=EthanSMC`, `reviewRequests=[]`, `latestReviews=[]`, and `reviewDecision=""`.
+- PR review-state evidence (verified 2026-09-01): PR `#36` reference is https://github.com/EthanSMC/qwen-harness-bridge/pull/36. The controller's PR review-state query for `EthanSMC/qwen-harness-bridge` had `author=EthanSMC`, `reviewRequests=[]`, `latestReviews=[]`, and `reviewDecision=""`.
+- Controller mode rule: query direct collaborators, exclude the repository owner, and select formal mode only when another collaborator has `admin`, `maintain`, or `push` role/permission. Otherwise select solo mode and leave `required_pull_request_reviews` unset (`null`) while retaining the non-review branch protections.
 - When a different eligible GitHub reviewer is available, a formal GitHub Approve is required. Until then, a fresh independent subagent reviewer must return PASS and all required GitHub checks must succeed.
 - The reviewer must differ from the implementer and inspect the complete diff and commit range. The pull request records reviewer type and identity, findings, fix rounds, final verdict, and CI/verification evidence. The author cannot self-approve or fabricate evidence; the fallback ends as soon as a second eligible reviewer is available.
-- Re-run the collaborator and PR review-state checks whenever collaborator membership, role, or permissions change, and before relying on the solo fallback for a new merge.
+- Re-run the collaborator and PR review-state checks immediately before changing or relying on the selected mode, including before relying on the solo fallback. Any collaborator membership, role, or permission change is a mandatory re-verification trigger; do not rely on the previous solo result after such a change.
+- The PR body validator checks evidence structure and accepts a GitHub Actions run URL or PR checks URL. It does not establish that CI passed; the controller must query the GitHub checks API and confirm successful required checks immediately before merge, keeping this evidence check from depending on itself.
 - Issue-first work remains required: each change uses its issue-linked pull request and `Closes #<issue>` for GitHub Issue auto-close. Required CI checks, release-gate acceptance evidence, and the normal PR gate remain in force.
 
 ## Branch-protection limitation
