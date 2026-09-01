@@ -22,6 +22,7 @@ Verified on 2026-09-01 against [EthanSMC/qwen-harness-bridge](https://github.com
 - The reviewer must differ from the implementer and inspect the complete diff and commit range. The pull request records reviewer type and identity, findings, fix rounds, final verdict, and CI/verification evidence. The author cannot self-approve or fabricate evidence; the fallback ends as soon as a second eligible reviewer is available.
 - Re-run the collaborator and PR review-state checks immediately before changing or relying on the selected mode, including before relying on the solo fallback. Any collaborator membership, role, or permission change is a mandatory re-verification trigger; do not rely on the previous solo result after such a change.
 - The PR body validator checks evidence structure and accepts a GitHub Actions run URL or PR checks URL. It does not establish that CI passed; the controller must query the GitHub checks API and confirm successful required checks immediately before merge, keeping this evidence check from depending on itself.
+- The PR workflow runs static governance first and a final `governance` job only after `needs: static`; the final job performs the live PR/API state check. Pushes to `main` run static governance only and do not require PR body evidence.
 - Issue-first work remains required: each change uses its issue-linked pull request and `Closes #<issue>` for GitHub Issue auto-close. Required CI checks, release-gate acceptance evidence, and the normal PR gate remain in force.
 
 ## Branch-protection limitation

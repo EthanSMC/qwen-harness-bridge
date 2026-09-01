@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import test from "node:test";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
-import { main, validatePullRequestEvent } from "./verify-pr-review-evidence.mjs";
+import { validatePullRequestEvent } from "./verify-pr-review-evidence.mjs";
 
 const eventWithBody = (body, author = "EthanSMC") => ({
   action: "opened",
@@ -49,7 +46,7 @@ const bodyFor = ({
   `- Fresh review of this exact commit range: ${fresh}`,
   `- Independent review (no author self-approval or fabricated evidence): ${independent}`,
   "",
-  `- Commit range reviewed (base..head): ${commitRange}`,
+  `- Commit range reviewed (base..head; use the exact event base.sha..head.sha): ${commitRange}`,
   `- Findings: ${findings}`,
   `- Fix rounds: ${fixRounds}`,
   `- Final verdict: ${verdict}`,
@@ -75,16 +72,8 @@ test("accepts a complete formal review body with a distinct GitHub reviewer", ()
   assert.equal(result.mode, "formal");
 });
 
-test("main parses pull_request.body from the GitHub event file", () => {
-  const directory = mkdtempSync(join(tmpdir(), "qhb-review-evidence-"));
-  const eventPath = join(directory, "event.json");
-  writeFileSync(eventPath, JSON.stringify(eventWithBody(bodyFor())));
-
-  try {
-    assert.equal(main(eventPath).mode, "solo");
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
+test("parses pull_request.body from the GitHub event", () => {
+  assert.equal(validatePullRequestEvent(eventWithBody(bodyFor())).mode, "solo");
 });
 
 test("rejects a PR body that selects both review modes", () => {

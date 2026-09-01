@@ -11,6 +11,7 @@
 ## Review evidence
 
 <!-- Complete exactly one review mode. Do not check both boxes. The solo fallback is valid only for a private single-maintainer repository with no second eligible GitHub reviewer account. -->
+<!-- CI evidence must be this PR's https://github.com/<owner>/<repo>/pull/<number>/checks URL. The PR number is unavailable before creation, so create the PR, immediately edit this body with the current checks URL, and rerun the edited gate. A first opened run may fail; the final merge gate must be green. -->
 
 ### Review mode (check exactly one)
 
@@ -35,7 +36,7 @@
 
 ### Scope, findings, and verdict (required)
 
-- Commit range reviewed (base..head):
+- Commit range reviewed (base..head; use the exact event base.sha..head.sha):
 - Findings:
 - Fix rounds:
 - Final verdict: PASS / FAIL

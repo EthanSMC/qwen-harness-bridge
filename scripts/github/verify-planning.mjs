@@ -67,7 +67,7 @@ for (const [pattern, message] of [
   [/Reviewer agent ID:/, "the reviewer agent ID field"],
   [/Fresh review of this exact commit range:/, "the fresh-review declaration"],
   [/Independent review \(no author self-approval or fabricated evidence\):/, "the independent-review declaration"],
-  [/Commit range reviewed \(base\.\.head\):/, "the reviewed commit-range field"],
+  [/Commit range reviewed \(base\.\.head; use the exact event base\.sha\.\.head\.sha\):/, "the event-matched reviewed commit-range field"],
   [/Findings:/, "the findings field"],
   [/Fix rounds:/, "the fix-rounds field"],
   [/Final verdict: PASS \/ FAIL/, "the final-verdict field"],
@@ -123,14 +123,19 @@ for (const [pattern, message] of [
 const workflow = ".github/workflows/governance.yml";
 for (const [pattern, message] of [
   [/pull_request:[\s\S]*?types:/, "the explicit pull-request event types"],
+  [/contents: read/, "contents read permission"],
+  [/pull-requests: read/, "pull requests read permission"],
+  [/checks: read/, "checks read permission"],
+  [/actions: read/, "actions read permission for the current run"],
   [/\n\s*- opened\b/, "the opened pull-request trigger"],
   [/\n\s*- synchronize\b/, "the synchronize pull-request trigger"],
   [/\n\s*- reopened\b/, "the reopened pull-request trigger"],
   [/\n\s*- edited\b/, "the edited pull-request trigger"],
   [/node scripts\/github\/verify-pr-review-evidence\.mjs/, "the actual pull-request body validator command"],
-  [/node --test scripts\/github\/verify-pr-review-evidence\.test\.mjs/, "the review evidence node:test command"],
-  [/if: always\(\) && github\.event_name == 'pull_request'/, "the always-run PR test condition"],
-  [/if: github\.event_name == 'pull_request'/, "the PR-only validator condition"],
+  [/node --test scripts\/github\/verify-pr-review-evidence\.test\.mjs scripts\/github\/verify-pr-review-state\.test\.mjs/, "the review evidence node:test commands"],
+  [/needs: static/, "the final gate dependency on static"],
+  [/name: governance/, "the final governance job name"],
+  [/if: github\.event_name == 'pull_request'/, "the PR-only live state gate condition"],
 ]) requireGovernanceField(workflow, pattern, message);
 
 console.log(`Planning baseline verified: ${files.length} files, ${taskCount} implementation tasks.`);

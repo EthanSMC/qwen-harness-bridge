@@ -13,7 +13,7 @@ const FIELD_LABELS = {
   distinct: "Reviewer is distinct from implementer",
   fresh: "Fresh review of this exact commit range",
   independent: "Independent review (no author self-approval or fabricated evidence)",
-  commitRange: "Commit range reviewed (base..head)",
+  commitRange: "Commit range reviewed (base..head; use the exact event base.sha..head.sha)",
   findings: "Findings",
   fixRounds: "Fix rounds",
   verdict: "Final verdict",
@@ -110,6 +110,177 @@ const validateCiEvidence = (value) => {
   }
 };
 
+const normalizeRepository = (value) => value.trim().toLowerCase();
+
+const requiredPositiveNumber = (value, label) => {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1) throw new Error(`${label} must be a positive integer`);
+  return number;
+};
+
+const apiJson = async (fetchImpl, repository, path, token) => {
+  if (typeof fetchImpl !== "function") throw new Error("GitHub API fetch implementation is unavailable; failing closed");
+  const url = `https://api.github.com/repos/${repository}${path}`;
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+  } catch (error) {
+    throw new Error(`GitHub API request failed for ${path}: ${error.message}`);
+  }
+  if (!response || response.ok !== true) {
+    throw new Error(`GitHub API request failed for ${path}: HTTP ${response?.status ?? "unknown"}`);
+  }
+  try {
+    return await response.json();
+  } catch (error) {
+    throw new Error(`GitHub API response was not valid JSON for ${path}: ${error.message}`);
+  }
+};
+
+const requireObject = (value, label) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object`);
+  return value;
+};
+
+const requireArray = (value, label) => {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value;
+};
+
+const requireEqual = (actual, expected, label) => {
+  if (actual !== expected) throw new Error(`${label} mismatch: expected ${expected}, received ${actual ?? "missing"}`);
+};
+
+const eligibleCollaborators = (collaborators, authorLogin) => {
+  const eligibleRoles = new Set(["admin", "maintain", "push"]);
+  return collaborators.filter((collaborator) => {
+    const login = typeof collaborator.login === "string" ? collaborator.login : "";
+    const role = typeof collaborator.role_name === "string" ? collaborator.role_name.toLowerCase() : "";
+    const permissions = collaborator.permissions ?? {};
+    const hasEligibleRole = eligibleRoles.has(role);
+    const hasEligiblePermission = permissions.admin === true || permissions.maintain === true || permissions.push === true;
+    return login && normalizedIdentity(login) !== normalizedIdentity(authorLogin) && (hasEligibleRole || hasEligiblePermission);
+  });
+};
+
+const evidenceUrls = (value) => [...value.matchAll(/https:\/\/github\.com\/[^\s)>,]+/gi)]
+  .map((match) => match[0].replace(/[.,;]+$/, ""));
+
+const validateCurrentChecksUrl = (value, repository, number) => {
+  const urls = evidenceUrls(value);
+  if (urls.length !== 1) throw new Error("CI evidence must contain exactly one current PR checks URL");
+  const url = githubUrl(urls[0], "CI evidence");
+  const expectedPath = `/${repository}/pull/${number}/checks`.toLowerCase();
+  if (url.pathname.toLowerCase() !== expectedPath || url.search || url.hash) {
+    throw new Error(`CI evidence must be the current PR checks URL: https://github.com/${repository}/pull/${number}/checks`);
+  }
+};
+
+const pullRequestFromEvent = (event, repository) => {
+  if (!event || !event.pull_request) throw new Error("GitHub event must contain pull_request");
+  if (normalizeRepository(event.repository?.full_name ?? "") !== normalizeRepository(repository)) {
+    throw new Error("event repository does not match GITHUB_REPOSITORY");
+  }
+  const pullRequest = event.pull_request;
+  const number = requiredPositiveNumber(pullRequest.number, "event pull request number");
+  const authorLogin = requiredValue(pullRequest.user?.login, "event pull request author");
+  const base = requireObject(pullRequest.base, "event pull request base");
+  const head = requireObject(pullRequest.head, "event pull request head");
+  const baseRepo = requiredValue(base.repo?.full_name, "event pull request base repository");
+  const headRepo = requiredValue(head.repo?.full_name, "event pull request head repository");
+  return {
+    number,
+    authorLogin,
+    base: {
+      ref: requiredValue(base.ref, "event pull request base ref"),
+      sha: requiredValue(base.sha, "event pull request base sha"),
+      repository: baseRepo,
+    },
+    head: {
+      ref: requiredValue(head.ref, "event pull request head ref"),
+      sha: requiredValue(head.sha, "event pull request head sha"),
+      repository: headRepo,
+    },
+  };
+};
+
+const verifyPullRequestApiState = (eventPullRequest, currentPullRequest, repository) => {
+  requireObject(currentPullRequest, "current pull request API response");
+  requireEqual(requiredPositiveNumber(currentPullRequest.number, "current pull request number"), eventPullRequest.number, "pull request number");
+  requireEqual(currentPullRequest.state, "open", "pull request state");
+  requireEqual(normalizedIdentity(requiredValue(currentPullRequest.user?.login, "current pull request author")), normalizedIdentity(eventPullRequest.authorLogin), "pull request author");
+  const currentBase = requireObject(currentPullRequest.base, "current pull request base");
+  const currentHead = requireObject(currentPullRequest.head, "current pull request head");
+  requireEqual(currentBase.ref, eventPullRequest.base.ref, "pull request base ref");
+  requireEqual(currentBase.sha, eventPullRequest.base.sha, "pull request base sha");
+  requireEqual(currentHead.ref, eventPullRequest.head.ref, "pull request head ref");
+  requireEqual(currentHead.sha, eventPullRequest.head.sha, "pull request head sha");
+  requireEqual(normalizeRepository(requiredValue(currentBase.repo?.full_name, "current pull request base repository")), normalizeRepository(eventPullRequest.base.repository), "pull request base repository");
+  requireEqual(normalizeRepository(requiredValue(currentHead.repo?.full_name, "current pull request head repository")), normalizeRepository(eventPullRequest.head.repository), "pull request head repository");
+  requireEqual(normalizeRepository(requiredValue(currentBase.repo?.full_name, "current pull request repository")), normalizeRepository(repository), "current pull request repository");
+};
+
+const verifyWorkflowRun = (run, runId, repository, pullRequest) => {
+  requireObject(run, "current workflow run API response");
+  requireEqual(String(run.id), String(runId), "workflow run id");
+  requireEqual(normalizeRepository(requiredValue(run.repository?.full_name, "workflow run repository")), normalizeRepository(repository), "workflow run repository");
+  requireEqual(run.head_sha, pullRequest.head.sha, "workflow run head sha");
+  const runPullRequests = requireArray(run.pull_requests, "workflow run pull requests");
+  if (!runPullRequests.some((item) => Number(item.number) === pullRequest.number)) {
+    throw new Error("workflow run is not associated with the current PR");
+  }
+};
+
+const latestReviewFor = (reviews, reviewerLogin) => reviews
+  .filter((review) => normalizedIdentity(review.user?.login ?? "") === normalizedIdentity(reviewerLogin))
+  .sort((left, right) => {
+    const leftTime = Date.parse(left.submitted_at ?? left.created_at ?? "") || 0;
+    const rightTime = Date.parse(right.submitted_at ?? right.created_at ?? "") || 0;
+    return rightTime - leftTime;
+  })[0];
+
+export async function validatePullRequestState({ event, token, repository, runId, fetchImpl = globalThis.fetch }) {
+  requiredValue(token, "GITHUB_TOKEN");
+  requiredValue(repository, "GITHUB_REPOSITORY");
+  if (!/^[^/]+\/[^/]+$/.test(repository)) throw new Error("GITHUB_REPOSITORY must be owner/name");
+  requiredPositiveNumber(runId, "GITHUB_RUN_ID");
+  const eventPullRequest = pullRequestFromEvent(event, repository);
+  const bodyResult = validatePullRequestBody(event.pull_request.body, { authorLogin: eventPullRequest.authorLogin });
+  const expectedCommitRange = `${eventPullRequest.base.sha}..${eventPullRequest.head.sha}`;
+  requireEqual(bodyResult.fields.commitRange, expectedCommitRange, "reviewed commit range");
+  validateCurrentChecksUrl(bodyResult.fields.ciEvidence, repository, eventPullRequest.number);
+
+  const currentPullRequest = await apiJson(fetchImpl, repository, `/pulls/${eventPullRequest.number}`, token);
+  verifyPullRequestApiState(eventPullRequest, currentPullRequest, repository);
+  const currentRun = await apiJson(fetchImpl, repository, `/actions/runs/${runId}`, token);
+  verifyWorkflowRun(currentRun, runId, repository, eventPullRequest);
+  const collaborators = requireArray(await apiJson(fetchImpl, repository, "/collaborators?affiliation=direct&per_page=100", token), "direct collaborators");
+  const eligible = eligibleCollaborators(collaborators, eventPullRequest.authorLogin);
+
+  if (bodyResult.mode === "solo") {
+    if (eligible.length > 0) throw new Error("solo mode is invalid while an eligible reviewer exists");
+  } else {
+    const formalIdentity = bodyResult.fields.formalIdentity;
+    if (!eligible.some((collaborator) => normalizedIdentity(collaborator.login) === normalizedIdentity(formalIdentity))) {
+      throw new Error("formal reviewer is not a current eligible collaborator");
+    }
+    const reviews = requireArray(await apiJson(fetchImpl, repository, `/pulls/${eventPullRequest.number}/reviews?per_page=100`, token), "pull request reviews");
+    const latestReview = latestReviewFor(reviews, formalIdentity);
+    if (!latestReview || String(latestReview.state).toUpperCase() !== "APPROVED" || latestReview.commit_id !== eventPullRequest.head.sha) {
+      throw new Error("specified formal reviewer lacks an APPROVED review on the current head");
+    }
+  }
+
+  return { mode: bodyResult.mode, pullRequestNumber: eventPullRequest.number, headSha: eventPullRequest.head.sha, eligibleReviewerLogins: eligible.map(({ login }) => login) };
+}
+
 const requiredCommonEvidence = (body, { authorLogin } = {}) => {
   const fields = Object.fromEntries(Object.entries(FIELD_LABELS).map(([key, label]) => [key, fieldValue(body, label)]));
   for (const key of ["commitRange", "findings", "fixRounds", "verdict", "ciEvidence"]) {
@@ -170,7 +341,12 @@ export function validatePullRequestEvent(event) {
   return validatePullRequestBody(event.pull_request.body, { authorLogin });
 }
 
-export function main(eventPath = process.env.GITHUB_EVENT_PATH) {
+export async function main(options = {}) {
+  const config = typeof options === "string" ? { eventPath: options } : options;
+  const eventPath = config.eventPath ?? process.env.GITHUB_EVENT_PATH;
+  const token = config.token ?? process.env.GITHUB_TOKEN;
+  const repository = config.repository ?? process.env.GITHUB_REPOSITORY;
+  const runId = config.runId ?? process.env.GITHUB_RUN_ID;
   requiredValue(eventPath, "GITHUB_EVENT_PATH");
   let event;
   try {
@@ -178,16 +354,14 @@ export function main(eventPath = process.env.GITHUB_EVENT_PATH) {
   } catch (error) {
     throw new Error(`Unable to parse GITHUB_EVENT_PATH: ${error.message}`);
   }
-  const result = validatePullRequestEvent(event);
-  console.log(`Review evidence verified: ${result.mode} mode; pull_request.body is structurally complete.`);
+  const result = await validatePullRequestState({ event, token, repository, runId, fetchImpl: config.fetchImpl ?? globalThis.fetch });
+  console.log(`Review evidence verified: ${result.mode} mode; PR #${result.pullRequestNumber} head ${result.headSha} matches current GitHub state.`);
   return result;
 }
 
 if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
-  try {
-    main();
-  } catch (error) {
+  main().catch((error) => {
     console.error(`Review evidence validation failed: ${error.message}`);
     process.exitCode = 1;
-  }
+  });
 }
