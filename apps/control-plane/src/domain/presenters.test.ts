@@ -480,6 +480,20 @@ describe("presenters", () => {
     expect(sanitized).toContain("[redacted path]");
   });
 
+  it("redacts absolute paths after punctuation separators without touching HTTPS URLs", () => {
+    const sanitized = sanitizePublicText(
+      "prefix,/Users/张三/Project Files/posix.txt\nprefix;/Volumes/团队 资料/volume.txt\nprefix|/tmp/构建 输出/tmp.txt\nprefix|C:\\Users\\张三\\Build Output\\windows.txt\nprefix,\\\\server\\共享 目录\\unc.txt\nkeep https://example.test/path and https://example.test/another-path",
+      600,
+    );
+
+    expect(sanitized).not.toMatch(
+      /\/Users\/张三|\/Volumes\/团队|\/tmp\/构建|C:\\Users|\\\\server|posix\.txt|volume\.txt|tmp\.txt|windows\.txt|unc\.txt/,
+    );
+    expect(sanitized).toContain("https://example.test/path");
+    expect(sanitized).toContain("https://example.test/another-path");
+    expect(sanitized.match(/\[redacted path\]/g)).toHaveLength(5);
+  });
+
   it("fails closed for Unicode, spaced, quoted, and Windows absolute paths", () => {
     const detail = presentJobDetail({
       job: job(),

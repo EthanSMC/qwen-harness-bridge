@@ -294,10 +294,23 @@ const PATH_BOUNDARIES = new Set([
   "【",
   "=",
   ":",
+  ",",
+  ";",
+  "|",
+  ")",
+  "<",
+  ">",
+  "，",
+  "；",
+  "｜",
+  "、",
 ]);
 
 const isPathBoundary = (value: string | undefined): boolean =>
-  value === undefined || /\s/u.test(value) || PATH_BOUNDARIES.has(value);
+  value === undefined ||
+  /\s/u.test(value) ||
+  PATH_BOUNDARIES.has(value) ||
+  (value !== "/" && value !== "\\" && /[\p{P}\p{S}]/u.test(value));
 
 const hasWebSchemeBefore = (value: string, index: number): boolean =>
   /https?:$/iu.test(value.slice(Math.max(0, index - 8), index));
