@@ -17,6 +17,22 @@ const repo = json(["repo", "view", "--json", "nameWithOwner"]).nameWithOwner;
 const [owner, name] = repo.split("/");
 if (!owner || !name) throw new Error(`invalid repository identity: ${repo}`);
 
+const directCollaborators = api(`repos/${repo}/collaborators?affiliation=direct&per_page=100`);
+if (!Array.isArray(directCollaborators)) throw new Error("GitHub collaborators response was not an array");
+const ownerLogin = owner.toLowerCase();
+const eligibleRoles = new Set(["admin", "maintain", "push"]);
+const eligibleReviewers = directCollaborators.filter((collaborator) => {
+  const login = typeof collaborator.login === "string" ? collaborator.login : "";
+  const role = typeof collaborator.role_name === "string" ? collaborator.role_name.toLowerCase() : "";
+  const permissions = collaborator.permissions ?? {};
+  const hasEligibleRole = eligibleRoles.has(role);
+  const hasEligiblePermission = permissions.admin === true || permissions.maintain === true || permissions.push === true;
+  return login && login.toLowerCase() !== ownerLogin && (hasEligibleRole || hasEligiblePermission);
+});
+const reviewMode = eligibleReviewers.length > 0 ? "formal" : "solo";
+const eligibleReviewerLogins = eligibleReviewers.map(({ login }) => login).join(", ") || "none";
+console.log(`Review mode selected: ${reviewMode}; direct eligible reviewers excluding ${owner}: ${eligibleReviewerLogins}.`);
+
 const labelSource = readFileSync(resolve(root, ".github/labels.yml"), "utf8");
 const labels = [...labelSource.matchAll(/- \{ name: "([^"]+)", color: "([0-9a-f]+)", description: "([^"]+)" \}/g)]
   .map(([, labelName, color, description]) => ({ name: labelName, color, description }));
@@ -76,17 +92,26 @@ for (const definition of planDefinitions) {
 }
 
 let protectionStatus = "enabled";
+const formalReviewRequirements = {
+  dismiss_stale_reviews: true,
+  require_code_owner_reviews: false,
+  required_approving_review_count: 1,
+  require_last_push_approval: true,
+};
+const requiredPullRequestReviews = reviewMode === "formal" ? formalReviewRequirements : null;
+const mainBranchProtection = {
+  required_status_checks: { strict: true, contexts: ["governance"] },
+  // Keep the review gate effective for repository administrators as well.
+  enforce_admins: true,
+  required_pull_request_reviews: requiredPullRequestReviews,
+  restrictions: null,
+  required_linear_history: true,
+  allow_force_pushes: false,
+  allow_deletions: false,
+  required_conversation_resolution: true,
+};
 try {
-  api(`repos/${repo}/branches/main/protection`, "PUT", {
-    required_status_checks: { strict: true, contexts: ["governance"] },
-    enforce_admins: false,
-    required_pull_request_reviews: null,
-    restrictions: null,
-    required_linear_history: true,
-    allow_force_pushes: false,
-    allow_deletions: false,
-    required_conversation_resolution: true,
-  });
+  api(`repos/${repo}/branches/main/protection`, "PUT", mainBranchProtection);
 } catch (error) {
   const detail = `${error.stderr ?? ""}${error.stdout ?? ""}${error.message ?? ""}`;
   if (!detail.includes("Upgrade to GitHub Pro or make this repository public")) throw error;
@@ -103,4 +128,4 @@ try {
   else api(`repos/${repo}/issues`, "POST", payload);
 }
 
-console.log(`Synchronized ${labels.length} managed labels, ${desiredMilestones.length} milestones, 34 plan issues; main protection: ${protectionStatus}.`);
+console.log(`Synchronized ${labels.length} managed labels, ${desiredMilestones.length} milestones, 34 plan issues; review mode: ${reviewMode}; main protection: ${protectionStatus}.`);

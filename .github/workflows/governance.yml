@@ -2,19 +2,28 @@ name: Governance
 
 on:
   pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
   push:
     branches:
       - main
 
 permissions:
   contents: read
+  pull-requests: read
+  checks: read
+  actions: read
 
 concurrency:
   group: governance-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  governance:
+  static:
+    name: static
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
@@ -23,5 +32,27 @@ jobs:
           fetch-depth: 2
       - name: Verify planning and repository governance
         run: node scripts/github/verify-planning.mjs
+      - name: Test pull-request review evidence validator
+        run: node --test scripts/github/verify-pr-review-evidence.test.mjs scripts/github/verify-pr-review-state.test.mjs
       - name: Check whitespace errors
         run: git diff --check HEAD^
+
+  governance:
+    name: governance
+    needs: static
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Verify live pull-request review state
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_STATIC_RESULT: ${{ needs.static.result }}
+        run: node scripts/github/verify-pr-review-evidence.mjs
