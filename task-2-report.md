@@ -63,3 +63,23 @@
 - `git diff --check`：passed。
 
 注：`pnpm typecheck` 在本机被 pnpm 10.15.1 registry signature 校验拦截，未进入编译；已使用同一仓库本地 `tsc` 对两个 strict tsconfig 完成验证。
+
+# Task 2 Fix Round 4
+
+基于：`c5d19caa3438c44711caf1c9c59dd2361d0564be`。
+
+## 改动
+
+- `packages/protocol/src/mcp.ts` 抽出 safe non-negative integer schema，令 `RevisionSchema` 的 `expected_revision` 与 `expected_job_revision` 接受 `Number.MAX_SAFE_INTEGER`、拒绝 `MAX_SAFE_INTEGER + 1`。
+- 审计 `packages/protocol/src` 全部 `z.number().int()`：connector 的 Positive/NonNegative schema 与 mcp 的 Revision/BoundedListLimit 均有 safe-integer 上界；列表 `limit` 另有合理业务上限 `5`，因此不适用 MAX_SAFE boundary 通过，但 unsafe 值仍被拒绝。
+- 增加 CancelTask/DecideApproval 修订字段的 safe boundary 与 unsafe 拒绝测试，并覆盖列表 limit 的 unsafe 拒绝；保留现有安全 payload、sha256 fingerprint、精确 expiry、SequenceCursor/state machine 和 governance merge 改动。
+
+## 验证
+
+- `./node_modules/.bin/vitest run`：33/33 passed。
+- `./node_modules/.bin/tsc -p packages/protocol/tsconfig.json --noEmit`：passed。
+- `./node_modules/.bin/tsc -p apps/control-plane/tsconfig.json --noEmit`：passed。
+- `node --test scripts/github/verify-pr-review-state.test.mjs scripts/github/verify-pr-review-evidence.test.mjs`：37/37 passed。
+- `node scripts/github/verify-planning.mjs`：passed，verified 17 files / 34 implementation tasks。
+- `for file in scripts/github/*.mjs; do node --check "$file"; done`：passed。
+- `git diff --check`：passed。

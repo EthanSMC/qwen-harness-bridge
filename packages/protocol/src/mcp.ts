@@ -1,8 +1,13 @@
 import { z } from "zod";
 import { JobStatusSchema } from "./job.js";
 
-const BoundedListLimitSchema = z.number().int().min(1).max(5);
-const RevisionSchema = z.number().int().nonnegative();
+const SafeNonNegativeIntegerSchema = z
+  .number()
+  .int()
+  .nonnegative()
+  .max(Number.MAX_SAFE_INTEGER);
+const BoundedListLimitSchema = SafeNonNegativeIntegerSchema.min(1).max(5);
+const RevisionSchema = SafeNonNegativeIntegerSchema;
 const JobIdSchema = z.string().uuid();
 
 export const ListTasksInputSchema = z

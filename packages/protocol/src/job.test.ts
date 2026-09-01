@@ -206,6 +206,46 @@ describe("job protocol", () => {
     ).toThrow();
   });
 
+  it("accepts safe revision boundaries and rejects unsafe revisions", () => {
+    const maxSafeInteger = Number.MAX_SAFE_INTEGER;
+    const unsafeInteger = maxSafeInteger + 1;
+    const jobId = crypto.randomUUID();
+    const approvalId = crypto.randomUUID();
+
+    expect(
+      CancelTaskInputSchema.parse({
+        job_id: jobId,
+        expected_revision: maxSafeInteger,
+      }),
+    ).toMatchObject({ expected_revision: maxSafeInteger });
+    expect(
+      DecideApprovalInputSchema.parse({
+        approval_id: approvalId,
+        decision: "approve",
+        expected_job_revision: maxSafeInteger,
+      }),
+    ).toMatchObject({ expected_job_revision: maxSafeInteger });
+    expect(() =>
+      CancelTaskInputSchema.parse({
+        job_id: jobId,
+        expected_revision: unsafeInteger,
+      }),
+    ).toThrow();
+    expect(() =>
+      DecideApprovalInputSchema.parse({
+        approval_id: approvalId,
+        decision: "approve",
+        expected_job_revision: unsafeInteger,
+      }),
+    ).toThrow();
+    expect(() =>
+      ListTasksInputSchema.parse({ limit: unsafeInteger }),
+    ).toThrow();
+    expect(() =>
+      ListPendingApprovalsInputSchema.parse({ limit: unsafeInteger }),
+    ).toThrow();
+  });
+
   it("validates pending approval list bounds", () => {
     expect(ListPendingApprovalsInputSchema.parse({})).toEqual({ limit: 5 });
     expect(ListPendingApprovalsInputSchema.parse({ limit: 1 })).toEqual({
