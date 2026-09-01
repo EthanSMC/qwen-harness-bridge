@@ -15,6 +15,9 @@
     "typecheck": "pnpm -r typecheck"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@qhb/protocol": "workspace:*",
+    "@types/node": "^24.0.0",
     "@biomejs/biome": "^2.2.2",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"

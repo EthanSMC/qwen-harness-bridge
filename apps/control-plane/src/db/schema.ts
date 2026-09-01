@@ -177,6 +177,7 @@ export const jobs = pgTable(
     title: varchar("title", { length: 40 }),
     summary: jsonb("summary").$type<Record<string, unknown>>(),
     unreadTerminal: boolean("unread_terminal").notNull().default(false),
+    acknowledgedAt: timestamp("acknowledged_at", dateTimestamp),
     acceptedAt: timestamp("accepted_at", dateTimestamp).notNull().defaultNow(),
     expiresAt: timestamp("expires_at", dateTimestamp)
       .notNull()
