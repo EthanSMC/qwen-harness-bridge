@@ -306,29 +306,50 @@ const PATH_BOUNDARIES = new Set([
   "、",
 ]);
 
-const isPathBoundary = (value: string | undefined): boolean =>
+const codePointBefore = (value: string, index: number): string | undefined => {
+  if (index <= 0) return undefined;
+  const previousCodeUnit = value.charCodeAt(index - 1);
+  if (previousCodeUnit >= 0xdc00 && previousCodeUnit <= 0xdfff && index >= 2) {
+    const precedingCodeUnit = value.charCodeAt(index - 2);
+    if (precedingCodeUnit >= 0xd800 && precedingCodeUnit <= 0xdbff) {
+      return value.slice(index - 2, index);
+    }
+  }
+  return value.slice(index - 1, index);
+};
+
+const isPathBoundary = (
+  value: string | undefined,
+  allowPathSeparators = false,
+): boolean =>
   value === undefined ||
   /\s/u.test(value) ||
   PATH_BOUNDARIES.has(value) ||
-  (value !== "/" && value !== "\\" && /[\p{P}\p{S}]/u.test(value));
+  ((allowPathSeparators || (value !== "/" && value !== "\\")) &&
+    /[\p{P}\p{S}]/u.test(value));
 
 const hasWebSchemeBefore = (value: string, index: number): boolean =>
-  /https?:$/iu.test(value.slice(Math.max(0, index - 8), index));
+  /https?:\/?$/iu.test(value.slice(Math.max(0, index - 9), index));
 
 const absolutePathStart = (value: string, index: number): boolean => {
-  if (!isPathBoundary(value[index - 1])) return false;
   const current = value[index];
   const next = value[index + 1];
   const afterNext = value[index + 2];
   if (current === "/") {
-    return !hasWebSchemeBefore(value, index);
+    return (
+      isPathBoundary(codePointBefore(value, index), true) &&
+      !hasWebSchemeBefore(value, index)
+    );
   }
-  if (current === "\\" && next === "\\") return true;
+  if (current === "\\" && next === "\\") {
+    return isPathBoundary(codePointBefore(value, index), true);
+  }
   return (
     current !== undefined &&
     /^[A-Za-z]$/.test(current) &&
     next === ":" &&
-    (afterNext === "/" || afterNext === "\\")
+    (afterNext === "/" || afterNext === "\\") &&
+    isPathBoundary(codePointBefore(value, index), true)
   );
 };
 

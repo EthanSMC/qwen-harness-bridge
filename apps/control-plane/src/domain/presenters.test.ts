@@ -494,6 +494,19 @@ describe("presenters", () => {
     expect(sanitized.match(/\[redacted path\]/g)).toHaveLength(5);
   });
 
+  it("redacts paths after astral and slash separators for Windows and UNC candidates", () => {
+    const sanitized = sanitizePublicText(
+      "prefix🛠/Users/张三/astral-secret.txt\nprefix//Users/张三/double-slash-secret.txt\nprefix/C:\\Users\\张三\\slash-secret.txt\nprefix/\\\\server\\共享\\unc-secret.txt\nkeep https://example.test/path",
+      600,
+    );
+
+    expect(sanitized).not.toMatch(
+      /\/Users\/张三|C:\\Users|\\\\server|astral-secret|double-slash-secret|slash-secret|unc-secret/,
+    );
+    expect(sanitized).toContain("keep https://example.test/path");
+    expect(sanitized.match(/\[redacted path\]/g)).toHaveLength(4);
+  });
+
   it("fails closed for Unicode, spaced, quoted, and Windows absolute paths", () => {
     const detail = presentJobDetail({
       job: job(),

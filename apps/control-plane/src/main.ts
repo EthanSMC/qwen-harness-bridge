@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import type { ServerOptions as HttpsServerOptions } from "node:https";
 import { resolve } from "node:path";
+import { createSecureContext } from "node:tls";
 import { fileURLToPath } from "node:url";
-import { config } from "./config.js";
+import { type AppConfig, config, requireTlsPaths } from "./config.js";
 import { db } from "./db/client.js";
 import { JobRepository } from "./db/job-repository.js";
 import {
@@ -10,29 +13,52 @@ import {
 } from "./domain/job-coordinator.js";
 import { createApp } from "./http/app.js";
 
-const requiredConfiguration = (): {
+export type RuntimeConfiguration = Readonly<{
   ownerId: string;
   mcpBearerToken: string;
   requestEncryptionKey: string;
-} => {
+  tlsCertPath: string;
+  tlsKeyPath: string;
+}>;
+
+export const requiredConfiguration = (
+  value: AppConfig = config,
+): RuntimeConfiguration => {
   if (
-    config.ownerId === undefined ||
-    config.mcpBearerToken === undefined ||
-    config.requestEncryptionKey === undefined
+    value.ownerId === undefined ||
+    value.mcpBearerToken === undefined ||
+    value.requestEncryptionKey === undefined
   ) {
     throw new Error(
       "QHB_OWNER_ID, QHB_MCP_BEARER_TOKEN, and QHB_REQUEST_ENCRYPTION_KEY are required",
     );
   }
+  const tls = requireTlsPaths(value);
   return {
-    ownerId: config.ownerId,
-    mcpBearerToken: config.mcpBearerToken,
-    requestEncryptionKey: config.requestEncryptionKey,
+    ownerId: value.ownerId,
+    mcpBearerToken: value.mcpBearerToken,
+    requestEncryptionKey: value.requestEncryptionKey,
+    tlsCertPath: tls.certPath,
+    tlsKeyPath: tls.keyPath,
   };
+};
+
+export const readTlsOptions = (
+  value: Pick<RuntimeConfiguration, "tlsCertPath" | "tlsKeyPath">,
+): Pick<HttpsServerOptions, "cert" | "key"> => {
+  try {
+    const cert = readFileSync(value.tlsCertPath);
+    const key = readFileSync(value.tlsKeyPath);
+    createSecureContext({ cert, key });
+    return { cert, key };
+  } catch {
+    throw new Error("QHB TLS certificate and key are invalid");
+  }
 };
 
 export async function start() {
   const runtime = requiredConfiguration();
+  const https = readTlsOptions(runtime);
   const coordinator = new JobCoordinator({
     repository: new JobRepository(db),
     encryptor: new Aes256GcmEncryptor(
@@ -46,6 +72,7 @@ export async function start() {
     coordinator,
     ownerId: runtime.ownerId,
     mcpBearerToken: runtime.mcpBearerToken,
+    https,
   });
   await app.listen({ port: config.port, host: config.host });
   return app;

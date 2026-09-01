@@ -1,3 +1,4 @@
+import type { ServerOptions as HttpsServerOptions } from "node:https";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import Fastify, { type FastifyInstance } from "fastify";
 import { createMcpAuthenticator, McpAuthenticationError } from "../mcp/auth.js";
@@ -8,6 +9,7 @@ export type CreateAppOptions = Readonly<{
   coordinator: McpCoordinator;
   ownerId: string;
   mcpBearerToken: string;
+  https: HttpsServerOptions;
 }>;
 
 const authenticationFailure = {
@@ -42,11 +44,18 @@ const duplicateAuthorizationHeader = (
 export async function createApp(
   options: CreateAppOptions,
 ): Promise<FastifyInstance> {
-  const app = Fastify({ logger: false });
+  if (options.https === undefined) {
+    throw new Error("TLS options are required for the control-plane server");
+  }
+  const app = Fastify({ logger: false, https: options.https });
   const authenticator = createMcpAuthenticator({
     expectedToken: options.mcpBearerToken,
     ownerId: options.ownerId,
   });
+
+  app.get("/healthz", async (_request, reply) =>
+    reply.type("application/json").send({ status: "ok" }),
+  );
 
   app.post("/mcp", async (request, reply) => {
     let owner: ReturnType<typeof authenticator.authenticate>;

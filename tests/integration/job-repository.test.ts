@@ -102,6 +102,39 @@ const expectCode = async (
   await expect(operation).rejects.toMatchObject({ code });
 };
 
+type ProductionMcpConnection = {
+  client: Client;
+  server: ReturnType<typeof createMcpServer>;
+};
+
+const connectProductionMcp = async (
+  repository: JobRepository,
+  ownerId: string,
+): Promise<ProductionMcpConnection> => {
+  const coordinator = new JobCoordinator({
+    repository,
+    encryptor: new Aes256GcmEncryptor(new Uint8Array(32).fill(7)),
+    now: () => new Date(),
+  });
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  const server = createMcpServer({ coordinator, ownerId });
+  const client = new Client({
+    name: "qhb-postgres-integration-client",
+    version: "1.0.0",
+  });
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  return { client, server };
+};
+
+const closeProductionMcp = async (
+  connection: ProductionMcpConnection,
+): Promise<void> => {
+  await connection.client.close();
+  await connection.server.close();
+};
+
 const quoteIdentifier = (identifier: string): string =>
   `"${identifier.replaceAll('"', '""')}"`;
 
@@ -170,11 +203,12 @@ const prepareApproval = async (
   repository: JobRepository,
   database: TestDatabase,
   expiresAt: Date,
+  overrides: Partial<CreateInput> = {},
 ): Promise<{
   job: Awaited<ReturnType<JobRepository["transitionAndAppend"]>>;
   fixture: ApprovalFixture;
 }> => {
-  const job = await createJob(repository);
+  const job = await createJob(repository, overrides);
   if (job === null) {
     throw new Error("createIdempotent unexpectedly returned no job");
   }
@@ -1324,6 +1358,338 @@ describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
     } finally {
       await client.close();
       await server.close();
+    }
+  });
+
+  it("lists and gets only the authenticated owner's jobs through production MCP", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const ownerRepositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const otherOwnerId = crypto.randomUUID();
+    const otherRepositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const ownJob = await createJob(repository, {
+      ownerId,
+      repositoryId: ownerRepositoryId,
+    });
+    const otherJob = await createJob(repository, {
+      ownerId: otherOwnerId,
+      repositoryId: otherRepositoryId,
+    });
+    const connection = await connectProductionMcp(repository, ownerId);
+
+    try {
+      const listed = await connection.client.callTool({
+        name: "list_tasks",
+        arguments: { limit: 5, unread_only: false },
+      });
+      expect(listed.isError).not.toBe(true);
+      expect(listed.structuredContent).toMatchObject({
+        tasks: [
+          {
+            short_id: ownJob.shortId,
+            status: "queued",
+            freshness: "offline",
+          },
+        ],
+      });
+      expect(JSON.stringify(listed.structuredContent)).not.toContain(
+        otherJob.shortId,
+      );
+
+      const detail = await connection.client.callTool({
+        name: "get_task",
+        arguments: { job_id: ownJob.jobId },
+      });
+      expect(detail.isError).not.toBe(true);
+      expect(detail.structuredContent).toMatchObject({
+        job_id: ownJob.jobId,
+        repository: ownerRepositoryId,
+        status: "queued",
+        current_stage: "queued",
+        revision: 0,
+        recent_events: [],
+        pending_approval: null,
+        terminal_summary: null,
+      });
+      expect(Object.keys(detail.structuredContent as object).sort()).toEqual([
+        "current_stage",
+        "freshness",
+        "job_id",
+        "pending_approval",
+        "recent_events",
+        "repository",
+        "revision",
+        "status",
+        "terminal_summary",
+        "text",
+        "title",
+      ]);
+
+      const otherDetail = await connection.client.callTool({
+        name: "get_task",
+        arguments: { job_id: otherJob.jobId },
+      });
+      expect(otherDetail.isError).toBe(true);
+      expect(otherDetail.structuredContent).toMatchObject({
+        error: { code: "JOB_NOT_FOUND" },
+      });
+    } finally {
+      await closeProductionMcp(connection);
+    }
+  });
+
+  it("cancels through production MCP and persists the terminal job state", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const job = await createJob(repository, { ownerId, repositoryId });
+    const connection = await connectProductionMcp(repository, ownerId);
+
+    try {
+      const cancelled = await connection.client.callTool({
+        name: "cancel_task",
+        arguments: { job_id: job.jobId, expected_revision: 0 },
+      });
+      expect(cancelled.isError).not.toBe(true);
+      expect(cancelled.structuredContent).toEqual({
+        job_id: job.jobId,
+        status: "cancelled",
+        revision: 1,
+      });
+
+      const repeated = await connection.client.callTool({
+        name: "cancel_task",
+        arguments: { job_id: job.jobId, expected_revision: 0 },
+      });
+      expect(repeated.isError).not.toBe(true);
+      expect(repeated.structuredContent).toEqual(cancelled.structuredContent);
+
+      const stored = await db.query<{
+        status: string;
+        revision: number;
+        terminal_at: string | null;
+        unread_terminal: boolean;
+      }>(
+        "SELECT status, revision, terminal_at, unread_terminal FROM jobs WHERE id = $1",
+        [job.jobId],
+      );
+      expect(stored.rows[0]).toMatchObject({
+        status: "cancelled",
+        revision: 1,
+        unread_terminal: true,
+      });
+      expect(stored.rows[0]?.terminal_at).toBeTruthy();
+    } finally {
+      await closeProductionMcp(connection);
+    }
+  });
+
+  it("lists pending approvals through production MCP with owner isolation and bounds", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const expiresAt = new Date(Date.now() + 5 * 60_000);
+    for (let index = 0; index < 6; index += 1) {
+      await prepareApproval(repository, db, expiresAt, {
+        ownerId,
+        repositoryId,
+      });
+    }
+    const connection = await connectProductionMcp(repository, ownerId);
+    const otherConnection = await connectProductionMcp(
+      repository,
+      crypto.randomUUID(),
+    );
+
+    try {
+      const listed = await connection.client.callTool({
+        name: "list_pending_approvals",
+        arguments: { limit: 5 },
+      });
+      expect(listed.isError).not.toBe(true);
+      const content = listed.structuredContent as {
+        approvals: Array<Record<string, unknown>>;
+      };
+      expect(content.approvals).toHaveLength(5);
+      for (const approval of content.approvals) {
+        expect(Object.keys(approval).sort()).toEqual([
+          "action_summary",
+          "approval_id",
+          "expires_at",
+          "impact_summary",
+          "job_id",
+          "job_revision",
+          "job_short_id",
+          "risk_class",
+        ]);
+        expect(String(approval.action_summary).length).toBeLessThanOrEqual(600);
+        expect(String(approval.impact_summary).length).toBeLessThanOrEqual(600);
+        expect(String(approval.job_short_id).length).toBeLessThanOrEqual(7);
+      }
+
+      const otherOwner = await otherConnection.client.callTool({
+        name: "list_pending_approvals",
+        arguments: { limit: 5 },
+      });
+      expect(otherOwner.isError).not.toBe(true);
+      expect(otherOwner.structuredContent).toEqual({ approvals: [] });
+    } finally {
+      await closeProductionMcp(otherConnection);
+      await closeProductionMcp(connection);
+    }
+  });
+
+  it("decides an approval through production MCP with one persisted outbox effect", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const connectorId = crypto.randomUUID();
+    const { job, fixture } = await prepareApproval(
+      repository,
+      db,
+      new Date(Date.now() + 5 * 60_000),
+      { ownerId, repositoryId },
+    );
+    await seedConnector(db, connectorId, ownerId);
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, attempt = 1 WHERE id = $2",
+      [connectorId, job.jobId],
+    );
+    const connection = await connectProductionMcp(repository, ownerId);
+
+    try {
+      const decision = {
+        name: "decide_approval" as const,
+        arguments: {
+          approval_id: fixture.approvalId,
+          decision: "approve" as const,
+          expected_job_revision: fixture.jobRevision,
+        },
+      };
+      const first = await connection.client.callTool(decision);
+      expect(first.isError).not.toBe(true);
+      expect(first.structuredContent).toEqual({
+        approval_id: fixture.approvalId,
+        job_id: fixture.jobId,
+        decision: "approve",
+        revision: fixture.jobRevision,
+      });
+
+      const retry = await connection.client.callTool(decision);
+      expect(retry.isError).not.toBe(true);
+      expect(retry.structuredContent).toEqual(first.structuredContent);
+
+      const approval = await db.query<{
+        decision: string | null;
+        decided_at: string | null;
+      }>("SELECT decision, decided_at FROM approvals WHERE id = $1", [
+        fixture.approvalId,
+      ]);
+      expect(approval.rows[0]).toMatchObject({ decision: "approve" });
+      expect(approval.rows[0]?.decided_at).toBeTruthy();
+
+      const storedJob = await db.query<{
+        status: string;
+        revision: number;
+      }>("SELECT status, revision FROM jobs WHERE id = $1", [fixture.jobId]);
+      expect(storedJob.rows[0]).toMatchObject({
+        status: "waiting_approval",
+        revision: fixture.jobRevision,
+      });
+
+      const events = await db.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM job_events WHERE job_id = $1 AND event_type = 'approval.decided'",
+        [fixture.jobId],
+      );
+      expect(Number(events.rows[0]?.count)).toBe(1);
+
+      const messages = await db.query<{
+        count: string;
+        type: string;
+      }>(
+        "SELECT count(*)::text AS count, max(type) AS type FROM connector_messages WHERE connector_id = $1 AND direction = 'server' AND type = 'approval.decision' AND payload->>'approval_id' = $2",
+        [connectorId, fixture.approvalId],
+      );
+      expect(messages.rows[0]).toEqual({
+        count: "1",
+        type: "approval.decision",
+      });
+    } finally {
+      await closeProductionMcp(connection);
+    }
+  });
+
+  it("keeps get_task_result terminal-only and acknowledges through production MCP idempotently", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const job = await createJob(repository, { ownerId, repositoryId });
+    const connection = await connectProductionMcp(repository, ownerId);
+
+    try {
+      const queued = await connection.client.callTool({
+        name: "get_task_result",
+        arguments: { job_id: job.jobId },
+      });
+      expect(queued.isError).toBe(true);
+      expect(queued.structuredContent).toMatchObject({
+        error: { code: "JOB_NOT_MUTABLE" },
+      });
+
+      await db.query(
+        "UPDATE jobs SET status = 'succeeded', terminal_at = now(), unread_terminal = true, summary = $1::jsonb WHERE id = $2",
+        [
+          JSON.stringify({
+            summary: "Integration checks passed",
+            changed_files: ["src/index.ts"],
+            tests: { passed: 8, failed: 0, summary: "8 passed" },
+            artifacts: [],
+          }),
+          job.jobId,
+        ],
+      );
+
+      const first = await connection.client.callTool({
+        name: "get_task_result",
+        arguments: { job_id: job.jobId },
+      });
+      expect(first.isError).not.toBe(true);
+      expect(first.structuredContent).toMatchObject({
+        job_id: job.jobId,
+        summary: "Integration checks passed",
+        changed_files: ["src/index.ts"],
+        tests: { passed: 8, failed: 0, summary: "8 passed" },
+      });
+      const firstAcknowledgedAt = (
+        first.structuredContent as { acknowledged_at: string }
+      ).acknowledged_at;
+      expect(firstAcknowledgedAt).toBeTruthy();
+
+      const retry = await connection.client.callTool({
+        name: "get_task_result",
+        arguments: { job_id: job.jobId },
+      });
+      expect(retry.isError).not.toBe(true);
+      expect(
+        (retry.structuredContent as { acknowledged_at: string })
+          .acknowledged_at,
+      ).toBe(firstAcknowledgedAt);
+
+      const stored = await db.query<{
+        status: string;
+        acknowledged_at: string | null;
+        unread_terminal: boolean;
+      }>(
+        "SELECT status, acknowledged_at, unread_terminal FROM jobs WHERE id = $1",
+        [job.jobId],
+      );
+      expect(stored.rows[0]).toMatchObject({
+        status: "succeeded",
+        unread_terminal: false,
+      });
+      expect(stored.rows[0]?.acknowledged_at).toBeTruthy();
+    } finally {
+      await closeProductionMcp(connection);
     }
   });
 });

@@ -1,4 +1,5 @@
 import { timingSafeEqual as nodeTimingSafeEqual } from "node:crypto";
+import * as https from "node:https";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../../apps/control-plane/src/http/app.js";
@@ -104,7 +105,7 @@ describe("MCP bearer authentication", () => {
   });
 });
 
-describe("MCP HTTP authentication", () => {
+describe("MCP transport authentication", () => {
   const openApps: Array<{ close(): Promise<void> }> = [];
 
   afterEach(async () => {
@@ -129,6 +130,7 @@ describe("MCP HTTP authentication", () => {
       coordinator: coordinator as never,
       ownerId: OWNER_ID,
       mcpBearerToken: TOKEN,
+      https: {},
     } as never);
     await app.ready();
     openApps.push(app);
@@ -155,11 +157,53 @@ describe("MCP HTTP authentication", () => {
     },
   );
 
-  it("accepts one valid authenticated HTTP MCP initialize request", async () => {
+  it("accepts one valid authenticated MCP initialize request through injection", async () => {
     const app = await appForTest();
     const response = await injectMcp(app, `Bearer ${TOKEN}`);
     expect(response.statusCode).toBe(200);
     expect(response.body).toContain("result");
     expect(response.body).not.toContain(TOKEN);
+  });
+
+  it("rejects app construction without TLS options", async () => {
+    const coordinator = {
+      submit: async () => ({ status: "queued" }),
+      list: async () => ({ tasks: [] }),
+      get: async () => ({}),
+      cancel: async () => ({}),
+      listApprovals: async () => ({ approvals: [] }),
+      decideApproval: async () => ({}),
+      getResult: async () => ({}),
+    };
+    await expect(
+      createApp({
+        coordinator: coordinator as never,
+        ownerId: OWNER_ID,
+        mcpBearerToken: TOKEN,
+      } as never),
+    ).rejects.toThrow("TLS options are required for the control-plane server");
+  });
+
+  it("builds an HTTPS Fastify server when TLS options are supplied", async () => {
+    const coordinator = {
+      submit: async () => ({ status: "queued" }),
+      list: async () => ({ tasks: [] }),
+      get: async () => ({}),
+      cancel: async () => ({}),
+      listApprovals: async () => ({ approvals: [] }),
+      decideApproval: async () => ({}),
+      getResult: async () => ({}),
+    };
+    const app = await createApp({
+      coordinator: coordinator as never,
+      ownerId: OWNER_ID,
+      mcpBearerToken: TOKEN,
+      https: {},
+    } as never);
+    try {
+      expect(app.server).toBeInstanceOf(https.Server);
+    } finally {
+      await app.close();
+    }
   });
 });
