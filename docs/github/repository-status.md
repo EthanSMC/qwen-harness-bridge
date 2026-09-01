@@ -15,10 +15,11 @@ Verified on 2026-09-01 against [EthanSMC/qwen-harness-bridge](https://github.com
 
 ## Review gate status
 
-- This is a private repository currently operated by one maintainer; no second eligible GitHub reviewer account is available for the solo-maintainer fallback.
-- The current GitHub review state returned empty `reviewRequests` and `latestReviews` collections.
+- Solo-fallback eligibility evidence (verified 2026-09-01): repository `EthanSMC/qwen-harness-bridge`; collaborator endpoint `GET /repos/EthanSMC/qwen-harness-bridge/collaborators` returned only `EthanSMC`, with `role_name=admin` and `admin/maintain/push/pull/triage` permissions. No distinct eligible GitHub reviewer account was present in that response.
+- PR review-state evidence (verified 2026-09-01): PR `#36` in `EthanSMC/qwen-harness-bridge`, queried via `GET /repos/EthanSMC/qwen-harness-bridge/pulls/36` and its review-state fields, had `author=EthanSMC`, `reviewRequests=[]`, `latestReviews=[]`, and `reviewDecision=""`.
 - When a different eligible GitHub reviewer is available, a formal GitHub Approve is required. Until then, a fresh independent subagent reviewer must return PASS and all required GitHub checks must succeed.
 - The reviewer must differ from the implementer and inspect the complete diff and commit range. The pull request records reviewer type and identity, findings, fix rounds, final verdict, and CI/verification evidence. The author cannot self-approve or fabricate evidence; the fallback ends as soon as a second eligible reviewer is available.
+- Re-run the collaborator and PR review-state checks whenever collaborator membership, role, or permissions change, and before relying on the solo fallback for a new merge.
 - Issue-first work remains required: each change uses its issue-linked pull request and `Closes #<issue>` for GitHub Issue auto-close. Required CI checks, release-gate acceptance evidence, and the normal PR gate remain in force.
 
 ## Branch-protection limitation
