@@ -25,6 +25,7 @@ import {
   isDomainErrorCode,
   publicMessageFor,
 } from "../domain/errors.js";
+import { sanitizePublicText } from "../domain/presenters.js";
 import type { McpOwnerContext } from "./auth.js";
 
 export type McpCoordinator = Readonly<{
@@ -147,34 +148,19 @@ const GetTaskResultOutputSchema = z
 const MAX_PUBLIC_TEXT_CODE_POINTS = 600;
 const TOOL_DEADLINE_MS = 1_500;
 const INTERNAL_FIELD_PATTERN =
-  /(?:request|prompt|raw[_-]?log|logs?|ciphertext|digest|credentials?|password|token|secret|api[_-]?key|(?:harness|agent|session|database|connector|internal)[_-]?id)/i;
-const ABSOLUTE_PATH_PATTERN = /^(?:file:|[A-Za-z]:[\\/]|\/)/i;
-const ABSOLUTE_PATH_TEXT_PATTERN =
-  /(?:file:|\/(?:Users|private|home|var)\/)[^\s,;]*/giu;
-const SENSITIVE_TEXT_PATTERN =
-  /\b(api[_-]?key|token|credential|password|secret)\b\s*[:=]\s*(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;]+)/giu;
-const BEARER_TEXT_PATTERN = /\bBearer\s+[^\s,;]+/gu;
-
-const truncateUnicode = (value: string, limit: number): string =>
-  Array.from(value).slice(0, limit).join("");
+  /(?:request|prompt|ciphertext|digest|password|token|secret|credentials?|api[_-]?key|authorization|raw[_-]?logs?|harness(?:[_-]?(?:agent|session))?[_-]?id|agent[_-]?id|session[_-]?id|database[_-]?id|connector[_-]?id|internal[_-]?id)/i;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const redactSensitiveText = (value: string): string =>
-  value
-    .replace(SENSITIVE_TEXT_PATTERN, "$1=[redacted]")
-    .replace(BEARER_TEXT_PATTERN, "Bearer [redacted]")
-    .replace(ABSOLUTE_PATH_TEXT_PATTERN, "[redacted path]");
-
 export const sanitizePublicValue = (value: unknown, depth = 0): unknown => {
   if (typeof value === "string") {
-    return ABSOLUTE_PATH_PATTERN.test(value)
-      ? "[redacted path]"
-      : truncateUnicode(
-          redactSensitiveText(value),
-          MAX_PUBLIC_TEXT_CODE_POINTS,
-        );
+    return sanitizePublicText(
+      value,
+      MAX_PUBLIC_TEXT_CODE_POINTS,
+      undefined,
+      MAX_PUBLIC_TEXT_CODE_POINTS,
+    );
   }
   if (depth > 8) {
     return "[redacted]";
@@ -205,7 +191,12 @@ const boundedText = (value: unknown): string => {
   } catch {
     serialized = "{}";
   }
-  return truncateUnicode(serialized, MAX_PUBLIC_TEXT_CODE_POINTS);
+  return sanitizePublicText(
+    serialized,
+    MAX_PUBLIC_TEXT_CODE_POINTS,
+    undefined,
+    MAX_PUBLIC_TEXT_CODE_POINTS,
+  );
 };
 
 const success = (value: unknown): CallToolResult => {

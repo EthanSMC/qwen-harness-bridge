@@ -5,6 +5,7 @@ import {
   presentJobList,
   presentPendingApprovals,
   presentTaskResult,
+  sanitizePublicText,
   truncateUnicode,
 } from "./presenters.js";
 
@@ -58,6 +59,22 @@ const assertNoUnpairedSurrogates = (value: string): void => {
       expect(code < 0xdc00 || code > 0xdfff).toBe(true);
     }
   }
+};
+
+const assertPublicTextBounds = (
+  value: string,
+  maxCodePoints: number,
+  maxUtf16CodeUnits: number,
+  maxUtf8Bytes?: number,
+): void => {
+  expect(Array.from(value).length).toBeLessThanOrEqual(maxCodePoints);
+  expect(value.length).toBeLessThanOrEqual(maxUtf16CodeUnits);
+  if (maxUtf8Bytes !== undefined) {
+    expect(new TextEncoder().encode(value).byteLength).toBeLessThanOrEqual(
+      maxUtf8Bytes,
+    );
+  }
+  assertNoUnpairedSurrogates(value);
 };
 
 describe("presenters", () => {
@@ -423,6 +440,46 @@ describe("presenters", () => {
     expect(serialized).toContain("ordinary artifact name");
   });
 
+  it("redacts internal request metadata from nested structured free text", () => {
+    const sanitized = sanitizePublicText(
+      JSON.stringify({
+        summary: "ordinary public summary",
+        request: "request-secret",
+        prompt: "prompt-secret",
+        request_ciphertext: "ciphertext-secret",
+        request_digest: "digest-secret",
+        harness_agent_id: "agent-id-secret",
+        harness_session_id: "session-id-secret",
+        database_id: "database-id-secret",
+        connector_id: "connector-id-secret",
+        internal_id: "internal-id-secret",
+        nested: {
+          RequestDigest: "nested-digest-secret",
+          agentId: "nested-agent-id-secret",
+        },
+      }),
+      600,
+    );
+
+    expect(sanitized).not.toMatch(
+      /request-secret|prompt-secret|ciphertext-secret|digest-secret|agent-id-secret|session-id-secret|database-id-secret|connector-id-secret|internal-id-secret|nested-digest-secret|nested-agent-id-secret/,
+    );
+    expect(sanitized).toContain("ordinary public summary");
+  });
+
+  it("fails closed for embedded credentials and Unicode or platform absolute paths", () => {
+    const sanitized = sanitizePublicText(
+      "Authorization: plain-token Authorization: Bearer bearer-token Bearer standalone-token; POSIX “/Users/张三/Project Files/secret.txt”; Volumes /Volumes/团队 资料/秘密.txt; tmp /tmp/构建 输出/result.txt; Windows “C:\\Users\\张三\\Build Output\\secret.txt”; UNC ‘\\\\server\\共享 目录\\秘密.txt’",
+      600,
+    );
+
+    expect(sanitized).not.toMatch(
+      /plain-token|bearer-token|standalone-token|\/Users\/张三|\/Volumes\/团队|\/tmp\/构建|C:\\Users|\\\\server|秘密\.txt|secret\.txt/,
+    );
+    expect(sanitized).toContain("Authorization: [redacted]");
+    expect(sanitized).toContain("[redacted path]");
+  });
+
   it("fails closed for Unicode, spaced, quoted, and Windows absolute paths", () => {
     const detail = presentJobDetail({
       job: job(),
@@ -541,6 +598,69 @@ describe("presenters", () => {
       "application/octet-stream",
       "application/octet-stream",
     ]);
+  });
+
+  it("bounds every public string by code points, UTF-16 units, and UTF-8 bytes", () => {
+    const emoji = "😀".repeat(400);
+    const detail = presentJobDetail({
+      job: job({ title: emoji, currentStage: emoji }),
+      repository: { displayName: emoji },
+      events: [
+        {
+          sequence: 1,
+          type: emoji,
+          payload: { stage: emoji, detail: emoji },
+          createdAt: new Date(now),
+        },
+      ],
+      pendingApproval: {
+        approvalId: "22222222-2222-4222-8222-222222222222",
+        jobShortId: emoji,
+        jobRevision: 3,
+        actionSummary: emoji,
+        impactSummary: emoji,
+        riskClass: emoji,
+        expiresAt: new Date("2026-09-01T00:05:00.000Z"),
+      },
+      terminalSummary: emoji,
+    });
+    const result = presentTaskResult(
+      {
+        summary: emoji,
+        changedFiles: [`src/${emoji}.ts`],
+        tests: { passed: 1, failed: 0, summary: emoji },
+        artifacts: [
+          {
+            name: emoji,
+            mediaType: "text/plain",
+            url: "https://example.test/report",
+          },
+        ],
+        acknowledgedAt: new Date(now),
+      },
+      repository,
+    );
+
+    assertPublicTextBounds(detail.title, 40, 40, 40);
+    assertPublicTextBounds(detail.repository, 120, 120);
+    assertPublicTextBounds(detail.current_stage, 36, 36, 36);
+    assertPublicTextBounds(detail.text, 600, 600);
+    assertPublicTextBounds(detail.terminal_summary ?? "", 600, 600);
+    const event = detail.recent_events[0];
+    expect(event).toBeDefined();
+    assertPublicTextBounds(event?.type ?? "", 64, 64);
+    assertPublicTextBounds(event?.current_stage ?? "", 36, 36, 36);
+    assertPublicTextBounds(event?.detail ?? "", 600, 600);
+    const approval = detail.pending_approval;
+    expect(approval).not.toBeNull();
+    assertPublicTextBounds(approval?.job_short_id ?? "", 7, 7);
+    assertPublicTextBounds(approval?.action_summary ?? "", 600, 600);
+    assertPublicTextBounds(approval?.impact_summary ?? "", 600, 600);
+    assertPublicTextBounds(approval?.risk_class ?? "", 64, 64);
+    assertPublicTextBounds(result.summary, 120, 120);
+    assertPublicTextBounds(result.tests.summary, 120, 120);
+    assertPublicTextBounds(result.artifacts[0]?.name ?? "", 120, 120);
+    assertPublicTextBounds(result.changed_files[0] ?? "", 512, 512, 2048);
   });
 
   it("truncates arbitrary Unicode text without producing lone surrogates", () => {

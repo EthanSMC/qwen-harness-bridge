@@ -138,23 +138,44 @@ const truncateUtf8 = (value: string, maxBytes: number): string => {
   return output;
 };
 
+const truncateUtf16 = (value: string, maxCodeUnits: number): string => {
+  if (maxCodeUnits <= 0) return "";
+  let codeUnits = 0;
+  let output = "";
+  for (const character of value) {
+    if (codeUnits + character.length > maxCodeUnits) break;
+    output += character;
+    codeUnits += character.length;
+  }
+  return output;
+};
+
 const boundedText = (
   value: string | null | undefined,
   maxCodePoints: number,
   maxBytes?: number,
+  maxUtf16CodeUnits = maxCodePoints,
 ): string => {
-  const truncated = truncateUnicode(value?.trim() || "", maxCodePoints);
-  return maxBytes === undefined ? truncated : truncateUtf8(truncated, maxBytes);
+  const byCodePoint = truncateUnicode(value?.trim() || "", maxCodePoints);
+  const byUtf8 =
+    maxBytes === undefined ? byCodePoint : truncateUtf8(byCodePoint, maxBytes);
+  return truncateUtf16(byUtf8, maxUtf16CodeUnits);
 };
 
 const RAW_LOG_PREFIX =
   /^\s*(?:\[\s*)?raw(?:[-_\s]+connector)?[-_\s]+logs?(?:\s*\])?\s*(?::|=|-)?/iu;
 const SENSITIVE_KEY =
   /(?:password|token|secret|api[-_]?key|credential|authorization|bearer|raw[-_]?log)/iu;
+const INTERNAL_KEY =
+  /(?:request(?:[_-]?(?:ciphertext|digest))?|prompt|ciphertext|digest|harness[_-]?agent[_-]?id|harness[_-]?session[_-]?id|database[_-]?id|connector[_-]?id|internal[_-]?id|agent[_-]?id|session[_-]?id)/iu;
+const isRestrictedKey = (key: string): boolean =>
+  SENSITIVE_KEY.test(key) || INTERNAL_KEY.test(key);
 const AUTHORIZATION_ASSIGNMENT =
-  /(["']?)(authorization)\1\s*([:=])\s*("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|bearer\s+[^\s,;}\]]+|[^\s,;}\]]+)/giu;
+  /(["']?)(authorization)\1\s*([:=]\s*)("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|bearer\s+[^\s,;}\]]+|[^\s,;}\]]+)/giu;
 const SECRET_ASSIGNMENT =
-  /(["']?)(api[-_\s]?key|token|credential|password|secret)\1\s*([:=])\s*("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
+  /(["']?)(api[-_\s]?key|token|credential|password|secret)\1\s*([:=]\s*)("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
+const INTERNAL_ASSIGNMENT =
+  /(["']?)(request(?:[_-]?(?:ciphertext|digest))?|prompt|ciphertext|digest|harness[_-]?agent[_-]?id|harness[_-]?session[_-]?id|database[_-]?id|connector[_-]?id|internal[_-]?id|agent[_-]?id|session[_-]?id)\1\s*([:=]\s*)("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
 const BEARER_TOKEN =
   /\bbearer\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
 
@@ -176,6 +197,7 @@ const redactedAssignment = (
 const redactSensitiveValues = (value: string): string => {
   if (RAW_LOG_PREFIX.test(value)) return "[redacted raw log]";
   return value
+    .replace(INTERNAL_ASSIGNMENT, redactedAssignment)
     .replace(AUTHORIZATION_ASSIGNMENT, redactedAssignment)
     .replace(SECRET_ASSIGNMENT, redactedAssignment)
     .replace(BEARER_TOKEN, "Bearer [redacted]");
@@ -212,7 +234,7 @@ const redactStructuredValue = (
   const redacted: Record<string, unknown> = {};
   const entries = Object.entries(value);
   for (const [key, item] of entries.slice(0, MAX_STRUCTURED_ITEMS)) {
-    if (SENSITIVE_KEY.test(key)) {
+    if (isRestrictedKey(key)) {
       redacted[key] = "[redacted]";
       changed = true;
       continue;
@@ -230,16 +252,19 @@ const redactStructuredValue = (
 
 const redactStructuredSensitiveText = (value: string): string => {
   const trimmed = value.trim();
-  if (
-    new TextEncoder().encode(trimmed).byteLength <= MAX_STRUCTURED_TEXT_BYTES &&
-    (trimmed.startsWith("{") || trimmed.startsWith("["))
-  ) {
+  const looksStructured = trimmed.startsWith("{") || trimmed.startsWith("[");
+  if (looksStructured) {
+    if (
+      new TextEncoder().encode(trimmed).byteLength > MAX_STRUCTURED_TEXT_BYTES
+    ) {
+      return "[redacted structured content]";
+    }
     try {
       const parsed: unknown = JSON.parse(trimmed);
       const result = redactStructuredValue(parsed);
       if (result.changed) return JSON.stringify(result.value);
     } catch {
-      // Fall through to the assignment redactor for JSON-like text.
+      if (isRestrictedKey(trimmed)) return "[redacted structured content]";
     }
   }
   return redactSensitiveValues(value);
@@ -326,16 +351,29 @@ const redactAbsolutePathText = (value: string): string => {
   return output;
 };
 
-const publicFreeText = (
+/**
+ * Sanitize public free text before exposing it to a protocol or MCP schema.
+ * Limits are applied independently so callers can satisfy code-point,
+ * UTF-16-unit, and optional UTF-8-byte constraints without splitting pairs.
+ */
+export const sanitizePublicText = (
   value: string | null | undefined,
   maxCodePoints: number,
   maxBytes?: number,
+  maxUtf16CodeUnits = maxCodePoints,
 ): string =>
   boundedText(
     redactAbsolutePathText(redactStructuredSensitiveText(value?.trim() || "")),
     maxCodePoints,
     maxBytes,
+    maxUtf16CodeUnits,
   );
+
+const publicFreeText = (
+  value: string | null | undefined,
+  maxCodePoints: number,
+  maxBytes?: number,
+): string => sanitizePublicText(value, maxCodePoints, maxBytes);
 
 const safeTitle = (value: string | null | undefined): string =>
   publicFreeText(value, MAX_TITLE_CODE_POINTS, 40) || "Untitled task";
@@ -395,7 +433,7 @@ const publicChangedFiles = (
     .filter((value): value is string => typeof value === "string")
     .map((value) => relativeRepositoryPath(value, repository))
     .filter((value): value is string => value !== null)
-    .map((value) => truncateUtf8(truncateUnicode(value, 512), 2048))
+    .map((value) => boundedText(value, 512, 2048, 512))
     .filter((value) => value.length > 0)
     .slice(0, MAX_ITEMS);
 };
@@ -516,6 +554,7 @@ const publicArtifactUrl = (raw: string): string | null => {
     value !== raw ||
     new TextEncoder().encode(value).byteLength > MAX_ARTIFACT_URL_BYTES ||
     Array.from(value).length > MAX_ARTIFACT_URL_BYTES ||
+    value.length > MAX_ARTIFACT_URL_BYTES ||
     hasControlOrWhitespace ||
     /%(?![0-9a-f]{2})/iu.test(value) ||
     value.includes("?") ||

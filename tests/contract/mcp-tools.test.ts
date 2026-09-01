@@ -12,6 +12,10 @@ import {
 } from "@qhb/protocol";
 import { describe, expect, it } from "vitest";
 import { DomainError } from "../../apps/control-plane/src/domain/errors.js";
+import {
+  presentJobDetail,
+  presentTaskResult,
+} from "../../apps/control-plane/src/domain/presenters.js";
 import { createMcpServer } from "../../apps/control-plane/src/mcp/server.js";
 import { sanitizePublicValue } from "../../apps/control-plane/src/mcp/tools.js";
 
@@ -111,7 +115,7 @@ type FakeCoordinator = {
 
 function fakeCoordinator(
   overrides: Partial<
-    Pick<FakeCoordinator, "get" | "submit" | "decideApproval">
+    Pick<FakeCoordinator, "get" | "submit" | "decideApproval" | "getResult">
   > = {},
 ): FakeCoordinator {
   const calls: RecordedCall[] = [];
@@ -160,10 +164,15 @@ function fakeCoordinator(
           record("decideApproval", owner, input);
           return DECISION_RESULT;
         },
-    getResult: async (owner, input) => {
-      record("getResult", owner, input);
-      return TASK_RESULT_OUTPUT;
-    },
+    getResult: overrides.getResult
+      ? async (owner, input) => {
+          record("getResult", owner, input);
+          return overrides.getResult?.(owner, input);
+        }
+      : async (owner, input) => {
+          record("getResult", owner, input);
+          return TASK_RESULT_OUTPUT;
+        },
   };
 }
 
@@ -586,6 +595,138 @@ describe("MCP public tool contract", () => {
     expect(serialized).not.toContain("deep-password");
     expect(serialized).not.toContain("deep-text-password");
     expect((sanitized as { items: unknown[] }).items).toHaveLength(5);
+  });
+
+  it("redacts adversarial paths, authorization forms, and stringified internal JSON", () => {
+    const value = {
+      authorization: "plain-secret",
+      text: [
+        "Authorization: plain-secret",
+        "Authorization: Bearer bearer-secret",
+        "checkout /Volumes/private/repo, /tmp/secret.txt, and /opt/private/repo",
+        String.raw`Windows C:\Users\private\repo and \\server\share\secret.txt`,
+        '{"request":"json-request","request_ciphertext":"json-cipher","request_digest":"json-digest","harness_agent_id":"json-agent","internal_id":"json-internal","path":"/tmp/json"}',
+      ],
+    };
+
+    const serialized = JSON.stringify(sanitizePublicValue(value));
+    expect(serialized).not.toContain("plain-secret");
+    expect(serialized).not.toContain("bearer-secret");
+    expect(serialized).not.toContain("/Volumes/private");
+    expect(serialized).not.toContain("/tmp/secret.txt");
+    expect(serialized).not.toContain("/opt/private");
+    expect(serialized).not.toContain("C:\\\\Users\\\\private");
+    expect(serialized).not.toContain("server\\\\share");
+    expect(serialized).not.toContain("json-request");
+    expect(serialized).not.toContain("json-cipher");
+    expect(serialized).not.toContain("json-digest");
+    expect(serialized).not.toContain("json-agent");
+    expect(serialized).not.toContain("json-internal");
+    expect(serialized).not.toContain("/tmp/json");
+  });
+
+  it("accepts emoji-heavy production presenter output through official SDK callTool", async () => {
+    const productionDetail = presentJobDetail({
+      job: {
+        jobId: JOB_ID,
+        shortId: "QH-7M2P",
+        repositoryId: "emoji-repository",
+        status: "running",
+        currentStage: "🧪".repeat(100),
+        revision: 2,
+        title: "🧪 登录测试 ".repeat(100),
+        unreadTerminal: false,
+        updatedAt: new Date(ACCEPTED_AT),
+      },
+      repository: {
+        displayName: "🧪 Repository ".repeat(100),
+        canonicalPath: "/repo",
+      },
+      events: [
+        {
+          sequence: 1,
+          type: "progress",
+          payload: {
+            current_stage: "🧪".repeat(100),
+            detail: "🧪 detail ".repeat(100),
+            changed_files: ["/repo/src/🧪.ts"],
+          },
+          createdAt: new Date(ACCEPTED_AT),
+        },
+      ],
+      pendingApproval: null,
+      terminalSummary: "🧪 summary ".repeat(100),
+    });
+    const productionResult = presentTaskResult(
+      {
+        jobId: JOB_ID,
+        summary: "🧪 result ".repeat(100),
+        changedFiles: ["/repo/src/🧪.ts"],
+        tests: {
+          passed: 1,
+          failed: 0,
+          summary: "🧪 passed ".repeat(100),
+        },
+        artifacts: [
+          {
+            name: "🧪 artifact ".repeat(100),
+            mediaType: "TEXT/PLAIN",
+            url: "https://example.com/artifact.txt",
+          },
+        ],
+        acknowledgedAt: new Date(ACCEPTED_AT),
+      },
+      { canonicalPath: "/repo" },
+    );
+    const connection = await connectedClient(
+      fakeCoordinator({
+        get: async () => productionDetail,
+        getResult: async () => productionResult,
+      }),
+    );
+    try {
+      const detail = await connection.client.callTool({
+        name: "get_task",
+        arguments: { job_id: JOB_ID },
+      });
+      const result = await connection.client.callTool({
+        name: "get_task_result",
+        arguments: { job_id: JOB_ID },
+      });
+
+      expect(detail.isError).not.toBe(true);
+      expect(result.isError).not.toBe(true);
+      const detailOutput = detail.structuredContent as typeof productionDetail;
+      const resultOutput = result.structuredContent as typeof productionResult;
+      expect(detailOutput).toMatchObject({ job_id: JOB_ID });
+      expect(resultOutput).toMatchObject({ job_id: JOB_ID });
+      const expectStringBounds = (value: string, max: number): void => {
+        expect(Array.from(value).length).toBeLessThanOrEqual(max);
+        expect(value.length).toBeLessThanOrEqual(max);
+      };
+      expectStringBounds(detailOutput.title, 40);
+      expectStringBounds(detailOutput.repository, 120);
+      expectStringBounds(detailOutput.current_stage, 36);
+      expectStringBounds(detailOutput.text, 600);
+      expect(detailOutput.recent_events).toHaveLength(1);
+      expectStringBounds(detailOutput.recent_events[0]?.type ?? "", 64);
+      expectStringBounds(detailOutput.recent_events[0]?.detail ?? "", 600);
+      expect(detailOutput.recent_events[0]?.changed_files).toHaveLength(1);
+      expectStringBounds(
+        detailOutput.recent_events[0]?.changed_files?.[0] ?? "",
+        512,
+      );
+      expectStringBounds(resultOutput.summary, 120);
+      expect(resultOutput.changed_files).toHaveLength(1);
+      expectStringBounds(resultOutput.changed_files[0] ?? "", 512);
+      expectStringBounds(resultOutput.tests.summary, 120);
+      expect(resultOutput.artifacts).toHaveLength(1);
+      expectStringBounds(resultOutput.artifacts[0]?.name ?? "", 120);
+      expectStringBounds(resultOutput.artifacts[0]?.media_type ?? "", 120);
+      expectStringBounds(resultOutput.artifacts[0]?.url ?? "", 2048);
+    } finally {
+      await closeConnection(connection);
+    }
   });
 
   it("allows an identical decide_approval retry after the first call times out", async () => {
