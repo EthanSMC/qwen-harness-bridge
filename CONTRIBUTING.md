@@ -32,5 +32,15 @@ A pull request is ready only when:
 - Protocol compatibility, database migration, security/privacy effect, and rollback path are explicit.
 - Acceptance evidence is updated when the issue closes a release gate.
 
-Do not mix stable-path and RTC behavior in one pull request unless the change is a shared interface and stable tests pass with RTC disabled.
+Review is a two-path gate:
 
+- When a different eligible GitHub reviewer is available, the pull request requires a formal GitHub Approve from that reviewer.
+- In a private single-maintainer repository with no second eligible GitHub account, the merge gate is a PASS from a fresh independent subagent reviewer plus success of all required GitHub checks. This solo fallback does not apply once a second eligible reviewer is available.
+
+For either path, the reviewer must be different from the implementer, review the complete diff and commit range, and record the reviewer type and identity, findings, fix rounds, final verdict, and verification evidence. The author must not self-approve or fabricate review evidence.
+
+The management sync queries direct collaborators before applying main-branch protection. It excludes the repository owner and selects formal mode only when another collaborator has `admin`, `maintain`, or `push` role/permission; formal mode requires one approval, stale-review dismissal, and approval after the last push. With no such collaborator, it selects the documented solo mode and applies no formal pull-request review requirement. Re-run the collaborator and PR review-state checks immediately before changing or relying on the selected mode, and treat any collaborator membership, role, or permission change as a re-verification trigger.
+
+The pull-request body validator only verifies the selected evidence mode and the current PR checks URL. Before merging, the controller must independently query the GitHub checks API and confirm all required checks succeeded; the body evidence URL is not itself a CI result. The initial PR creation run may fail because the PR number is not known when the body is authored; edit the body immediately with the current PR checks URL and require the final `governance` gate to be green.
+
+Do not mix stable-path and RTC behavior in one pull request unless the change is a shared interface and stable tests pass with RTC disabled.
