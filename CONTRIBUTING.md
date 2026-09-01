@@ -32,5 +32,11 @@ A pull request is ready only when:
 - Protocol compatibility, database migration, security/privacy effect, and rollback path are explicit.
 - Acceptance evidence is updated when the issue closes a release gate.
 
-Do not mix stable-path and RTC behavior in one pull request unless the change is a shared interface and stable tests pass with RTC disabled.
+Review is a two-path gate:
 
+- When a different eligible GitHub reviewer is available, the pull request requires a formal GitHub Approve from that reviewer.
+- In a private single-maintainer repository with no second eligible GitHub account, the merge gate is a PASS from a fresh independent subagent reviewer plus success of all required GitHub checks. This solo fallback does not apply once a second eligible reviewer is available.
+
+For either path, the reviewer must be different from the implementer, review the complete diff and commit range, and record the reviewer type and identity, findings, fix rounds, final verdict, and verification evidence. The author must not self-approve or fabricate review evidence.
+
+Do not mix stable-path and RTC behavior in one pull request unless the change is a shared interface and stable tests pass with RTC disabled.

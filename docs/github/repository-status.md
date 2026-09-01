@@ -13,6 +13,14 @@ Verified on 2026-09-01 against [EthanSMC/qwen-harness-bridge](https://github.com
 - Distribution: M0 7, M1 7, M2 6, M3 6, M4 7, M5 1.
 - Source commits: approved Spec, five-plan roadmap, and repository governance are pushed.
 
+## Review gate status
+
+- This is a private repository currently operated by one maintainer; no second eligible GitHub reviewer account is available for the solo-maintainer fallback.
+- The current GitHub review state returned empty `reviewRequests` and `latestReviews` collections.
+- When a different eligible GitHub reviewer is available, a formal GitHub Approve is required. Until then, a fresh independent subagent reviewer must return PASS and all required GitHub checks must succeed.
+- The reviewer must differ from the implementer and inspect the complete diff and commit range. The pull request records reviewer type and identity, findings, fix rounds, final verdict, and CI/verification evidence. The author cannot self-approve or fabricate evidence; the fallback ends as soon as a second eligible reviewer is available.
+- Issue-first work remains required: each change uses its issue-linked pull request and `Closes #<issue>` for GitHub Issue auto-close. Required CI checks, release-gate acceptance evidence, and the normal PR gate remain in force.
+
 ## Branch-protection limitation
 
 GitHub returned HTTP 403 when enabling protection on this private repository: the current account plan requires GitHub Pro or a public repository. Making the repository public is not an acceptable workaround because the product and its operational planning are private by design.
@@ -21,6 +29,7 @@ Until the account or repository plan supports private branch protection:
 
 - The Governance workflow checks the planning baseline on pull requests and main pushes.
 - CODEOWNERS, issue-first development, pull-request evidence, Conventional Commits, and no-force-push/no-delete policy remain mandatory process controls.
+- The review paths above are documented process controls only; branch protection is not enabled and must not be represented as enabled.
 - The synchronization script keeps an open governance issue for the missing platform enforcement.
 - After a plan upgrade or eligible organization transfer, rerun `node scripts/github/sync-management.mjs` and verify required `governance` status, linear history, conversation resolution, and force-push/deletion denial.
 
