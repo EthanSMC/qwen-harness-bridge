@@ -732,6 +732,7 @@ export class JobRepository {
       .where(
         and(
           eq(jobs.ownerId, ownerId),
+          eq(jobs.status, "waiting_approval"),
           isNull(approvals.decision),
           gt(approvals.expiresAt, now),
         ),
@@ -760,6 +761,7 @@ export class JobRepository {
         and(
           eq(jobs.ownerId, ownerId),
           eq(jobs.id, jobId),
+          eq(jobs.status, "waiting_approval"),
           isNull(approvals.decision),
           gt(approvals.expiresAt, now),
         ),

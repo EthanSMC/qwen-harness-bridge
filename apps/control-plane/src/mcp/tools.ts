@@ -146,14 +146,62 @@ const GetTaskResultOutputSchema = z
   })
   .strict();
 const MAX_PUBLIC_TEXT_CODE_POINTS = 600;
+const MAX_PUBLIC_OBJECT_ITEMS = 25;
 const TOOL_DEADLINE_MS = 1_500;
-const INTERNAL_FIELD_PATTERN =
-  /(?:request|prompt|ciphertext|digest|password|token|secret|credentials?|api[_-]?key|authorization|raw[_-]?logs?|harness(?:[_-]?(?:agent|session))?[_-]?id|agent[_-]?id|session[_-]?id|database[_-]?id|connector[_-]?id|internal[_-]?id)/i;
+const PUBLIC_OUTPUT_KEYS = new Set([
+  "job_id",
+  "short_id",
+  "status",
+  "connector_status",
+  "accepted_at",
+  "expires_at",
+  "tasks",
+  "title",
+  "repository",
+  "current_stage",
+  "freshness",
+  "unread_terminal",
+  "updated_at",
+  "revision",
+  "text",
+  "recent_events",
+  "pending_approval",
+  "terminal_summary",
+  "sequence",
+  "type",
+  "detail",
+  "changed_files",
+  "created_at",
+  "approval_id",
+  "job_short_id",
+  "job_revision",
+  "action_summary",
+  "impact_summary",
+  "risk_class",
+  "approvals",
+  "decision",
+  "summary",
+  "tests",
+  "passed",
+  "failed",
+  "artifacts",
+  "name",
+  "media_type",
+  "url",
+  "acknowledged_at",
+  "error",
+  "code",
+  "message",
+]);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-export const sanitizePublicValue = (value: unknown, depth = 0): unknown => {
+export const sanitizePublicValue = (
+  value: unknown,
+  depth = 0,
+  key?: string,
+): unknown => {
   if (typeof value === "string") {
     return sanitizePublicText(
       value,
@@ -169,17 +217,35 @@ export const sanitizePublicValue = (value: unknown, depth = 0): unknown => {
     return value;
   }
   if (Array.isArray(value)) {
+    if (key === "changed_files") {
+      return value
+        .slice(0, 5)
+        .filter((item): item is string => typeof item === "string")
+        .filter((item) => {
+          const sanitized = sanitizePublicText(
+            item,
+            Array.from(item).length,
+            new TextEncoder().encode(item).byteLength,
+            item.length,
+          );
+          return sanitized === item;
+        })
+        .map((item) =>
+          sanitizePublicText(item, MAX_PUBLIC_TEXT_CODE_POINTS, undefined, 512),
+        );
+    }
     return value
       .slice(0, 5)
-      .map((item) => sanitizePublicValue(item, depth + 1));
+      .map((item) => sanitizePublicValue(item, depth + 1, key));
   }
 
   const output: Record<string, unknown> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (INTERNAL_FIELD_PATTERN.test(key)) {
-      continue;
-    }
-    output[key] = sanitizePublicValue(item, depth + 1);
+  for (const [childKey, item] of Object.entries(value).slice(
+    0,
+    MAX_PUBLIC_OBJECT_ITEMS,
+  )) {
+    if (!PUBLIC_OUTPUT_KEYS.has(childKey)) continue;
+    output[childKey] = sanitizePublicValue(item, depth + 1, childKey);
   }
   return output;
 };

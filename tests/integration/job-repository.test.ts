@@ -958,24 +958,17 @@ describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
       repository.events(crypto.randomUUID(), job.jobId, 5),
     ).resolves.toEqual([]);
 
-    const approvalJobs = await Promise.all(
+    const approvalFixtures = await Promise.all(
       Array.from({ length: 6 }, () =>
-        createJob(repository, { ownerId, repositoryId }),
+        prepareApproval(repository, db, new Date(Date.now() + 5 * 60_000), {
+          ownerId,
+          repositoryId,
+        }),
       ),
     );
-    const approvalIds: string[] = [];
-    for (const approvalJob of approvalJobs) {
-      const approvalId = crypto.randomUUID();
-      approvalIds.push(approvalId);
-      await insertApproval(db, {
-        approvalId,
-        jobId: approvalJob.jobId,
-        ownerId,
-        jobRevision: approvalJob.revision,
-        expiresAt: new Date(Date.now() + 5 * 60_000),
-        actionFingerprint: SHA256_A,
-      });
-    }
+    const approvalIds = approvalFixtures.map(
+      ({ fixture }) => fixture.approvalId,
+    );
     await insertApproval(db, {
       approvalId: crypto.randomUUID(),
       jobId: job.jobId,
@@ -997,13 +990,50 @@ describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
     await expect(
       repository.getPendingApproval(
         ownerId,
-        approvalJobs[5]?.jobId as string,
+        approvalFixtures[5]?.job.jobId as string,
         new Date(),
       ),
     ).resolves.toMatchObject({ approvalId: approvalIds[5] });
     await expect(
       repository.listPendingApprovals(crypto.randomUUID(), 5, new Date()),
     ).resolves.toEqual([]);
+  });
+
+  it("lists pending approvals only for jobs still waiting for approval", async () => {
+    const repository = new JobRepository(db.client);
+    const ownerId = crypto.randomUUID();
+    const repositoryId = `repo-${crypto.randomUUID().replaceAll("-", "").slice(0, 12)}`;
+    const expiresAt = new Date(Date.now() + 5 * 60_000);
+    const valid = await prepareApproval(repository, db, expiresAt, {
+      ownerId,
+      repositoryId,
+    });
+    const cancelled = await prepareApproval(repository, db, expiresAt, {
+      ownerId,
+      repositoryId,
+    });
+    const failed = await prepareApproval(repository, db, expiresAt, {
+      ownerId,
+      repositoryId,
+    });
+
+    await db.query(
+      "UPDATE jobs SET status = CASE WHEN id = $1 THEN 'cancelled'::job_status WHEN id = $2 THEN 'failed'::job_status ELSE status END WHERE id IN ($1, $2)",
+      [cancelled.job.jobId, failed.job.jobId],
+    );
+
+    const listed = await repository.listPendingApprovals(
+      ownerId,
+      5,
+      new Date(),
+    );
+    expect(listed.map((approval) => approval.approvalId)).toEqual([
+      valid.fixture.approvalId,
+    ]);
+
+    await expect(
+      repository.getPendingApproval(ownerId, failed.job.jobId, new Date()),
+    ).resolves.toBeNull();
   });
 
   it("cancels queued work idempotently without creating a connector message", async () => {

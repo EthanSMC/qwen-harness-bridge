@@ -542,7 +542,7 @@ describe("MCP public tool contract", () => {
     }
   });
 
-  it("fails closed on deeply nested unexpected coordinator output", async () => {
+  it("drops deeply nested unexpected coordinator output keys", async () => {
     let nested: Record<string, unknown> = {
       credential: "do-not-return-this-secret",
       path: "/Users/secret/private.key",
@@ -558,7 +558,9 @@ describe("MCP public tool contract", () => {
         arguments: { job_id: JOB_ID },
       });
       const serialized = JSON.stringify(result);
-      expect(result.isError).toBe(true);
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject(DETAIL_RESULT);
+      expect(result.structuredContent).not.toHaveProperty("debug");
       expect(serialized).not.toContain("do-not-return-this-secret");
       expect(serialized).not.toContain("/Users/secret");
     } finally {
@@ -581,7 +583,7 @@ describe("MCP public tool contract", () => {
         },
         text: "password=deep-text-password token=deep-text-token",
       },
-      items: Array.from({ length: 8 }, (_, index) => ({ index })),
+      tasks: Array.from({ length: 8 }, (_, index) => ({ index })),
     };
 
     const sanitized = sanitizePublicValue(value);
@@ -594,7 +596,7 @@ describe("MCP public tool contract", () => {
     expect(serialized).not.toContain("/Users/secret");
     expect(serialized).not.toContain("deep-password");
     expect(serialized).not.toContain("deep-text-password");
-    expect((sanitized as { items: unknown[] }).items).toHaveLength(5);
+    expect((sanitized as { tasks: unknown[] }).tasks).toHaveLength(5);
   });
 
   it("redacts adversarial paths, authorization forms, and stringified internal JSON", () => {
@@ -623,6 +625,67 @@ describe("MCP public tool contract", () => {
     expect(serialized).not.toContain("json-agent");
     expect(serialized).not.toContain("json-internal");
     expect(serialized).not.toContain("/tmp/json");
+  });
+
+  it("keeps only exact public output keys in coordinator objects", () => {
+    const sanitized = sanitizePublicValue({
+      job_id: JOB_ID,
+      title: "public title",
+      status: "queued",
+      current_stage: "waiting",
+      summary: "public summary",
+      tests: {
+        passed: 1,
+        failed: 0,
+        summary: "public test summary",
+        trace_id: "trace-secret",
+      },
+      correlation_id: "correlation-secret",
+      event_id: "event-secret",
+      owner: "owner-secret",
+      repository_id: "repository-secret",
+      harness_agent_id: "agent-secret",
+      DATABASE_URL: "postgres://user:password@db/internal",
+      service_TOKEN: "token-secret",
+      private_KEY: "key-secret",
+      webhook_SECRET: "secret-secret",
+      admin_PASSWORD: "password-secret",
+      unknown_public_field: "must be dropped",
+    });
+
+    expect(sanitized).toEqual({
+      job_id: JOB_ID,
+      title: "public title",
+      status: "queued",
+      current_stage: "waiting",
+      summary: "public summary",
+      tests: {
+        passed: 1,
+        failed: 0,
+        summary: "public test summary",
+      },
+    });
+    const serialized = JSON.stringify(sanitized);
+    expect(serialized).not.toMatch(
+      /correlation_id|event_id|trace_id|owner|repository_id|harness_|DATABASE_URL|service_TOKEN|private_KEY|webhook_SECRET|admin_PASSWORD|trace-secret|correlation-secret|event-secret|owner-secret|repository-secret|agent-secret|postgres:\/\/|token-secret|key-secret|secret-secret|password-secret|must be dropped/,
+    );
+  });
+
+  it("drops changed-file paths after MCP string sanitization", () => {
+    const sanitized = sanitizePublicValue({
+      job_id: JOB_ID,
+      changed_files: [
+        "src/password=leaked-secret.txt",
+        "src/index.ts",
+        "src/password-reset.ts",
+        "/Users/secret/private.key",
+      ],
+    });
+
+    expect(sanitized).toEqual({
+      job_id: JOB_ID,
+      changed_files: ["src/index.ts", "src/password-reset.ts"],
+    });
   });
 
   it("accepts emoji-heavy production presenter output through official SDK callTool", async () => {

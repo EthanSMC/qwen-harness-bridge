@@ -164,20 +164,41 @@ const boundedText = (
 
 const RAW_LOG_PREFIX =
   /^\s*(?:\[\s*)?raw(?:[-_\s]+connector)?[-_\s]+logs?(?:\s*\])?\s*(?::|=|-)?/iu;
-const SENSITIVE_KEY =
-  /(?:password|token|secret|api[-_]?key|credential|authorization|bearer|raw[-_]?log)/iu;
-const INTERNAL_KEY =
-  /(?:request(?:[_-]?(?:ciphertext|digest))?|prompt|ciphertext|digest|harness[_-]?agent[_-]?id|harness[_-]?session[_-]?id|database[_-]?id|connector[_-]?id|internal[_-]?id|agent[_-]?id|session[_-]?id)/iu;
-const isRestrictedKey = (key: string): boolean =>
-  SENSITIVE_KEY.test(key) || INTERNAL_KEY.test(key);
 const AUTHORIZATION_ASSIGNMENT =
   /(["']?)(authorization)\1\s*([:=]\s*)("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|bearer\s+[^\s,;}\]]+|[^\s,;}\]]+)/giu;
 const SECRET_ASSIGNMENT =
-  /(["']?)(api[-_\s]?key|token|credential|password|secret)\1\s*([:=]\s*)("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
+  /(["']?)((?:[A-Za-z0-9][A-Za-z0-9_.-]*[_.-])?(?:token|key|secret|password|credential)|database[_-]?url)\1\s*([:=]\s*)("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
 const INTERNAL_ASSIGNMENT =
-  /(["']?)(request(?:[_-]?(?:ciphertext|digest))?|prompt|ciphertext|digest|harness[_-]?agent[_-]?id|harness[_-]?session[_-]?id|database[_-]?id|connector[_-]?id|internal[_-]?id|agent[_-]?id|session[_-]?id)\1\s*([:=]\s*)("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
+  /(["']?)(correlation[_-]?id|event[_-]?id|trace[_-]?id|owner(?:[_-]?id)?|repository(?:[_-]?id)?|request(?:[_-]?(?:ciphertext|digest))?|prompt|ciphertext|digest|harness[_-]?(?:agent|session)[_-]?id|database[_-]?id|connector[_-]?id|internal[_-]?id|agent[_-]?id|session[_-]?id)\1\s*([:=]\s*)("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
 const BEARER_TOKEN =
-  /\bbearer\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s,;}\]]+)/giu;
+  /\bbearer\s+(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|\[[^\]]*\]|[^\s,;}\]]+)/giu;
+const CREDENTIAL_URL =
+  /\b[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@[^\s,;}\]]+/giu;
+
+// JSON found in connector summaries is untrusted. Keep this list deliberately
+// small and exact; an unknown key is discarded with its entire value.
+const PUBLIC_STRUCTURED_KEYS = new Set([
+  "summary",
+  "message",
+  "detail",
+  "title",
+  "stage",
+  "current_stage",
+  "status",
+  "type",
+  "outcome",
+  "action",
+  "impact",
+  "label",
+  "name",
+  "passed",
+  "failed",
+  "count",
+  "total",
+  "tests",
+  "result",
+  "results",
+]);
 
 const redactedAssignment = (
   _match: string,
@@ -200,7 +221,8 @@ const redactSensitiveValues = (value: string): string => {
     .replace(INTERNAL_ASSIGNMENT, redactedAssignment)
     .replace(AUTHORIZATION_ASSIGNMENT, redactedAssignment)
     .replace(SECRET_ASSIGNMENT, redactedAssignment)
-    .replace(BEARER_TOKEN, "Bearer [redacted]");
+    .replace(BEARER_TOKEN, "Bearer [redacted]")
+    .replace(CREDENTIAL_URL, "[redacted credential URL]");
 };
 
 type RedactedStructuredValue = { value: unknown; changed: boolean };
@@ -234,8 +256,7 @@ const redactStructuredValue = (
   const redacted: Record<string, unknown> = {};
   const entries = Object.entries(value);
   for (const [key, item] of entries.slice(0, MAX_STRUCTURED_ITEMS)) {
-    if (isRestrictedKey(key)) {
-      redacted[key] = "[redacted]";
+    if (!PUBLIC_STRUCTURED_KEYS.has(key)) {
       changed = true;
       continue;
     }
@@ -263,8 +284,9 @@ const redactStructuredSensitiveText = (value: string): string => {
       const parsed: unknown = JSON.parse(trimmed);
       const result = redactStructuredValue(parsed);
       if (result.changed) return JSON.stringify(result.value);
+      return value;
     } catch {
-      if (isRestrictedKey(trimmed)) return "[redacted structured content]";
+      return "[redacted structured content]";
     }
   }
   return redactSensitiveValues(value);
@@ -467,6 +489,12 @@ const publicChangedFiles = (
     .filter((value): value is string => typeof value === "string")
     .map((value) => relativeRepositoryPath(value, repository))
     .filter((value): value is string => value !== null)
+    .filter((value) => {
+      const codePoints = Array.from(value).length;
+      const codeUnits = value.length;
+      const bytes = new TextEncoder().encode(value).byteLength;
+      return sanitizePublicText(value, codePoints, bytes, codeUnits) === value;
+    })
     .map((value) => boundedText(value, 512, 2048, 512))
     .filter((value) => value.length > 0)
     .slice(0, MAX_ITEMS);

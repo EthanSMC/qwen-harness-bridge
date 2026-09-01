@@ -8,8 +8,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-qhb}
       POSTGRES_USER: ${POSTGRES_USER:-qhb}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-qhb}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - qhb-postgres-data:/var/lib/postgresql/data
     healthcheck:

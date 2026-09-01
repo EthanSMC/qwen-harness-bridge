@@ -467,6 +467,66 @@ describe("presenters", () => {
     expect(sanitized).toContain("ordinary public summary");
   });
 
+  it("fails closed for unknown structured keys and generic secret assignments", () => {
+    const sanitized = sanitizePublicText(
+      JSON.stringify({
+        summary: "ordinary public summary",
+        message: "ordinary public message",
+        detail:
+          "ordinary public detail postgres://db-user:db-password@db.internal/app",
+        correlation_id: "correlation-secret",
+        event_id: "event-secret",
+        trace_id: "trace-secret",
+        owner: "owner-secret",
+        repository: "repository-secret",
+        harness_agent_id: "agent-secret",
+        harness_session_id: "session-secret",
+        DATABASE_URL: "postgres://user:password@db/internal",
+        service_TOKEN: "token-secret",
+        signing_KEY: "key-secret",
+        webhook_SECRET: "secret-secret",
+        admin_PASSWORD: "password-secret",
+        nested: {
+          summary: "nested summary must not widen the public surface",
+          event_id: "nested-event-secret",
+        },
+      }),
+      600,
+    );
+
+    expect(sanitized).toContain("ordinary public summary");
+    expect(sanitized).toContain("ordinary public message");
+    expect(sanitized).toContain("ordinary public detail");
+    expect(sanitized).toContain("[redacted credential URL]");
+    expect(sanitized).not.toMatch(
+      /correlation_id|event_id|trace_id|owner|repository|harness_|DATABASE_URL|service_TOKEN|signing_KEY|webhook_SECRET|admin_PASSWORD|correlation-secret|event-secret|trace-secret|owner-secret|repository-secret|agent-secret|session-secret|postgres:\/\/|db-user|db-password|token-secret|key-secret|secret-secret|password-secret|nested summary/,
+    );
+  });
+
+  it("drops changed-file paths whose public sensitive sanitizer changes them", () => {
+    const result = presentTaskResult({
+      summary: "ordinary result",
+      changedFiles: [
+        "src/password=leaked-secret.txt",
+        "src/DATABASE_URL=leaked-connection.txt",
+        "src/build_TOKEN=leaked-token.txt",
+        "src/password-reset.ts",
+        "src/index.ts",
+      ],
+      tests: { passed: 1, failed: 0, summary: "1 passed" },
+      artifacts: [],
+      acknowledgedAt: new Date(now),
+    });
+
+    expect(result.changed_files).toEqual([
+      "src/password-reset.ts",
+      "src/index.ts",
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(
+      /leaked-secret|leaked-connection|leaked-token|password=|DATABASE_URL=|build_TOKEN=/,
+    );
+  });
+
   it("fails closed for embedded credentials and Unicode or platform absolute paths", () => {
     const sanitized = sanitizePublicText(
       "Authorization: plain-token Authorization: Bearer bearer-token Bearer standalone-token; POSIX “/Users/张三/Project Files/secret.txt”; Volumes /Volumes/团队 资料/秘密.txt; tmp /tmp/构建 输出/result.txt; Windows “C:\\Users\\张三\\Build Output\\secret.txt”; UNC ‘\\\\server\\共享 目录\\秘密.txt’",
