@@ -155,10 +155,23 @@ const sanitizeConnectorEventPayload = (
 
 const storedClientPayload = (
   message: ConnectorClientMessage,
-): Record<string, unknown> => ({
-  payload: message.payload,
-  sent_at: message.sent_at,
-});
+): Record<string, unknown> => {
+  const payload =
+    message.type === "job.event"
+      ? {
+          ...message.payload,
+          payload: sanitizeConnectorEventPayload(message.payload.payload),
+        }
+      : message.payload;
+  return {
+    payload,
+    payload_digest: `sha256:${crypto
+      .createHash("sha256")
+      .update(canonicalJson(message.payload))
+      .digest("hex")}`,
+    sent_at: new Date(message.sent_at).toISOString(),
+  };
+};
 
 const isExactDuplicate = (
   row: ConnectorMessageRow,
@@ -168,7 +181,7 @@ const isExactDuplicate = (
   row.sequence === message.sequence &&
   row.type === message.type &&
   row.correlationId === message.correlation_id &&
-  row.expiresAt.toISOString() === message.expires_at &&
+  row.expiresAt.getTime() === Date.parse(message.expires_at) &&
   canonicalJson(row.payload) === canonicalJson(storedClientPayload(message));
 
 const findOriginalResponse = async (
@@ -630,7 +643,6 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
                 connectorMessages.sequence,
                 message.payload.last_server_sequence,
               ),
-              gt(connectorMessages.expiresAt, now),
             ),
           )
           .orderBy(asc(connectorMessages.sequence));
@@ -806,7 +818,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
   async pendingServerMessages(
     identity: ConnectorIdentity,
     afterSequence: number,
-    now = new Date(),
+    _now = new Date(),
   ): Promise<readonly StoredServerMessage[]> {
     assertSafeSequence(afterSequence);
     const connectorRows = await this.#db
@@ -830,7 +842,6 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
           eq(connectorMessages.connectorId, identity.connectorId),
           eq(connectorMessages.direction, "server"),
           gt(connectorMessages.sequence, afterSequence),
-          gt(connectorMessages.expiresAt, now),
         ),
       )
       .orderBy(asc(connectorMessages.sequence));

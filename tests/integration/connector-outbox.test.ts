@@ -139,6 +139,18 @@ describe("PostgreSQL Connector outbox", () => {
     const duplicate = await store.acceptClientMessage(identity, hello);
     expect(duplicate.duplicate).toBe(true);
     expect(duplicate.response?.messageId).toBe(accepted.response?.messageId);
+
+    const equivalentTimestampDuplicate = ConnectorClientMessageSchema.parse({
+      ...hello,
+      sent_at: hello.sent_at.replace(/Z$/, "+00:00"),
+      expires_at: hello.expires_at.replace(/Z$/, "+00:00"),
+    });
+    await expect(
+      store.acceptClientMessage(identity, equivalentTimestampDuplicate),
+    ).resolves.toMatchObject({
+      duplicate: true,
+      response: { messageId: accepted.response?.messageId },
+    });
     const responseCount = await database.query<{ count: string }>(
       `SELECT count(*)::text AS count
          FROM connector_messages
@@ -223,6 +235,19 @@ describe("PostgreSQL Connector outbox", () => {
       stage: "testing",
       summary: "[redacted source content]",
     });
+    const durableMessages = await database.query<{ payload_text: string }>(
+      `SELECT payload::text AS payload_text
+         FROM connector_messages
+        WHERE connector_id = $1 AND message_id = $2`,
+      [CONNECTOR_ID, progress.message_id],
+    );
+    expect(durableMessages.rows).toHaveLength(1);
+    expect(durableMessages.rows[0]?.payload_text).not.toContain(
+      "privateRepositoryBody",
+    );
+    expect(durableMessages.rows[0]?.payload_text).toContain(
+      "[redacted source content]",
+    );
   });
 
   it("releases an expired offer lease without incrementing the product attempt", async () => {
@@ -261,6 +286,47 @@ describe("PostgreSQL Connector outbox", () => {
       status: "dispatched",
       attempt: 0,
     });
+
+    if (first === null || second === null) {
+      throw new Error("expected both durable offers");
+    }
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE message_id = $1",
+      [first.messageId],
+    );
+    const replay = await store.pendingServerMessages(
+      identity,
+      first.sequence - 1,
+    );
+    expect(replay.slice(0, 2)).toMatchObject([
+      {
+        sequence: first.sequence,
+        messageId: first.messageId,
+        type: "job.offer",
+        payload: { job_id: job.jobId },
+      },
+      {
+        sequence: second.sequence,
+        messageId: second.messageId,
+        type: "job.offer",
+      },
+    ]);
+    expect(replay[1]?.sequence).toBe(replay[0]?.sequence + 1);
+    expect(JSON.stringify(replay[0])).not.toContain(
+      "Redispatch the expired offer",
+    );
+
+    const reconnect = envelope("connector.hello", 4, {
+      connector_id: CONNECTOR_ID,
+      connector_version: "integration-1.0",
+      capabilities: ["tests"],
+      last_server_sequence: first.sequence - 1,
+      last_client_sequence: 3,
+    });
+    const reconnected = await store.acceptClientMessage(identity, reconnect);
+    expect(
+      reconnected.replay.slice(0, 2).map((message) => message.sequence),
+    ).toEqual([first.sequence, second.sequence]);
   });
 
   it("does not dispatch beyond a repository's configured concurrency", async () => {

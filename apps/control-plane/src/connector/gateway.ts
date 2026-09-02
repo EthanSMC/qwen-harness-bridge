@@ -28,6 +28,33 @@ const SOCKET_WRITE_TIMEOUT_MS = 1_000;
 const DEFAULT_DISPATCH_INTERVAL_MS = 250;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
+const isValidCloseStatusCode = (code: number): boolean =>
+  (code >= 1000 && code <= 1003) ||
+  (code >= 1007 && code <= 1014) ||
+  (code >= 3000 && code <= 4999);
+
+const awaitBeforeDeadline = async <T>(
+  operation: () => Promise<T>,
+  deadline: number,
+): Promise<T | undefined> => {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return undefined;
+  return new Promise<T | undefined>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(undefined), remaining);
+    timer.unref();
+    operation().then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+};
+
 export type ConnectorGatewayOptions = Readonly<{
   database: Database;
   sessionSigningKey: string | Uint8Array;
@@ -63,22 +90,36 @@ class ServerWebSocket {
   }
 
   close(): void {
-    void this.closeGracefully();
+    void this.closeGracefully().catch(() => undefined);
   }
 
-  async closeGracefully(): Promise<void> {
+  #closeForProtocolError(): void {
+    void this.closeGracefully(1002).catch(() => undefined);
+  }
+
+  async closeGracefully(
+    statusCode?: number,
+    deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS,
+  ): Promise<void> {
     if (this.#closed || this.#closing) return;
     this.#closing = true;
     try {
-      await this.#sendFrame(0x8, Buffer.alloc(0), true);
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, SOCKET_WRITE_TIMEOUT_MS);
-        timer.unref();
-        this.#socket.end(() => {
-          clearTimeout(timer);
-          resolve();
+      const payload =
+        statusCode === undefined
+          ? Buffer.alloc(0)
+          : Buffer.from([(statusCode >> 8) & 0xff, statusCode & 0xff]);
+      await this.#sendFrame(0x8, payload, true, deadline);
+      const remaining = deadline - Date.now();
+      if (remaining > 0 && !this.#closed) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, remaining);
+          timer.unref();
+          this.#socket.end(() => {
+            clearTimeout(timer);
+            resolve();
+          });
         });
-      });
+      }
     } finally {
       this.#finish();
     }
@@ -88,6 +129,7 @@ class ServerWebSocket {
     opcode: number,
     payload: Buffer,
     allowClosing = false,
+    deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS,
   ): Promise<void> {
     if (this.#closed || (this.#closing && !allowClosing)) {
       throw new Error("Connector WebSocket is closed");
@@ -107,10 +149,16 @@ class ServerWebSocket {
     }
     payload.copy(frame, headerLength);
     await new Promise<void>((resolve, reject) => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        this.#finish();
+        reject(new Error("Connector WebSocket write deadline exceeded"));
+        return;
+      }
       const timer = setTimeout(() => {
         this.#finish();
         reject(new Error("Connector WebSocket write timed out"));
-      }, SOCKET_WRITE_TIMEOUT_MS);
+      }, remaining);
       timer.unref();
       this.#socket.write(frame, (error?: Error | null) => {
         clearTimeout(timer);
@@ -170,10 +218,6 @@ class ServerWebSocket {
         this.close();
         return;
       }
-      if (opcode === 0x8 && length === 1) {
-        this.close();
-        return;
-      }
       const frameLength = offset + 4 + length;
       if (this.#buffer.length < frameLength) return;
       const mask = this.#buffer.subarray(offset, offset + 4);
@@ -184,6 +228,27 @@ class ServerWebSocket {
       for (let index = 0; index < payload.length; index += 1) {
         payload[index] ^= mask[index % 4] ?? 0;
       }
+      if (opcode === 0x8) {
+        if (payload.length === 1) {
+          this.#closeForProtocolError();
+          return;
+        }
+        if (payload.length >= 2) {
+          const statusCode = payload.readUInt16BE(0);
+          if (!isValidCloseStatusCode(statusCode)) {
+            this.#closeForProtocolError();
+            return;
+          }
+          try {
+            utf8Decoder.decode(payload.subarray(2));
+          } catch {
+            this.#closeForProtocolError();
+            return;
+          }
+        }
+        void this.closeGracefully().catch(() => undefined);
+        return;
+      }
       if (opcode === 0x1) {
         try {
           this.#handlers.message(utf8Decoder.decode(payload));
@@ -191,9 +256,6 @@ class ServerWebSocket {
           this.close();
           return;
         }
-      } else if (opcode === 0x8) {
-        void this.closeGracefully();
-        return;
       } else if (opcode === 0x9) {
         void this.#sendFrame(0xa, payload).catch(() => this.#finish());
       }
@@ -351,33 +413,49 @@ export class ConnectorGateway {
     let scanAfterSequence = 0;
     let processing = Promise.resolve();
     let dispatching = false;
+    let failureGeneration = 0;
     let timer: ReturnType<typeof setInterval> | undefined;
+    const canContinue = (generation: number): boolean =>
+      accepting && generation === failureGeneration && !this.#closed;
     const sendStored = async (
       connection: ServerWebSocket,
       stored: StoredServerMessage,
       retransmit = false,
-    ): Promise<void> => {
-      if (!retransmit && stored.sequence <= scanAfterSequence) return;
+      generation = failureGeneration,
+    ): Promise<boolean> => {
+      if (!canContinue(generation)) return false;
+      if (!retransmit && stored.sequence <= scanAfterSequence) return true;
       const message = await this.#store.materializeServerMessage(
         stored,
         this.#requestDecryptor,
       );
+      if (!canContinue(generation)) return false;
       await connection.sendJson(message);
-      if (!retransmit) {
+      if (!retransmit && canContinue(generation)) {
         scanAfterSequence = Math.max(scanAfterSequence, stored.sequence);
       }
+      return true;
     };
     const pump = async (connection: ServerWebSocket): Promise<void> => {
-      if (!accepting || !initialized || dispatching || this.#closed) return;
+      const generation = failureGeneration;
+      if (!canContinue(generation) || !initialized || dispatching) {
+        return;
+      }
       dispatching = true;
       try {
+        if (!canContinue(generation)) return;
         await this.#store.dispatchNext(identity, this.#now());
+        if (!canContinue(generation)) return;
         const pending = await this.#store.pendingServerMessages(
           identity,
           scanAfterSequence,
           this.#now(),
         );
-        for (const message of pending) await sendStored(connection, message);
+        for (const message of pending) {
+          if (!(await sendStored(connection, message, false, generation))) {
+            return;
+          }
+        }
       } finally {
         dispatching = false;
       }
@@ -391,22 +469,41 @@ export class ConnectorGateway {
     const failProtocol = async (code: string): Promise<void> => {
       if (!accepting) return;
       accepting = false;
+      failureGeneration += 1;
       if (timer !== undefined) clearInterval(timer);
+      const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
       try {
-        await this.#store.enqueueServer(
-          identity,
-          "protocol.error",
-          { code, message: "Connector protocol error." },
-          new Date(this.#now().getTime() + 60_000),
+        const errorMessage = await awaitBeforeDeadline(
+          () =>
+            this.#store.enqueueServer(
+              identity,
+              "protocol.error",
+              { code, message: "Connector protocol error." },
+              new Date(this.#now().getTime() + 60_000),
+            ),
+          deadline,
         );
-        const pending = await this.#store.pendingServerMessages(
-          identity,
-          scanAfterSequence,
-          this.#now(),
-        );
-        for (const message of pending) await sendStored(connection, message);
+        if (
+          errorMessage !== undefined &&
+          errorMessage.sequence === scanAfterSequence + 1
+        ) {
+          const error = await awaitBeforeDeadline(
+            () =>
+              this.#store.materializeServerMessage(
+                errorMessage,
+                this.#requestDecryptor,
+              ),
+            deadline,
+          );
+          if (error !== undefined) {
+            await awaitBeforeDeadline(
+              () => connection.sendJson(error),
+              deadline,
+            );
+          }
+        }
       } finally {
-        await connection.closeGracefully();
+        await connection.closeGracefully(undefined, deadline);
       }
     };
     const handle = async (serialized: string): Promise<void> => {

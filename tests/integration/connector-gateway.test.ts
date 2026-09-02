@@ -1,4 +1,6 @@
 import * as https from "node:https";
+import type { AddressInfo } from "node:net";
+import type { Duplex } from "node:stream";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { hashConnectorCredential } from "../../apps/control-plane/src/connector/auth.js";
 import { createApp } from "../../apps/control-plane/src/http/app.js";
@@ -26,6 +28,52 @@ type GatewayAppOptions = Parameters<typeof createApp>[0] & {
 const createGatewayApp = createApp as unknown as (
   options: GatewayAppOptions,
 ) => ReturnType<typeof createApp>;
+
+const sendRawFrame = (
+  socket: Duplex,
+  opcode: number,
+  payload: Buffer,
+): void => {
+  const mask = Buffer.from(crypto.randomUUID().replaceAll("-", "")).subarray(
+    0,
+    4,
+  );
+  const length = payload.length;
+  const headerLength = length < 126 ? 2 : length <= 0xffff ? 4 : 10;
+  const frame = Buffer.alloc(headerLength + 4 + length);
+  frame[0] = 0x80 | opcode;
+  if (length < 126) {
+    frame[1] = 0x80 | length;
+  } else if (length <= 0xffff) {
+    frame[1] = 0x80 | 126;
+    frame.writeUInt16BE(length, 2);
+  } else {
+    frame[1] = 0x80 | 127;
+    frame.writeBigUInt64BE(BigInt(length), 2);
+  }
+  mask.copy(frame, headerLength);
+  for (let index = 0; index < length; index += 1) {
+    frame[headerLength + 4 + index] =
+      (payload[index] ?? 0) ^ (mask[index % mask.length] ?? 0);
+  }
+  socket.write(frame);
+};
+
+const readClosePayload = (chunks: readonly Buffer[]): Buffer | undefined => {
+  const frame = Buffer.concat(chunks);
+  if (frame.length < 2 || ((frame[0] ?? 0) & 0x0f) !== 0x8) {
+    return undefined;
+  }
+  const length = (frame[1] ?? 0) & 0x7f;
+  if (frame.length < 2 + length) return undefined;
+  return frame.subarray(2, 2 + length);
+};
+
+const readCloseCode = (chunks: readonly Buffer[]): number | undefined => {
+  const payload = readClosePayload(chunks);
+  if (payload === undefined || payload.length < 2) return undefined;
+  return payload.readUInt16BE(0);
+};
 
 const noOpCoordinator = {
   submit: async () => ({ status: "queued" }),
@@ -70,7 +118,7 @@ const seedConnector = async (
   };
 };
 
-const startApp = async () => {
+const startApp = async (dispatchIntervalMs?: number) => {
   const app = await createGatewayApp({
     coordinator: noOpCoordinator as never,
     ownerId: OWNER_ID,
@@ -79,10 +127,57 @@ const startApp = async () => {
     connectorGateway: {
       database: db.client,
       sessionSigningKey: SESSION_SIGNING_KEY,
+      ...(dispatchIntervalMs === undefined ? {} : { dispatchIntervalMs }),
     },
   });
   await app.listen({ host: "127.0.0.1", port: 0 });
   return app;
+};
+
+const rawConnectorSocket = async (
+  app: Awaited<ReturnType<typeof startApp>>,
+  credentials: ConnectorCredentials,
+): Promise<Duplex> => {
+  const address = app.server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("Gateway app is not listening on a TCP address");
+  }
+  const session = await FakeConnector.exchangeSession(app, credentials);
+  const key = Buffer.from(
+    crypto.randomUUID().replaceAll("-", ""),
+    "hex",
+  ).toString("base64");
+  return new Promise((resolve, reject) => {
+    const request = https.request({
+      hostname: "127.0.0.1",
+      port: (address as AddressInfo).port,
+      path: "/connector/v1",
+      method: "GET",
+      ca: LOCALHOST_TLS.cert,
+      rejectUnauthorized: true,
+      headers: {
+        authorization: `Bearer ${session.token}`,
+        connection: "Upgrade",
+        upgrade: "websocket",
+        "sec-websocket-version": "13",
+        "sec-websocket-key": key,
+      },
+    });
+    request.once("upgrade", (response, socket) => {
+      if (response.statusCode !== 101) {
+        socket.destroy();
+        reject(new Error(`Connector upgrade returned ${response.statusCode}`));
+        return;
+      }
+      resolve(socket);
+    });
+    request.once("response", (response) => {
+      response.resume();
+      reject(new Error(`Connector upgrade returned ${response.statusCode}`));
+    });
+    request.once("error", reject);
+    request.end();
+  });
 };
 
 beforeAll(async () => {
@@ -242,6 +337,101 @@ describe("Connector gateway authentication and handshake", () => {
       await app.close();
     }
   });
+
+  it("does not flush queued application frames after protocol failure begins", async () => {
+    const app = await startApp(5_000);
+    const credentials = await seedConnector(db);
+    const connector = await FakeConnector.connect(app, credentials);
+    try {
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      const firstSequence = connector.lastServerSequence + 1;
+      const expiresAt = new Date(Date.now() + 60_000).toISOString();
+      for (let index = 0; index < 32; index += 1) {
+        await db.query(
+          `
+            INSERT INTO connector_messages
+              (connector_id, direction, sequence, message_id, type, payload, correlation_id, expires_at)
+            VALUES ($1, 'server', $2, $3, 'ack', $4::jsonb, $5, $6)
+          `,
+          [
+            credentials.connector_id,
+            firstSequence + index,
+            crypto.randomUUID(),
+            JSON.stringify({ sequence: 10_000 + index }),
+            crypto.randomUUID(),
+            expiresAt,
+          ],
+        );
+      }
+      await db.query(
+        "UPDATE connectors SET last_server_sequence = $2 WHERE id = $1",
+        [credentials.connector_id, firstSequence + 31],
+      );
+
+      await connector.sendFrameForTest(0x1, "{");
+      await connector.waitForClose();
+
+      expect(
+        connector.wireReceived.filter((message) => message.type === "ack"),
+      ).toHaveLength(0);
+      expect(
+        connector.wireReceived.filter(
+          (message) => message.type === "protocol.error",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      await connector.close();
+      await app.close();
+    }
+  });
+
+  it.each([
+    ["reserved close status code", Buffer.from([0x03, 0xed])],
+    ["invalid UTF-8 close reason", Buffer.from([0x03, 0xe8, 0xff])],
+  ])("rejects a %s with close status 1002", async (_name, payload) => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    const socket = await rawConnectorSocket(app, credentials);
+    const chunks: Buffer[] = [];
+    socket.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+    const closed = new Promise<void>((resolve) => {
+      socket.once("close", () => resolve());
+    });
+    try {
+      sendRawFrame(socket, 0x8, payload);
+      await expect(closed).resolves.toBeUndefined();
+      expect(readCloseCode(chunks)).toBe(1002);
+    } finally {
+      socket.destroy();
+      await app.close();
+    }
+  });
+
+  it.each([1012, 1013, 1014])(
+    "accepts registered close status code %s",
+    async (statusCode) => {
+      const app = await startApp();
+      const credentials = await seedConnector(db);
+      const socket = await rawConnectorSocket(app, credentials);
+      const chunks: Buffer[] = [];
+      socket.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+      const closed = new Promise<void>((resolve) => {
+        socket.once("close", () => resolve());
+      });
+      try {
+        sendRawFrame(
+          socket,
+          0x8,
+          Buffer.from([(statusCode >> 8) & 0xff, statusCode & 0xff]),
+        );
+        await expect(closed).resolves.toBeUndefined();
+        expect(readClosePayload(chunks)).toEqual(Buffer.alloc(0));
+      } finally {
+        socket.destroy();
+        await app.close();
+      }
+    },
+  );
 
   it("closes on RSV and oversized or invalid control frames", async () => {
     const invalidFrames = [
