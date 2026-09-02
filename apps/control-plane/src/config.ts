@@ -46,6 +46,7 @@ const environmentSchema = z
     QHB_OWNER_ID: z.string().trim().min(1).optional(),
     QHB_MCP_BEARER_TOKEN: optionalSecretSchema,
     QHB_REQUEST_ENCRYPTION_KEY: optionalSecretSchema,
+    QHB_CONNECTOR_SESSION_SIGNING_KEY: optionalSecretSchema,
     QHB_TLS_CERT_PATH: optionalPathSchema,
     QHB_TLS_KEY_PATH: optionalPathSchema,
   })
@@ -72,6 +73,7 @@ export type AppConfig = {
   ownerId?: string;
   mcpBearerToken?: string;
   requestEncryptionKey?: string;
+  connectorSessionSigningKey?: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
 };
@@ -102,6 +104,11 @@ export function loadConfig(
     ...(parsed.QHB_REQUEST_ENCRYPTION_KEY === undefined
       ? {}
       : { requestEncryptionKey: parsed.QHB_REQUEST_ENCRYPTION_KEY }),
+    ...(parsed.QHB_CONNECTOR_SESSION_SIGNING_KEY === undefined
+      ? {}
+      : {
+          connectorSessionSigningKey: parsed.QHB_CONNECTOR_SESSION_SIGNING_KEY,
+        }),
     ...(parsed.QHB_TLS_CERT_PATH === undefined
       ? {}
       : { tlsCertPath: parsed.QHB_TLS_CERT_PATH }),

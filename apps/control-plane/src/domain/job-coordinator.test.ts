@@ -8,7 +8,7 @@ import type {
   SubmitTaskInput,
 } from "@qhb/protocol";
 import { describe, expect, it } from "vitest";
-import { JobCoordinator } from "./job-coordinator.js";
+import { Aes256GcmEncryptor, JobCoordinator } from "./job-coordinator.js";
 
 const OWNER_ID = "owner-a";
 const OTHER_OWNER_ID = "owner-b";
@@ -481,6 +481,41 @@ const expectCode = async (
 ): Promise<void> => {
   await expect(operation).rejects.toMatchObject({ code });
 };
+
+describe("Aes256GcmEncryptor", () => {
+  it("round-trips an authenticated request", () => {
+    const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(19));
+    const encoded = cipher.encrypt("private Connector request");
+
+    expect(encoded).toMatch(/^aes256gcm:v1:/);
+    expect(encoded).not.toContain("private Connector request");
+    expect(cipher.decrypt(encoded)).toBe("private Connector request");
+  });
+
+  it("fails closed for malformed, tampered, and wrong-key ciphertext", () => {
+    const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(19));
+    const wrongKey = new Aes256GcmEncryptor(new Uint8Array(32).fill(20));
+    const encoded = cipher.encrypt("private Connector request");
+    const replacement = encoded.endsWith("A") ? "B" : "A";
+    const tampered = `${encoded.slice(0, -1)}${replacement}`;
+
+    expect(() => cipher.decrypt("not-ciphertext")).toThrow(
+      "Encrypted request is invalid",
+    );
+    expect(() => cipher.decrypt(tampered)).toThrow(
+      "Encrypted request is invalid",
+    );
+    expect(() => wrongKey.decrypt(encoded)).toThrow(
+      "Encrypted request is invalid",
+    );
+  });
+
+  it("requires an exact 256-bit key", () => {
+    expect(() => new Aes256GcmEncryptor(new Uint8Array(31))).toThrow(
+      "AES-256-GCM requires a 32-byte key",
+    );
+  });
+});
 
 describe("JobCoordinator.submit", () => {
   it("returns the original receipt for repeated equal canonical payloads", async () => {

@@ -1,4 +1,9 @@
-import { createCipheriv, createHash, randomBytes } from "node:crypto";
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+} from "node:crypto";
 import type {
   CancelTaskInput,
   ConnectorHealth,
@@ -137,6 +142,10 @@ export interface RequestEncryptor {
   encrypt(plaintext: string): Promise<string> | string;
 }
 
+export interface RequestDecryptor {
+  decrypt(ciphertext: string): Promise<string> | string;
+}
+
 export interface JobCoordinatorDependencies {
   repository: JobRepositoryPort;
   encryptor: RequestEncryptor;
@@ -241,6 +250,39 @@ export class Aes256GcmEncryptor implements RequestEncryptor {
     const encode = (value: Uint8Array): string =>
       Buffer.from(value).toString("base64url");
     return `aes256gcm:v1:${encode(nonce)}:${encode(ciphertext)}:${encode(tag)}`;
+  }
+
+  decrypt(encoded: string): string {
+    const parts = encoded.split(":");
+    if (parts.length !== 5 || parts[0] !== "aes256gcm" || parts[1] !== "v1") {
+      throw new Error("Encrypted request is invalid");
+    }
+    const decode = (value: string | undefined): Buffer => {
+      if (value === undefined || !/^[A-Za-z0-9_-]+$/.test(value)) {
+        throw new Error("Encrypted request is invalid");
+      }
+      const decoded = Buffer.from(value, "base64url");
+      if (decoded.toString("base64url") !== value) {
+        throw new Error("Encrypted request is invalid");
+      }
+      return decoded;
+    };
+    const nonce = decode(parts[2]);
+    const ciphertext = decode(parts[3]);
+    const tag = decode(parts[4]);
+    if (nonce.length !== 12 || tag.length !== 16 || ciphertext.length === 0) {
+      throw new Error("Encrypted request is invalid");
+    }
+    try {
+      const decipher = createDecipheriv("aes-256-gcm", this.#key, nonce);
+      decipher.setAuthTag(tag);
+      return Buffer.concat([
+        decipher.update(ciphertext),
+        decipher.final(),
+      ]).toString("utf8");
+    } catch {
+      throw new Error("Encrypted request is invalid");
+    }
   }
 }
 

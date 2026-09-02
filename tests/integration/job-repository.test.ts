@@ -652,19 +652,29 @@ describe("JobRepository offer claims", () => {
     const connectorId = crypto.randomUUID();
     const job = await createJob(repository);
     await seedConnector(db, connectorId, job.ownerId);
-    const dispatched = await repository.transitionAndAppend(
+    await repository.transitionAndAppend(
       job.jobId,
       job.revision,
       "dispatched",
       event("job.dispatched"),
     );
+    const leaseId = crypto.randomUUID();
+    await db.query(
+      `UPDATE jobs
+          SET connector_id = $2, lease_id = $3,
+              lease_expires_at = now() + interval '30 seconds'
+        WHERE id = $1`,
+      [job.jobId, connectorId, leaseId],
+    );
+    const dispatched = await repository.get(job.jobId);
+    if (dispatched === null) throw new Error("expected dispatched job");
     const eventsBefore = await repository.events(job.jobId);
 
     await expect(
       repository.claimOffer(job.jobId, {
         connectorId,
         attempt: dispatched.attempt + 2,
-        leaseId: crypto.randomUUID(),
+        leaseId,
       }),
     ).resolves.toBeNull();
 
@@ -672,7 +682,7 @@ describe("JobRepository offer claims", () => {
     await expect(repository.events(job.jobId)).resolves.toEqual(eventsBefore);
   });
 
-  it("allows one connector to claim a dispatched offer and rejects a concurrent loser", async () => {
+  it("allows only the exact offered connector and lease to win a concurrent claim", async () => {
     const repository = new JobRepository(db.client);
     const firstConnector = crypto.randomUUID();
     const secondConnector = crypto.randomUUID();
@@ -685,12 +695,20 @@ describe("JobRepository offer claims", () => {
       "dispatched",
       event("job.dispatched"),
     );
+    const leaseId = crypto.randomUUID();
+    await db.query(
+      `UPDATE jobs
+          SET connector_id = $2, lease_id = $3,
+              lease_expires_at = now() + interval '30 seconds'
+        WHERE id = $1`,
+      [job.jobId, firstConnector, leaseId],
+    );
 
     const claims = await Promise.all([
       repository.claimOffer(job.jobId, {
         connectorId: firstConnector,
         attempt: 1,
-        leaseId: crypto.randomUUID(),
+        leaseId,
       }),
       repository.claimOffer(job.jobId, {
         connectorId: secondConnector,
@@ -710,7 +728,7 @@ describe("JobRepository offer claims", () => {
       revision: 2,
     });
     const stored = await repository.get(job.jobId);
-    expect([firstConnector, secondConnector]).toContain(stored?.connectorId);
+    expect(stored?.connectorId).toBe(firstConnector);
   });
 
   it("does not allow a second claim to replace the winning attempt or lease", async () => {
@@ -727,6 +745,13 @@ describe("JobRepository offer claims", () => {
       event("job.dispatched"),
     );
     const leaseId = crypto.randomUUID();
+    await db.query(
+      `UPDATE jobs
+          SET connector_id = $2, lease_id = $3,
+              lease_expires_at = now() + interval '30 seconds'
+        WHERE id = $1`,
+      [job.jobId, firstConnector, leaseId],
+    );
     const first = await repository.claimOffer(job.jobId, {
       connectorId: firstConnector,
       attempt: 1,

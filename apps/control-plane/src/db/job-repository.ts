@@ -961,6 +961,7 @@ export class JobRepository {
   ): Promise<JobRecord | null> {
     validateClaim(input);
     return this.#db.transaction(async (tx) => {
+      const now = new Date();
       const lockedRows = await tx
         .select()
         .from(jobs)
@@ -970,6 +971,10 @@ export class JobRepository {
       if (
         current === undefined ||
         current.status !== "dispatched" ||
+        current.connectorId !== input.connectorId ||
+        current.leaseId !== input.leaseId ||
+        current.leaseExpiresAt === null ||
+        current.leaseExpiresAt.getTime() <= now.getTime() ||
         input.attempt !== current.attempt + 1
       ) {
         return null;
@@ -1003,6 +1008,9 @@ export class JobRepository {
             eq(jobs.status, "dispatched"),
             eq(jobs.revision, current.revision),
             eq(jobs.attempt, input.attempt - 1),
+            eq(jobs.connectorId, input.connectorId),
+            eq(jobs.leaseId, input.leaseId),
+            gt(jobs.leaseExpiresAt, now),
           ),
         )
         .returning();
