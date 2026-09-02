@@ -35,6 +35,34 @@ const waitForStatus = async (jobId: string, status: string): Promise<void> => {
   throw new Error(`Timed out waiting for job status ${status}`);
 };
 
+const nextAckFor = async (connector: FakeConnector, clientSequence: number) => {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const ack = await connector.next("ack");
+    if (ack.payload.sequence === clientSequence) return ack;
+  }
+  throw new Error(
+    `Timed out waiting for ACK of client sequence ${clientSequence}`,
+  );
+};
+
+const waitForWireOccurrences = async (
+  connector: FakeConnector,
+  messageId: string,
+  expected: number,
+): Promise<void> => {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (
+      connector.wireReceived.filter(
+        (message) => message.message_id === messageId,
+      ).length >= expected
+    ) {
+      return;
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`Timed out waiting for ${expected} wire deliveries`);
+};
+
 describe("Foundation fake Connector end to end", () => {
   it("dispatches once and restores deduplicated delivery after reconnect", async () => {
     const ownerId = `owner-${crypto.randomUUID()}`;
@@ -129,9 +157,20 @@ describe("Foundation fake Connector end to end", () => {
         last_server_sequence: 0,
       });
       try {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
         expect(
           resumed.received.filter((message) => message.type === "job.offer"),
         ).toHaveLength(0);
+        expect(
+          resumed.wireReceived.filter(
+            (message) => message.type === "job.offer",
+          ),
+        ).toHaveLength(1);
+        for (let index = 1; index < resumed.wireReceived.length; index += 1) {
+          expect(resumed.wireReceived[index]?.sequence).toBeGreaterThan(
+            resumed.wireReceived[index - 1]?.sequence ?? 0,
+          );
+        }
 
         const event = await resumed.send("job.event", {
           job_id: jobId,
@@ -140,7 +179,8 @@ describe("Foundation fake Connector end to end", () => {
           payload: { stage: "testing", summary: "Focused tests are green" },
           source: "fake-connector",
         });
-        await resumed.next("ack");
+        const eventAck = await nextAckFor(resumed, event.sequence);
+        expect(eventAck.payload.sequence).toBe(event.sequence);
         await resumed.send("job.event", event.payload, {
           message_id: event.message_id,
           sequence: event.sequence,
@@ -148,7 +188,7 @@ describe("Foundation fake Connector end to end", () => {
           sent_at: event.sent_at,
           expires_at: event.expires_at,
         });
-        await resumed.next("ack");
+        await waitForWireOccurrences(resumed, eventAck.message_id, 2);
 
         const eventCount = await database.query<{ count: string }>(
           `SELECT count(*)::text AS count

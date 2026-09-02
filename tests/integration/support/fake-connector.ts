@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { request } from "node:https";
 import type { AddressInfo } from "node:net";
 import type { Duplex } from "node:stream";
@@ -8,6 +8,7 @@ import {
   type ConnectorServerMessage,
   ConnectorServerMessageSchema,
 } from "@qhb/protocol";
+import { LOCALHOST_TLS } from "./tls.js";
 
 export type ConnectorCredentials = {
   connector_id: string;
@@ -81,7 +82,8 @@ const requestJson = async (
       url,
       {
         method: "POST",
-        rejectUnauthorized: false,
+        ca: LOCALHOST_TLS.cert,
+        rejectUnauthorized: true,
         headers: {
           accept: "application/json",
           "content-type": "application/json",
@@ -159,7 +161,8 @@ class RawWebSocket {
       const key = randomBytes(16).toString("base64");
       const httpRequest = request(url, {
         method: "GET",
-        rejectUnauthorized: false,
+        ca: LOCALHOST_TLS.cert,
+        rejectUnauthorized: true,
         headers: {
           accept: "application/json",
           authorization: `Bearer ${sessionToken}`,
@@ -178,6 +181,17 @@ class RawWebSocket {
             reject(
               new Error(`Connector upgrade returned ${response.statusCode}`),
             );
+          }
+          return;
+        }
+        const expectedAccept = createHash("sha1")
+          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, "ascii")
+          .digest("base64");
+        if (response.headers["sec-websocket-accept"] !== expectedAccept) {
+          socket.destroy();
+          if (!settled) {
+            settled = true;
+            reject(new Error("Connector upgrade returned an invalid accept"));
           }
           return;
         }
@@ -252,18 +266,26 @@ class RawWebSocket {
     await this.#waitForClose();
   }
 
+  sendFrameForTest(opcode: number, payload: string, rsv = 0): void {
+    this.#sendFrame(opcode, Buffer.from(payload, "utf8"), rsv);
+  }
+
+  waitForClose(): Promise<void> {
+    return this.#waitForClose();
+  }
+
   #waitForClose(): Promise<void> {
     if (this.#closed) return Promise.resolve();
     return new Promise((resolve) => this.#closeHandlers.push(resolve));
   }
 
-  #sendFrame(opcode: number, payload: Buffer): void {
+  #sendFrame(opcode: number, payload: Buffer, rsv = 0): void {
     if (this.#closed) throw new Error("Connector WebSocket is closed");
     const mask = randomBytes(4);
     const length = payload.byteLength;
     const headerLength = length < 126 ? 2 : length <= 0xffff ? 4 : 10;
     const frame = Buffer.alloc(headerLength + 4 + length);
-    frame[0] = 0x80 | opcode;
+    frame[0] = 0x80 | (rsv & 0x70) | opcode;
     if (length < 126) {
       frame[1] = 0x80 | length;
     } else if (length <= 0xffff) {
@@ -366,16 +388,32 @@ type MessageWaiter = {
 };
 
 export class FakeConnector {
-  static readonly #seenByConnector = new Map<string, Set<string>>();
+  static readonly #seenByConnector = new Map<
+    string,
+    Map<string, { sequence: number; serialized: string }>
+  >();
+  static readonly #sequenceByConnector = new Map<string, Map<number, string>>();
 
   static async connect(
     endpoint: ConnectorEndpoint,
     credentials: ConnectorCredentials,
   ): Promise<FakeConnector> {
     const session = await exchangeConnectorSession(endpoint, credentials);
+    return FakeConnector.connectWithSessionToken(
+      endpoint,
+      credentials,
+      session.token,
+    );
+  }
+
+  static async connectWithSessionToken(
+    endpoint: ConnectorEndpoint,
+    credentials: ConnectorCredentials,
+    sessionToken: string,
+  ): Promise<FakeConnector> {
     const socket = await RawWebSocket.connect(
       asBaseUrl(endpoint),
-      session.token,
+      sessionToken,
     );
     const connector = new FakeConnector(socket, credentials);
     await connector.send("connector.hello", {
@@ -400,15 +438,17 @@ export class FakeConnector {
   readonly wireReceived: ConnectorServerMessage[] = [];
   readonly credentials: ConnectorCredentials;
   #clientSequence: number;
-  #serverSequence = 0;
+  #serverSequence: number;
   #pending: ConnectorServerMessage[] = [];
   #waiters: MessageWaiter[] = [];
   #socket: RawWebSocket;
+  #receiveError: Error | undefined;
 
   private constructor(socket: RawWebSocket, credentials: ConnectorCredentials) {
     this.#socket = socket;
     this.credentials = credentials;
     this.#clientSequence = credentials.last_client_sequence ?? 0;
+    this.#serverSequence = credentials.last_server_sequence ?? 0;
     socket.onMessage((serialized) => this.#receive(serialized));
     socket.onClose(() => {
       const error = new Error("FakeConnector WebSocket closed");
@@ -459,6 +499,9 @@ export class FakeConnector {
     type: T,
     timeoutMs = 2_000,
   ): Promise<ServerMessageOf<T>> {
+    if (this.#receiveError !== undefined) {
+      return Promise.reject(this.#receiveError);
+    }
     const pendingIndex = this.#pending.findIndex(
       (message) => message.type === type,
     );
@@ -490,6 +533,18 @@ export class FakeConnector {
     await this.#socket.close();
   }
 
+  async sendFrameForTest(
+    opcode: number,
+    payload: string,
+    rsv = 0,
+  ): Promise<void> {
+    this.#socket.sendFrameForTest(opcode, payload, rsv);
+  }
+
+  async waitForClose(): Promise<void> {
+    await this.#socket.waitForClose();
+  }
+
   #receive(serialized: string): void {
     let parsed: ConnectorServerMessage;
     try {
@@ -502,21 +557,68 @@ export class FakeConnector {
         clearTimeout(waiter.timer);
         waiter.reject(error);
       }
+      this.#receiveError = error;
+      void this.#socket.destroy();
       return;
     }
     this.wireReceived.push(parsed);
+    const connectorId = this.credentials.connector_id;
     const seen =
-      FakeConnector.#seenByConnector.get(this.credentials.connector_id) ??
-      new Set<string>();
+      FakeConnector.#seenByConnector.get(connectorId) ??
+      new Map<string, { sequence: number; serialized: string }>();
     FakeConnector.#seenByConnector.set(this.credentials.connector_id, seen);
-    if (seen.has(parsed.message_id)) {
-      this.#serverSequence = Math.max(this.#serverSequence, parsed.sequence);
-      this.credentials.last_server_sequence = this.#serverSequence;
+    const serializedMessage = canonicalJson(parsed);
+    const previous = seen.get(parsed.message_id);
+    if (previous !== undefined) {
+      if (
+        previous.sequence !== parsed.sequence ||
+        previous.serialized !== serializedMessage
+      ) {
+        this.#failReceive(
+          new Error("FakeConnector received a mismatched server replay"),
+        );
+        return;
+      }
+      if (parsed.sequence > this.#serverSequence + 1) {
+        this.#failReceive(
+          new Error(
+            `FakeConnector expected server sequence ${this.#serverSequence + 1} but received replay ${parsed.sequence}`,
+          ),
+        );
+        return;
+      }
+      if (parsed.sequence === this.#serverSequence + 1) {
+        this.#serverSequence = parsed.sequence;
+        this.credentials.last_server_sequence = this.#serverSequence;
+      }
       return;
     }
-    seen.add(parsed.message_id);
+    const bySequence =
+      FakeConnector.#sequenceByConnector.get(connectorId) ??
+      new Map<number, string>();
+    FakeConnector.#sequenceByConnector.set(connectorId, bySequence);
+    const previousMessageId = bySequence.get(parsed.sequence);
+    if (previousMessageId !== undefined) {
+      this.#failReceive(
+        new Error("FakeConnector received a different message for a sequence"),
+      );
+      return;
+    }
+    if (parsed.sequence !== this.#serverSequence + 1) {
+      this.#failReceive(
+        new Error(
+          `FakeConnector expected server sequence ${this.#serverSequence + 1} but received ${parsed.sequence}`,
+        ),
+      );
+      return;
+    }
+    seen.set(parsed.message_id, {
+      sequence: parsed.sequence,
+      serialized: serializedMessage,
+    });
+    bySequence.set(parsed.sequence, parsed.message_id);
     this.received.push(parsed);
-    this.#serverSequence = Math.max(this.#serverSequence, parsed.sequence);
+    this.#serverSequence = parsed.sequence;
     this.credentials.last_server_sequence = this.#serverSequence;
     const waiterIndex = this.#waiters.findIndex(
       (waiter) => waiter.type === parsed.type,
@@ -531,4 +633,27 @@ export class FakeConnector {
     }
     this.#pending.push(parsed);
   }
+
+  #failReceive(error: Error): void {
+    if (this.#receiveError !== undefined) return;
+    this.#receiveError = error;
+    for (const waiter of this.#waiters.splice(0)) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    void this.#socket.destroy();
+  }
 }
+
+const canonicalize = (value: unknown): unknown => {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, canonicalize(entry)]),
+  );
+};
+
+const canonicalJson = (value: unknown): string =>
+  JSON.stringify(canonicalize(value));

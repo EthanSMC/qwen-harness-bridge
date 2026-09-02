@@ -43,3 +43,45 @@ describe("control-plane TLS configuration", () => {
     });
   });
 });
+
+describe("control-plane secret domain separation", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    [
+      "QHB_MCP_BEARER_TOKEN and QHB_REQUEST_ENCRYPTION_KEY",
+      {
+        ...BASE_ENV,
+        QHB_REQUEST_ENCRYPTION_KEY: BASE_ENV.QHB_MCP_BEARER_TOKEN,
+      },
+    ],
+    [
+      "QHB_MCP_BEARER_TOKEN and QHB_CONNECTOR_SESSION_SIGNING_KEY",
+      {
+        ...BASE_ENV,
+        QHB_CONNECTOR_SESSION_SIGNING_KEY: BASE_ENV.QHB_MCP_BEARER_TOKEN,
+      },
+    ],
+    [
+      "QHB_REQUEST_ENCRYPTION_KEY and QHB_CONNECTOR_SESSION_SIGNING_KEY",
+      {
+        ...BASE_ENV,
+        QHB_CONNECTOR_SESSION_SIGNING_KEY: BASE_ENV.QHB_REQUEST_ENCRYPTION_KEY,
+      },
+    ],
+  ] as const)("rejects equal %s", async (_case, environment) => {
+    const { loadConfig } = await loadConfigModule();
+    expect(() => loadConfig(environment)).toThrow();
+  });
+
+  it("loads distinct runtime secrets", async () => {
+    const { loadConfig } = await loadConfigModule();
+    expect(loadConfig(BASE_ENV)).toMatchObject({
+      mcpBearerToken: BASE_ENV.QHB_MCP_BEARER_TOKEN,
+      requestEncryptionKey: BASE_ENV.QHB_REQUEST_ENCRYPTION_KEY,
+      connectorSessionSigningKey: BASE_ENV.QHB_CONNECTOR_SESSION_SIGNING_KEY,
+    });
+  });
+});

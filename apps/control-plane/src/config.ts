@@ -51,6 +51,25 @@ const environmentSchema = z
     QHB_TLS_KEY_PATH: optionalPathSchema,
   })
   .superRefine((value, context) => {
+    const secretPairs = [
+      ["QHB_MCP_BEARER_TOKEN", "QHB_REQUEST_ENCRYPTION_KEY"],
+      ["QHB_MCP_BEARER_TOKEN", "QHB_CONNECTOR_SESSION_SIGNING_KEY"],
+      ["QHB_REQUEST_ENCRYPTION_KEY", "QHB_CONNECTOR_SESSION_SIGNING_KEY"],
+    ] as const;
+
+    for (const [firstSecret, secondSecret] of secretPairs) {
+      if (
+        value[firstSecret] !== undefined &&
+        value[firstSecret] === value[secondSecret]
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [secondSecret],
+          message: `${firstSecret} and ${secondSecret} must be different`,
+        });
+      }
+    }
+
     const hasCertificate = value.QHB_TLS_CERT_PATH !== undefined;
     const hasKey = value.QHB_TLS_KEY_PATH !== undefined;
     if (hasCertificate !== hasKey) {

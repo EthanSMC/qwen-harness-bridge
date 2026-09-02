@@ -24,7 +24,9 @@ import {
 
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_FRAME_BYTES = 64 * 1024;
+const SOCKET_WRITE_TIMEOUT_MS = 1_000;
 const DEFAULT_DISPATCH_INTERVAL_MS = 250;
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 export type ConnectorGatewayOptions = Readonly<{
   database: Database;
@@ -44,6 +46,7 @@ class ServerWebSocket {
   readonly #handlers: FrameHandlers;
   #buffer: Buffer;
   #closed = false;
+  #closing = false;
 
   constructor(socket: Duplex, head: Buffer, handlers: FrameHandlers) {
     this.#socket = socket;
@@ -55,18 +58,40 @@ class ServerWebSocket {
     if (head.length > 0) this.#read(Buffer.alloc(0));
   }
 
-  sendJson(message: ConnectorServerMessage): void {
-    this.#sendFrame(0x1, Buffer.from(JSON.stringify(message), "utf8"));
+  async sendJson(message: ConnectorServerMessage): Promise<void> {
+    await this.#sendFrame(0x1, Buffer.from(JSON.stringify(message), "utf8"));
   }
 
   close(): void {
-    if (this.#closed) return;
-    this.#sendFrame(0x8, Buffer.alloc(0));
-    this.#finish();
+    void this.closeGracefully();
   }
 
-  #sendFrame(opcode: number, payload: Buffer): void {
-    if (this.#closed) return;
+  async closeGracefully(): Promise<void> {
+    if (this.#closed || this.#closing) return;
+    this.#closing = true;
+    try {
+      await this.#sendFrame(0x8, Buffer.alloc(0), true);
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, SOCKET_WRITE_TIMEOUT_MS);
+        timer.unref();
+        this.#socket.end(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    } finally {
+      this.#finish();
+    }
+  }
+
+  async #sendFrame(
+    opcode: number,
+    payload: Buffer,
+    allowClosing = false,
+  ): Promise<void> {
+    if (this.#closed || (this.#closing && !allowClosing)) {
+      throw new Error("Connector WebSocket is closed");
+    }
     const length = payload.length;
     const headerLength = length < 126 ? 2 : length <= 0xffff ? 4 : 10;
     const frame = Buffer.alloc(headerLength + length);
@@ -81,20 +106,48 @@ class ServerWebSocket {
       frame.writeBigUInt64BE(BigInt(length), 2);
     }
     payload.copy(frame, headerLength);
-    this.#socket.write(frame);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#finish();
+        reject(new Error("Connector WebSocket write timed out"));
+      }, SOCKET_WRITE_TIMEOUT_MS);
+      timer.unref();
+      this.#socket.write(frame, (error?: Error | null) => {
+        clearTimeout(timer);
+        if (error !== undefined && error !== null) {
+          this.#finish();
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
   }
 
   #read(chunk: Buffer): void {
+    if (this.#closing) return;
     if (chunk.length > 0) this.#buffer = Buffer.concat([this.#buffer, chunk]);
     while (!this.#closed && this.#buffer.length >= 2) {
       const first = this.#buffer[0] ?? 0;
       const second = this.#buffer[1] ?? 0;
-      if ((first & 0x80) === 0 || (second & 0x80) === 0) {
+      if (
+        (first & 0x80) === 0 ||
+        (first & 0x70) !== 0 ||
+        (second & 0x80) === 0
+      ) {
         this.close();
         return;
       }
       const opcode = first & 0x0f;
       const lengthCode = second & 0x7f;
+      const controlFrame = opcode >= 0x8;
+      if (
+        ![0x1, 0x8, 0x9, 0xa].includes(opcode) ||
+        (controlFrame && lengthCode > 125)
+      ) {
+        this.close();
+        return;
+      }
       let offset = 2;
       let length: number;
       if (lengthCode < 126) {
@@ -117,6 +170,10 @@ class ServerWebSocket {
         this.close();
         return;
       }
+      if (opcode === 0x8 && length === 1) {
+        this.close();
+        return;
+      }
       const frameLength = offset + 4 + length;
       if (this.#buffer.length < frameLength) return;
       const mask = this.#buffer.subarray(offset, offset + 4);
@@ -128,15 +185,17 @@ class ServerWebSocket {
         payload[index] ^= mask[index % 4] ?? 0;
       }
       if (opcode === 0x1) {
-        this.#handlers.message(payload.toString("utf8"));
+        try {
+          this.#handlers.message(utf8Decoder.decode(payload));
+        } catch {
+          this.close();
+          return;
+        }
       } else if (opcode === 0x8) {
-        this.close();
+        void this.closeGracefully();
         return;
       } else if (opcode === 0x9) {
-        this.#sendFrame(0xa, payload);
-      } else if (opcode !== 0xa) {
-        this.close();
-        return;
+        void this.#sendFrame(0xa, payload).catch(() => this.#finish());
       }
     }
   }
@@ -144,7 +203,8 @@ class ServerWebSocket {
   #finish(): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#socket.destroy();
+    this.#closing = true;
+    if (!this.#socket.destroyed) this.#socket.destroy();
     this.#handlers.close();
   }
 }
@@ -254,11 +314,18 @@ export class ConnectorGateway {
       return rejectUpgrade(socket);
     }
     const key = request.headers["sec-websocket-key"];
+    const decodedKey =
+      typeof key === "string" ? Buffer.from(key, "base64") : undefined;
+    const connectionTokens = request.headers.connection
+      ?.split(",")
+      .map((token) => token.trim().toLowerCase());
     if (
       request.headers.upgrade?.toLowerCase() !== "websocket" ||
+      !connectionTokens?.includes("upgrade") ||
       request.headers["sec-websocket-version"] !== "13" ||
       typeof key !== "string" ||
-      Buffer.from(key, "base64").length !== 16
+      decodedKey?.length !== 16 ||
+      decodedKey.toString("base64") !== key
     ) {
       return rejectUpgrade(socket);
     }
@@ -280,32 +347,34 @@ export class ConnectorGateway {
     identity: ConnectorIdentity,
   ): void {
     let initialized = false;
-    let replayAfterSequence = 0;
+    let accepting = true;
+    let scanAfterSequence = 0;
     let processing = Promise.resolve();
     let dispatching = false;
     let timer: ReturnType<typeof setInterval> | undefined;
-    const sentSequences = new Set<number>();
     const sendStored = async (
       connection: ServerWebSocket,
       stored: StoredServerMessage,
+      retransmit = false,
     ): Promise<void> => {
-      if (sentSequences.has(stored.sequence)) return;
+      if (!retransmit && stored.sequence <= scanAfterSequence) return;
       const message = await this.#store.materializeServerMessage(
         stored,
         this.#requestDecryptor,
       );
-      connection.sendJson(message);
-      sentSequences.add(stored.sequence);
+      await connection.sendJson(message);
+      if (!retransmit) {
+        scanAfterSequence = Math.max(scanAfterSequence, stored.sequence);
+      }
     };
     const pump = async (connection: ServerWebSocket): Promise<void> => {
-      if (!initialized || dispatching || this.#closed) return;
+      if (!accepting || !initialized || dispatching || this.#closed) return;
       dispatching = true;
       try {
-        const offer = await this.#store.dispatchNext(identity, this.#now());
-        if (offer !== null) await sendStored(connection, offer);
+        await this.#store.dispatchNext(identity, this.#now());
         const pending = await this.#store.pendingServerMessages(
           identity,
-          replayAfterSequence,
+          scanAfterSequence,
           this.#now(),
         );
         for (const message of pending) await sendStored(connection, message);
@@ -315,23 +384,33 @@ export class ConnectorGateway {
     };
     let connection: ServerWebSocket;
     const closeConnection = (): void => {
+      accepting = false;
       if (timer !== undefined) clearInterval(timer);
       this.#connections.delete(connection);
     };
     const failProtocol = async (code: string): Promise<void> => {
+      if (!accepting) return;
+      accepting = false;
+      if (timer !== undefined) clearInterval(timer);
       try {
-        const error = await this.#store.enqueueServer(
+        await this.#store.enqueueServer(
           identity,
           "protocol.error",
           { code, message: "Connector protocol error." },
           new Date(this.#now().getTime() + 60_000),
         );
-        await sendStored(connection, error);
+        const pending = await this.#store.pendingServerMessages(
+          identity,
+          scanAfterSequence,
+          this.#now(),
+        );
+        for (const message of pending) await sendStored(connection, message);
       } finally {
-        connection.close();
+        await connection.closeGracefully();
       }
     };
     const handle = async (serialized: string): Promise<void> => {
+      if (!accepting) return;
       let message: ConnectorClientMessage;
       try {
         message = ConnectorClientMessageSchema.parse(JSON.parse(serialized));
@@ -347,16 +426,21 @@ export class ConnectorGateway {
           message,
           this.#now(),
         );
+        if (message.type === "connector.hello" && !initialized) {
+          scanAfterSequence = message.payload.last_server_sequence;
+        }
         for (const replay of accepted.replay)
           await sendStored(connection, replay);
         if (accepted.response !== null) {
-          await sendStored(connection, accepted.response);
+          await sendStored(connection, accepted.response, accepted.duplicate);
         }
         if (message.type === "connector.hello" && !initialized) {
-          replayAfterSequence = message.payload.last_server_sequence;
           initialized = true;
           timer = setInterval(() => {
-            void pump(connection).catch(() => connection.close());
+            void pump(connection).catch(() => {
+              accepting = false;
+              connection.close();
+            });
           }, this.#dispatchIntervalMs);
           timer.unref();
           await pump(connection);
@@ -369,9 +453,11 @@ export class ConnectorGateway {
     };
     connection = new ServerWebSocket(socket, head, {
       message(value) {
+        if (!accepting) return;
         processing = processing
           .then(() => handle(value))
           .catch(() => {
+            accepting = false;
             connection.close();
           });
       },

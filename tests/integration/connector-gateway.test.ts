@@ -111,6 +111,9 @@ describe("Connector gateway authentication and handshake", () => {
           credential_secret: MCP_BEARER,
         }),
       ).rejects.toMatchObject({ statusCode: 401 });
+      await expect(
+        FakeConnector.connectWithSessionToken(app, credentials, MCP_BEARER),
+      ).rejects.toMatchObject({ statusCode: 401 });
 
       const connector = await FakeConnector.connect(app, credentials);
       try {
@@ -165,6 +168,108 @@ describe("Connector gateway authentication and handshake", () => {
     } finally {
       await connector.close();
       await app.close();
+    }
+  });
+
+  it("retransmits an already-sent ACK for an exact duplicate client message", async () => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    const connector = await FakeConnector.connect(app, credentials);
+    try {
+      const heartbeat = await connector.send("connector.heartbeat", {});
+      const originalAck = await connector.next("ack");
+
+      await connector.send(
+        "connector.heartbeat",
+        {},
+        {
+          message_id: heartbeat.message_id,
+          sequence: heartbeat.sequence,
+          correlation_id: heartbeat.correlation_id,
+          sent_at: heartbeat.sent_at,
+          expires_at: heartbeat.expires_at,
+        },
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      expect(
+        connector.wireReceived.filter(
+          (message) => message.message_id === originalAck.message_id,
+        ),
+      ).toEqual([originalAck, originalAck]);
+    } finally {
+      await connector.close();
+      await app.close();
+    }
+  });
+
+  it("does not process frames queued after a protocol failure begins", async () => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    const connector = await FakeConnector.connect(app, credentials);
+    const lastAcceptedClientSequence = connector.lastClientSequence;
+    try {
+      const gap = await connector.send(
+        "connector.heartbeat",
+        {},
+        { sequence: lastAcceptedClientSequence + 2 },
+      );
+      await connector.send(
+        "connector.heartbeat",
+        {},
+        { sequence: gap.sequence + 1 },
+      );
+
+      await expect(connector.next("protocol.error")).resolves.toMatchObject({
+        payload: { code: "CLIENT_SEQUENCE_GAP" },
+      });
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      const state = await db.query<{ last_client_sequence: number }>(
+        "SELECT last_client_sequence FROM connectors WHERE id = $1",
+        [credentials.connector_id],
+      );
+      expect(Number(state.rows[0]?.last_client_sequence)).toBe(
+        lastAcceptedClientSequence,
+      );
+      expect(
+        connector.wireReceived.filter(
+          (message) => message.type === "protocol.error",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      await connector.close();
+      await app.close();
+    }
+  });
+
+  it("closes on RSV and oversized or invalid control frames", async () => {
+    const invalidFrames = [
+      { name: "RSV1", rsv: 0x40, opcode: 0x1, payload: "{}" },
+      { name: "oversized ping", rsv: 0, opcode: 0x9, payload: "x".repeat(126) },
+      { name: "one-byte close", rsv: 0, opcode: 0x8, payload: "x" },
+    ] as const;
+
+    for (const frame of invalidFrames) {
+      const app = await startApp();
+      const credentials = await seedConnector(db);
+      const connector = await FakeConnector.connect(app, credentials);
+      try {
+        await connector.sendFrameForTest(
+          frame.opcode,
+          frame.payload,
+          frame.rsv,
+        );
+        await expect(connector.waitForClose()).resolves.toBeUndefined();
+        expect(
+          connector.wireReceived.some(
+            (message) => message.type === "protocol.error",
+          ),
+        ).toBe(false);
+      } finally {
+        await connector.close();
+        await app.close();
+      }
     }
   });
 });

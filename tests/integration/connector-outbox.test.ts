@@ -202,18 +202,121 @@ describe("PostgreSQL Connector outbox", () => {
       job_id: payload.job_id,
       attempt: payload.attempt,
       event_type: "progress",
-      payload: { stage: "testing", summary: "Focused tests are running" },
+      payload: {
+        stage: "testing",
+        summary: "const privateRepositoryBody = true;",
+        metadata: { source: "const privateRepositoryBody = true;" },
+      },
       source: "fake-connector",
     });
     await store.acceptClientMessage(identity, progress);
     await store.acceptClientMessage(identity, progress);
 
-    const events = await database.query<{ count: string }>(
-      `SELECT count(*)::text AS count
+    const events = await database.query<{ payload: Record<string, unknown> }>(
+      `SELECT payload
          FROM job_events
         WHERE job_id = $1 AND message_id = $2`,
       [payload.job_id, progress.message_id],
     );
-    expect(events.rows[0]?.count).toBe("1");
+    expect(events.rows).toHaveLength(1);
+    expect(events.rows[0]?.payload).toEqual({
+      stage: "testing",
+      summary: "[redacted source content]",
+    });
+  });
+
+  it("releases an expired offer lease without incrementing the product attempt", async () => {
+    const repositoryId = `expired-offer-${crypto.randomUUID()}`;
+    await database.query(
+      `INSERT INTO repository_policies
+         (id, owner_id, display_name, canonical_path,
+          allowed_action_classes, max_concurrency)
+       VALUES ($1, $2, 'Expired offer repository', '/private/redacted',
+               '[]'::jsonb, 1)`,
+      [repositoryId, OWNER_ID],
+    );
+    const repository = new JobRepository(database.client);
+    const job = await repository.createIdempotent({
+      ownerId: OWNER_ID,
+      clientRequestId: crypto.randomUUID(),
+      repositoryId,
+      requestCiphertext: cipher.encrypt("Redispatch the expired offer"),
+      requestDigest: `sha256:${"6".repeat(64)}`,
+    });
+    const store = new PostgresConnectorStore(database.client);
+    const first = await store.dispatchNext(identity);
+    expect(first?.payload.job_id).toBe(job.jobId);
+    await database.query(
+      "UPDATE jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+      [job.jobId],
+    );
+
+    const second = await store.dispatchNext(identity);
+    expect(second).toMatchObject({
+      type: "job.offer",
+      payload: { job_id: job.jobId, attempt: 1 },
+    });
+    expect(second?.payload.lease_id).not.toBe(first?.payload.lease_id);
+    await expect(repository.get(job.jobId)).resolves.toMatchObject({
+      status: "dispatched",
+      attempt: 0,
+    });
+  });
+
+  it("does not dispatch beyond a repository's configured concurrency", async () => {
+    const repositoryId = `bounded-dispatch-${crypto.randomUUID()}`;
+    const secondConnectorId = crypto.randomUUID();
+    await database.query(
+      `INSERT INTO repository_policies
+         (id, owner_id, display_name, canonical_path,
+          allowed_action_classes, max_concurrency)
+       VALUES ($1, $2, 'Bounded repository', '/private/redacted',
+               '[]'::jsonb, 1)`,
+      [repositoryId, OWNER_ID],
+    );
+    await database.query(
+      `INSERT INTO connectors
+         (id, owner_id, credential_id, credential_hash, protocol_version)
+       VALUES ($1, $2, $3, 'scrypt$fixture', '1.0')`,
+      [
+        secondConnectorId,
+        OWNER_ID,
+        `bounded-credential-${crypto.randomUUID()}`,
+      ],
+    );
+    const repository = new JobRepository(database.client);
+    const firstJob = await repository.createIdempotent({
+      ownerId: OWNER_ID,
+      clientRequestId: crypto.randomUUID(),
+      repositoryId,
+      requestCiphertext: cipher.encrypt("First bounded request"),
+      requestDigest: `sha256:${"7".repeat(64)}`,
+    });
+    const secondJob = await repository.createIdempotent({
+      ownerId: OWNER_ID,
+      clientRequestId: crypto.randomUUID(),
+      repositoryId,
+      requestCiphertext: cipher.encrypt("Second bounded request"),
+      requestDigest: `sha256:${"8".repeat(64)}`,
+    });
+    const store = new PostgresConnectorStore(database.client);
+    const secondStore = new PostgresConnectorStore(database.client);
+
+    const offers = await Promise.all([
+      store.dispatchNext(identity),
+      secondStore.dispatchNext({
+        ...identity,
+        connectorId: secondConnectorId,
+      }),
+    ]);
+    expect(offers.filter((offer) => offer !== null)).toHaveLength(1);
+    const offeredJobId = offers.find((offer) => offer !== null)?.payload.job_id;
+    expect([firstJob.jobId, secondJob.jobId]).toContain(offeredJobId);
+    const queuedJobId =
+      offeredJobId === firstJob.jobId ? secondJob.jobId : firstJob.jobId;
+    await expect(repository.get(queuedJobId)).resolves.toMatchObject({
+      status: "queued",
+      attempt: 0,
+    });
   });
 });

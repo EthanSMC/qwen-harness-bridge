@@ -5,16 +5,18 @@ import type {
   JobStatus,
 } from "@qhb/protocol";
 import { ConnectorServerMessageSchema } from "@qhb/protocol";
-import { and, asc, eq, gt, lte, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import {
   connectorMessages,
   connectors,
   jobEvents,
   jobs,
+  repositoryPolicies,
 } from "../db/schema.js";
 import type { RequestDecryptor } from "../domain/job-coordinator.js";
 import { assertTransition, TERMINAL_JOB_STATES } from "../domain/job-state.js";
+import { sanitizePublicText } from "../domain/presenters.js";
 import type {
   ConnectorCredentialRecord,
   ConnectorCredentialStore,
@@ -90,6 +92,66 @@ const canonicalize = (value: unknown): unknown => {
 
 const canonicalJson = (value: unknown): string =>
   JSON.stringify(canonicalize(value));
+
+const PUBLIC_EVENT_PAYLOAD_KEYS = new Set([
+  "action",
+  "artifacts",
+  "changed_files",
+  "count",
+  "current_stage",
+  "detail",
+  "failed",
+  "impact",
+  "label",
+  "media_type",
+  "message",
+  "name",
+  "outcome",
+  "passed",
+  "reason",
+  "result",
+  "results",
+  "stage",
+  "status",
+  "summary",
+  "tests",
+  "title",
+  "total",
+  "type",
+  "url",
+]);
+const SOURCE_LIKE_EVENT_TEXT =
+  /\b(?:(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=|function\s+[A-Za-z_$][\w$]*\s*\(|class\s+[A-Za-z_$][\w$]*\s*[{<]|def\s+[A-Za-z_]\w*\s*\(|(?:import|export)\s+(?:[\w*{]|from\b))/u;
+
+const sanitizeEventValue = (value: unknown): unknown => {
+  if (typeof value === "string") {
+    const sanitized = sanitizePublicText(value, 500, 500, 500);
+    if (SOURCE_LIKE_EVENT_TEXT.test(sanitized)) {
+      return "[redacted source content]";
+    }
+    return sanitized || "[redacted]";
+  }
+  if (
+    value === null ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(sanitizeEventValue);
+  const record = asRecord(value);
+  if (record === null) return "[redacted]";
+  return Object.fromEntries(
+    Object.entries(record)
+      .filter(([key]) => PUBLIC_EVENT_PAYLOAD_KEYS.has(key))
+      .map(([key, item]) => [key, sanitizeEventValue(item)]),
+  );
+};
+
+const sanitizeConnectorEventPayload = (
+  payload: Record<string, unknown>,
+): Record<string, unknown> =>
+  sanitizeEventValue(payload) as Record<string, unknown>;
 
 const storedClientPayload = (
   message: ConnectorClientMessage,
@@ -366,10 +428,13 @@ const ingestJobEvent = async (
   ) {
     throw new ConnectorStoreError("EVENT_REJECTED");
   }
+  const sanitizedPayload = sanitizeConnectorEventPayload(
+    message.payload.payload,
+  );
   const nextStatus = statusForEvent(
     job.status,
     message.payload.event_type,
-    message.payload.payload,
+    sanitizedPayload,
   );
   if (nextStatus !== job.status) {
     try {
@@ -378,7 +443,7 @@ const ingestJobEvent = async (
       throw new ConnectorStoreError("EVENT_REJECTED");
     }
   }
-  const stage = message.payload.payload.stage;
+  const stage = sanitizedPayload.stage;
   const currentStage =
     typeof stage === "string" && stage.length <= 128
       ? stage
@@ -396,7 +461,7 @@ const ingestJobEvent = async (
             terminalAt: now,
             requestDeleteAt: new Date(now.getTime() + 24 * 60 * 60 * 1000),
             unreadTerminal: true,
-            summary: message.payload.payload,
+            summary: sanitizedPayload,
           }
         : {}),
     })
@@ -405,7 +470,7 @@ const ingestJobEvent = async (
   if (updated.length !== 1) throw new ConnectorStoreError("EVENT_REJECTED");
   await appendJobEvent(database, job.id, {
     type: message.payload.event_type,
-    payload: message.payload.payload,
+    payload: sanitizedPayload,
     source: message.payload.source,
     messageId: message.message_id,
     correlationId: message.correlation_id,
@@ -609,13 +674,64 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
   ): Promise<StoredServerMessage | null> {
     return this.#db.transaction(async (tx) => {
       const connector = await lockConnector(tx, identity);
+      const policies = await tx
+        .select({
+          id: repositoryPolicies.id,
+          maxConcurrency: repositoryPolicies.maxConcurrency,
+        })
+        .from(repositoryPolicies)
+        .where(
+          and(
+            eq(repositoryPolicies.ownerId, identity.ownerId),
+            eq(repositoryPolicies.enabled, true),
+          ),
+        )
+        .orderBy(asc(repositoryPolicies.id))
+        .for("update");
+      if (policies.length === 0) return null;
+
+      const activeRows = await tx
+        .select({
+          repositoryId: jobs.repositoryId,
+          count: sql<number>`count(*)::integer`.as("count"),
+        })
+        .from(jobs)
+        .where(
+          and(
+            eq(jobs.ownerId, identity.ownerId),
+            or(
+              inArray(jobs.status, [
+                "running",
+                "waiting_approval",
+                "cancelling",
+              ]),
+              and(eq(jobs.status, "dispatched"), gt(jobs.leaseExpiresAt, now)),
+            ),
+          ),
+        )
+        .groupBy(jobs.repositoryId);
+      const activeByRepository = new Map(
+        activeRows.map((row) => [row.repositoryId, Number(row.count)]),
+      );
+      const eligibleRepositoryIds = policies
+        .filter(
+          (policy) =>
+            (activeByRepository.get(policy.id) ?? 0) < policy.maxConcurrency,
+        )
+        .map((policy) => policy.id);
+      if (eligibleRepositoryIds.length === 0) return null;
+
       const jobRows = await tx
         .select()
         .from(jobs)
         .where(
           and(
             eq(jobs.ownerId, identity.ownerId),
-            eq(jobs.status, "queued"),
+            inArray(jobs.repositoryId, eligibleRepositoryIds),
+            or(
+              eq(jobs.status, "queued"),
+              and(eq(jobs.status, "dispatched"), lte(jobs.leaseExpiresAt, now)),
+            ),
             gt(jobs.expiresAt, now),
           ),
         )
@@ -626,6 +742,15 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
       if (job === undefined) return null;
       if (job.requestCiphertext === null) {
         throw new ConnectorStoreError("INTERNAL", "Queued request is missing");
+      }
+      const redispatch = job.status === "dispatched";
+      if (
+        redispatch &&
+        (job.leaseId === null ||
+          job.leaseExpiresAt === null ||
+          job.leaseExpiresAt.getTime() > now.getTime())
+      ) {
+        throw new ConnectorStoreError("INTERNAL", "Offer lease is invalid");
       }
       const leaseId = crypto.randomUUID();
       const leaseExpiresAt = new Date(now.getTime() + OFFER_LEASE_MS);
@@ -644,18 +769,22 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         .where(
           and(
             eq(jobs.id, job.id),
-            eq(jobs.status, "queued"),
+            eq(jobs.status, job.status),
             eq(jobs.revision, job.revision),
+            redispatch && job.leaseId !== null
+              ? eq(jobs.leaseId, job.leaseId)
+              : undefined,
           ),
         )
         .returning({ id: jobs.id });
       if (updated.length !== 1) return null;
       await appendJobEvent(tx, job.id, {
-        type: "job.dispatched",
+        type: redispatch ? "job.redispatched" : "job.dispatched",
         payload: {
           connector_id: identity.connectorId,
           attempt,
           lease_id: leaseId,
+          ...(redispatch ? { previous_lease_id: job.leaseId } : {}),
         },
         source: "control-plane",
       });
