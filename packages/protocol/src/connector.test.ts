@@ -15,6 +15,7 @@ import {
   JobEventPayloadSchema,
   JobOfferPayloadSchema,
   ProtocolErrorPayloadSchema,
+  rfc3339InstantKey,
   SequenceCursor,
 } from "./connector.js";
 
@@ -36,6 +37,16 @@ const commonEnvelope = {
 const validActionFingerprint = `sha256:${"a".repeat(64)}`;
 
 describe("connector envelope", () => {
+  it("canonicalizes equivalent RFC3339 instants without losing sub-millisecond precision", () => {
+    expect(rfc3339InstantKey("2026-09-01T00:00:00.123400Z")).toBe(
+      rfc3339InstantKey("2026-09-01T08:00:00.1234+08:00"),
+    );
+    expect(rfc3339InstantKey("2026-09-01T00:00:00.123456Z")).not.toBe(
+      rfc3339InstantKey("2026-09-01T00:00:00.123999Z"),
+    );
+    expect(rfc3339InstantKey("not-a-timestamp")).toBeNull();
+  });
+
   it("rejects unsupported versions and invalid expiry", () => {
     const base = {
       protocol_version: "2.0",

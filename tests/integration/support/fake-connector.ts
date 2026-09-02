@@ -150,6 +150,14 @@ export const exchangeConnectorSession = async (
 
 type FrameHandler = (payload: string) => void;
 type CloseHandler = () => void;
+type ErrorHandler = (error: Error) => void;
+const MAX_FRAME_BYTES = 64 * 1024;
+const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+
+const isValidCloseStatusCode = (code: number): boolean =>
+  (code >= 1000 && code <= 1003) ||
+  (code >= 1007 && code <= 1014) ||
+  (code >= 3000 && code <= 4999);
 
 class RawWebSocket {
   static async connect(
@@ -228,8 +236,11 @@ class RawWebSocket {
   readonly #socket: Duplex;
   readonly #messageHandlers: FrameHandler[] = [];
   readonly #closeHandlers: CloseHandler[] = [];
+  readonly #errorHandlers: ErrorHandler[] = [];
   #buffer: Buffer;
   #closed = false;
+  #fragmentedText: Buffer[] | undefined;
+  #fragmentedTextBytes = 0;
 
   private constructor(socket: Duplex, head: Buffer) {
     this.#socket = socket;
@@ -250,6 +261,10 @@ class RawWebSocket {
     this.#closeHandlers.push(handler);
   }
 
+  onError(handler: ErrorHandler): void {
+    this.#errorHandlers.push(handler);
+  }
+
   sendText(payload: string): void {
     this.#sendFrame(0x1, Buffer.from(payload, "utf8"));
   }
@@ -266,8 +281,14 @@ class RawWebSocket {
     await this.#waitForClose();
   }
 
-  sendFrameForTest(opcode: number, payload: string, rsv = 0): void {
-    this.#sendFrame(opcode, Buffer.from(payload, "utf8"), rsv);
+  sendFrameForTest(
+    opcode: number,
+    payload: string,
+    rsv = 0,
+    fin = true,
+    masked = true,
+  ): void {
+    this.#sendFrame(opcode, Buffer.from(payload, "utf8"), rsv, fin, masked);
   }
 
   waitForClose(): Promise<void> {
@@ -279,27 +300,34 @@ class RawWebSocket {
     return new Promise((resolve) => this.#closeHandlers.push(resolve));
   }
 
-  #sendFrame(opcode: number, payload: Buffer, rsv = 0): void {
+  #sendFrame(
+    opcode: number,
+    payload: Buffer,
+    rsv = 0,
+    fin = true,
+    masked = true,
+  ): void {
     if (this.#closed) throw new Error("Connector WebSocket is closed");
-    const mask = randomBytes(4);
+    const mask = masked ? randomBytes(4) : undefined;
     const length = payload.byteLength;
     const headerLength = length < 126 ? 2 : length <= 0xffff ? 4 : 10;
-    const frame = Buffer.alloc(headerLength + 4 + length);
-    frame[0] = 0x80 | (rsv & 0x70) | opcode;
+    const frame = Buffer.alloc(headerLength + (masked ? 4 : 0) + length);
+    frame[0] = (fin ? 0x80 : 0) | (rsv & 0x70) | opcode;
     if (length < 126) {
-      frame[1] = 0x80 | length;
+      frame[1] = (masked ? 0x80 : 0) | length;
     } else if (length <= 0xffff) {
-      frame[1] = 0x80 | 126;
+      frame[1] = (masked ? 0x80 : 0) | 126;
       frame.writeUInt16BE(length, 2);
     } else {
-      frame[1] = 0x80 | 127;
+      frame[1] = (masked ? 0x80 : 0) | 127;
       frame.writeBigUInt64BE(BigInt(length), 2);
     }
     const maskOffset = headerLength;
-    mask.copy(frame, maskOffset);
+    mask?.copy(frame, maskOffset);
     for (let index = 0; index < length; index += 1) {
-      frame[maskOffset + 4 + index] =
-        payload[index] ^ mask[index % mask.byteLength];
+      frame[maskOffset + (masked ? 4 : 0) + index] = masked
+        ? (payload[index] ?? 0) ^ (mask?.[index % 4] ?? 0)
+        : (payload[index] ?? 0);
     }
     this.#socket.write(frame);
   }
@@ -311,13 +339,35 @@ class RawWebSocket {
     while (this.#buffer.byteLength >= 2) {
       const first = this.#buffer[0] ?? 0;
       const second = this.#buffer[1] ?? 0;
-      if ((first & 0x80) === 0) {
-        this.#finishClose();
-        return;
-      }
+      const fin = (first & 0x80) !== 0;
+      const rsv = first & 0x70;
       const opcode = first & 0x0f;
       const masked = (second & 0x80) !== 0;
       const lengthCode = second & 0x7f;
+      const controlFrame = opcode >= 0x8;
+      if (rsv !== 0 || masked) {
+        this.#failReceive(
+          new Error("FakeConnector received an invalid server frame header"),
+        );
+        return;
+      }
+      if (
+        ![0x0, 0x1, 0x2, 0x8, 0x9, 0xa].includes(opcode) ||
+        (controlFrame && (!fin || lengthCode > 125)) ||
+        (opcode === 0x0 && this.#fragmentedText === undefined) ||
+        (opcode === 0x1 && this.#fragmentedText !== undefined)
+      ) {
+        this.#failReceive(
+          new Error("FakeConnector received an invalid server frame"),
+        );
+        return;
+      }
+      if (opcode === 0x2) {
+        this.#failReceive(
+          new Error("FakeConnector received an unsupported binary frame"),
+        );
+        return;
+      }
       let offset = 2;
       let length: number;
       if (lengthCode < 126) {
@@ -329,38 +379,87 @@ class RawWebSocket {
       } else {
         if (this.#buffer.byteLength < 10) return;
         const extended = this.#buffer.readBigUInt64BE(2);
-        if (extended > BigInt(Number.MAX_SAFE_INTEGER)) {
-          this.#finishClose();
+        if (extended > BigInt(MAX_FRAME_BYTES)) {
+          this.#failReceive(
+            new Error("FakeConnector received an oversized server frame"),
+          );
           return;
         }
         length = Number(extended);
         offset = 10;
       }
-      const maskLength = masked ? 4 : 0;
-      const frameLength = offset + maskLength + length;
+      if (length > MAX_FRAME_BYTES) {
+        this.#failReceive(
+          new Error("FakeConnector received an oversized server frame"),
+        );
+        return;
+      }
+      const frameLength = offset + length;
       if (this.#buffer.byteLength < frameLength) return;
-      const mask = masked
-        ? this.#buffer.subarray(offset, offset + maskLength)
-        : undefined;
-      const payloadOffset = offset + maskLength;
       const payload = Buffer.from(
-        this.#buffer.subarray(payloadOffset, payloadOffset + length),
+        this.#buffer.subarray(offset, offset + length),
       );
       this.#buffer = this.#buffer.subarray(frameLength);
-      if (mask !== undefined) {
-        for (let index = 0; index < payload.length; index += 1) {
-          payload[index] ^= mask[index % mask.length] ?? 0;
+
+      if (opcode === 0x8) {
+        if (payload.length === 1) {
+          this.#failReceive(
+            new Error("FakeConnector received a one-byte close frame"),
+          );
+          return;
         }
-      }
-      if (opcode === 0x1) {
-        for (const handler of this.#messageHandlers) {
-          handler(payload.toString("utf8"));
+        if (payload.length >= 2) {
+          const statusCode = payload.readUInt16BE(0);
+          if (!isValidCloseStatusCode(statusCode)) {
+            this.#failReceive(
+              new Error("FakeConnector received an invalid close status"),
+            );
+            return;
+          }
+          try {
+            utf8Decoder.decode(payload.subarray(2));
+          } catch {
+            this.#failReceive(
+              new Error("FakeConnector received an invalid close reason"),
+            );
+            return;
+          }
         }
-      } else if (opcode === 0x8) {
         this.#finishClose();
         return;
-      } else if (opcode === 0x9) {
+      }
+      if (opcode === 0x9) {
         this.#sendFrame(0xa, payload);
+        continue;
+      }
+      if (opcode === 0xa) continue;
+
+      if (opcode === 0x1 || opcode === 0x0) {
+        if (this.#fragmentedTextBytes + payload.length > MAX_FRAME_BYTES) {
+          this.#failReceive(
+            new Error("FakeConnector received an oversized server message"),
+          );
+          return;
+        }
+        this.#fragmentedText ??= [];
+        this.#fragmentedText.push(payload);
+        this.#fragmentedTextBytes += payload.length;
+        if (!fin) continue;
+        const message = Buffer.concat(this.#fragmentedText);
+        this.#fragmentedText = undefined;
+        this.#fragmentedTextBytes = 0;
+        let serialized: string;
+        try {
+          serialized = utf8Decoder.decode(message);
+        } catch {
+          this.#failReceive(
+            new Error("FakeConnector received invalid UTF-8 text"),
+          );
+          return;
+        }
+        for (const handler of this.#messageHandlers) {
+          handler(serialized);
+        }
       }
     }
   }
@@ -372,6 +471,14 @@ class RawWebSocket {
     for (const handler of this.#closeHandlers.splice(0)) {
       handler();
     }
+  }
+
+  #failReceive(error: Error): void {
+    if (this.#closed) return;
+    for (const handler of this.#errorHandlers) {
+      handler(error);
+    }
+    this.#finishClose();
   }
 }
 
@@ -450,8 +557,10 @@ export class FakeConnector {
     this.#clientSequence = credentials.last_client_sequence ?? 0;
     this.#serverSequence = credentials.last_server_sequence ?? 0;
     socket.onMessage((serialized) => this.#receive(serialized));
+    socket.onError((error) => this.#failReceive(error));
     socket.onClose(() => {
-      const error = new Error("FakeConnector WebSocket closed");
+      const error =
+        this.#receiveError ?? new Error("FakeConnector WebSocket closed");
       for (const waiter of this.#waiters.splice(0)) {
         clearTimeout(waiter.timer);
         waiter.reject(error);

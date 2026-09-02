@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   type ConnectorStoreError,
   PostgresConnectorStore,
+  SERVER_REPLAY_BATCH_SIZE,
   storedServerMessageContainsPlaintextRequest,
 } from "../../apps/control-plane/src/connector/outbox.js";
 import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js";
@@ -151,6 +152,14 @@ describe("PostgreSQL Connector outbox", () => {
       duplicate: true,
       response: { messageId: accepted.response?.messageId },
     });
+    const changedSubMillisecondTimestamp = ConnectorClientMessageSchema.parse({
+      ...hello,
+      sent_at: hello.sent_at.replace(/Z$/, "001Z"),
+    });
+    await expectStoreError(
+      store.acceptClientMessage(identity, changedSubMillisecondTimestamp),
+      "CLIENT_REPLAY_MISMATCH",
+    );
     const responseCount = await database.query<{ count: string }>(
       `SELECT count(*)::text AS count
          FROM connector_messages
@@ -219,13 +228,16 @@ describe("PostgreSQL Connector outbox", () => {
         summary: "const privateRepositoryBody = true;",
         metadata: { source: "const privateRepositoryBody = true;" },
       },
-      source: "fake-connector",
+      source: "sk-abcdefghijklmnop",
     });
     await store.acceptClientMessage(identity, progress);
     await store.acceptClientMessage(identity, progress);
 
-    const events = await database.query<{ payload: Record<string, unknown> }>(
-      `SELECT payload
+    const events = await database.query<{
+      payload: Record<string, unknown>;
+      source: string;
+    }>(
+      `SELECT payload, source
          FROM job_events
         WHERE job_id = $1 AND message_id = $2`,
       [payload.job_id, progress.message_id],
@@ -235,6 +247,7 @@ describe("PostgreSQL Connector outbox", () => {
       stage: "testing",
       summary: "[redacted source content]",
     });
+    expect(events.rows[0]?.source).not.toContain("abcdefghijklmnop");
     const durableMessages = await database.query<{ payload_text: string }>(
       `SELECT payload::text AS payload_text
          FROM connector_messages
@@ -244,6 +257,9 @@ describe("PostgreSQL Connector outbox", () => {
     expect(durableMessages.rows).toHaveLength(1);
     expect(durableMessages.rows[0]?.payload_text).not.toContain(
       "privateRepositoryBody",
+    );
+    expect(durableMessages.rows[0]?.payload_text).not.toContain(
+      "abcdefghijklmnop",
     );
     expect(durableMessages.rows[0]?.payload_text).toContain(
       "[redacted source content]",
@@ -301,9 +317,8 @@ describe("PostgreSQL Connector outbox", () => {
     expect(replay.slice(0, 2)).toMatchObject([
       {
         sequence: first.sequence,
-        messageId: first.messageId,
-        type: "job.offer",
-        payload: { job_id: job.jobId },
+        type: "protocol.error",
+        payload: { code: "MESSAGE_EXPIRED" },
       },
       {
         sequence: second.sequence,
@@ -312,14 +327,23 @@ describe("PostgreSQL Connector outbox", () => {
       },
     ]);
     expect(replay[1]?.sequence).toBe(replay[0]?.sequence + 1);
+    expect(replay[0]?.messageId).not.toBe(first.messageId);
     expect(JSON.stringify(replay[0])).not.toContain(
       "Redispatch the expired offer",
     );
+    await expect(
+      store.materializeServerMessage(
+        replay[0] as NonNullable<(typeof replay)[0]>,
+      ),
+    ).resolves.toMatchObject({
+      type: "protocol.error",
+      payload: { code: "MESSAGE_EXPIRED" },
+    });
 
     const reconnect = envelope("connector.hello", 4, {
       connector_id: CONNECTOR_ID,
-      connector_version: "integration-1.0",
-      capabilities: ["tests"],
+      connector_version: "sk-abcdefghijklmnop",
+      capabilities: ["/Users/ethan/private-repo"],
       last_server_sequence: first.sequence - 1,
       last_client_sequence: 3,
     });
@@ -327,6 +351,82 @@ describe("PostgreSQL Connector outbox", () => {
     expect(
       reconnected.replay.slice(0, 2).map((message) => message.sequence),
     ).toEqual([first.sequence, second.sequence]);
+    expect(reconnected.replay[0]?.messageId).toBe(replay[0]?.messageId);
+    const connectorState = await database.query<{ capabilities: string[] }>(
+      "SELECT capabilities FROM connectors WHERE id = $1",
+      [CONNECTOR_ID],
+    );
+    expect(JSON.stringify(connectorState.rows[0]?.capabilities)).not.toContain(
+      "/Users/ethan/private-repo",
+    );
+  });
+
+  it("sanitizes all untrusted client text before durable persistence", async () => {
+    const store = new PostgresConnectorStore(database.client);
+    const approvalExpiresAt = new Date(Date.now() + 120_000).toISOString();
+    const approval = envelope("approval.requested", 5, {
+      approval_id: crypto.randomUUID(),
+      job_id: crypto.randomUUID(),
+      attempt: 1,
+      job_revision: 1,
+      action_summary: "Run with sk-abcdefghijklmnop",
+      impact_summary: "Read /Users/ethan/private-repo",
+      risk_class: "approval_required",
+      action_fingerprint: `sha256:${"a".repeat(64)}`,
+      expires_at: approvalExpiresAt,
+    });
+    const cancelled = envelope("job.cancelled", 6, {
+      job_id: crypto.randomUUID(),
+      attempt: 1,
+      reason: "Authorization: Bearer abcdefghijklmnop",
+    });
+
+    await store.acceptClientMessage(identity, approval);
+    await store.acceptClientMessage(identity, cancelled);
+
+    const persisted = await database.query<{ payload_text: string }>(
+      `SELECT payload::text AS payload_text
+         FROM connector_messages
+        WHERE connector_id = $1 AND message_id = ANY($2::uuid[])
+        ORDER BY sequence`,
+      [CONNECTOR_ID, [approval.message_id, cancelled.message_id]],
+    );
+    const serialized = persisted.rows.map((row) => row.payload_text).join("\n");
+    expect(persisted.rows).toHaveLength(2);
+    expect(serialized).not.toContain("sk-abcdefghijklmnop");
+    expect(serialized).not.toContain("/Users/ethan/private-repo");
+    expect(serialized).not.toContain("abcdefghijklmnop");
+  });
+
+  it("caps each replay query and continues from the returned cursor", async () => {
+    const connectorId = crypto.randomUUID();
+    await database.query(
+      `INSERT INTO connectors
+         (id, owner_id, credential_id, credential_hash, protocol_version)
+       VALUES ($1, $2, $3, 'scrypt$fixture', '1.0')`,
+      [connectorId, OWNER_ID, `replay-batch-${crypto.randomUUID()}`],
+    );
+    const batchIdentity = { ...identity, connectorId };
+    const store = new PostgresConnectorStore(database.client);
+    for (let index = 0; index <= SERVER_REPLAY_BATCH_SIZE; index += 1) {
+      await store.enqueueServer(
+        batchIdentity,
+        "ack",
+        { sequence: index + 1 },
+        new Date(Date.now() + 60_000),
+      );
+    }
+
+    const firstBatch = await store.pendingServerMessages(batchIdentity, 0);
+    expect(firstBatch).toHaveLength(SERVER_REPLAY_BATCH_SIZE);
+    const cursor = firstBatch.at(-1)?.sequence;
+    if (cursor === undefined) throw new Error("expected a full replay batch");
+    const secondBatch = await store.pendingServerMessages(
+      batchIdentity,
+      cursor,
+    );
+    expect(secondBatch).toHaveLength(1);
+    expect(secondBatch[0]?.sequence).toBe(cursor + 1);
   });
 
   it("does not dispatch beyond a repository's configured concurrency", async () => {

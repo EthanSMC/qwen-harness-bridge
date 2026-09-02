@@ -27,6 +27,7 @@ const MAX_FRAME_BYTES = 64 * 1024;
 const SOCKET_WRITE_TIMEOUT_MS = 1_000;
 const DEFAULT_DISPATCH_INTERVAL_MS = 250;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+const DEADLINE_EXCEEDED = Symbol("connector gateway deadline exceeded");
 
 const isValidCloseStatusCode = (code: number): boolean =>
   (code >= 1000 && code <= 1003) ||
@@ -36,11 +37,11 @@ const isValidCloseStatusCode = (code: number): boolean =>
 const awaitBeforeDeadline = async <T>(
   operation: () => Promise<T>,
   deadline: number,
-): Promise<T | undefined> => {
+): Promise<T | typeof DEADLINE_EXCEEDED> => {
   const remaining = deadline - Date.now();
-  if (remaining <= 0) return undefined;
-  return new Promise<T | undefined>((resolve, reject) => {
-    const timer = setTimeout(() => resolve(undefined), remaining);
+  if (remaining <= 0) return DEADLINE_EXCEEDED;
+  return new Promise<T | typeof DEADLINE_EXCEEDED>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(DEADLINE_EXCEEDED), remaining);
     timer.unref();
     operation().then(
       (value) => {
@@ -74,6 +75,9 @@ class ServerWebSocket {
   #buffer: Buffer;
   #closed = false;
   #closing = false;
+  #closePromise: Promise<void> | undefined;
+  #fragmentedText: Buffer[] | undefined;
+  #fragmentedTextBytes = 0;
 
   constructor(socket: Duplex, head: Buffer, handlers: FrameHandlers) {
     this.#socket = socket;
@@ -85,24 +89,38 @@ class ServerWebSocket {
     if (head.length > 0) this.#read(Buffer.alloc(0));
   }
 
-  async sendJson(message: ConnectorServerMessage): Promise<void> {
-    await this.#sendFrame(0x1, Buffer.from(JSON.stringify(message), "utf8"));
+  async sendJson(
+    message: ConnectorServerMessage,
+    deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS,
+  ): Promise<void> {
+    await this.#sendFrame(
+      0x1,
+      Buffer.from(JSON.stringify(message), "utf8"),
+      false,
+      deadline,
+    );
   }
 
-  close(): void {
-    void this.closeGracefully().catch(() => undefined);
+  close(): Promise<void> {
+    return this.closeGracefully();
   }
 
-  #closeForProtocolError(): void {
-    void this.closeGracefully(1002).catch(() => undefined);
+  #closeForProtocolError(statusCode = 1002): void {
+    void this.closeGracefully(statusCode).catch(() => undefined);
   }
 
-  async closeGracefully(
+  closeGracefully(
     statusCode?: number,
     deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS,
   ): Promise<void> {
-    if (this.#closed || this.#closing) return;
+    if (this.#closed) return Promise.resolve();
+    if (this.#closePromise !== undefined) return this.#closePromise;
     this.#closing = true;
+    this.#closePromise = this.#performClose(statusCode, deadline);
+    return this.#closePromise;
+  }
+
+  async #performClose(statusCode: number | undefined, deadline: number) {
     try {
       const payload =
         statusCode === undefined
@@ -112,12 +130,17 @@ class ServerWebSocket {
       const remaining = deadline - Date.now();
       if (remaining > 0 && !this.#closed) {
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, remaining);
-          timer.unref();
-          this.#socket.end(() => {
+          const finish = (): void => {
             clearTimeout(timer);
             resolve();
-          });
+          };
+          const timer = setTimeout(() => {
+            this.#finish();
+            resolve();
+          }, remaining);
+          timer.unref();
+          this.#socket.once("close", finish);
+          this.#socket.end();
         });
       }
     } finally {
@@ -178,22 +201,25 @@ class ServerWebSocket {
     while (!this.#closed && this.#buffer.length >= 2) {
       const first = this.#buffer[0] ?? 0;
       const second = this.#buffer[1] ?? 0;
-      if (
-        (first & 0x80) === 0 ||
-        (first & 0x70) !== 0 ||
-        (second & 0x80) === 0
-      ) {
-        this.close();
+      const fin = (first & 0x80) !== 0;
+      const opcode = first & 0x0f;
+      const controlFrame = opcode >= 0x8;
+      const lengthCode = second & 0x7f;
+      if ((first & 0x70) !== 0 || (second & 0x80) === 0) {
+        this.#closeForProtocolError();
         return;
       }
-      const opcode = first & 0x0f;
-      const lengthCode = second & 0x7f;
-      const controlFrame = opcode >= 0x8;
       if (
-        ![0x1, 0x8, 0x9, 0xa].includes(opcode) ||
-        (controlFrame && lengthCode > 125)
+        ![0x0, 0x1, 0x2, 0x8, 0x9, 0xa].includes(opcode) ||
+        (controlFrame && (!fin || lengthCode > 125)) ||
+        (opcode === 0x0 && this.#fragmentedText === undefined) ||
+        (opcode === 0x1 && this.#fragmentedText !== undefined)
       ) {
-        this.close();
+        this.#closeForProtocolError();
+        return;
+      }
+      if (opcode === 0x2) {
+        this.#closeForProtocolError(1003);
         return;
       }
       let offset = 2;
@@ -208,14 +234,14 @@ class ServerWebSocket {
         if (this.#buffer.length < 10) return;
         const extended = this.#buffer.readBigUInt64BE(2);
         if (extended > BigInt(MAX_FRAME_BYTES)) {
-          this.close();
+          this.#closeForProtocolError(1009);
           return;
         }
         length = Number(extended);
         offset = 10;
       }
       if (length > MAX_FRAME_BYTES) {
-        this.close();
+        this.#closeForProtocolError(1009);
         return;
       }
       const frameLength = offset + 4 + length;
@@ -249,15 +275,30 @@ class ServerWebSocket {
         void this.closeGracefully().catch(() => undefined);
         return;
       }
-      if (opcode === 0x1) {
-        try {
-          this.#handlers.message(utf8Decoder.decode(payload));
-        } catch {
-          this.close();
+      if (opcode === 0x9) {
+        void this.#sendFrame(0xa, payload).catch(() => this.#finish());
+        continue;
+      }
+      if (opcode === 0xa) continue;
+
+      if (opcode === 0x1 || opcode === 0x0) {
+        if (this.#fragmentedTextBytes + payload.length > MAX_FRAME_BYTES) {
+          this.#closeForProtocolError(1009);
           return;
         }
-      } else if (opcode === 0x9) {
-        void this.#sendFrame(0xa, payload).catch(() => this.#finish());
+        this.#fragmentedText ??= [];
+        this.#fragmentedText.push(payload);
+        this.#fragmentedTextBytes += payload.length;
+        if (!fin) continue;
+        const text = Buffer.concat(this.#fragmentedText);
+        this.#fragmentedText = undefined;
+        this.#fragmentedTextBytes = 0;
+        try {
+          this.#handlers.message(utf8Decoder.decode(text));
+        } catch {
+          this.#closeForProtocolError(1007);
+          return;
+        }
       }
     }
   }
@@ -309,6 +350,7 @@ export class ConnectorGateway {
   ) => void;
   readonly #healthTimer: ReturnType<typeof setInterval>;
   #closed = false;
+  #closePromise: Promise<void> | undefined;
 
   constructor(server: HttpsServer, options: ConnectorGatewayOptions) {
     this.#store = new PostgresConnectorStore(options.database);
@@ -347,13 +389,18 @@ export class ConnectorGateway {
     return this.#sessionService;
   }
 
-  close(server: HttpsServer): void {
-    if (this.#closed) return;
+  close(server: HttpsServer): Promise<void> {
+    if (this.#closePromise !== undefined) return this.#closePromise;
+    if (this.#closed) return Promise.resolve();
     this.#closed = true;
     clearInterval(this.#healthTimer);
     server.off("upgrade", this.#upgradeListener);
-    for (const connection of this.#connections) connection.close();
+    const connections = [...this.#connections];
     this.#connections.clear();
+    this.#closePromise = Promise.allSettled(
+      connections.map((connection) => connection.closeGracefully()),
+    ).then(() => undefined);
+    return this.#closePromise;
   }
 
   async #upgrade(
@@ -422,15 +469,25 @@ export class ConnectorGateway {
       stored: StoredServerMessage,
       retransmit = false,
       generation = failureGeneration,
+      deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS,
     ): Promise<boolean> => {
       if (!canContinue(generation)) return false;
       if (!retransmit && stored.sequence <= scanAfterSequence) return true;
-      const message = await this.#store.materializeServerMessage(
-        stored,
-        this.#requestDecryptor,
+      if (!retransmit && stored.sequence !== scanAfterSequence + 1) {
+        return false;
+      }
+      const message = await awaitBeforeDeadline(
+        () =>
+          this.#store.materializeServerMessage(stored, this.#requestDecryptor),
+        deadline,
       );
+      if (message === DEADLINE_EXCEEDED) return false;
       if (!canContinue(generation)) return false;
-      await connection.sendJson(message);
+      const sent = await awaitBeforeDeadline(
+        () => connection.sendJson(message, deadline),
+        deadline,
+      );
+      if (sent === DEADLINE_EXCEEDED) return false;
       if (!retransmit && canContinue(generation)) {
         scanAfterSequence = Math.max(scanAfterSequence, stored.sequence);
       }
@@ -442,17 +499,35 @@ export class ConnectorGateway {
         return;
       }
       dispatching = true;
+      const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
       try {
         if (!canContinue(generation)) return;
-        await this.#store.dispatchNext(identity, this.#now());
-        if (!canContinue(generation)) return;
-        const pending = await this.#store.pendingServerMessages(
-          identity,
-          scanAfterSequence,
-          this.#now(),
+        const dispatched = await awaitBeforeDeadline(
+          () => this.#store.dispatchNext(identity, this.#now()),
+          deadline,
         );
+        if (dispatched === DEADLINE_EXCEEDED) return;
+        if (!canContinue(generation)) return;
+        const pending = await awaitBeforeDeadline(
+          () =>
+            this.#store.pendingServerMessages(
+              identity,
+              scanAfterSequence,
+              this.#now(),
+            ),
+          deadline,
+        );
+        if (pending === DEADLINE_EXCEEDED) return;
         for (const message of pending) {
-          if (!(await sendStored(connection, message, false, generation))) {
+          if (
+            !(await sendStored(
+              connection,
+              message,
+              false,
+              generation,
+              deadline,
+            ))
+          ) {
             return;
           }
         }
@@ -484,7 +559,7 @@ export class ConnectorGateway {
           deadline,
         );
         if (
-          errorMessage !== undefined &&
+          errorMessage !== DEADLINE_EXCEEDED &&
           errorMessage.sequence === scanAfterSequence + 1
         ) {
           const error = await awaitBeforeDeadline(
@@ -495,9 +570,9 @@ export class ConnectorGateway {
               ),
             deadline,
           );
-          if (error !== undefined) {
+          if (error !== DEADLINE_EXCEEDED) {
             await awaitBeforeDeadline(
-              () => connection.sendJson(error),
+              () => connection.sendJson(error, deadline),
               deadline,
             );
           }
@@ -523,23 +598,80 @@ export class ConnectorGateway {
           message,
           this.#now(),
         );
-        if (message.type === "connector.hello" && !initialized) {
+        const isInitialHello =
+          message.type === "connector.hello" && !initialized;
+        if (isInitialHello) {
           scanAfterSequence = message.payload.last_server_sequence;
-        }
-        for (const replay of accepted.replay)
-          await sendStored(connection, replay);
-        if (accepted.response !== null) {
-          await sendStored(connection, accepted.response, accepted.duplicate);
-        }
-        if (message.type === "connector.hello" && !initialized) {
           initialized = true;
+          dispatching = true;
           timer = setInterval(() => {
             void pump(connection).catch(() => {
               accepting = false;
-              connection.close();
+              void connection.close().catch(() => undefined);
             });
           }, this.#dispatchIntervalMs);
           timer.unref();
+        }
+        const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
+        try {
+          for (const replay of accepted.replay) {
+            if (
+              !(await sendStored(
+                connection,
+                replay,
+                false,
+                failureGeneration,
+                deadline,
+              ))
+            ) {
+              return;
+            }
+          }
+          if (isInitialHello) {
+            while (true) {
+              const pending = await awaitBeforeDeadline(
+                () =>
+                  this.#store.pendingServerMessages(
+                    identity,
+                    scanAfterSequence,
+                    this.#now(),
+                  ),
+                deadline,
+              );
+              if (pending === DEADLINE_EXCEEDED) return;
+              if (pending.length === 0) break;
+              for (const replay of pending) {
+                if (
+                  !(await sendStored(
+                    connection,
+                    replay,
+                    false,
+                    failureGeneration,
+                    deadline,
+                  ))
+                ) {
+                  return;
+                }
+              }
+            }
+          }
+          if (accepted.response !== null) {
+            if (
+              !(await sendStored(
+                connection,
+                accepted.response,
+                accepted.duplicate,
+                failureGeneration,
+                deadline,
+              ))
+            ) {
+              return;
+            }
+          }
+        } finally {
+          if (isInitialHello) dispatching = false;
+        }
+        if (isInitialHello) {
           await pump(connection);
         }
       } catch (error) {
@@ -555,7 +687,7 @@ export class ConnectorGateway {
           .then(() => handle(value))
           .catch(() => {
             accepting = false;
-            connection.close();
+            void connection.close().catch(() => undefined);
           });
       },
       close: closeConnection,

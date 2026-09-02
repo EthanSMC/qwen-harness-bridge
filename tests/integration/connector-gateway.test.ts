@@ -33,30 +33,102 @@ const sendRawFrame = (
   socket: Duplex,
   opcode: number,
   payload: Buffer,
+  options: {
+    fin?: boolean;
+    masked?: boolean;
+    rsv?: number;
+  } = {},
 ): void => {
-  const mask = Buffer.from(crypto.randomUUID().replaceAll("-", "")).subarray(
-    0,
-    4,
-  );
+  const fin = options.fin ?? true;
+  const masked = options.masked ?? true;
+  const rsv = options.rsv ?? 0;
+  const mask = masked
+    ? Buffer.from(crypto.randomUUID().replaceAll("-", "")).subarray(0, 4)
+    : undefined;
   const length = payload.length;
   const headerLength = length < 126 ? 2 : length <= 0xffff ? 4 : 10;
-  const frame = Buffer.alloc(headerLength + 4 + length);
-  frame[0] = 0x80 | opcode;
+  const frame = Buffer.alloc(headerLength + (masked ? 4 : 0) + length);
+  frame[0] = (fin ? 0x80 : 0) | (rsv & 0x70) | opcode;
   if (length < 126) {
-    frame[1] = 0x80 | length;
+    frame[1] = (masked ? 0x80 : 0) | length;
   } else if (length <= 0xffff) {
-    frame[1] = 0x80 | 126;
+    frame[1] = (masked ? 0x80 : 0) | 126;
     frame.writeUInt16BE(length, 2);
   } else {
-    frame[1] = 0x80 | 127;
+    frame[1] = (masked ? 0x80 : 0) | 127;
     frame.writeBigUInt64BE(BigInt(length), 2);
   }
-  mask.copy(frame, headerLength);
+  const maskOffset = headerLength;
+  mask?.copy(frame, maskOffset);
   for (let index = 0; index < length; index += 1) {
-    frame[headerLength + 4 + index] =
-      (payload[index] ?? 0) ^ (mask[index % mask.length] ?? 0);
+    frame[maskOffset + (masked ? 4 : 0) + index] = masked
+      ? (payload[index] ?? 0) ^ (mask?.[index % 4] ?? 0)
+      : (payload[index] ?? 0);
   }
   socket.write(frame);
+};
+
+const waitForServerMessage = async (
+  socket: Duplex,
+  predicate: (message: Record<string, unknown>) => boolean,
+): Promise<Record<string, unknown>> => {
+  let buffer = Buffer.alloc(0);
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      socket.off("data", onData);
+      reject(new Error("Timed out waiting for server message"));
+    }, 2_000);
+    const finish = (message: Record<string, unknown>): void => {
+      clearTimeout(timeout);
+      socket.off("data", onData);
+      resolve(message);
+    };
+    const onData = (chunk: Buffer): void => {
+      buffer = Buffer.concat([buffer, chunk]);
+      while (buffer.length >= 2) {
+        const first = buffer[0] ?? 0;
+        const second = buffer[1] ?? 0;
+        const lengthCode = second & 0x7f;
+        let offset = 2;
+        let length = lengthCode;
+        if (lengthCode === 126) {
+          if (buffer.length < 4) return;
+          length = buffer.readUInt16BE(2);
+          offset = 4;
+        } else if (lengthCode === 127) {
+          if (buffer.length < 10) return;
+          const extended = buffer.readBigUInt64BE(2);
+          if (extended > BigInt(Number.MAX_SAFE_INTEGER)) {
+            reject(new Error("Server frame is too large for test parser"));
+            return;
+          }
+          length = Number(extended);
+          offset = 10;
+        }
+        const frameLength = offset + length;
+        if (buffer.length < frameLength) return;
+        const payload = buffer.subarray(offset, frameLength);
+        buffer = buffer.subarray(frameLength);
+        if ((first & 0x0f) !== 0x1) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(payload.toString("utf8"));
+        } catch {
+          reject(new Error("Server text frame was not JSON"));
+          return;
+        }
+        if (
+          parsed !== null &&
+          typeof parsed === "object" &&
+          predicate(parsed as Record<string, unknown>)
+        ) {
+          finish(parsed as Record<string, unknown>);
+          return;
+        }
+      }
+    };
+    socket.on("data", onData);
+  });
 };
 
 const readClosePayload = (chunks: readonly Buffer[]): Buffer | undefined => {
@@ -460,6 +532,172 @@ describe("Connector gateway authentication and handshake", () => {
         await connector.close();
         await app.close();
       }
+    }
+  });
+
+  it("accepts fragmented text with an interleaved ping control frame", async () => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    const socket = await rawConnectorSocket(app, credentials);
+    const hello = JSON.stringify({
+      protocol_version: "1.0",
+      message_id: crypto.randomUUID(),
+      sequence: 1,
+      sent_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      correlation_id: crypto.randomUUID(),
+      type: "connector.hello",
+      payload: {
+        connector_id: credentials.connector_id,
+        connector_version: "raw-fragmented-test/1.0",
+        capabilities: ["harness", "integration-test"],
+        last_server_sequence: 0,
+        last_client_sequence: 0,
+      },
+    });
+    const splitAt = Math.floor(hello.length / 2);
+    try {
+      sendRawFrame(socket, 0x1, Buffer.from(hello.slice(0, splitAt)), {
+        fin: false,
+      });
+      sendRawFrame(socket, 0x9, Buffer.from("keep-alive"));
+      sendRawFrame(socket, 0x0, Buffer.from(hello.slice(splitAt)), {
+        fin: true,
+      });
+
+      await expect(
+        waitForServerMessage(
+          socket,
+          (message) => message.type === "connector.welcome",
+        ),
+      ).resolves.toMatchObject({
+        type: "connector.welcome",
+        payload: { connector_id: credentials.connector_id },
+      });
+    } finally {
+      socket.destroy();
+      await app.close();
+    }
+  });
+
+  it.each([
+    {
+      name: "RSV1",
+      opcode: 0x1,
+      payload: Buffer.from("{}"),
+      options: { rsv: 0x40 },
+      expectedCode: 1002,
+    },
+    {
+      name: "unmasked client frame",
+      opcode: 0x1,
+      payload: Buffer.from("{}"),
+      options: { masked: false },
+      expectedCode: 1002,
+    },
+    {
+      name: "reserved opcode",
+      opcode: 0x3,
+      payload: Buffer.alloc(0),
+      options: {},
+      expectedCode: 1002,
+    },
+    {
+      name: "fragmented control frame",
+      opcode: 0x9,
+      payload: Buffer.from("x"),
+      options: { fin: false },
+      expectedCode: 1002,
+    },
+    {
+      name: "oversized text message",
+      opcode: 0x1,
+      payload: Buffer.alloc(64 * 1024 + 1, 0x61),
+      options: {},
+      expectedCode: 1009,
+    },
+  ])(
+    "closes a %s with the RFC6455 status code",
+    async ({ opcode, payload, options, expectedCode }) => {
+      const app = await startApp();
+      const credentials = await seedConnector(db);
+      const socket = await rawConnectorSocket(app, credentials);
+      const chunks: Buffer[] = [];
+      socket.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+      const closed = new Promise<void>((resolve) => {
+        socket.once("close", () => resolve());
+      });
+      try {
+        sendRawFrame(socket, opcode, payload, options);
+        await expect(closed).resolves.toBeUndefined();
+        expect(readCloseCode(chunks)).toBe(expectedCode);
+      } finally {
+        socket.destroy();
+        await app.close();
+      }
+    },
+  );
+
+  it("waits for every upgraded connector socket before app.close resolves", async () => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    const socket = await rawConnectorSocket(app, credentials);
+    let socketClosed = false;
+    socket.once("close", () => {
+      socketClosed = true;
+    });
+    socket.once("data", (chunk: Buffer) => {
+      if (((chunk[0] ?? 0) & 0x0f) === 0x8) socket.destroy();
+    });
+    try {
+      await app.close();
+      expect(socketClosed).toBe(true);
+      expect(socket.destroyed).toBe(true);
+    } finally {
+      socket.destroy();
+    }
+  });
+
+  it("replays a large retained backlog in strict contiguous sequence order", async () => {
+    const app = await startApp(5_000);
+    const credentials = await seedConnector(db);
+    const backlogSize = 192;
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+    try {
+      for (let sequence = 1; sequence <= backlogSize; sequence += 1) {
+        await db.query(
+          `
+            INSERT INTO connector_messages
+              (connector_id, direction, sequence, message_id, type, payload, correlation_id, expires_at)
+            VALUES ($1, 'server', $2, $3, 'ack', $4::jsonb, $5, $6)
+          `,
+          [
+            credentials.connector_id,
+            sequence,
+            crypto.randomUUID(),
+            JSON.stringify({ sequence }),
+            crypto.randomUUID(),
+            expiresAt,
+          ],
+        );
+      }
+      await db.query(
+        "UPDATE connectors SET last_server_sequence = $2 WHERE id = $1",
+        [credentials.connector_id, backlogSize],
+      );
+
+      const connector = await FakeConnector.connect(app, credentials);
+      try {
+        expect(
+          connector.wireReceived.map((message) => message.sequence),
+        ).toEqual(
+          Array.from({ length: backlogSize + 1 }, (_, index) => index + 1),
+        );
+      } finally {
+        await connector.close();
+      }
+    } finally {
+      await app.close();
     }
   });
 });

@@ -4,7 +4,7 @@ import type {
   ConnectorServerMessage,
   JobStatus,
 } from "@qhb/protocol";
-import { ConnectorServerMessageSchema } from "@qhb/protocol";
+import { ConnectorServerMessageSchema, rfc3339InstantKey } from "@qhb/protocol";
 import { and, asc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import {
@@ -26,6 +26,8 @@ export const HEARTBEAT_INTERVAL_MS = 10_000;
 export const CONNECTOR_STALE_AFTER_MS = 20_000;
 export const CONNECTOR_OFFLINE_AFTER_MS = 30_000;
 export const OFFER_LEASE_MS = 30_000;
+export const SERVER_REPLAY_BATCH_SIZE = 100;
+const REPLAY_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 type QueryDatabase = Database | Transaction;
@@ -122,6 +124,8 @@ const PUBLIC_EVENT_PAYLOAD_KEYS = new Set([
 ]);
 const SOURCE_LIKE_EVENT_TEXT =
   /\b(?:(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=|function\s+[A-Za-z_$][\w$]*\s*\(|class\s+[A-Za-z_$][\w$]*\s*[{<]|def\s+[A-Za-z_]\w*\s*\(|(?:import|export)\s+(?:[\w*{]|from\b))/u;
+const SECRET_LIKE_CONNECTOR_TEXT =
+  /\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9]{12,}|xox[baprs]-[A-Za-z0-9-]{12,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/giu;
 
 const sanitizeEventValue = (value: unknown): unknown => {
   if (typeof value === "string") {
@@ -153,6 +157,39 @@ const sanitizeConnectorEventPayload = (
 ): Record<string, unknown> =>
   sanitizeEventValue(payload) as Record<string, unknown>;
 
+const sanitizeConnectorText = (value: string, maxLength = 800): string => {
+  const sanitized = sanitizePublicText(
+    value.replace(SECRET_LIKE_CONNECTOR_TEXT, "[redacted]"),
+    maxLength,
+    maxLength,
+    maxLength,
+  );
+  if (SOURCE_LIKE_EVENT_TEXT.test(sanitized)) {
+    return "[redacted source content]";
+  }
+  return sanitized || "[redacted]";
+};
+
+const sanitizeDurableClientValue = (value: unknown): unknown => {
+  if (typeof value === "string") return sanitizeConnectorText(value);
+  if (
+    value === null ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(sanitizeDurableClientValue);
+  const record = asRecord(value);
+  if (record === null) return "[redacted]";
+  return Object.fromEntries(
+    Object.entries(record).map(([key, item]) => [
+      key,
+      sanitizeDurableClientValue(item),
+    ]),
+  );
+};
+
 const storedClientPayload = (
   message: ConnectorClientMessage,
 ): Record<string, unknown> => {
@@ -160,16 +197,24 @@ const storedClientPayload = (
     message.type === "job.event"
       ? {
           ...message.payload,
+          event_type: sanitizeConnectorText(message.payload.event_type, 64),
           payload: sanitizeConnectorEventPayload(message.payload.payload),
+          source: sanitizeConnectorText(message.payload.source, 32),
         }
-      : message.payload;
+      : sanitizeDurableClientValue(message.payload);
+  const sentAt = rfc3339InstantKey(message.sent_at);
+  const expiresAt = rfc3339InstantKey(message.expires_at);
+  if (sentAt === null || expiresAt === null) {
+    throw new ConnectorStoreError("INTERNAL", "Invalid Connector timestamp");
+  }
   return {
     payload,
     payload_digest: `sha256:${crypto
       .createHash("sha256")
       .update(canonicalJson(message.payload))
       .digest("hex")}`,
-    sent_at: new Date(message.sent_at).toISOString(),
+    sent_at_instant: sentAt,
+    expires_at_instant: expiresAt,
   };
 };
 
@@ -234,6 +279,54 @@ const toStoredServerMessage = (
     expiresAt: row.expiresAt,
     createdAt: row.createdAt,
   };
+};
+
+const tombstoneExpiredOffers = async (
+  database: QueryDatabase,
+  connectorId: string,
+  afterSequence: number,
+  now: Date,
+): Promise<void> => {
+  const expiredOffers = await database
+    .select()
+    .from(connectorMessages)
+    .where(
+      and(
+        eq(connectorMessages.connectorId, connectorId),
+        eq(connectorMessages.direction, "server"),
+        eq(connectorMessages.type, "job.offer"),
+        gt(connectorMessages.sequence, afterSequence),
+        lte(connectorMessages.expiresAt, now),
+      ),
+    )
+    .orderBy(asc(connectorMessages.sequence))
+    .limit(SERVER_REPLAY_BATCH_SIZE)
+    .for("update");
+
+  const tombstoneExpiresAt = new Date(
+    now.getTime() + REPLAY_TOMBSTONE_RETENTION_MS,
+  );
+  for (const offer of expiredOffers) {
+    await database
+      .update(connectorMessages)
+      .set({
+        messageId: crypto.randomUUID(),
+        type: "protocol.error",
+        payload: {
+          code: "MESSAGE_EXPIRED",
+          message: "A Connector message expired before delivery.",
+        },
+        expiresAt: tombstoneExpiresAt,
+      })
+      .where(
+        and(
+          eq(connectorMessages.id, offer.id),
+          eq(connectorMessages.messageId, offer.messageId),
+          eq(connectorMessages.type, "job.offer"),
+          lte(connectorMessages.expiresAt, now),
+        ),
+      );
+  }
 };
 
 const lockConnector = async (
@@ -444,9 +537,14 @@ const ingestJobEvent = async (
   const sanitizedPayload = sanitizeConnectorEventPayload(
     message.payload.payload,
   );
+  const sanitizedEventType = sanitizeConnectorText(
+    message.payload.event_type,
+    64,
+  );
+  const sanitizedSource = sanitizeConnectorText(message.payload.source, 32);
   const nextStatus = statusForEvent(
     job.status,
-    message.payload.event_type,
+    sanitizedEventType,
     sanitizedPayload,
   );
   if (nextStatus !== job.status) {
@@ -460,7 +558,7 @@ const ingestJobEvent = async (
   const currentStage =
     typeof stage === "string" && stage.length <= 128
       ? stage
-      : message.payload.event_type.slice(0, 128);
+      : sanitizedEventType;
   const terminal = TERMINAL_JOB_STATES.has(nextStatus);
   const updated = await database
     .update(jobs)
@@ -482,9 +580,9 @@ const ingestJobEvent = async (
     .returning({ id: jobs.id });
   if (updated.length !== 1) throw new ConnectorStoreError("EVENT_REJECTED");
   await appendJobEvent(database, job.id, {
-    type: message.payload.event_type,
+    type: sanitizedEventType,
     payload: sanitizedPayload,
-    source: message.payload.source,
+    source: sanitizedSource,
     messageId: message.message_id,
     correlationId: message.correlation_id,
   });
@@ -597,7 +695,9 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
 
       const capabilities =
         message.type === "connector.hello"
-          ? (message.payload.capabilities ?? connector.capabilities)
+          ? (message.payload.capabilities?.map((capability: string) =>
+              sanitizeConnectorText(capability, 64),
+            ) ?? connector.capabilities)
           : connector.capabilities;
       await tx
         .update(connectors)
@@ -632,6 +732,12 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
               ),
             ),
           );
+        await tombstoneExpiredOffers(
+          tx,
+          connector.id,
+          message.payload.last_server_sequence,
+          now,
+        );
         const replayRows = await tx
           .select()
           .from(connectorMessages)
@@ -645,7 +751,8 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
               ),
             ),
           )
-          .orderBy(asc(connectorMessages.sequence));
+          .orderBy(asc(connectorMessages.sequence))
+          .limit(SERVER_REPLAY_BATCH_SIZE);
         const welcome = await enqueueServerMessage(
           tx,
           connector,
@@ -818,34 +925,26 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
   async pendingServerMessages(
     identity: ConnectorIdentity,
     afterSequence: number,
-    _now = new Date(),
+    now = new Date(),
   ): Promise<readonly StoredServerMessage[]> {
     assertSafeSequence(afterSequence);
-    const connectorRows = await this.#db
-      .select()
-      .from(connectors)
-      .where(eq(connectors.id, identity.connectorId))
-      .limit(1);
-    const connector = connectorRows[0];
-    if (
-      connector === undefined ||
-      connector.ownerId !== identity.ownerId ||
-      connector.protocolVersion !== identity.protocolVersion
-    ) {
-      throw new ConnectorStoreError("AUTHORIZATION_FAILED");
-    }
-    const rows = await this.#db
-      .select()
-      .from(connectorMessages)
-      .where(
-        and(
-          eq(connectorMessages.connectorId, identity.connectorId),
-          eq(connectorMessages.direction, "server"),
-          gt(connectorMessages.sequence, afterSequence),
-        ),
-      )
-      .orderBy(asc(connectorMessages.sequence));
-    return rows.map(toStoredServerMessage);
+    return this.#db.transaction(async (tx) => {
+      const connector = await lockConnector(tx, identity);
+      await tombstoneExpiredOffers(tx, connector.id, afterSequence, now);
+      const rows = await tx
+        .select()
+        .from(connectorMessages)
+        .where(
+          and(
+            eq(connectorMessages.connectorId, identity.connectorId),
+            eq(connectorMessages.direction, "server"),
+            gt(connectorMessages.sequence, afterSequence),
+          ),
+        )
+        .orderBy(asc(connectorMessages.sequence))
+        .limit(SERVER_REPLAY_BATCH_SIZE);
+      return rows.map(toStoredServerMessage);
+    });
   }
 
   async enqueueServer(

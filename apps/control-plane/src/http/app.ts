@@ -116,9 +116,11 @@ export async function createApp(
           .send(authenticationFailure);
       }
     });
-    app.addHook("onClose", async () => {
-      connectorGateway.close(app.server as unknown as HttpsServer);
-    });
+    const closeConnectorGateway = async (): Promise<void> => {
+      await connectorGateway.close(app.server as unknown as HttpsServer);
+    };
+    app.addHook("preClose", closeConnectorGateway);
+    app.addHook("onClose", closeConnectorGateway);
   }
 
   app.get("/healthz", async (_request, reply) =>
