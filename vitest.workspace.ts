@@ -15,6 +15,7 @@ export default defineWorkspace([
         "tests/integration/approval-flow.test.ts",
         "tests/integration/cancellation-flow.test.ts",
         "tests/integration/result-flow.test.ts",
+        "tests/integration/readiness.test.ts",
       ],
     },
   },
@@ -24,6 +25,8 @@ export default defineWorkspace([
       include: [
         "tests/contract/mcp-tools.test.ts",
         "tests/contract/mcp-auth.test.ts",
+        "tests/contract/health-metrics.test.ts",
+        "tests/contract/runtime-build.test.ts",
       ],
     },
   },
