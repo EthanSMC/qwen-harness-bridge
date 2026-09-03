@@ -51,7 +51,7 @@ type StoredResponseMetadata = Readonly<{
   type: unknown;
   payload: unknown;
   sequence: unknown;
-  correlation_id: unknown;
+  correlation_id?: unknown;
 }>;
 
 const STORED_RESPONSE_KEY = "__qhb_original_response";
@@ -322,10 +322,10 @@ const findOriginalResponse = async (
   });
   const validateResponse = (
     candidate: ConnectorMessageRow,
-    type: unknown = candidate.type,
-    payload: unknown = candidate.payload,
-    sequence: unknown = candidate.sequence,
-    correlationId: unknown = candidate.correlationId,
+    type: unknown,
+    payload: unknown,
+    sequence: unknown,
+    correlationId: unknown,
   ): OriginalResponse | null => {
     if (
       candidate.connectorId !== connectorId ||
@@ -384,7 +384,13 @@ const findOriginalResponse = async (
     };
   };
   if (row !== undefined) {
-    const response = validateResponse(row);
+    const response = validateResponse(
+      row,
+      row.type,
+      row.payload,
+      row.sequence,
+      row.correlationId,
+    );
     if (response === null) {
       throw new ConnectorStoreError("INTERNAL", "Original response is invalid");
     }
@@ -406,12 +412,15 @@ const findOriginalResponse = async (
   if (tombstone === undefined || storedResponse === null) {
     throw new ConnectorStoreError("INTERNAL", "Original response is missing");
   }
+  const storedCorrelationId = Object.hasOwn(storedResponse, "correlation_id")
+    ? storedResponse.correlation_id
+    : tombstone.correlationId;
   const response = validateResponse(
     tombstone,
     storedResponse.type,
     storedResponse.payload,
     storedResponse.sequence,
-    storedResponse.correlation_id,
+    storedCorrelationId,
   );
   if (response === null) {
     throw new ConnectorStoreError("INTERNAL", "Original response is invalid");

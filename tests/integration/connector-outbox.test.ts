@@ -696,6 +696,155 @@ describe("PostgreSQL Connector outbox", () => {
     });
   });
 
+  it("restores a legacy tombstoned response without stored correlation metadata", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const hello = envelope("connector.hello", 1, {
+      connector_id: testIdentity.connectorId,
+      connector_version: "integration-1.0",
+      capabilities: ["tests"],
+      last_server_sequence: 0,
+      last_client_sequence: 0,
+    });
+    const accepted = await store.acceptClientMessage(testIdentity, hello);
+    if (accepted.response === null) throw new Error("expected a welcome");
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE message_id = $1",
+      [accepted.response.messageId],
+    );
+    const maintained = await store.pendingServerMessages(
+      testIdentity,
+      0,
+      new Date(),
+    );
+    const tombstone = maintained[0];
+    if (tombstone === undefined) throw new Error("expected a tombstone");
+    expect(tombstone).toMatchObject({
+      type: "protocol.error",
+      sequence: accepted.response.sequence,
+      correlationId: hello.correlation_id,
+      payload: { code: "MESSAGE_EXPIRED" },
+    });
+
+    await database.query(
+      `UPDATE connector_messages
+          SET payload = payload #- '{__qhb_original_response,correlation_id}'
+        WHERE connector_id = $1 AND direction = 'client' AND message_id = $2`,
+      [testIdentity.connectorId, hello.message_id],
+    );
+    const legacyRows = await database.query<{
+      metadata: Record<string, unknown>;
+    }>(
+      `SELECT payload->'__qhb_original_response' AS metadata
+         FROM connector_messages
+        WHERE connector_id = $1 AND direction = 'client' AND message_id = $2`,
+      [testIdentity.connectorId, hello.message_id],
+    );
+    expect(legacyRows.rows[0]?.metadata).toMatchObject({
+      type: "connector.welcome",
+      payload: accepted.response.payload,
+      sequence: accepted.response.sequence,
+    });
+    expect(legacyRows.rows[0]?.metadata).not.toHaveProperty("correlation_id");
+
+    const retried = await store.acceptClientMessage(
+      testIdentity,
+      hello,
+      new Date(),
+    );
+    if (retried.response === null) {
+      throw new Error("expected a restored legacy welcome");
+    }
+    expect(retried).toMatchObject({ duplicate: true });
+    expect(retried.response).toMatchObject({
+      type: "connector.welcome",
+      sequence: accepted.response.sequence,
+      payload: accepted.response.payload,
+    });
+    expect(retried.response.messageId).not.toBe(accepted.response.messageId);
+  });
+
+  it("rejects tombstoned response metadata with an omitted type", async () => {
+    const testIdentity = await insertConnector();
+    const repository = new JobRepository(database.client);
+    const job = await createJob(
+      `retry-invalid-metadata-${crypto.randomUUID()}`,
+      "Reject invalid response metadata",
+    );
+    await database.query("UPDATE jobs SET accepted_at = $1 WHERE id = $2", [
+      new Date("2000-01-01T00:00:00.000Z"),
+      job.jobId,
+    ]);
+    const store = new PostgresConnectorStore(database.client);
+    const offer = await store.dispatchNext(testIdentity);
+    if (offer === null) throw new Error("expected a job offer");
+    const claim = envelope("job.claim", 1, {
+      job_id: job.jobId,
+      attempt: offer.payload.attempt as number,
+      lease_id: offer.payload.lease_id as string,
+    });
+    const dispatched = await repository.get(job.jobId);
+    if (dispatched === null) throw new Error("expected a dispatched job");
+    await expect(
+      repository.cancelAtomically({
+        ownerId: OWNER_ID,
+        jobId: job.jobId,
+        expectedRevision: dispatched.revision,
+      }),
+    ).resolves.toMatchObject({ status: "cancelled" });
+
+    const accepted = await store.acceptClientMessage(testIdentity, claim);
+    if (accepted.response === null) {
+      throw new Error("expected a CLAIM_REJECTED response");
+    }
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE message_id = $1",
+      [accepted.response.messageId],
+    );
+    const maintained = await store.pendingServerMessages(
+      testIdentity,
+      0,
+      new Date(),
+    );
+    const tombstone = maintained.find(
+      (message) => message.sequence === accepted.response?.sequence,
+    );
+    if (tombstone === undefined) throw new Error("expected a tombstone");
+    await database.query(
+      `UPDATE connector_messages
+          SET payload = payload #- '{__qhb_original_response,type}'
+        WHERE connector_id = $1 AND direction = 'client' AND message_id = $2`,
+      [testIdentity.connectorId, claim.message_id],
+    );
+
+    await expectStoreError(
+      store.acceptClientMessage(testIdentity, claim, new Date()),
+      "INTERNAL",
+    );
+    await expect(
+      database.query<{
+        message_id: string;
+        sequence: number;
+        type: string;
+        payload: Record<string, unknown>;
+      }>(
+        `SELECT message_id, sequence::integer AS sequence, type, payload
+           FROM connector_messages
+          WHERE connector_id = $1 AND sequence = $2 AND direction = 'server'`,
+        [testIdentity.connectorId, tombstone.sequence],
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        {
+          message_id: tombstone.messageId,
+          sequence: tombstone.sequence,
+          type: "protocol.error",
+          payload: { code: "MESSAGE_EXPIRED" },
+        },
+      ],
+    });
+  });
+
   it("validates ACK ownership and keeps a valid duplicate idempotent", async () => {
     const ackIdentity = await insertConnector();
     const otherIdentity = await insertConnector();
