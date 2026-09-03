@@ -28,6 +28,7 @@ const MAX_FRAGMENT_COUNT = 1_024;
 const MAX_FRAGMENT_OVERHEAD_BYTES = 64 * 1024;
 const MAX_PENDING_MESSAGES = 128;
 const MAX_PENDING_MESSAGE_BYTES = 512 * 1024;
+const MAX_SCHEDULED_STORE_OPERATIONS = 2;
 const MAX_OUTBOUND_QUEUE_FRAMES = 128;
 const MAX_OUTBOUND_QUEUE_BYTES = 256 * 1024;
 const SOCKET_WRITE_TIMEOUT_MS = 1_000;
@@ -630,24 +631,56 @@ export class ConnectorGateway {
     let pendingMessageCount = 0;
     let pendingMessageBytes = 0;
     let dispatching = false;
-    let activeStoreOperation: Promise<unknown> | undefined;
+    let scheduledStoreOperations = 0;
+    let storeOperationTail = Promise.resolve();
     let failureGeneration = 0;
     let timer: ReturnType<typeof setInterval> | undefined;
-    const runStoreBeforeDeadline = <T>(
+    const runStoreBeforeDeadline = async <T>(
       operation: () => Promise<T>,
       deadline: number,
+      canStart: () => boolean = () => true,
     ): Promise<T | typeof DEADLINE_EXCEEDED> => {
-      if (activeStoreOperation !== undefined) {
-        return Promise.resolve(DEADLINE_EXCEEDED);
+      if (scheduledStoreOperations >= MAX_SCHEDULED_STORE_OPERATIONS) {
+        throw new Error("Connector store operation queue is full");
       }
-      const operationPromise = operation();
-      activeStoreOperation = operationPromise;
-      const clearOperation = (): void => {
-        if (activeStoreOperation === operationPromise) {
-          activeStoreOperation = undefined;
+      scheduledStoreOperations += 1;
+      const previousOperation = storeOperationTail;
+      let releaseStoreSlot!: () => void;
+      const storeSlot = new Promise<void>((resolve) => {
+        releaseStoreSlot = resolve;
+      });
+      storeOperationTail = previousOperation
+        .catch(() => undefined)
+        .then(() => storeSlot);
+      const finishStoreOperation = (): void => {
+        scheduledStoreOperations -= 1;
+        releaseStoreSlot();
+        if (scheduledStoreOperations === 0) {
+          storeOperationTail = Promise.resolve();
         }
       };
-      void operationPromise.then(clearOperation, clearOperation);
+
+      const acquired = await awaitBeforeDeadline(
+        () => previousOperation.catch(() => undefined),
+        deadline,
+      );
+      if (
+        acquired === DEADLINE_EXCEEDED ||
+        Date.now() >= deadline ||
+        !canStart()
+      ) {
+        finishStoreOperation();
+        return DEADLINE_EXCEEDED;
+      }
+
+      let operationPromise: Promise<T>;
+      try {
+        operationPromise = operation();
+      } catch (error) {
+        finishStoreOperation();
+        throw error;
+      }
+      void operationPromise.then(finishStoreOperation, finishStoreOperation);
       return awaitBeforeDeadline(() => operationPromise, deadline);
     };
     const canContinue = (generation: number): boolean =>
@@ -676,6 +709,7 @@ export class ConnectorGateway {
               this.#requestDecryptor,
             ),
           deadline,
+          () => canContinue(generation),
         );
       } catch (error) {
         if (
@@ -704,7 +738,7 @@ export class ConnectorGateway {
         !canContinue(generation) ||
         !initialized ||
         dispatching ||
-        activeStoreOperation !== undefined
+        scheduledStoreOperations > 0
       ) {
         return;
       }
@@ -715,6 +749,7 @@ export class ConnectorGateway {
         const dispatched = await runStoreBeforeDeadline(
           () => this.#store.dispatchNext(identity, this.#now()),
           deadline,
+          () => canContinue(generation),
         );
         if (dispatched === DEADLINE_EXCEEDED) return;
         if (!canContinue(generation)) return;
@@ -726,6 +761,7 @@ export class ConnectorGateway {
               this.#now(),
             ),
           deadline,
+          () => canContinue(generation),
         );
         if (pending === DEADLINE_EXCEEDED) return;
         for (const message of pending) {
@@ -763,8 +799,13 @@ export class ConnectorGateway {
       if (!accepting) return;
       accepting = false;
       failureGeneration += 1;
+      const generation = failureGeneration;
       if (timer !== undefined) clearInterval(timer);
       const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
+      const canContinueFailure = (): boolean =>
+        generation === failureGeneration &&
+        !this.#closed &&
+        !connection.isClosing;
       try {
         const errorMessage = await runStoreBeforeDeadline(
           () =>
@@ -775,6 +816,7 @@ export class ConnectorGateway {
               new Date(this.#now().getTime() + 60_000),
             ),
           deadline,
+          canContinueFailure,
         );
         if (
           errorMessage !== DEADLINE_EXCEEDED &&
@@ -787,6 +829,7 @@ export class ConnectorGateway {
                 this.#requestDecryptor,
               ),
             deadline,
+            canContinueFailure,
           );
           if (error !== DEADLINE_EXCEEDED) {
             await awaitBeforeDeadline(
@@ -814,12 +857,14 @@ export class ConnectorGateway {
       if (initialized && message.type === "connector.hello") {
         return failProtocol("HELLO_ALREADY_INITIALIZED");
       }
+      const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
       try {
-        const accepted = await this.#store.acceptClientMessage(
-          identity,
-          message,
-          this.#now(),
+        const accepted = await runStoreBeforeDeadline(
+          () => this.#store.acceptClientMessage(identity, message, this.#now()),
+          deadline,
+          () => canContinue(generation),
         );
+        if (accepted === DEADLINE_EXCEEDED) return;
         if (!canContinue(generation)) return;
         const isInitialHello =
           message.type === "connector.hello" && !initialized;
@@ -835,7 +880,6 @@ export class ConnectorGateway {
           }, this.#dispatchIntervalMs);
           timer.unref();
         }
-        const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
         try {
           for (const replay of accepted.replay) {
             if (
@@ -860,6 +904,7 @@ export class ConnectorGateway {
                     this.#now(),
                   ),
                 deadline,
+                () => canContinue(generation),
               );
               if (pending === DEADLINE_EXCEEDED) return;
               if (pending.length === 0) break;

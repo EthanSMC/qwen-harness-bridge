@@ -419,6 +419,125 @@ describe("Connector gateway authentication and handshake", () => {
     }
   });
 
+  it("queues duplicate ACK retransmission behind active pump store work", async () => {
+    const originalAcceptClientMessage =
+      PostgresConnectorStore.prototype.acceptClientMessage;
+    const originalDispatchNext = PostgresConnectorStore.prototype.dispatchNext;
+    const originalPendingServerMessages =
+      PostgresConnectorStore.prototype.pendingServerMessages;
+    const originalMaterializeServerMessage =
+      PostgresConnectorStore.prototype.materializeServerMessage;
+    let activeStoreCalls = 0;
+    let maximumActiveStoreCalls = 0;
+    const trackStoreCall = async <T>(
+      operation: () => Promise<T>,
+    ): Promise<T> => {
+      activeStoreCalls += 1;
+      maximumActiveStoreCalls = Math.max(
+        maximumActiveStoreCalls,
+        activeStoreCalls,
+      );
+      try {
+        return await operation();
+      } finally {
+        activeStoreCalls -= 1;
+      }
+    };
+    let blockNextPump = false;
+    let pumpBlocked = false;
+    let releasePump: (() => void) | undefined;
+    let pumpStartedResolve!: () => void;
+    const pumpStarted = new Promise<void>((resolve) => {
+      pumpStartedResolve = resolve;
+    });
+    const pumpGate = new Promise<void>((resolve) => {
+      releasePump = resolve;
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "acceptClientMessage",
+    ).mockImplementation(async function (identity, message, now) {
+      return trackStoreCall(() =>
+        originalAcceptClientMessage.call(this, identity, message, now),
+      );
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "dispatchNext",
+    ).mockImplementation(async function (identity, now) {
+      return trackStoreCall(async () => {
+        if (blockNextPump && !pumpBlocked) {
+          pumpBlocked = true;
+          pumpStartedResolve();
+          await pumpGate;
+        }
+        return originalDispatchNext.call(this, identity, now);
+      });
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "pendingServerMessages",
+    ).mockImplementation(async function (identity, afterSequence, now) {
+      return trackStoreCall(() =>
+        originalPendingServerMessages.call(this, identity, afterSequence, now),
+      );
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "materializeServerMessage",
+    ).mockImplementation(async function (stored, decryptor) {
+      return trackStoreCall(() =>
+        originalMaterializeServerMessage.call(this, stored, decryptor),
+      );
+    });
+
+    const app = await startApp(10);
+    const credentials = await seedConnector(db);
+    const connector = await FakeConnector.connect(app, credentials);
+    try {
+      const heartbeat = await connector.send("connector.heartbeat", {});
+      const originalAck = await connector.next("ack");
+      blockNextPump = true;
+      await pumpStarted;
+
+      await connector.send(
+        "connector.heartbeat",
+        {},
+        {
+          message_id: heartbeat.message_id,
+          sequence: heartbeat.sequence,
+          correlation_id: heartbeat.correlation_id,
+          sent_at: heartbeat.sent_at,
+          expires_at: heartbeat.expires_at,
+        },
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 250));
+      expect(
+        connector.wireReceived.filter(
+          (message) => message.message_id === originalAck.message_id,
+        ),
+      ).toHaveLength(1);
+
+      releasePump?.();
+      await vi.waitFor(
+        () => {
+          expect(
+            connector.wireReceived.filter(
+              (message) => message.message_id === originalAck.message_id,
+            ),
+          ).toEqual([originalAck, originalAck]);
+        },
+        { timeout: 2_000, interval: 10 },
+      );
+      expect(maximumActiveStoreCalls).toBe(1);
+    } finally {
+      releasePump?.();
+      await connector.close();
+      await app.close();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("does not process frames queued after a protocol failure begins", async () => {
     const app = await startApp();
     const credentials = await seedConnector(db);
