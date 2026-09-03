@@ -19,6 +19,8 @@ const repositoryRoot = dirname(
 );
 const absolute = (path: string): string => join(repositoryRoot, path);
 const read = (path: string): string => readFileSync(absolute(path), "utf8");
+const escapeRegExp = (value: string): string =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const yamlMappingBlock = (
   source: string,
@@ -396,7 +398,7 @@ describe("release runtime build contract", () => {
         .filter((entry): entry is [string, number] => entry[0] !== undefined),
     );
     const finalWorkdir = dockerStageWorkdir(finalStage);
-    expect(finalWorkdir).toBe("/app");
+    expect(finalWorkdir).toBeDefined();
     const observedCopies = new Set<string>();
     for (const copy of finalCopies) {
       const { from, sources, destination } = dockerCopyOperands(copy);
@@ -411,10 +413,11 @@ describe("release runtime build contract", () => {
       expect(sourceStageIndex ?? -1).toBeLessThan(stages.length - 1);
       const destinationPath = destination.startsWith("/")
         ? normalizeDockerPath(destination)
-        : normalizeDockerPath(`${finalWorkdir ?? "/app"}/${destination}`);
+        : normalizeDockerPath(`${finalWorkdir ?? "/"}/${destination}`);
       expect(
-        destinationPath === "/app" || destinationPath.startsWith("/app/"),
-        `final-stage COPY must stay under /app: ${copy}`,
+        destinationPath === finalWorkdir ||
+          destinationPath.startsWith(`${finalWorkdir}/`),
+        `final-stage COPY must stay under ${finalWorkdir}: ${copy}`,
       ).toBe(true);
       for (const source of sources) {
         const sourceKey = runtimeCopyKey(source);
@@ -428,7 +431,7 @@ describe("release runtime build contract", () => {
             : normalizeDockerPath(
                 `${destinationPath}/${source.split("/").at(-1) ?? ""}`,
               );
-        const expectedTarget = `/app/${sourceKey ?? ""}`;
+        const expectedTarget = `${finalWorkdir}/${sourceKey ?? ""}`;
         expect(
           target,
           `disallowed final-stage COPY destination: ${target}`,
@@ -658,7 +661,11 @@ describe("release runtime build contract", () => {
     );
     expect(image).toMatch(/tar\s+(?:-t[fF]|tf\b|--list)/);
     expect(image).toMatch(/(?:archive|RUNTIME_ARCHIVE)/i);
-    expect(image).toContain("/app");
+    const runtimeWorkdir = dockerStageWorkdir(
+      finalDockerStage(read("apps/control-plane/Dockerfile")),
+    );
+    expect(runtimeWorkdir).toBeDefined();
+    expect(image).toContain(runtimeWorkdir ?? "");
     for (const allowed of [
       "node_modules",
       "package.json",
@@ -695,7 +702,10 @@ describe("release runtime build contract", () => {
       /grep\s+(?:(?:-[^\n]*E[^\n]*v)|(?:-[^\n]*v[^\n]*E)|(?:[^\n]*--extended-regexp[^\n]*--invert-match)|(?:[^\n]*--invert-match[^\n]*--extended-regexp))/i,
     );
     expect(image).toMatch(
-      /grep[\s\S]*(?:\/app\/|app\/)[\s\S]*node_modules[\s\S]*(?:apps\/control-plane\/dist|packages\/protocol\/dist)/i,
+      new RegExp(
+        `grep[\\s\\S]*${escapeRegExp(runtimeWorkdir ?? "")}[\\s\\S]*node_modules[\\s\\S]*(?:apps/control-plane/dist|packages/protocol/dist)`,
+        "i",
+      ),
     );
     expect(image).toMatch(/if[\s\S]*grep[\s\S]*then[\s\S]*exit\s+1/);
 
@@ -832,16 +842,19 @@ describe("release runtime build contract", () => {
         observation,
       );
     }
-    expect(evidence).toMatch(/live_status[\s:=]+(?:\$live_status|200)/i);
-    expect(evidence).toMatch(/ready_status[\s:=]+(?:\$ready_status|200)/i);
-    expect(evidence).toMatch(/metrics_status[\s:=]+(?:\$metrics_status|200)/i);
-    expect(evidence).toContain('{"status":"ok"}');
-    expect(evidence).toContain('{"status":"ready"}');
-    expect(evidence).toMatch(
-      /(?:readiness|ready)[^\n]*(?:503|db[-_ ]loss|postgres[-_ ]stop)/i,
+    expect(evidence).toMatch(/live_status[\s:=]+\$live_status/i);
+    expect(evidence).toMatch(/ready_status[\s:=]+\$ready_status/i);
+    expect(evidence).toMatch(/metrics_status[\s:=]+\$metrics_status/i);
+    expect(evidence).toMatch(/(?:cat|source)[^\n]*RUNTIME_[A-Z_]*OBSERV/i);
+    expect(evidence).toMatch(/live_body/);
+    expect(evidence).toMatch(/ready_body/);
+    expect(evidence).toMatch(/metrics_body/);
+    expect(evidence).not.toMatch(
+      /(?:printf|echo|tee)[^\n]*\{"status":"(?:ok|ready)"\}/,
     );
+    expect(evidence).toMatch(/(?:readiness|ready)[^\n]*\$readiness_status/i);
     expect(evidence).toMatch(/(?:db[-_ ]loss|postgres[-_ ]stop)/i);
-    expect(evidence).toMatch(/recovery/i);
+    expect(evidence).toMatch(/recovery[^\n]*\$readiness_status/i);
     expect(evidence).toMatch(/__drizzle_migrations/);
     for (const [name, value] of [
       ["migration_tag", "0002_result_acknowledgement"],

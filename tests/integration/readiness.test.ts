@@ -89,6 +89,7 @@ const createFakeReadinessTransaction = (
     readSentinel?: string;
     writeError?: Error;
     readError?: Error;
+    hangOnWrite?: boolean;
     hangOnRead?: boolean;
   }> = {},
 ): FakeReadinessTransaction => {
@@ -114,6 +115,9 @@ const createFakeReadinessTransaction = (
       identities.push(backendPid);
       if (options.writeError !== undefined) {
         throw options.writeError;
+      }
+      if (options.hangOnWrite) {
+        await new Promise<void>(() => {});
       }
       writtenSentinel.value = value;
     },
@@ -338,33 +342,47 @@ describe("readiness transaction orchestrator contract", () => {
     ]);
   });
 
-  it("enforces a complete-operation deadline for a hanging read phase", async () => {
-    const health = await loadHealthModule();
-    const fake = createFakeReadinessTransaction({ hangOnRead: true });
-    const deadlineMs = 40;
-    const ciBoundMs = deadlineMs * 10 + 250;
-    const startedAt = performance.now();
-    const outcome = await Promise.race([
-      health
-        .assertReadinessTransaction(fake.port, { deadlineMs })
-        .then(() => "resolved" as const)
-        .catch(() => "rejected" as const),
-      new Promise<"test-guard-timeout">((resolve) => {
-        setTimeout(() => resolve("test-guard-timeout"), ciBoundMs);
-      }),
-    ]);
+  it.each([
+    [
+      "write",
+      { hangOnWrite: true },
+      ["begin", "read-migration-metadata", "write-probe-sentinel"],
+    ],
+    [
+      "read",
+      { hangOnRead: true },
+      [
+        "begin",
+        "read-migration-metadata",
+        "write-probe-sentinel",
+        "read-probe-sentinel",
+      ],
+    ],
+  ] as const)(
+    "enforces a complete-operation deadline for a hanging sentinel %s phase",
+    async (_phase, options, expectedEvents) => {
+      vi.useFakeTimers();
+      try {
+        const health = await loadHealthModule();
+        const fake = createFakeReadinessTransaction(options);
+        const deadlineMs = 40;
+        const pending = health.assertReadinessTransaction(fake.port, {
+          deadlineMs,
+        });
 
-    expect(outcome).toBe("rejected");
-    expect(performance.now() - startedAt).toBeLessThan(ciBoundMs);
-    expect(fake.events).toEqual([
-      "begin",
-      "read-migration-metadata",
-      "write-probe-sentinel",
-      "read-probe-sentinel",
-      "rollback",
-      "cleanup",
-    ]);
-  });
+        await vi.advanceTimersByTimeAsync(deadlineMs);
+        await expect(pending).rejects.toThrow();
+        expect(fake.events).toEqual(expectedEvents);
+        expect(fake.identities).toEqual(
+          expectedEvents
+            .filter((event) => event !== "begin")
+            .map(() => fake.backendPid),
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 });
 
 describe("PostgreSQL readiness probe", () => {

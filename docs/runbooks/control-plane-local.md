@@ -126,13 +126,13 @@ done
 test "$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")" = "200"
 test "$(curl --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")" = '{"status":"ok"}'
 docker compose --env-file "$runtime_env_file" start postgres
-trap - EXIT
 for attempt in $(seq 1 60); do
   readiness_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready" || true)
   test "$readiness_status" = "200" && break
   test "$attempt" = "60" && exit 1
   sleep 1
 done
+trap - EXIT
 ```
 
 Every loop exits nonzero on timeout. Do not continue unless readiness has recovered.
