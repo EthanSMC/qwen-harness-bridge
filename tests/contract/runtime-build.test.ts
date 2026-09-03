@@ -22,37 +22,77 @@ const read = (path: string): string => readFileSync(absolute(path), "utf8");
 
 const yamlMappingBlock = (
   source: string,
-  name: string,
-  indentation: number,
+  parentName: string,
+  childName: string,
 ): string => {
   const lines = source.split("\n");
-  const prefix = " ".repeat(indentation);
-  const start = lines.indexOf(`${prefix}${name}:`);
-  expect(start, `missing YAML mapping ${name}`).toBeGreaterThan(-1);
+  const mappingLine = (name: string): RegExp =>
+    new RegExp(
+      `^(\\s*)${name.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&")}:\\s*(?:#.*)?$`,
+    );
+  const parentMatch = lines
+    .map((line, index) => ({
+      index,
+      match: line.match(mappingLine(parentName)),
+    }))
+    .find(({ match }) => match !== null);
+  expect(parentMatch, `missing YAML mapping ${parentName}`).toBeDefined();
+  const parentIndex = parentMatch?.index ?? -1;
+  const parentIndent = parentMatch?.match?.[1].length ?? -1;
+  const start = lines.findIndex((line, index) => {
+    if (
+      index <= parentIndex ||
+      line.trim().length === 0 ||
+      line.trimStart().startsWith("#")
+    ) {
+      return false;
+    }
+    const indent = line.length - line.trimStart().length;
+    if (indent <= parentIndent) return false;
+    return mappingLine(childName).test(line);
+  });
+  expect(
+    start,
+    `missing YAML mapping ${childName} under ${parentName}`,
+  ).toBeGreaterThan(-1);
+  const childIndent =
+    (lines[start]?.length ?? 0) - (lines[start]?.trimStart().length ?? 0);
   const end = lines.findIndex(
     (line, index) =>
       index > start &&
       line.trim().length > 0 &&
       !line.trimStart().startsWith("#") &&
-      line.length - line.trimStart().length <= indentation,
+      line.length - line.trimStart().length <= childIndent,
   );
   return lines.slice(start, end === -1 ? lines.length : end).join("\n");
 };
 
-const workflowStep = (workflow: string, name: string): string => {
+const workflowStepIndex = (workflow: string, name: string): number => {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const marker = new RegExp(`^(\\s*)-\\s+name:\\s*${escapedName}\\s*$`);
   const lines = workflow.split("\n");
-  const marker = `      - name: ${name}`;
   const occurrences = lines
-    .map((line, index) => (line === marker ? index : -1))
+    .map((line, index) => (marker.test(line) ? index : -1))
     .filter((index) => index !== -1);
   expect(occurrences, `workflow step ${name} must be unique`).toHaveLength(1);
   const start = occurrences[0] ?? -1;
   expect(start, `missing workflow step ${name}`).toBeGreaterThan(-1);
+  return start;
+};
+
+const workflowStep = (workflow: string, name: string): string => {
+  const lines = workflow.split("\n");
+  const start = workflowStepIndex(workflow, name);
+  const stepIndent = lines[start]?.length ?? 0;
+  const stepPrefixLength = lines[start]?.trimStart().length ?? 0;
+  const indentation = stepIndent - stepPrefixLength;
   const end = lines.findIndex(
     (line, index) =>
       index > start &&
-      (line.startsWith("      - ") ||
-        (line.trim().length > 0 && line.length - line.trimStart().length < 6)),
+      line.trim().length > 0 &&
+      !line.trimStart().startsWith("#") &&
+      line.length - line.trimStart().length <= indentation &&
+      /^\s*(?:-|[A-Za-z_][A-Za-z0-9_-]*:)/.test(line),
   );
   return lines.slice(start, end === -1 ? lines.length : end).join("\n");
 };
@@ -98,12 +138,12 @@ const buildEnvironment = (): NodeJS.ProcessEnv => {
 };
 
 const finalDockerStage = (dockerfile: string): string => {
-  const stages = dockerfile
-    .split(/(?=^FROM\s+)/im)
-    .filter((stage) => /^FROM\s+/i.test(stage));
+  const stages = dockerStageBlocks(dockerfile);
   expect(stages.length).toBeGreaterThanOrEqual(2);
   for (const stage of stages) {
-    expect(stage.split("\n")[0]).toMatch(/@sha256:[0-9a-f]{64}(?:\s|$)/i);
+    expect(stage.split("\n")[0]).toMatch(
+      /^FROM\s+(?:--\S+\s+)*\S+@sha256:[0-9a-f]{64}(?:\s|$)/i,
+    );
   }
   const finalStage = stages.at(-1);
   expect(finalStage).toBeDefined();
@@ -145,18 +185,17 @@ const dockerStageBlocks = (dockerfile: string): string[] =>
   dockerfile.split(/(?=^FROM\s+)/im).filter((stage) => /^FROM\s+/i.test(stage));
 
 const dockerStageName = (stage: string): string | undefined =>
-  stage.match(/^FROM\s+\S+(?:\s+AS\s+(\S+))?/i)?.[1]?.toLowerCase();
+  stage
+    .split("\n")[0]
+    ?.match(/^FROM\s+(?:--\S+\s+)*\S+(?:\s+AS\s+(\S+))?/i)?.[1]
+    ?.toLowerCase();
 
-const dockerStageWorkdir = (stage: string): string => {
+const dockerStageWorkdir = (stage: string): string | undefined => {
   const workdir = dockerfileInstructions(stage)
     .filter((instruction) => /^WORKDIR\s+/i.test(instruction))
     .at(-1)
     ?.match(/^WORKDIR\s+(\S+)/i)?.[1];
-  expect(
-    workdir,
-    "every build/runtime stage must declare WORKDIR",
-  ).toBeDefined();
-  return normalizeDockerPath(workdir ?? "/");
+  return workdir === undefined ? undefined : normalizeDockerPath(workdir);
 };
 
 const dockerCopyOperands = (
@@ -166,7 +205,8 @@ const dockerCopyOperands = (
     .trim()
     .split(/\s+/)
     .slice(1)
-    .map((token) => token.replace(/^['"]|['"]$/g, ""));
+    .map((token) => token.replace(/^[\x5b"']+|[\x5d"',]+$/g, ""))
+    .filter((token) => token.length > 0);
   const options: string[] = [];
   const operands: string[] = [];
   for (const token of tokens) {
@@ -183,13 +223,38 @@ const dockerCopyOperands = (
   ).toBeDefined();
   expect(
     operands.length,
-    `COPY must have one source and one destination: ${instruction}`,
-  ).toBe(2);
+    `COPY must have at least one source and one destination: ${instruction}`,
+  ).toBeGreaterThanOrEqual(2);
   return {
     from: (from ?? "--from=").slice("--from=".length).toLowerCase(),
     sources: operands.slice(0, -1),
     destination: operands.at(-1) ?? "",
   };
+};
+
+const runtimeCopyAllowlist = new Set([
+  "node_modules",
+  "package.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "apps/control-plane/package.json",
+  "apps/control-plane/dist",
+  "packages/protocol/package.json",
+  "packages/protocol/dist",
+]);
+
+const runtimeCopyKey = (source: string): string | undefined => {
+  const normalized = normalizeDockerPath(source);
+  return [...runtimeCopyAllowlist]
+    .sort((left, right) => right.length - left.length)
+    .find((key) => {
+      const path = `/${key}`;
+      return (
+        normalized === path ||
+        normalized.startsWith(`${path}/`) ||
+        normalized.endsWith(path)
+      );
+    });
 };
 
 const expectBoundedPolling = (step: string): void => {
@@ -319,64 +384,64 @@ describe("release runtime build contract", () => {
     expect(instructions.filter((line) => /^ADD\s+/i.test(line))).toHaveLength(
       0,
     );
+    expect(instructions.filter((line) => /^RUN\s+/i.test(line))).toHaveLength(
+      0,
+    );
 
     const finalCopies = instructions.filter((line) => /^COPY\s+/i.test(line));
     const stages = dockerStageBlocks(dockerfile);
     const stagesByName = new Map(
       stages
-        .map((stage) => [dockerStageName(stage), stage] as const)
-        .filter((entry): entry is [string, string] => entry[0] !== undefined),
+        .map((stage, index) => [dockerStageName(stage), index] as const)
+        .filter((entry): entry is [string, number] => entry[0] !== undefined),
     );
     const finalWorkdir = dockerStageWorkdir(finalStage);
-    const expectedCopies = new Map([
-      ["node_modules", "node_modules"],
-      ["package.json", "package.json"],
-      ["pnpm-workspace.yaml", "pnpm-workspace.yaml"],
-      ["pnpm-lock.yaml", "pnpm-lock.yaml"],
-      ["apps/control-plane/package.json", "apps/control-plane/package.json"],
-      ["apps/control-plane/dist", "apps/control-plane/dist"],
-      ["packages/protocol/package.json", "packages/protocol/package.json"],
-      ["packages/protocol/dist", "packages/protocol/dist"],
-    ]);
-    const observedCopies = new Map<string, string>();
-    expect(finalCopies.length).toBe(expectedCopies.size);
+    expect(finalWorkdir).toBe("/app");
+    const observedCopies = new Set<string>();
     for (const copy of finalCopies) {
       const { from, sources, destination } = dockerCopyOperands(copy);
-      const sourceStage =
+      const sourceStageIndex =
         from.match(/^\d+$/)?.[0] !== undefined
-          ? stages[Number(from)]
+          ? Number(from)
           : stagesByName.get(from);
       expect(
-        sourceStage,
+        sourceStageIndex,
         `COPY source stage must exist: ${from}`,
       ).toBeDefined();
-      const sourceWorkdir = dockerStageWorkdir(sourceStage ?? "");
-      const sourcePath = normalizeDockerPath(sources[0] ?? "");
-      const sourcePrefix = sourceWorkdir === "/" ? "/" : `${sourceWorkdir}/`;
-      expect(sourcePath.startsWith(sourcePrefix)).toBe(true);
-      const sourceKey = sourcePath.slice(sourcePrefix.length);
-      expect(
-        expectedCopies.has(sourceKey),
-        `disallowed final-stage COPY source: ${sourceKey}`,
-      ).toBe(true);
+      expect(sourceStageIndex ?? -1).toBeLessThan(stages.length - 1);
       const destinationPath = destination.startsWith("/")
         ? normalizeDockerPath(destination)
-        : normalizeDockerPath(`${finalWorkdir}/${destination}`);
-      const expectedDestination = normalizeDockerPath(
-        `${finalWorkdir}/${expectedCopies.get(sourceKey) ?? ""}`,
-      );
+        : normalizeDockerPath(`${finalWorkdir ?? "/app"}/${destination}`);
       expect(
-        destinationPath,
-        `final-stage COPY destination must be exact for ${sourceKey}`,
-      ).toBe(expectedDestination);
-      expect(
-        observedCopies.has(sourceKey),
-        `duplicate final-stage COPY source: ${sourceKey}`,
-      ).toBe(false);
-      observedCopies.set(sourceKey, destinationPath);
+        destinationPath === "/app" || destinationPath.startsWith("/app/"),
+        `final-stage COPY must stay under /app: ${copy}`,
+      ).toBe(true);
+      for (const source of sources) {
+        const sourceKey = runtimeCopyKey(source);
+        expect(
+          sourceKey,
+          `disallowed final-stage COPY source: ${source}`,
+        ).toBeDefined();
+        const target =
+          sources.length === 1
+            ? destinationPath
+            : normalizeDockerPath(
+                `${destinationPath}/${source.split("/").at(-1) ?? ""}`,
+              );
+        const expectedTarget = `/app/${sourceKey ?? ""}`;
+        expect(
+          target,
+          `disallowed final-stage COPY destination: ${target}`,
+        ).toBe(expectedTarget);
+        expect(
+          observedCopies.has(sourceKey ?? ""),
+          `duplicate final-stage COPY source: ${sourceKey}`,
+        ).toBe(false);
+        observedCopies.add(sourceKey ?? "");
+      }
     }
-    expect([...observedCopies.keys()].sort()).toEqual(
-      [...expectedCopies.keys()].sort(),
+    expect([...observedCopies].sort()).toEqual(
+      [...runtimeCopyAllowlist].sort(),
     );
 
     const ignored = dockerignore
@@ -410,27 +475,25 @@ describe("release runtime build contract", () => {
 
   it("scopes migration and readiness wiring to the correct Compose services", () => {
     const compose = read("docker-compose.yml");
-    const postgres = yamlMappingBlock(compose, "postgres", 2);
-    const migrate = yamlMappingBlock(compose, "migrate", 2);
-    const controlPlane = yamlMappingBlock(compose, "control-plane", 2);
+    const postgres = yamlMappingBlock(compose, "services", "postgres");
+    const migrate = yamlMappingBlock(compose, "services", "migrate");
+    const controlPlane = yamlMappingBlock(compose, "services", "control-plane");
 
     expect(postgres).toMatch(/image:\s*postgres:16-alpine@sha256:[0-9a-f]{64}/);
     expect(migrate).toMatch(/restart:\s*(?:["']?no["']?|false)/);
     expect(migrate).toMatch(
       /(?:command:|entrypoint:)[\s\S]*dist\/db\/migrate\.js/,
     );
-    const migrationDependencies = yamlMappingBlock(migrate, "depends_on", 4);
-    const migrationPostgres = yamlMappingBlock(
-      migrationDependencies,
+    const migrationDependencies = yamlMappingBlock(
+      migrate,
+      "depends_on",
       "postgres",
-      6,
     );
-    expect(migrationPostgres).toContain("condition: service_healthy");
-    const controlDependencies = yamlMappingBlock(controlPlane, "depends_on", 4);
+    expect(migrationDependencies).toMatch(/condition:\s*service_healthy/);
     const controlMigration = yamlMappingBlock(
-      controlDependencies,
+      controlPlane,
+      "depends_on",
       "migrate",
-      6,
     );
     expect(controlMigration).toContain(
       "condition: service_completed_successfully",
@@ -450,35 +513,25 @@ describe("release runtime build contract", () => {
     expect(controlPlane).not.toMatch(/QHB_TLS_(?:CERT|KEY)\s*:/);
   });
 
-  it("pins readiness to the exact expected migration and a safe probe", () => {
-    const health = read("apps/control-plane/src/db/health.ts");
-
-    expect(health).toContain("0002_result_acknowledgement");
-    expect(health).toContain("1788244364352");
-    expect(health).toContain(
-      "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
-    );
-    expect(health).toMatch(/CREATE\s+TEMP(?:ORARY)?\s+TABLE/i);
-    expect(health).toMatch(/ON\s+COMMIT\s+DROP/i);
-    expect(health).toMatch(/statement_timeout/i);
-    expect(health).not.toMatch(
-      /(?:INSERT|UPDATE|DELETE)\s+(?:INTO\s+)?(?:jobs|connectors|approvals)\b/i,
-    );
-    expect(read("vitest.workspace.ts")).toContain(
-      "tests/integration/readiness.test.ts",
-    );
-    expect(read("vitest.workspace.ts")).toContain(
-      "tests/contract/health-metrics.test.ts",
-    );
-    expect(read("vitest.workspace.ts")).toContain(
-      "tests/contract/runtime-build.test.ts",
-    );
-  });
-
   it("has an executable PR Docker gate with evidence and unconditional cleanup", () => {
     const workflow = read(".github/workflows/runtime.yml");
-    const runtimeJob = yamlMappingBlock(workflow, "runtime", 2);
-    expect(runtimeJob).not.toMatch(/^ {6}- (?!name:)/m);
+    const runtimeJob = yamlMappingBlock(workflow, "jobs", "runtime");
+    const orderedSteps = [
+      "Generate ephemeral runtime material",
+      "Build and start runtime",
+      "Verify healthy runtime",
+      "Inspect effective runtime image",
+      "Verify database failure separation",
+      "Capture runtime evidence",
+      "Upload runtime evidence",
+      "Cleanup runtime",
+    ];
+    const stepIndexes = orderedSteps.map((name) =>
+      workflowStepIndex(runtimeJob, name),
+    );
+    expect(stepIndexes).toEqual(
+      [...stepIndexes].sort((left, right) => left - right),
+    );
     const material = workflowStep(
       runtimeJob,
       "Generate ephemeral runtime material",
@@ -501,36 +554,79 @@ describe("release runtime build contract", () => {
     );
     expect(material).toContain("umask 077");
     expect(material).toMatch(/chmod\s+700\b/);
-    expect(material).toMatch(/chmod\s+600\b/);
-    expect(material).toMatch(/openssl\s+req[\s\S]*-keyout[\s\S]*-out/);
-    expect(material).toMatch(/openssl[^\n]*(?:>|--out\s+)\S+/);
+    expect(material).toMatch(/chmod\s+600[^\n]*RUNTIME_ENV_FILE/i);
+    expect(material).toMatch(/chmod\s+600[^\n]*(?:cert|key)/i);
+    expect(material).toMatch(/openssl\s+req[\s\S]*-x509/i);
+    expect(material).toMatch(
+      /openssl\s+req[\s\S]*-keyout[\s\S]*-out[\s\S]*127\.0\.0\.1/i,
+    );
+    expect(material).toMatch(
+      /openssl\s+req[\s\S]*-keyout\s+["']?\$QHB_TLS_KEY_FILE["']?/i,
+    );
+    expect(material).toMatch(
+      /openssl\s+req[\s\S]*-out\s+["']?\$QHB_TLS_CERT_FILE["']?/i,
+    );
+    expect(material).toMatch(/subjectAltName\s*=\s*IP:127\.0\.0\.1/i);
     expect(material).not.toMatch(/echo[^\n]*\$\([^\n]*openssl/);
-    for (const name of [
+    const randomNames = [
       "POSTGRES_PASSWORD",
       "QHB_OWNER_ID",
       "QHB_MCP_BEARER_TOKEN",
       "QHB_REQUEST_ENCRYPTION_KEY",
       "QHB_CONNECTOR_SESSION_SIGNING_KEY",
-    ]) {
-      expect(material).toMatch(
-        new RegExp(`(?:^|\\n)\\s*${name}=.*\\$\\(openssl\\s+rand\\b`),
+    ];
+    for (const name of randomNames) {
+      const randomAssignment = material.match(
+        new RegExp(
+          `${name}\\s*=\\s*\\$\\(openssl\\s+rand\\b(?:\\s+--?[A-Za-z0-9_-]+)*\\s+(\\d+)\\b`,
+        ),
       );
+      expect(randomAssignment, `${name} must use openssl rand`).not.toBeNull();
+      expect(Number(randomAssignment?.[1])).toBeGreaterThanOrEqual(32);
       expect(material).toMatch(new RegExp(`${name}=\\$\\{?${name}\\}?`));
     }
+    const uniquenessOffset = material.indexOf("sort -u");
+    expect(uniquenessOffset).toBeGreaterThan(-1);
+    const uniquenessWindow = material.slice(
+      Math.max(0, uniquenessOffset - 700),
+      uniquenessOffset + 300,
+    );
+    for (const name of randomNames) {
+      expect(uniquenessWindow).toMatch(new RegExp(`\\$\\{?${name}\\}?`));
+    }
+    expect(material).toMatch(/sort\s+-u[\s\S]*wc\s+-l[\s\S]*(?:-eq|==)\s+5\b/);
     expect(material).toContain("QHB_TLS_CERT_FILE");
     expect(material).toContain("QHB_TLS_KEY_FILE");
-    expect(material).toMatch(/QHB_TLS_CERT_FILE=.*(?:\.crt|cert)/i);
-    expect(material).toMatch(/QHB_TLS_KEY_FILE=.*(?:\.key|key)/i);
+    expect(material).toMatch(
+      /(?:QHB_TLS_CERT_FILE|[A-Za-z_]*CERT_FILE)[^\n]*\.(?:crt|cert)/i,
+    );
+    expect(material).toMatch(
+      /(?:QHB_TLS_KEY_FILE|[A-Za-z_]*KEY_FILE)[^\n]*\.(?:key)/i,
+    );
+    expect(material).toMatch(
+      /openssl\s+x509\b[\s\S]*-in\s+[^\n]*(?:cert|CERT)/i,
+    );
+    expect(material).toMatch(
+      /openssl\s+x509\b[\s\S]*-in\s+["']?\$QHB_TLS_CERT_FILE["']?/i,
+    );
+    expect(material).toMatch(/openssl\s+x509\b[\s\S]*-noout\b/i);
+    expect(material).toMatch(/(?:grep|test)[^\n]*127\.0\.0\.1/);
     expect(material).toMatch(/RUNTIME_ENV_FILE=.*runtime[._-]env/);
-    expect(material).toMatch(/(?:GITHUB_ENV|GITHUB_OUTPUT|runtime[._-]env)/);
-    expect(material).toMatch(/sort\s+-u/);
-    expect(material).toMatch(/wc\s+-l/);
-    expect(material).toMatch(/(?:-eq|==)\s+5\b/);
+    expect(material).toMatch(
+      /(?:GITHUB_ENV|GITHUB_OUTPUT)[^\n]*RUNTIME_ENV_FILE/,
+    );
+    expect(material).toMatch(/(?:>>|tee\s+-a|>)[^\n]*RUNTIME_ENV_FILE/);
     expect(start).toContain("set -euo pipefail");
     expect(start).toMatch(/pnpm\s+(?:--[^\n]+\s+)?build/);
-    expect(start).toMatch(/docker compose config --quiet/);
-    expect(start).toMatch(/docker compose build/);
-    expect(start).toMatch(/docker compose up -d/);
+    expect(start).toMatch(
+      /docker compose[^\n]*--env-file\s+["']?\$RUNTIME_ENV_FILE["']?[^\n]*config\s+--quiet/,
+    );
+    expect(start).toMatch(
+      /docker compose[^\n]*--env-file\s+["']?\$RUNTIME_ENV_FILE["']?[^\n]*build/,
+    );
+    expect(start).toMatch(
+      /docker compose[^\n]*--env-file\s+["']?\$RUNTIME_ENV_FILE["']?[^\n]*up\s+-d/,
+    );
 
     const composeCommands = normalizedWorkflowCommands(workflow);
     expect(composeCommands.length).toBeGreaterThan(0);
@@ -538,14 +634,43 @@ describe("release runtime build contract", () => {
       expect(
         command,
         `Compose command must use the generated env file: ${command}`,
-      ).toMatch(/--env-file\s+\S+/);
+      ).toMatch(/--env-file\s+["']?\$RUNTIME_ENV_FILE["']?(?:\s|$)/);
+      if (/\bconfig\b/.test(command)) {
+        expect(command).toMatch(/\b(?:--quiet|--hash)\b/);
+      }
     }
 
     expect(image).toContain("set -euo pipefail");
-    expect(image).toMatch(/docker\s+create\b/);
-    expect(image).toMatch(/docker\s+export\b/);
+    expect(image).toMatch(
+      /(?:container_id|RUNTIME_CONTAINER_ID)\s*=\s*\$\([\s\S]*docker compose[\s\S]*ps\s+-q\s+control-plane/,
+    );
+    expect(image).toMatch(
+      /docker\s+inspect[\s\S]*(?:Config\.Image|container_id|RUNTIME_CONTAINER_ID)/i,
+    );
+    expect(image).toMatch(
+      /(?:image_ref|RUNTIME_IMAGE_REF)[\s\S]*docker\s+inspect[\s\S]*(?:container_id|RUNTIME_CONTAINER_ID)/i,
+    );
+    expect(image).toMatch(
+      /docker\s+image\s+inspect[^\n]*(?:image_ref|RUNTIME_IMAGE_REF)/i,
+    );
+    expect(image).toMatch(
+      /docker\s+export[^\n]*(?:container_id|RUNTIME_CONTAINER_ID)/i,
+    );
     expect(image).toMatch(/tar\s+(?:-t[fF]|tf\b|--list)/);
-    expect(image).toMatch(/docker\s+rm\b/);
+    expect(image).toMatch(/(?:archive|RUNTIME_ARCHIVE)/i);
+    expect(image).toContain("/app");
+    for (const allowed of [
+      "node_modules",
+      "package.json",
+      "pnpm-lock.yaml",
+      "pnpm-workspace.yaml",
+      "apps/control-plane/package.json",
+      "apps/control-plane/dist",
+      "packages/protocol/package.json",
+      "packages/protocol/dist",
+    ]) {
+      expect(image).toContain(allowed);
+    }
     for (const forbidden of [
       "src/",
       "tests/",
@@ -566,21 +691,35 @@ describe("release runtime build contract", () => {
       expect(image).toContain(forbidden);
     }
     expect(image).toMatch(/grep\s+(?:-[^\n]*E|--extended-regexp)/);
+    expect(image).toMatch(
+      /grep\s+(?:(?:-[^\n]*E[^\n]*v)|(?:-[^\n]*v[^\n]*E)|(?:[^\n]*--extended-regexp[^\n]*--invert-match)|(?:[^\n]*--invert-match[^\n]*--extended-regexp))/i,
+    );
+    expect(image).toMatch(
+      /grep[\s\S]*(?:\/app\/|app\/)[\s\S]*node_modules[\s\S]*(?:apps\/control-plane\/dist|packages\/protocol\/dist)/i,
+    );
     expect(image).toMatch(/if[\s\S]*grep[\s\S]*then[\s\S]*exit\s+1/);
 
     expect(healthy).toContain("set -euo pipefail");
     expect(healthy).toMatch(
       /runtime_url\s*=\s*["']https:\/\/127\.0\.0\.1:8443["']/,
     );
-    for (const endpoint of ["/health/live", "/health/ready", "/metrics"]) {
+    for (const [statusName, endpoint] of [
+      ["live_status", "/health/live"],
+      ["ready_status", "/health/ready"],
+      ["metrics_status", "/metrics"],
+    ]) {
       expect(healthy).toMatch(
         new RegExp(
-          `curl[^\\n]*--cacert[^\\n]*\\$runtime_url${endpoint.replaceAll("/", "\\/")}`,
+          `${statusName}\\s*=\\s*["']?\\$\\(curl[\\s\\S]*%\\{http_code\\}[\\s\\S]*${endpoint.replaceAll("/", "\\/")}`,
         ),
+      );
+      expect(healthy).toMatch(
+        new RegExp(`test\\s+["']?\\$${statusName}["']?\\s*=\\s*["']200["']`),
       );
     }
     expect(healthy).toMatch(/live_body\s*=\s*["']?\$\(curl/);
     expect(healthy).toMatch(/ready_body\s*=\s*["']?\$\(curl/);
+    expect(healthy).toMatch(/metrics_body/);
     expect(healthy).toMatch(
       /test\s+["']?\$live_body["']?\s*=\s*['"]\{"status":"ok"\}['"]/,
     );
@@ -625,13 +764,13 @@ describe("release runtime build contract", () => {
     expectBoundedPolling(healthy);
 
     expect(databaseLoss).toContain("set -euo pipefail");
-    expect(databaseLoss).toMatch(/docker compose stop postgres/);
+    expect(databaseLoss).toMatch(
+      /docker compose[^\n]*--env-file\s+["']?\$RUNTIME_ENV_FILE["']?[^\n]*stop\s+postgres/,
+    );
     expect(databaseLoss).toMatch(
       /runtime_url\s*=\s*["']https:\/\/127\.0\.0\.1:8443["']/,
     );
-    const recoveryMarker = databaseLoss.indexOf(
-      "docker compose start postgres",
-    );
+    const recoveryMarker = databaseLoss.indexOf("start postgres");
     expect(recoveryMarker).toBeGreaterThan(-1);
     const whileStopped = databaseLoss.slice(0, recoveryMarker);
     const afterRecovery = databaseLoss.slice(recoveryMarker);
@@ -661,12 +800,48 @@ describe("release runtime build contract", () => {
       /readiness_status\s*=\s*["']?\$\(curl[^\n]*%\{http_code\}/,
     );
     expect(afterRecovery).toMatch(/curl[^\n]*--cacert[^\n]*\/health\/ready/);
+    expect(afterRecovery).toMatch(/ready_body\s*=\s*["']?\$\(curl/);
+    expect(afterRecovery).toMatch(
+      /test\s+["']?\$ready_body["']?\s*=\s*['"]\{"status":"ready"\}['"]/,
+    );
     expectBoundedPolling(afterRecovery);
     expect(
       (databaseLoss.match(/for\s+attempt\s+in\s+\$\(seq\s+1\s+/g) ?? []).length,
     ).toBeGreaterThanOrEqual(2);
 
     expect(evidence).toContain("set -euo pipefail");
+    expect(evidence).toMatch(
+      /(?:>|>>|tee\s+(?:-a\s+)?)[^\n]*\$RUNTIME_EVIDENCE_FILE/,
+    );
+    for (const observation of [
+      "live_status",
+      "live_body",
+      "ready_status",
+      "ready_body",
+      "metrics_status",
+      "metrics_body",
+      "text/plain; version=0.0.4; charset=utf-8",
+      "qhb_mcp_submit_duration_seconds",
+      "qhb_connector_online",
+      "qhb_job_queue_age_seconds",
+      "privacy",
+      "image_digest",
+      "config_digest",
+    ]) {
+      expect(evidence, `evidence must record ${observation}`).toContain(
+        observation,
+      );
+    }
+    expect(evidence).toMatch(/live_status[\s:=]+(?:\$live_status|200)/i);
+    expect(evidence).toMatch(/ready_status[\s:=]+(?:\$ready_status|200)/i);
+    expect(evidence).toMatch(/metrics_status[\s:=]+(?:\$metrics_status|200)/i);
+    expect(evidence).toContain('{"status":"ok"}');
+    expect(evidence).toContain('{"status":"ready"}');
+    expect(evidence).toMatch(
+      /(?:readiness|ready)[^\n]*(?:503|db[-_ ]loss|postgres[-_ ]stop)/i,
+    );
+    expect(evidence).toMatch(/(?:db[-_ ]loss|postgres[-_ ]stop)/i);
+    expect(evidence).toMatch(/recovery/i);
     expect(evidence).toMatch(/__drizzle_migrations/);
     for (const [name, value] of [
       ["migration_tag", "0002_result_acknowledgement"],
@@ -681,11 +856,13 @@ describe("release runtime build contract", () => {
         new RegExp(`test\\s+["']?\\$${name}["']?\\s*=\\s*["']${value}["']`),
       );
     }
+    expect(evidence).toMatch(/image_digest\s*=\s*["']?sha256:\$\(/i);
     expect(evidence).toMatch(
-      /image_digest\s*=\s*["']?\$\(docker\s+(?:image\s+)?inspect/,
+      /image_digest[\s\S]*docker\s+image\s+inspect[\s\S]*(?:image_ref|RUNTIME_IMAGE_REF)/i,
     );
+    expect(evidence).toMatch(/config_digest\s*=\s*["']?sha256:/i);
     expect(evidence).toMatch(
-      /config_digest\s*=\s*["']?\$\(docker\s+(?:image\s+)?inspect/,
+      /docker compose[\s\S]*--env-file\s+["']?\$RUNTIME_ENV_FILE["']?[\s\S]*config\s+--hash\s+control-plane/,
     );
     expect(evidence).toMatch(
       /(?:=~|grep[^\n]*-E)[\s\S]*\^sha256:\[0-9a-f\]\{64\}\$/i,
@@ -702,10 +879,28 @@ describe("release runtime build contract", () => {
     );
     expect(evidence).toMatch(/runtime[-_]evidence/);
     expect(upload).toMatch(/uses:\s*actions\/upload-artifact@/);
+    expect(upload).toMatch(
+      /path:\s*["']?\$\{\{\s*env\.RUNTIME_EVIDENCE_FILE\s*\}\}/,
+    );
+    expect(upload).toMatch(
+      /name:\s*[^\n]*(?:runtime[-_]evidence|RUNTIME_EVIDENCE_FILE)/i,
+    );
     expect(cleanup).toMatch(/if:\s*always\(\)/);
-    expect(cleanup).toMatch(/docker compose[^\n]*down/);
     expect(cleanup).toMatch(
-      /if\s+\[[^\n]*-n[^\n]*RUNTIME_DIR[^\n]*\][\s\S]*-d[^\n]*RUNTIME_DIR[\s\S]*rm\s+-rf\s+--[^\n]*RUNTIME_DIR/,
+      /docker compose[^\n]*--env-file\s+["']?\$RUNTIME_ENV_FILE["']?[^\n]*down/,
+    );
+    expect(cleanup).toMatch(
+      /docker\s+rm[^\n]*(?:RUNTIME_CONTAINER_ID|container_id)/i,
+    );
+    expect(cleanup).toMatch(
+      /docker\s+(?:image\s+rm|rmi)[^\n]*(?:RUNTIME_IMAGE_REF|image_ref)/i,
+    );
+    expect(cleanup).toMatch(/rm\s+-f\s+--[^\n]*(?:RUNTIME_ARCHIVE|archive)/i);
+    expect(cleanup).toMatch(
+      /rm\s+-f\s+--[^\n]*(?:RUNTIME_EVIDENCE_FILE|evidence)/i,
+    );
+    expect(cleanup).toMatch(
+      /if\s+(?:\[\[?|\[)[\s\S]*-n[\s\S]*RUNTIME_DIR[\s\S]*-d[\s\S]*RUNTIME_DIR[\s\S]*(?:\/tmp\/|RUNTIME_DIR\s*==)[\s\S]*rm\s+-rf\s+--[\s\S]*RUNTIME_DIR/,
     );
     expect(workflow).not.toMatch(/curl[^\n]*(?:\s-k(?:\s|$)|--insecure)/);
   });

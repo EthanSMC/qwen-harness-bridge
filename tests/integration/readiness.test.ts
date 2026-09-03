@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql } from "../../apps/control-plane/node_modules/drizzle-orm";
 import { createTestDatabase } from "./support/postgres.js";
 
@@ -55,24 +55,123 @@ type ExpectedMigration = Readonly<{
   hash: string;
 }>;
 
-type ReadinessTransactionPort = Readonly<{
+type ReadinessTransactionContext = Readonly<{
+  backendPid: number;
   readMigrationMetadata(): Promise<ExpectedMigration>;
-  writeReadProbe(): Promise<string>;
+  writeProbeSentinel(sentinel: string): Promise<void>;
+  readProbeSentinel(): Promise<string>;
+}>;
+
+type ReadinessTransactionPort = Readonly<{
+  withTransaction(
+    callback: (context: ReadinessTransactionContext) => Promise<void>,
+  ): Promise<void>;
+}>;
+
+type ReadinessTransactionOptions = Readonly<{
+  deadlineMs: number;
 }>;
 
 const READINESS_PROBE_SENTINEL = "qhb_health_probe";
 
+type FakeReadinessTransaction = Readonly<{
+  port: ReadinessTransactionPort;
+  backendPid: number;
+  events: string[];
+  identities: number[];
+  writtenSentinel: { value: string | undefined };
+  withTransaction: ReturnType<typeof vi.fn>;
+}>;
+
+const createFakeReadinessTransaction = (
+  options: Readonly<{
+    migration?: ExpectedMigration;
+    readSentinel?: string;
+    writeError?: Error;
+    readError?: Error;
+    hangOnRead?: boolean;
+  }> = {},
+): FakeReadinessTransaction => {
+  const backendPid = 7001;
+  const events: string[] = [];
+  const identities: number[] = [];
+  const writtenSentinel = { value: undefined as string | undefined };
+  const context: ReadinessTransactionContext = {
+    backendPid,
+    async readMigrationMetadata() {
+      events.push("read-migration-metadata");
+      identities.push(backendPid);
+      return (
+        options.migration ?? {
+          tag: "0002_result_acknowledgement",
+          createdAt: 1788244364352,
+          hash: "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
+        }
+      );
+    },
+    async writeProbeSentinel(value) {
+      events.push("write-probe-sentinel");
+      identities.push(backendPid);
+      if (options.writeError !== undefined) {
+        throw options.writeError;
+      }
+      writtenSentinel.value = value;
+    },
+    async readProbeSentinel() {
+      events.push("read-probe-sentinel");
+      identities.push(backendPid);
+      if (options.hangOnRead) {
+        return new Promise<string>(() => {});
+      }
+      if (options.readError !== undefined) {
+        throw options.readError;
+      }
+      return options.readSentinel ?? writtenSentinel.value ?? "";
+    },
+  };
+  const withTransaction = vi.fn<ReadinessTransactionPort["withTransaction"]>(
+    async (callback) => {
+      events.push("begin");
+      try {
+        await callback(context);
+        events.push("commit");
+      } catch (error) {
+        events.push("rollback");
+        throw error;
+      } finally {
+        events.push("cleanup");
+      }
+    },
+  );
+
+  return {
+    port: { withTransaction },
+    backendPid,
+    events,
+    identities,
+    writtenSentinel,
+    withTransaction,
+  };
+};
+
 type HealthModule = Readonly<{
   EXPECTED_MIGRATION: ExpectedMigration;
-  assertReadinessTransaction(port: ReadinessTransactionPort): Promise<void>;
+  assertReadinessTransaction(
+    port: ReadinessTransactionPort,
+    options?: ReadinessTransactionOptions,
+  ): Promise<void>;
+  createPostgresReadinessTransactionPort(
+    database: typeof database.client,
+    options: { statementTimeoutMs: number },
+  ): ReadinessTransactionPort;
   createPostgresReadinessProbe(
     database: typeof database.client,
-    options?: { statementTimeoutMs: number },
+    options?: { statementTimeoutMs: number; deadlineMs?: number },
   ): ReadinessProbe;
 }>;
 
 const loadHealthModule = async (): Promise<HealthModule> =>
-  (await import("../../apps/control-plane/src/db/health.js")) as HealthModule;
+  (await import("../../apps/control-plane/src/http/health.js")) as HealthModule;
 
 const applicationRowCount = async (): Promise<number> => {
   const result = await database.query<{ row_count: string }>(
@@ -91,44 +190,52 @@ const applicationRowCount = async (): Promise<number> => {
 };
 
 describe("readiness transaction orchestrator contract", () => {
-  it("checks migration metadata before the temporary write/read", async () => {
+  it("begins one transaction and uses one context identity in contract order", async () => {
     const health = await loadHealthModule();
-    const callOrder: string[] = [];
+    const fake = createFakeReadinessTransaction();
 
     await expect(
-      health.assertReadinessTransaction({
-        async readMigrationMetadata() {
-          callOrder.push("read-migration-metadata");
-          return health.EXPECTED_MIGRATION;
-        },
-        async writeReadProbe() {
-          callOrder.push("write-read-probe");
-          return READINESS_PROBE_SENTINEL;
-        },
-      }),
+      health.assertReadinessTransaction(fake.port, { deadlineMs: 250 }),
     ).resolves.toBeUndefined();
 
-    expect(callOrder).toEqual(["read-migration-metadata", "write-read-probe"]);
+    expect(fake.withTransaction).toHaveBeenCalledTimes(1);
+    expect(fake.events).toEqual([
+      "begin",
+      "read-migration-metadata",
+      "write-probe-sentinel",
+      "read-probe-sentinel",
+      "commit",
+      "cleanup",
+    ]);
+    expect(fake.identities).toEqual([
+      fake.backendPid,
+      fake.backendPid,
+      fake.backendPid,
+    ]);
+    expect(fake.writtenSentinel.value).toBe(READINESS_PROBE_SENTINEL);
   });
 
   it("rejects a wrong migration tag before the temporary write/read", async () => {
     const health = await loadHealthModule();
-    const callOrder: string[] = [];
+    const fake = createFakeReadinessTransaction({
+      migration: {
+        tag: "0001_initial",
+        createdAt: 1788244364352,
+        hash: "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
+      },
+    });
 
     await expect(
-      health.assertReadinessTransaction({
-        async readMigrationMetadata() {
-          callOrder.push("read-migration-metadata");
-          return { ...health.EXPECTED_MIGRATION, tag: "0001_initial" };
-        },
-        async writeReadProbe() {
-          callOrder.push("write-read-probe");
-          return READINESS_PROBE_SENTINEL;
-        },
-      }),
+      health.assertReadinessTransaction(fake.port, { deadlineMs: 250 }),
     ).rejects.toThrow();
 
-    expect(callOrder).toEqual(["read-migration-metadata"]);
+    expect(fake.events).toEqual([
+      "begin",
+      "read-migration-metadata",
+      "rollback",
+      "cleanup",
+    ]);
+    expect(fake.identities).toEqual([fake.backendPid]);
   });
 
   it.each([
@@ -138,68 +245,171 @@ describe("readiness transaction orchestrator contract", () => {
     "rejects a wrong migration %s before the temporary write/read",
     async (_field, mismatch) => {
       const health = await loadHealthModule();
-      const callOrder: string[] = [];
+      const fake = createFakeReadinessTransaction({
+        migration: {
+          tag: "0002_result_acknowledgement",
+          createdAt: 1788244364352,
+          hash: "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
+          ...mismatch,
+        },
+      });
 
       await expect(
-        health.assertReadinessTransaction({
-          async readMigrationMetadata() {
-            callOrder.push("read-migration-metadata");
-            return { ...health.EXPECTED_MIGRATION, ...mismatch };
-          },
-          async writeReadProbe() {
-            callOrder.push("write-read-probe");
-            return READINESS_PROBE_SENTINEL;
-          },
-        }),
+        health.assertReadinessTransaction(fake.port, { deadlineMs: 250 }),
       ).rejects.toThrow();
 
-      expect(callOrder).toEqual(["read-migration-metadata"]);
+      expect(fake.events).toEqual([
+        "begin",
+        "read-migration-metadata",
+        "rollback",
+        "cleanup",
+      ]);
+      expect(fake.identities).toEqual([fake.backendPid]);
     },
   );
 
   it("rejects when the temporary write/read returns the wrong sentinel", async () => {
     const health = await loadHealthModule();
-    const callOrder: string[] = [];
+    const fake = createFakeReadinessTransaction({
+      readSentinel: "wrong-sentinel",
+    });
 
     await expect(
-      health.assertReadinessTransaction({
-        async readMigrationMetadata() {
-          callOrder.push("read-migration-metadata");
-          return health.EXPECTED_MIGRATION;
-        },
-        async writeReadProbe() {
-          callOrder.push("write-read-probe");
-          return "wrong-sentinel";
-        },
-      }),
+      health.assertReadinessTransaction(fake.port, { deadlineMs: 250 }),
     ).rejects.toThrow();
 
-    expect(callOrder).toEqual(["read-migration-metadata", "write-read-probe"]);
+    expect(fake.events).toEqual([
+      "begin",
+      "read-migration-metadata",
+      "write-probe-sentinel",
+      "read-probe-sentinel",
+      "rollback",
+      "cleanup",
+    ]);
+    expect(fake.identities).toEqual([
+      fake.backendPid,
+      fake.backendPid,
+      fake.backendPid,
+    ]);
   });
 
-  it("rejects when the temporary write/read throws", async () => {
+  it("rolls back and cleans up when the temporary write throws", async () => {
     const health = await loadHealthModule();
-    const callOrder: string[] = [];
-    const failure = new Error("READINESS_WRITE_READ_FAILURE");
+    const fake = createFakeReadinessTransaction({
+      writeError: new Error("READINESS_WRITE_FAILURE"),
+    });
 
     await expect(
-      health.assertReadinessTransaction({
-        async readMigrationMetadata() {
-          callOrder.push("read-migration-metadata");
-          return health.EXPECTED_MIGRATION;
-        },
-        async writeReadProbe() {
-          callOrder.push("write-read-probe");
-          throw failure;
-        },
-      }),
-    ).rejects.toBe(failure);
+      health.assertReadinessTransaction(fake.port, { deadlineMs: 250 }),
+    ).rejects.toThrow("READINESS_WRITE_FAILURE");
 
-    expect(callOrder).toEqual(["read-migration-metadata", "write-read-probe"]);
+    expect(fake.events).toEqual([
+      "begin",
+      "read-migration-metadata",
+      "write-probe-sentinel",
+      "rollback",
+      "cleanup",
+    ]);
+    expect(fake.identities).toEqual([fake.backendPid, fake.backendPid]);
+  });
+
+  it("rolls back and cleans up when the temporary read throws", async () => {
+    const health = await loadHealthModule();
+    const fake = createFakeReadinessTransaction({
+      readError: new Error("READINESS_READ_FAILURE"),
+    });
+
+    await expect(
+      health.assertReadinessTransaction(fake.port, { deadlineMs: 250 }),
+    ).rejects.toThrow("READINESS_READ_FAILURE");
+
+    expect(fake.events).toEqual([
+      "begin",
+      "read-migration-metadata",
+      "write-probe-sentinel",
+      "read-probe-sentinel",
+      "rollback",
+      "cleanup",
+    ]);
+    expect(fake.identities).toEqual([
+      fake.backendPid,
+      fake.backendPid,
+      fake.backendPid,
+    ]);
+  });
+
+  it("enforces a complete-operation deadline for a hanging read phase", async () => {
+    const health = await loadHealthModule();
+    const fake = createFakeReadinessTransaction({ hangOnRead: true });
+    const deadlineMs = 40;
+    const ciBoundMs = deadlineMs * 10 + 250;
+    const startedAt = performance.now();
+    const outcome = await Promise.race([
+      health
+        .assertReadinessTransaction(fake.port, { deadlineMs })
+        .then(() => "resolved" as const)
+        .catch(() => "rejected" as const),
+      new Promise<"test-guard-timeout">((resolve) => {
+        setTimeout(() => resolve("test-guard-timeout"), ciBoundMs);
+      }),
+    ]);
+
+    expect(outcome).toBe("rejected");
+    expect(performance.now() - startedAt).toBeLessThan(ciBoundMs);
+    expect(fake.events).toEqual([
+      "begin",
+      "read-migration-metadata",
+      "write-probe-sentinel",
+      "read-probe-sentinel",
+      "rollback",
+      "cleanup",
+    ]);
   });
 });
 
 describe("PostgreSQL readiness probe", () => {
+  it("uses the real PostgreSQL transaction context for metadata and sentinel identity", async () => {
+    const health = await loadHealthModule();
+    const before = await applicationRowCount();
+    const port = health.createPostgresReadinessTransactionPort(
+      database.client,
+      {
+        statementTimeoutMs: 250,
+      },
+    );
+    const operations: Array<Readonly<{ name: string; backendPid: number }>> =
+      [];
+
+    await port.withTransaction(async (context) => {
+      expect(Number.isInteger(context.backendPid)).toBe(true);
+      operations.push({ name: "transaction", backendPid: context.backendPid });
+      const migration = await context.readMigrationMetadata();
+      operations.push({ name: "migration", backendPid: context.backendPid });
+      expect(migration).toEqual(health.EXPECTED_MIGRATION);
+      await context.writeProbeSentinel(READINESS_PROBE_SENTINEL);
+      operations.push({ name: "write", backendPid: context.backendPid });
+      await expect(context.readProbeSentinel()).resolves.toBe(
+        READINESS_PROBE_SENTINEL,
+      );
+      operations.push({ name: "read", backendPid: context.backendPid });
+    });
+
+    expect(operations.map((operation) => operation.name)).toEqual([
+      "transaction",
+      "migration",
+      "write",
+      "read",
+    ]);
+    expect(
+      new Set(operations.map((operation) => operation.backendPid)).size,
+    ).toBe(1);
+    expect(await applicationRowCount()).toBe(before);
+    const relation = await database.query<{ relation: string | null }>(
+      "SELECT to_regclass('public.qhb_health_probe')::text AS relation",
+    );
+    expect(relation.rows[0]?.relation).toBeNull();
+  });
+
   it("checks the exact migration and rolls back its temporary write/read probe", async () => {
     const health = await loadHealthModule();
     expect(health.EXPECTED_MIGRATION).toEqual({
@@ -258,7 +468,7 @@ describe("PostgreSQL readiness probe", () => {
           await expect(probe.assertReady()).rejects.toThrow();
           throw rollback;
         }),
-      ).rejects.toBe(rollback);
+      ).rejects.toThrow("ROLLBACK_MIGRATION_FIXTURE");
 
       await health
         .createPostgresReadinessProbe(database.client, {
@@ -267,6 +477,38 @@ describe("PostgreSQL readiness probe", () => {
         .assertReady();
     },
   );
+
+  it("rejects a newer migration row inside a rolled-back transaction", async () => {
+    const health = await loadHealthModule();
+    const rollback = new Error("ROLLBACK_NEWER_MIGRATION_FIXTURE");
+
+    await expect(
+      database.client.transaction(async (transaction) => {
+        await transaction.execute(sql`
+          INSERT INTO drizzle.__drizzle_migrations (hash, created_at)
+          VALUES ('synthetic-newer-migration', ${health.EXPECTED_MIGRATION.createdAt + 1})
+        `);
+        const probe = health.createPostgresReadinessProbe(
+          transaction as typeof database.client,
+          { statementTimeoutMs: 250 },
+        );
+        await expect(probe.assertReady()).rejects.toThrow();
+        throw rollback;
+      }),
+    ).rejects.toThrow("ROLLBACK_NEWER_MIGRATION_FIXTURE");
+
+    const syntheticRow = await database.query<{ row_count: string }>(
+      `SELECT count(*)::text AS row_count
+       FROM drizzle.__drizzle_migrations
+       WHERE hash = 'synthetic-newer-migration'`,
+    );
+    expect(Number(syntheticRow.rows[0]?.row_count ?? "0")).toBe(0);
+    await health
+      .createPostgresReadinessProbe(database.client, {
+        statementTimeoutMs: 250,
+      })
+      .assertReady();
+  });
 
   it("does not read or transiently mutate application tables", async () => {
     const health = await loadHealthModule();
@@ -330,6 +572,7 @@ describe("PostgreSQL readiness probe", () => {
     await locked;
     const probe = health.createPostgresReadinessProbe(database.client, {
       statementTimeoutMs,
+      deadlineMs: statementTimeoutMs * 50,
     });
     const startedAt = performance.now();
 

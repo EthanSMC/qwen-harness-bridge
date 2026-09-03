@@ -22,6 +22,23 @@ type MetricsSnapshot = Readonly<{
   jobsByStatus: Readonly<Record<string, number>>;
 }>;
 
+type AggregateMetricsRow = Readonly<{
+  connector_online: boolean;
+  queue_age_seconds: number;
+  status: string;
+  status_count: number;
+}>;
+
+type AggregateMetricsQueryRunner = Readonly<{
+  query(
+    statement: string,
+  ): Promise<Readonly<{ rows: readonly AggregateMetricsRow[] }>>;
+}>;
+
+type MetricsSnapshotReader = Readonly<{
+  readSnapshot(): Promise<MetricsSnapshot>;
+}>;
+
 type MetricsRegistry = Readonly<{
   startMcpSubmit(): () => void;
   observeMcpSubmit(durationSeconds: number): void;
@@ -34,6 +51,16 @@ type RuntimeOptions = Readonly<{
   readinessProbe?: ReadinessProbe;
   isDraining?: () => boolean;
   metrics?: MetricsRegistry;
+}>;
+
+type MetricsModule = Readonly<{
+  createMetricsRegistry(options: {
+    readSnapshot(): Promise<MetricsSnapshot>;
+    monotonicNow?: () => number;
+  }): MetricsRegistry;
+  createPostgresMetricsAdapter(
+    database: AggregateMetricsQueryRunner,
+  ): MetricsSnapshotReader;
 }>;
 
 type RequiredRuntimeKeys = keyof RuntimeOptions;
@@ -184,17 +211,13 @@ const ALL_JOB_COUNTS = {
   expired: 0,
 } as const;
 
-const loadRegistry = async () => {
-  const module = (await import(
+const loadMetricsModule = async (): Promise<MetricsModule> =>
+  (await import(
     "../../apps/control-plane/src/http/metrics.js"
-  )) as {
-    createMetricsRegistry(options: {
-      readSnapshot(): Promise<MetricsSnapshot>;
-      monotonicNow?: () => number;
-    }): MetricsRegistry;
-  };
-  return module.createMetricsRegistry;
-};
+  )) as MetricsModule;
+
+const loadRegistry = async () =>
+  (await loadMetricsModule()).createMetricsRegistry;
 
 const sampleLines = (body: string, metric: string): string[] =>
   body
@@ -205,6 +228,7 @@ const sampleLines = (body: string, metric: string): string[] =>
 
 type ParsedMetricSample = Readonly<{
   metricName: string;
+  labels: ReadonlyArray<Readonly<{ key: string; value: string }>>;
   labelKeys: string[];
   value: string;
 }>;
@@ -226,19 +250,24 @@ const parseSampleLines = (body: string): ParsedMetricSample[] =>
           ? []
           : match[2].split(",").map((label) => {
               const labelMatch =
-                /^([a-zA-Z_][a-zA-Z0-9_]*)="(?:\\.|[^"\\])*"$/.exec(label);
+                /^([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"$/.exec(label);
               if (labelMatch === null) {
                 throw new Error(`Invalid Prometheus label: ${label}`);
               }
-              return labelMatch[1];
+              return { key: labelMatch[1], value: labelMatch[2] };
             });
-      if (new Set(labels).size !== labels.length) {
+      if (new Set(labels.map((label) => label.key)).size !== labels.length) {
         throw new Error(`Duplicate Prometheus label in sample: ${line}`);
       }
 
+      const sortedLabels = labels.sort((left, right) =>
+        left.key.localeCompare(right.key),
+      );
+
       return {
         metricName: match[1],
-        labelKeys: labels.sort(),
+        labels: sortedLabels,
+        labelKeys: sortedLabels.map((label) => label.key),
         value: match[3],
       };
     });
@@ -308,6 +337,8 @@ const METRIC_TYPES = {
 describe("bounded Prometheus metrics", () => {
   it("exports correct stable gauges, bounded families, and histogram samples", async () => {
     const createMetricsRegistry = await loadRegistry();
+    const terminalSummaryFixture =
+      "terminal summary: customer-payments completed with secret material";
     const sensitiveValues = [
       "00000000-0000-4000-8000-000000000099",
       "owner-private-123",
@@ -319,6 +350,7 @@ describe("bounded Prometheus metrics", () => {
       "https://token:secret@example.test/artifact?access_token=secret",
       "sk-proj-secret-material",
       "SELECT password FROM users",
+      terminalSummaryFixture,
     ];
     const registry = createMetricsRegistry({
       async readSnapshot() {
@@ -327,6 +359,7 @@ describe("bounded Prometheus metrics", () => {
           queueAgeSeconds: 12.5,
           jobsByStatus: ALL_JOB_COUNTS,
           ignoredSensitiveFixture: sensitiveValues,
+          terminalSummary: terminalSummaryFixture,
         } as MetricsSnapshot;
       },
     });
@@ -350,7 +383,21 @@ describe("bounded Prometheus metrics", () => {
         .split("\n")
         .flatMap((line) => /^# HELP (\S+) /.exec(line)?.[1] ?? []),
     ).toEqual(Object.keys(METRIC_TYPES));
+    const emittedTypes = Object.fromEntries(
+      response.body.split("\n").flatMap((line) => {
+        const match = /^# TYPE (\S+) (\S+)$/.exec(line);
+        return match === null ? [] : [[match[1], match[2]]];
+      }),
+    );
+    expect(emittedTypes).toEqual(METRIC_TYPES);
     const samples = parseSampleLines(response.body);
+    const sampleKeys = samples.map(
+      (sample) =>
+        `${sample.metricName}|${sample.labels
+          .map((label) => `${label.key}=${label.value}`)
+          .join(",")}`,
+    );
+    expect(new Set(sampleKeys).size).toBe(sampleKeys.length);
     expect(
       [
         ...new Set(
@@ -385,39 +432,32 @@ describe("bounded Prometheus metrics", () => {
     expect(response.body).toContain(
       'qhb_errors_total{error_code="INTERNAL"} 1',
     );
-    const expectedBuckets = [
-      ["0.005", 0],
-      ["0.01", 0],
-      ["0.025", 0],
-      ["0.05", 0],
-      ["0.1", 0],
-      ["0.25", 1],
-      ["0.5", 1],
-      ["1", 1],
-      ["2", 1],
-      ["5", 1],
-      ["10", 1],
-      ["+Inf", 1],
-    ] as const;
-    for (const [boundary, count] of expectedBuckets) {
-      expect(response.body).toContain(
-        `qhb_mcp_submit_duration_seconds_bucket{le="${boundary}"} ${count}\n`,
-      );
-    }
-    expect(response.body).toContain("qhb_mcp_submit_duration_seconds_count 1");
-    expect(response.body).toContain(
-      "qhb_mcp_submit_duration_seconds_sum 0.125",
-    );
-    const buckets = response.body
+    const bucketLines = response.body
       .split("\n")
       .filter((line) =>
         line.startsWith("qhb_mcp_submit_duration_seconds_bucket"),
-      )
-      .map((line) => Number(line.slice(line.lastIndexOf(" ") + 1)));
-    expect(buckets.length).toBeGreaterThan(1);
+      );
+    const buckets = bucketLines.map((line) =>
+      Number(line.slice(line.lastIndexOf(" ") + 1)),
+    );
+    expect(bucketLines.length).toBeGreaterThan(1);
+    expect(bucketLines.at(-1)).toMatch(
+      /qhb_mcp_submit_duration_seconds_bucket\{le="\+Inf"\} \S+$/,
+    );
+    expect(buckets.every((value) => Number.isFinite(value))).toBe(true);
     for (let index = 1; index < buckets.length; index += 1) {
       expect(buckets[index]).toBeGreaterThanOrEqual(buckets[index - 1] ?? 0);
     }
+    const count = Number(
+      /^qhb_mcp_submit_duration_seconds_count (\S+)$/m.exec(response.body)?.[1],
+    );
+    const sum = Number(
+      /^qhb_mcp_submit_duration_seconds_sum (\S+)$/m.exec(response.body)?.[1],
+    );
+    expect(Number.isFinite(count)).toBe(true);
+    expect(Number.isFinite(sum)).toBe(true);
+    expect(count).toBe(1);
+    expect(sum).toBe(0.125);
     expect(response.body.endsWith("\n")).toBe(true);
     for (const value of sensitiveValues) {
       expect(response.body).not.toContain(value);
@@ -528,16 +568,19 @@ describe("bounded Prometheus metrics", () => {
   it("keeps liveness healthy and hides a metric snapshot failure", async () => {
     const createMetricsRegistry = await loadRegistry();
     const secretError = "postgresql://user:secret@private/db SELECT password";
+    const readSnapshot = vi
+      .fn<MetricsSnapshotReader["readSnapshot"]>()
+      .mockRejectedValue(new Error(secretError));
     const registry = createMetricsRegistry({
-      async readSnapshot() {
-        throw new Error(secretError);
-      },
+      readSnapshot,
     });
     const app = await createTestApp({ metrics: registry });
 
     const live = await app.inject({ method: "GET", url: "/health/live" });
+    expect(readSnapshot).not.toHaveBeenCalled();
     const metrics = await app.inject({ method: "GET", url: "/metrics" });
 
+    expect(readSnapshot).toHaveBeenCalledTimes(1);
     expect(live.statusCode).toBe(200);
     expect(live.json()).toEqual({ status: "ok" });
     expect(metrics.statusCode).toBe(503);
@@ -604,8 +647,73 @@ describe("bounded Prometheus metrics", () => {
     expect(isolatedBody).not.toContain(
       'qhb_errors_total{error_code="INTERNAL"} 1',
     );
-    expect(isolatedBody).toContain("qhb_mcp_submit_duration_seconds_count 0\n");
-    expect(isolatedBody).toContain("qhb_mcp_submit_duration_seconds_sum 0\n");
+    const isolatedSamples = parseSampleLines(isolatedBody);
+    const freshProcessLocalSamples = isolatedSamples.filter((sample) =>
+      [
+        HISTOGRAM_FAMILY,
+        "qhb_connector_messages_total",
+        "qhb_errors_total",
+      ].includes(normalizeMetricFamily(sample.metricName)),
+    );
+    expect(
+      freshProcessLocalSamples.every((sample) => sample.value === "0"),
+    ).toBe(true);
+  });
+
+  it("uses one aggregate-only PostgreSQL metrics query without raw projections", async () => {
+    const metrics = await loadMetricsModule();
+    const aggregateRows = [
+      {
+        connector_online: true,
+        queue_age_seconds: 12.5,
+        status: "queued",
+        status_count: 2,
+      },
+      {
+        connector_online: true,
+        queue_age_seconds: 12.5,
+        status: "succeeded",
+        status_count: 4,
+      },
+    ] as const;
+    const query = vi.fn(
+      async (
+        statement: string,
+      ): Promise<{ rows: readonly AggregateMetricsRow[] }> => {
+        expect(statement).toMatch(/\b(?:bool_or|bool_and)\s*\(/i);
+        expect(statement).toMatch(/\b(?:count|max)\s*\(/i);
+        expect(statement).not.toMatch(
+          /\b(?:owner_id|connector_id|job_id|repository_id|prompt|summary|path|url|secret|raw_error|error_text)\b/i,
+        );
+        for (const row of aggregateRows) {
+          expect(Object.keys(row).sort()).toEqual([
+            "connector_online",
+            "queue_age_seconds",
+            "status",
+            "status_count",
+          ]);
+        }
+        return { rows: aggregateRows };
+      },
+    );
+
+    const adapter = metrics.createPostgresMetricsAdapter({ query });
+    const snapshot = await adapter.readSnapshot();
+
+    expect(query).toHaveBeenCalledTimes(1);
+    expect(Object.keys(snapshot).sort()).toEqual([
+      "connectorOnline",
+      "jobsByStatus",
+      "queueAgeSeconds",
+    ]);
+    expect(snapshot).toEqual({
+      connectorOnline: true,
+      queueAgeSeconds: 12.5,
+      jobsByStatus: {
+        queued: 2,
+        succeeded: 4,
+      },
+    });
   });
 
   it("rejects every value outside the bounded status/message/error allowlists", async () => {
