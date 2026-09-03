@@ -2750,9 +2750,25 @@ describe("PostgreSQL Connector outbox", () => {
     const testIdentity = await insertConnector();
     const store = new PostgresConnectorStore(database.client);
     const approvalExpiresAt = new Date(Date.now() + 120_000).toISOString();
+    const approvalJob = await insertConnectedJob(
+      testIdentity.connectorId,
+      "running",
+      new Date(Date.now() + 120_000),
+      1,
+      crypto.randomUUID(),
+      new Date(Date.now() + 60_000),
+    );
+    const cancellationJob = await insertConnectedJob(
+      testIdentity.connectorId,
+      "cancelling",
+      new Date(Date.now() + 120_000),
+      1,
+      crypto.randomUUID(),
+      new Date(Date.now() + 60_000),
+    );
     const approval = envelope("approval.requested", 1, {
       approval_id: crypto.randomUUID(),
-      job_id: crypto.randomUUID(),
+      job_id: approvalJob.jobId,
       attempt: 1,
       job_revision: 1,
       action_summary: "Run with sk-abcdefghijklmnop",
@@ -2762,7 +2778,7 @@ describe("PostgreSQL Connector outbox", () => {
       expires_at: approvalExpiresAt,
     });
     const cancelled = envelope("job.cancelled", 2, {
-      job_id: crypto.randomUUID(),
+      job_id: cancellationJob.jobId,
       attempt: 1,
       reason: "Authorization: Bearer abcdefghijklmnop",
     });

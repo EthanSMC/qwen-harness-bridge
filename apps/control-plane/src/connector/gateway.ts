@@ -726,7 +726,7 @@ export class ConnectorGateway {
     };
     const canContinue = (generation: number): boolean =>
       accepting && generation === failureGeneration && isCurrentConnection();
-    const sendStored = async (
+    const sendStoredNow = async (
       connection: ServerWebSocket,
       stored: StoredServerMessage,
       retransmit = false,
@@ -769,6 +769,23 @@ export class ConnectorGateway {
         scanAfterSequence = Math.max(scanAfterSequence, stored.sequence);
       }
       return true;
+    };
+    let outboundTail = Promise.resolve();
+    const sendStored = (
+      connection: ServerWebSocket,
+      stored: StoredServerMessage,
+      retransmit = false,
+      generation = failureGeneration,
+      deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS,
+    ): Promise<boolean> => {
+      const operation = outboundTail.then(() =>
+        sendStoredNow(connection, stored, retransmit, generation, deadline),
+      );
+      outboundTail = operation.then(
+        () => undefined,
+        () => undefined,
+      );
+      return operation;
     };
     const pump = async (connection: ServerWebSocket): Promise<void> => {
       const generation = failureGeneration;

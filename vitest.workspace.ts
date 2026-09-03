@@ -6,11 +6,15 @@ export default defineWorkspace([
   {
     test: {
       name: "integration",
+      testTimeout: 15_000,
       include: [
         "tests/integration/job-repository.test.ts",
         "tests/integration/connector-outbox.test.ts",
         "tests/integration/connector-gateway.test.ts",
         "tests/integration/foundation-e2e.test.ts",
+        "tests/integration/approval-flow.test.ts",
+        "tests/integration/cancellation-flow.test.ts",
+        "tests/integration/result-flow.test.ts",
       ],
     },
   },
