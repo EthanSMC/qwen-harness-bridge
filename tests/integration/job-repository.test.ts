@@ -682,6 +682,89 @@ describe("JobRepository offer claims", () => {
     await expect(repository.events(job.jobId)).resolves.toEqual(eventsBefore);
   });
 
+  it("rejects a dispatched claim when the job has expired", async () => {
+    const repository = new JobRepository(db.client);
+    const connectorId = crypto.randomUUID();
+    const job = await createJob(repository);
+    await seedConnector(db, connectorId, job.ownerId);
+    await repository.transitionAndAppend(
+      job.jobId,
+      job.revision,
+      "dispatched",
+      event("job.dispatched"),
+    );
+    const leaseId = crypto.randomUUID();
+    await db.query(
+      `UPDATE jobs
+          SET connector_id = $2,
+              lease_id = $3,
+              lease_expires_at = now() + interval '30 seconds',
+              expires_at = now() - interval '1 second'
+        WHERE id = $1`,
+      [job.jobId, connectorId, leaseId],
+    );
+
+    await expect(
+      repository.claimOffer(job.jobId, {
+        connectorId,
+        attempt: 1,
+        leaseId,
+      }),
+    ).resolves.toBeNull();
+    await expect(repository.get(job.jobId)).resolves.toMatchObject({
+      status: "dispatched",
+      attempt: 0,
+      revision: 1,
+    });
+    await expect(repository.events(job.jobId)).resolves.toMatchObject([
+      { sequence: 1, type: "job.dispatched" },
+    ]);
+    await db.query(
+      "UPDATE jobs SET status = 'expired'::job_status WHERE id = $1",
+      [job.jobId],
+    );
+  });
+
+  it("bounds a running lease by the job expiry after a successful claim", async () => {
+    const repository = new JobRepository(db.client);
+    const connectorId = crypto.randomUUID();
+    const job = await createJob(repository);
+    await seedConnector(db, connectorId, job.ownerId);
+    await repository.transitionAndAppend(
+      job.jobId,
+      job.revision,
+      "dispatched",
+      event("job.dispatched"),
+    );
+    const leaseId = crypto.randomUUID();
+    const jobExpiresAt = new Date(Date.now() + 5_000);
+    await db.query(
+      `UPDATE jobs
+          SET connector_id = $2,
+              lease_id = $3,
+              lease_expires_at = now() + interval '30 seconds',
+              expires_at = $4
+        WHERE id = $1`,
+      [job.jobId, connectorId, leaseId, jobExpiresAt],
+    );
+
+    const claimed = await repository.claimOffer(job.jobId, {
+      connectorId,
+      attempt: 1,
+      leaseId,
+    });
+
+    expect(claimed).toMatchObject({ status: "running", attempt: 1 });
+    expect(claimed?.leaseExpiresAt?.getTime()).toBeLessThanOrEqual(
+      jobExpiresAt.getTime(),
+    );
+    expect(claimed?.leaseExpiresAt?.getTime()).toBeGreaterThan(Date.now());
+    await db.query(
+      "UPDATE jobs SET status = 'expired'::job_status WHERE id = $1",
+      [job.jobId],
+    );
+  });
+
   it("allows only the exact offered connector and lease to win a concurrent claim", async () => {
     const repository = new JobRepository(db.client);
     const firstConnector = crypto.randomUUID();

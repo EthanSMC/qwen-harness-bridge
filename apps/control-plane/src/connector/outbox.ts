@@ -5,7 +5,7 @@ import type {
   JobStatus,
 } from "@qhb/protocol";
 import { ConnectorServerMessageSchema, rfc3339InstantKey } from "@qhb/protocol";
-import { and, asc, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import {
   connectorMessages,
@@ -28,6 +28,14 @@ export const CONNECTOR_OFFLINE_AFTER_MS = 30_000;
 export const OFFER_LEASE_MS = 30_000;
 export const SERVER_REPLAY_BATCH_SIZE = 100;
 const REPLAY_TOMBSTONE_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const ACTIVE_OFFER_JOB_STATUS_VALUES = [
+  "running",
+  "waiting_approval",
+  "cancelling",
+] as const;
+const CLAIMED_JOB_STATES: ReadonlySet<JobStatus> = new Set([
+  ...ACTIVE_OFFER_JOB_STATUS_VALUES,
+]);
 
 type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 type QueryDatabase = Database | Transaction;
@@ -333,7 +341,6 @@ const replaceServerMessage = async (
         eq(connectorMessages.id, row.id),
         eq(connectorMessages.messageId, row.messageId),
         eq(connectorMessages.direction, "server"),
-        isNull(connectorMessages.acknowledgedAt),
         expectedType === undefined
           ? undefined
           : eq(connectorMessages.type, expectedType),
@@ -363,7 +370,6 @@ const tombstoneExpiredServerMessages = async (
         and(
           eq(connectorMessages.connectorId, connectorId),
           eq(connectorMessages.direction, "server"),
-          isNull(connectorMessages.acknowledgedAt),
           gt(connectorMessages.sequence, afterSequence),
           lte(connectorMessages.expiresAt, now),
         ),
@@ -385,15 +391,15 @@ const tombstoneExpiredServerMessages = async (
   }
 };
 
-const tombstoneCancelledOffers = async (
+const tombstoneInactiveOffers = async (
   database: QueryDatabase,
   connectorId: string,
   afterSequence: number,
   now: Date,
 ): Promise<void> => {
   while (true) {
-    const cancelledOffers = await database
-      .select({ message: connectorMessages })
+    const inactiveOffers = await database
+      .select({ message: connectorMessages, job: jobs })
       .from(connectorMessages)
       .innerJoin(
         jobs,
@@ -404,20 +410,21 @@ const tombstoneCancelledOffers = async (
           eq(connectorMessages.connectorId, connectorId),
           eq(connectorMessages.direction, "server"),
           eq(connectorMessages.type, "job.offer"),
-          isNull(connectorMessages.acknowledgedAt),
           gt(connectorMessages.sequence, afterSequence),
-          eq(jobs.status, "cancelled"),
+          inArray(jobs.status, ["cancelled", "expired", "failed", "succeeded"]),
         ),
       )
       .orderBy(asc(connectorMessages.sequence))
       .limit(SERVER_REPLAY_BATCH_SIZE);
-    if (cancelledOffers.length === 0) return;
-    for (const { message } of cancelledOffers) {
+    if (inactiveOffers.length === 0) return;
+    for (const { message, job } of inactiveOffers) {
       await replaceServerMessage(
         database,
         message,
         now,
-        cancelledTombstonePayload(),
+        job.status === "cancelled"
+          ? cancelledTombstonePayload()
+          : expiredTombstonePayload(),
         "job.offer",
       );
     }
@@ -585,7 +592,6 @@ const withdrawCancelledOffer = async (
         eq(connectorMessages.connectorId, connectorId),
         eq(connectorMessages.direction, "server"),
         eq(connectorMessages.type, "job.offer"),
-        isNull(connectorMessages.acknowledgedAt),
         sql`${connectorMessages.payload}->>'job_id' = ${jobId}`,
         sql`${connectorMessages.payload}->>'lease_id' = ${leaseId}`,
       ),
@@ -653,6 +659,7 @@ const claimOfferedJob = async (
         eq(jobs.status, "dispatched"),
         eq(jobs.revision, job.revision),
         eq(jobs.leaseId, message.payload.lease_id),
+        gt(jobs.expiresAt, now),
       ),
     )
     .returning({ id: jobs.id });
@@ -698,6 +705,7 @@ const ingestJobEvent = async (
 ): Promise<void> => {
   if (
     job === undefined ||
+    !CLAIMED_JOB_STATES.has(job.status) ||
     job.attempt !== message.payload.attempt ||
     job.expiresAt.getTime() <= now.getTime() ||
     TERMINAL_JOB_STATES.has(job.status)
@@ -932,7 +940,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
               ),
             ),
           );
-        await tombstoneCancelledOffers(
+        await tombstoneInactiveOffers(
           tx,
           connector.id,
           message.payload.last_server_sequence,
@@ -1092,7 +1100,9 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         throw new ConnectorStoreError("INTERNAL", "Offer lease is invalid");
       }
       const leaseId = crypto.randomUUID();
-      const leaseExpiresAt = new Date(now.getTime() + OFFER_LEASE_MS);
+      const leaseExpiresAt = new Date(
+        Math.min(now.getTime() + OFFER_LEASE_MS, job.expiresAt.getTime()),
+      );
       const attempt = job.attempt + 1;
       const updated = await tx
         .update(jobs)
@@ -1150,7 +1160,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
     assertSafeSequence(afterSequence);
     return this.#db.transaction(async (tx) => {
       const connector = await lockConnector(tx, identity);
-      await tombstoneCancelledOffers(tx, connector.id, afterSequence, now);
+      await tombstoneInactiveOffers(tx, connector.id, afterSequence, now);
       await tombstoneExpiredServerMessages(
         tx,
         connector.id,
@@ -1199,6 +1209,9 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
     now = new Date(),
     currentTime: () => Date = () => new Date(),
   ): Promise<ConnectorServerMessage> {
+    const jobId = stored.payload.job_id;
+    const leaseId = stored.payload.lease_id;
+    const attempt = stored.payload.attempt;
     const assertNotExpired = (at: Date): void => {
       if (stored.expiresAt.getTime() <= at.getTime()) {
         throw new ConnectorStoreError(
@@ -1207,26 +1220,73 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         );
       }
     };
+    const readActionableOffer = async (at: Date): Promise<string> => {
+      if (
+        typeof jobId !== "string" ||
+        typeof leaseId !== "string" ||
+        typeof attempt !== "number" ||
+        !Number.isSafeInteger(attempt) ||
+        attempt < 1
+      ) {
+        throw new ConnectorStoreError(
+          "MESSAGE_EXPIRED",
+          "The Connector offer is no longer actionable",
+        );
+      }
+      const rows = await this.#db
+        .select({ message: connectorMessages, job: jobs })
+        .from(connectorMessages)
+        .innerJoin(jobs, eq(jobs.id, jobId))
+        .where(
+          and(
+            eq(connectorMessages.connectorId, stored.connectorId),
+            eq(connectorMessages.direction, "server"),
+            eq(connectorMessages.sequence, stored.sequence),
+            eq(connectorMessages.messageId, stored.messageId),
+            eq(connectorMessages.type, "job.offer"),
+            eq(connectorMessages.expiresAt, stored.expiresAt),
+            or(
+              and(eq(jobs.status, "dispatched"), eq(jobs.attempt, attempt - 1)),
+              and(
+                inArray(jobs.status, ACTIVE_OFFER_JOB_STATUS_VALUES),
+                eq(jobs.attempt, attempt),
+              ),
+            ),
+            eq(jobs.connectorId, stored.connectorId),
+            eq(jobs.leaseId, leaseId),
+            gt(connectorMessages.expiresAt, at),
+            gt(jobs.leaseExpiresAt, at),
+            gt(jobs.expiresAt, at),
+          ),
+        )
+        .limit(1);
+      const row = rows[0];
+      if (
+        row === undefined ||
+        row.message.payload.job_id !== jobId ||
+        row.message.payload.lease_id !== leaseId ||
+        row.message.payload.attempt !== attempt ||
+        row.job.requestCiphertext === null
+      ) {
+        throw new ConnectorStoreError(
+          "MESSAGE_EXPIRED",
+          "The Connector offer is no longer actionable",
+        );
+      }
+      return row.job.requestCiphertext;
+    };
     assertNotExpired(now);
     let payload = stored.payload;
     if (stored.type === "job.offer") {
-      const jobId = stored.payload.job_id;
       if (typeof jobId !== "string" || decryptor === undefined) {
         throw new ConnectorStoreError("INTERNAL", "Offer cannot be hydrated");
       }
-      const rows = await this.#db
-        .select({ ciphertext: jobs.requestCiphertext })
-        .from(jobs)
-        .where(eq(jobs.id, jobId))
-        .limit(1);
-      const ciphertext = rows[0]?.ciphertext;
-      if (ciphertext === null || ciphertext === undefined) {
-        throw new ConnectorStoreError("INTERNAL", "Offer request is missing");
-      }
+      const ciphertext = await readActionableOffer(now);
       payload = {
         ...stored.payload,
         request: await decryptor.decrypt(ciphertext),
       };
+      await readActionableOffer(currentTime());
     }
     assertNotExpired(currentTime());
     return ConnectorServerMessageSchema.parse({

@@ -975,6 +975,7 @@ export class JobRepository {
         current.leaseId !== input.leaseId ||
         current.leaseExpiresAt === null ||
         current.leaseExpiresAt.getTime() <= now.getTime() ||
+        current.expiresAt.getTime() <= now.getTime() ||
         input.attempt !== current.attempt + 1
       ) {
         return null;
@@ -998,7 +999,7 @@ export class JobRepository {
           connectorId: input.connectorId,
           attempt: input.attempt,
           leaseId: input.leaseId,
-          leaseExpiresAt: sql`now() + interval '30 seconds'`,
+          leaseExpiresAt: sql`least(now() + interval '30 seconds', ${jobs.expiresAt})`,
           revision: sql`${jobs.revision} + 1`,
           updatedAt: sql`now()`,
         })
@@ -1011,6 +1012,7 @@ export class JobRepository {
             eq(jobs.connectorId, input.connectorId),
             eq(jobs.leaseId, input.leaseId),
             gt(jobs.leaseExpiresAt, now),
+            gt(jobs.expiresAt, now),
           ),
         )
         .returning();

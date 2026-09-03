@@ -107,7 +107,12 @@ const createJob = async (
 
 const insertConnectedJob = async (
   connectorId: string,
-  status: "dispatched" | "running",
+  status:
+    | "queued"
+    | "dispatched"
+    | "running"
+    | "waiting_approval"
+    | "cancelling",
   expiresAt: Date,
   attempt: number,
   leaseId: string | null,
@@ -282,6 +287,38 @@ describe("PostgreSQL Connector outbox", () => {
     });
   });
 
+  it("caps an offer lease at the job expiry", async () => {
+    const repositoryId = `offer-expiry-cap-${crypto.randomUUID()}`;
+    const job = await createJob(repositoryId, "Offer expiry cap");
+    const now = new Date("2030-01-02T03:04:05.000Z");
+    const jobExpiresAt = new Date("2030-01-02T03:04:10.000Z");
+    await database.query("UPDATE jobs SET expires_at = $1 WHERE id = $2", [
+      jobExpiresAt,
+      job.jobId,
+    ]);
+
+    const store = new PostgresConnectorStore(database.client);
+    const offer = await store.dispatchNext(identity, now);
+
+    expect(offer?.expiresAt).toEqual(jobExpiresAt);
+    const stored = await database.query<{
+      lease_expires_at: string;
+      expires_at: string;
+    }>("SELECT lease_expires_at, expires_at FROM jobs WHERE id = $1", [
+      job.jobId,
+    ]);
+    expect(new Date(stored.rows[0]?.lease_expires_at ?? 0)).toEqual(
+      jobExpiresAt,
+    );
+    expect(
+      new Date(stored.rows[0]?.lease_expires_at ?? 0).getTime(),
+    ).toBeLessThanOrEqual(new Date(stored.rows[0]?.expires_at ?? 0).getTime());
+    await database.query(
+      "UPDATE jobs SET status = 'expired'::job_status WHERE id = $1",
+      [job.jobId],
+    );
+  });
+
   it("deduplicates exact client messages and rejects gaps or modified replay", async () => {
     const store = new PostgresConnectorStore(database.client);
     const hello = envelope("connector.hello", 1, {
@@ -448,6 +485,64 @@ describe("PostgreSQL Connector outbox", () => {
         type: "ack",
       },
     ]);
+  });
+
+  it("tombstones an expired ACKed row when the durable cursor lags", async () => {
+    const cursorIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const now = new Date("2030-01-02T03:04:05.000Z");
+    const expired = await store.enqueueServer(
+      cursorIdentity,
+      "ack",
+      { sequence: 1 },
+      new Date("2030-01-02T03:04:04.000Z"),
+    );
+    const ack = envelope(
+      "ack",
+      1,
+      { sequence: expired.sequence },
+      { sentAt: now },
+    );
+    await store.acceptClientMessage(cursorIdentity, ack, now);
+
+    const hello = envelope(
+      "connector.hello",
+      2,
+      {
+        connector_id: cursorIdentity.connectorId,
+        connector_version: "integration-1.0",
+        last_server_sequence: expired.sequence - 1,
+        last_client_sequence: 1,
+      },
+      { sentAt: now },
+    );
+    const reconnected = await store.acceptClientMessage(
+      cursorIdentity,
+      hello,
+      now,
+    );
+
+    expect(reconnected.replay).toMatchObject([
+      {
+        sequence: expired.sequence,
+        type: "protocol.error",
+        payload: { code: "MESSAGE_EXPIRED" },
+      },
+    ]);
+    expect(reconnected.replay[0]?.messageId).not.toBe(expired.messageId);
+    const durable = await database.query<{
+      message_id: string;
+      acknowledged_at: string | null;
+      type: string;
+    }>(
+      "SELECT message_id, acknowledged_at, type FROM connector_messages WHERE connector_id = $1 AND sequence = $2",
+      [cursorIdentity.connectorId, expired.sequence],
+    );
+    expect(durable.rows[0]).toMatchObject({
+      acknowledged_at: expect.any(String),
+      type: "protocol.error",
+    });
+    expect(durable.rows[0]?.message_id).not.toBe(expired.messageId);
   });
 
   it("makes an expired actionable row at N a same-sequence tombstone when hello reports N-1", async () => {
@@ -733,6 +828,114 @@ describe("PostgreSQL Connector outbox", () => {
     },
   );
 
+  it.each(["queued", "dispatched"] as const)(
+    "rejects a %s job.event before a successful claim",
+    async (status) => {
+      const testIdentity = await insertConnector();
+      const now = new Date("2030-01-02T03:04:05.000Z");
+      const job = await insertConnectedJob(
+        testIdentity.connectorId,
+        status,
+        new Date("2030-01-02T03:05:05.000Z"),
+        1,
+        null,
+        null,
+      );
+      const message = envelope(
+        "job.event",
+        1,
+        {
+          job_id: job.jobId,
+          attempt: 1,
+          event_type: "progress",
+          payload: { stage: "must not persist" },
+          source: "connector",
+        },
+        { sentAt: now },
+      );
+      const store = new PostgresConnectorStore(database.client);
+
+      await expectStoreError(
+        store.acceptClientMessage(testIdentity, message, now),
+        "EVENT_REJECTED",
+      );
+      await expect(
+        database.query<{
+          status: string;
+          revision: number;
+          event_count: string;
+        }>(
+          `SELECT j.status, j.revision, count(je.id)::text AS event_count
+             FROM jobs AS j
+             LEFT JOIN job_events AS je ON je.job_id = j.id
+            WHERE j.id = $1
+            GROUP BY j.id`,
+          [job.jobId],
+        ),
+      ).resolves.toMatchObject({
+        rows: [{ status, revision: 0, event_count: "0" }],
+      });
+      await expectClientCursor(testIdentity.connectorId, 0);
+      await database.query(
+        "UPDATE jobs SET status = 'expired'::job_status WHERE id = $1",
+        [job.jobId],
+      );
+    },
+  );
+
+  it.each(["running", "waiting_approval", "cancelling"] as const)(
+    "accepts a %s job.event after a successful claim",
+    async (status) => {
+      const testIdentity = await insertConnector();
+      const now = new Date("2030-01-02T03:04:05.000Z");
+      const job = await insertConnectedJob(
+        testIdentity.connectorId,
+        status,
+        new Date("2030-01-02T03:05:05.000Z"),
+        1,
+        null,
+        null,
+      );
+      const message = envelope(
+        "job.event",
+        1,
+        {
+          job_id: job.jobId,
+          attempt: 1,
+          event_type: "progress",
+          payload: { stage: "still active" },
+          source: "connector",
+        },
+        { sentAt: now },
+      );
+      const store = new PostgresConnectorStore(database.client);
+
+      await expect(
+        store.acceptClientMessage(testIdentity, message, now),
+      ).resolves.toMatchObject({ response: { type: "ack" } });
+      await expect(
+        database.query<{
+          status: string;
+          revision: number;
+          event_count: string;
+        }>(
+          `SELECT j.status, j.revision, count(je.id)::text AS event_count
+             FROM jobs AS j
+             LEFT JOIN job_events AS je ON je.job_id = j.id
+            WHERE j.id = $1
+            GROUP BY j.id`,
+          [job.jobId],
+        ),
+      ).resolves.toMatchObject({
+        rows: [{ status, revision: 1, event_count: "1" }],
+      });
+      await database.query(
+        "UPDATE jobs SET status = 'expired'::job_status WHERE id = $1",
+        [job.jobId],
+      );
+    },
+  );
+
   it("replaces every mixed expired server command in bounded contiguous replay batches", async () => {
     const replayIdentity = await insertConnector();
     const store = new PostgresConnectorStore(database.client);
@@ -927,7 +1130,7 @@ describe("PostgreSQL Connector outbox", () => {
       fetchIdentity.connectorId,
       "dispatched",
       new Date("2100-01-02T03:05:00.000Z"),
-      1,
+      0,
       leaseId,
       expiresAt,
     );
@@ -980,6 +1183,187 @@ describe("PostgreSQL Connector outbox", () => {
       code: "MESSAGE_EXPIRED",
     });
   });
+
+  it("rejects a fetched offer after its durable row is replaced", async () => {
+    const testIdentity = await insertConnector();
+    const repository = new JobRepository(database.client);
+    const job = await createJob(
+      `offer-replaced-${crypto.randomUUID()}`,
+      "Offer replaced while pending",
+    );
+    const store = new PostgresConnectorStore(database.client);
+    const fetchedAt = new Date();
+    await database.query("UPDATE jobs SET accepted_at = $1 WHERE id = $2", [
+      new Date("2000-01-01T00:00:00.000Z"),
+      job.jobId,
+    ]);
+    const offer = await store.dispatchNext(testIdentity, fetchedAt);
+    if (offer === null) throw new Error("expected an offer");
+    expect(offer.payload.job_id).toBe(job.jobId);
+    const fetched = await store.pendingServerMessages(
+      testIdentity,
+      0,
+      fetchedAt,
+    );
+    const fetchedOffer = fetched.find(
+      (message) => message.sequence === offer.sequence,
+    );
+    if (fetchedOffer === undefined)
+      throw new Error("expected the fetched offer");
+
+    await database.query(
+      "UPDATE connector_messages SET expires_at = $1 WHERE connector_id = $2 AND sequence = $3",
+      [
+        new Date(fetchedAt.getTime() - 1),
+        testIdentity.connectorId,
+        offer.sequence,
+      ],
+    );
+    const replayed = await store.pendingServerMessages(
+      testIdentity,
+      0,
+      new Date(fetchedAt.getTime() + 1),
+    );
+    expect(replayed[0]).toMatchObject({
+      sequence: offer.sequence,
+      type: "protocol.error",
+      payload: { code: "MESSAGE_EXPIRED" },
+    });
+
+    let decryptCalls = 0;
+    await expect(
+      store.materializeServerMessage(
+        fetchedOffer,
+        {
+          decrypt: async () => {
+            decryptCalls += 1;
+            return "must not be sent";
+          },
+        },
+        fetchedAt,
+        () => fetchedAt,
+      ),
+    ).rejects.toMatchObject({ code: "MESSAGE_EXPIRED" });
+    expect(decryptCalls).toBe(0);
+    await expect(repository.get(job.jobId)).resolves.toMatchObject({
+      status: "dispatched",
+    });
+    await database.query(
+      "UPDATE jobs SET status = 'expired'::job_status WHERE id = $1",
+      [job.jobId],
+    );
+  });
+
+  it("rejects a fetched offer after the job is cancelled", async () => {
+    const testIdentity = await insertConnector();
+    const repository = new JobRepository(database.client);
+    const job = await createJob(
+      `offer-cancelled-${crypto.randomUUID()}`,
+      "Offer cancelled while pending",
+    );
+    const store = new PostgresConnectorStore(database.client);
+    const fetchedAt = new Date();
+    await database.query("UPDATE jobs SET accepted_at = $1 WHERE id = $2", [
+      new Date("2000-01-01T00:00:00.000Z"),
+      job.jobId,
+    ]);
+    const offer = await store.dispatchNext(testIdentity, fetchedAt);
+    if (offer === null) throw new Error("expected an offer");
+    expect(offer.payload.job_id).toBe(job.jobId);
+    const fetched = await store.pendingServerMessages(
+      testIdentity,
+      0,
+      fetchedAt,
+    );
+    const fetchedOffer = fetched.find(
+      (message) => message.sequence === offer.sequence,
+    );
+    if (fetchedOffer === undefined)
+      throw new Error("expected the fetched offer");
+
+    await repository.cancelAtomically({
+      ownerId: OWNER_ID,
+      jobId: job.jobId,
+      expectedRevision: job.revision + 1,
+    });
+
+    let decryptCalls = 0;
+    await expect(
+      store.materializeServerMessage(
+        fetchedOffer,
+        {
+          decrypt: async () => {
+            decryptCalls += 1;
+            return "must not be sent";
+          },
+        },
+        fetchedAt,
+        () => fetchedAt,
+      ),
+    ).rejects.toMatchObject({ code: "MESSAGE_EXPIRED" });
+    expect(decryptCalls).toBe(0);
+  });
+
+  it.each(["expired", "failed", "succeeded"] as const)(
+    "tombstones a fetched offer when the job becomes %s",
+    async (status) => {
+      const testIdentity = await insertConnector();
+      const job = await createJob(
+        `offer-${status}-${crypto.randomUUID()}`,
+        `Offer becomes ${status} while pending`,
+      );
+      const store = new PostgresConnectorStore(database.client);
+      const fetchedAt = new Date();
+      await database.query("UPDATE jobs SET accepted_at = $1 WHERE id = $2", [
+        new Date("2000-01-01T00:00:00.000Z"),
+        job.jobId,
+      ]);
+      const offer = await store.dispatchNext(testIdentity, fetchedAt);
+      if (offer === null) throw new Error("expected an offer");
+      const fetched = await store.pendingServerMessages(
+        testIdentity,
+        0,
+        fetchedAt,
+      );
+      const fetchedOffer = fetched.find(
+        (message) => message.sequence === offer.sequence,
+      );
+      if (fetchedOffer === undefined)
+        throw new Error("expected the fetched offer");
+
+      await database.query(
+        "UPDATE jobs SET status = $1::job_status WHERE id = $2",
+        [status, job.jobId],
+      );
+      const replayed = await store.pendingServerMessages(
+        testIdentity,
+        0,
+        new Date(fetchedAt.getTime() + 1),
+      );
+      expect(replayed[0]).toMatchObject({
+        sequence: offer.sequence,
+        type: "protocol.error",
+        payload: { code: "MESSAGE_EXPIRED" },
+      });
+      expect(replayed[0]?.messageId).not.toBe(offer.messageId);
+
+      let decryptCalls = 0;
+      await expect(
+        store.materializeServerMessage(
+          fetchedOffer,
+          {
+            decrypt: async () => {
+              decryptCalls += 1;
+              return "must not be sent";
+            },
+          },
+          new Date(fetchedAt.getTime() + 1),
+          () => new Date(fetchedAt.getTime() + 1),
+        ),
+      ).rejects.toMatchObject({ code: "MESSAGE_EXPIRED" });
+      expect(decryptCalls).toBe(0);
+    },
+  );
 
   it("handles cancel-before-claim and claim-before-cancel without stale offers", async () => {
     for (const ordering of [
