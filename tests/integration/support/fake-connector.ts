@@ -712,11 +712,11 @@ export class FakeConnector {
       return;
     }
     this.wireReceived.push(parsed);
-    const connectorId = this.credentials.connector_id;
+    const connectorId = this.credentials.connector_id.toLowerCase();
     const seen =
       FakeConnector.#seenByConnector.get(connectorId) ??
       new Map<string, { sequence: number; serialized: string }>();
-    FakeConnector.#seenByConnector.set(this.credentials.connector_id, seen);
+    FakeConnector.#seenByConnector.set(connectorId, seen);
     const serializedMessage = canonicalJson(parsed);
     const previous = seen.get(parsed.message_id);
     if (previous !== undefined) {

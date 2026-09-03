@@ -64,10 +64,10 @@ const waitForWireOccurrences = async (
 };
 
 describe("Foundation fake Connector end to end", () => {
-  it("dispatches once and restores deduplicated delivery after reconnect", async () => {
+  it("deduplicates replayed delivery after reconnecting with a differently cased UUID", async () => {
     const ownerId = `owner-${crypto.randomUUID()}`;
     const repositoryId = `repo-${crypto.randomUUID()}`;
-    const connectorId = crypto.randomUUID();
+    const connectorId = `a${crypto.randomUUID().slice(1)}`;
     const credentialId = `credential-${crypto.randomUUID()}`;
     const credentialSecret = `connector-secret-${crypto.randomUUID()}`;
     await database.query(
@@ -153,6 +153,7 @@ describe("Foundation fake Connector end to end", () => {
 
       const resumed = await FakeConnector.connect(app, {
         ...credentials,
+        connector_id: credentials.connector_id.toUpperCase(),
         last_client_sequence: connector.lastClientSequence,
         last_server_sequence: 0,
       });
