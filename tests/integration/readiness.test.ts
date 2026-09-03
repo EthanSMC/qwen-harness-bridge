@@ -369,9 +369,13 @@ describe("readiness transaction orchestrator contract", () => {
         const pending = health.assertReadinessTransaction(fake.port, {
           deadlineMs,
         });
+        const outcome = pending.then(
+          () => "resolved" as const,
+          () => "rejected" as const,
+        );
 
         await vi.advanceTimersByTimeAsync(deadlineMs);
-        await expect(pending).rejects.toThrow();
+        await expect(outcome).resolves.toBe("rejected");
         expect(fake.events).toEqual(expectedEvents);
         expect(fake.identities).toEqual(
           expectedEvents

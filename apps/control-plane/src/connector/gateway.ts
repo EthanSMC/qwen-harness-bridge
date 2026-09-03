@@ -9,6 +9,7 @@ import {
 } from "@qhb/protocol";
 import type { Database } from "../db/client.js";
 import type { RequestDecryptor } from "../domain/job-coordinator.js";
+import type { MetricsRegistry } from "../http/metrics.js";
 import {
   CONNECTOR_OFFLINE_AFTER_MS,
   type ConnectorIdentity,
@@ -72,6 +73,7 @@ export type ConnectorGatewayOptions = Readonly<{
   requestDecryptor?: RequestDecryptor;
   dispatchIntervalMs?: number;
   now?: () => Date;
+  metrics?: Pick<MetricsRegistry, "recordConnectorMessage" | "recordError">;
 }>;
 
 type FrameHandlers = Readonly<{
@@ -520,6 +522,9 @@ export class ConnectorGateway {
   readonly #store: PostgresConnectorStore;
   readonly #sessionService: ReturnType<typeof createConnectorSessionService>;
   readonly #requestDecryptor: RequestDecryptor | undefined;
+  readonly #metrics:
+    | Pick<MetricsRegistry, "recordConnectorMessage" | "recordError">
+    | undefined;
   readonly #dispatchIntervalMs: number;
   readonly #connections = new Set<ServerWebSocket>();
   readonly #activeConnections = new Map<string, ActiveConnectorConnection>();
@@ -540,6 +545,7 @@ export class ConnectorGateway {
       now: options.now ?? (() => new Date()),
     });
     this.#requestDecryptor = options.requestDecryptor;
+    this.#metrics = options.metrics;
     this.#dispatchIntervalMs =
       options.dispatchIntervalMs === undefined
         ? DEFAULT_DISPATCH_INTERVAL_MS
@@ -860,6 +866,7 @@ export class ConnectorGateway {
     };
     const failProtocol = async (code: string): Promise<void> => {
       if (!accepting || !isCurrentConnection()) return;
+      this.#metrics?.recordError(code);
       accepting = false;
       failureGeneration += 1;
       const failureGenerationAtStart = failureGeneration;
@@ -916,6 +923,7 @@ export class ConnectorGateway {
       if (initialized && message.type === "connector.hello") {
         return failProtocol("HELLO_ALREADY_INITIALIZED");
       }
+      this.#metrics?.recordConnectorMessage(message.type);
       const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
       try {
         const accepted = await runStoreBeforeDeadline(

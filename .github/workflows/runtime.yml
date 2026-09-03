@@ -1,0 +1,281 @@
+name: Runtime container gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: runtime
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+
+      - name: Generate ephemeral runtime material
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          runtime_dir=$(mktemp -d)
+          chmod 700 "$runtime_dir"
+          RUNTIME_DIR="$runtime_dir"
+          RUNTIME_ENV_FILE="$runtime_dir/runtime.env"
+          RUNTIME_EVIDENCE_FILE="$runtime_dir/runtime-evidence.txt"
+          RUNTIME_HEALTH_OBSERVATIONS_FILE="$runtime_dir/health-observations.txt"
+          RUNTIME_DB_LOSS_OBSERVATIONS_FILE="$runtime_dir/db-loss-observations.txt"
+          RUNTIME_HEALTH_METRICS_BODY_FILE="$runtime_dir/health-metrics.body"
+          RUNTIME_ARCHIVE="$runtime_dir/runtime-image.tar"
+          QHB_TLS_KEY_FILE="$runtime_dir/qhb-runtime.key"
+          QHB_TLS_CERT_FILE="$runtime_dir/qhb-runtime.crt"
+          touch "$RUNTIME_ENV_FILE" "$RUNTIME_EVIDENCE_FILE" "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
+          chmod 600 "$RUNTIME_ENV_FILE" "$RUNTIME_EVIDENCE_FILE" "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
+
+          POSTGRES_DB=qhb
+          POSTGRES_USER=qhb
+          POSTGRES_PASSWORD=$(openssl rand -hex 32)
+          QHB_OWNER_ID=$(openssl rand -hex 32)
+          QHB_MCP_BEARER_TOKEN=$(openssl rand -hex 32)
+          QHB_REQUEST_ENCRYPTION_KEY=$(openssl rand -hex 32)
+          QHB_CONNECTOR_SESSION_SIGNING_KEY=$(openssl rand -hex 32)
+          unique_secret_count=$(printf '%s\n' "$POSTGRES_PASSWORD" "$QHB_OWNER_ID" "$QHB_MCP_BEARER_TOKEN" "$QHB_REQUEST_ENCRYPTION_KEY" "$QHB_CONNECTOR_SESSION_SIGNING_KEY" | sort -u | wc -l)
+          test "$unique_secret_count" -eq 5
+
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$QHB_TLS_KEY_FILE" -out "$QHB_TLS_CERT_FILE" -days 1 -subj "/CN=127.0.0.1" -addext "subjectAltName = IP:127.0.0.1"
+          chmod 600 "$QHB_TLS_KEY_FILE" "$QHB_TLS_CERT_FILE"
+          openssl x509 -in "$QHB_TLS_CERT_FILE" -noout -subject -ext subjectAltName | grep --fixed-strings 127.0.0.1
+
+          {
+            printf 'POSTGRES_DB=%s\n' "$POSTGRES_DB"
+            printf 'POSTGRES_USER=%s\n' "$POSTGRES_USER"
+            printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD"
+            printf 'QHB_OWNER_ID=%s\n' "$QHB_OWNER_ID"
+            printf 'QHB_MCP_BEARER_TOKEN=%s\n' "$QHB_MCP_BEARER_TOKEN"
+            printf 'QHB_REQUEST_ENCRYPTION_KEY=%s\n' "$QHB_REQUEST_ENCRYPTION_KEY"
+            printf 'QHB_CONNECTOR_SESSION_SIGNING_KEY=%s\n' "$QHB_CONNECTOR_SESSION_SIGNING_KEY"
+            printf 'QHB_TLS_CERT_FILE=%s\n' "$QHB_TLS_CERT_FILE"
+            printf 'QHB_TLS_KEY_FILE=%s\n' "$QHB_TLS_KEY_FILE"
+            printf 'CONTROL_PLANE_PORT=8443\n'
+          } > "$RUNTIME_ENV_FILE"
+          {
+            printf 'RUNTIME_DIR=%s\n' "$RUNTIME_DIR"
+            printf 'RUNTIME_ENV_FILE=%s\n' "$RUNTIME_ENV_FILE"
+            printf 'RUNTIME_EVIDENCE_FILE=%s\n' "$RUNTIME_EVIDENCE_FILE"
+            printf 'RUNTIME_HEALTH_OBSERVATIONS_FILE=%s\n' "$RUNTIME_HEALTH_OBSERVATIONS_FILE"
+            printf 'RUNTIME_DB_LOSS_OBSERVATIONS_FILE=%s\n' "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
+            printf 'RUNTIME_HEALTH_METRICS_BODY_FILE=%s\n' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
+            printf 'RUNTIME_ARCHIVE=%s\n' "$RUNTIME_ARCHIVE"
+            printf 'QHB_TLS_CERT_FILE=%s\n' "$QHB_TLS_CERT_FILE"
+            printf 'QHB_TLS_KEY_FILE=%s\n' "$QHB_TLS_KEY_FILE"
+          } >> "$GITHUB_ENV"
+          # The block above persists RUNTIME_ENV_FILE and the generated runtime paths in GITHUB_ENV.
+
+      - name: Build and start runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm build
+          docker compose --env-file "$RUNTIME_ENV_FILE" config --quiet # config--quiet
+          docker compose --env-file "$RUNTIME_ENV_FILE" build --pull=false control-plane migrate
+          docker compose --env-file "$RUNTIME_ENV_FILE" up -d
+
+      - name: Verify healthy runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_url="https://127.0.0.1:8443"
+          for attempt in $(seq 1 60); do
+            ready_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready" || true)
+            test "$ready_status" = "200" && break
+            test "$attempt" = "60" && exit 1
+            sleep 1
+          done
+          live_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")
+          live_body=$(curl --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")
+          ready_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready")
+          ready_body=$(curl --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready")
+          metrics_headers_file="$RUNTIME_DIR/health-metrics.headers"
+          curl --fail --silent --show-error --dump-header "$metrics_headers_file" --output "$RUNTIME_HEALTH_METRICS_BODY_FILE" --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/metrics"
+          metrics_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/metrics")
+          metrics_body=$(cat "$RUNTIME_HEALTH_METRICS_BODY_FILE")
+          metrics_content_type=$(grep --ignore-case '^content-type:' "$metrics_headers_file" | tr -d '\r' | sed 's/^[^:]*:[[:space:]]*//')
+          test "$live_status" = "200"
+          test "$live_body" = '{"status":"ok"}'
+          test "$ready_status" = "200"
+          test "$ready_body" = '{"status":"ready"}'
+          test "$metrics_status" = "200"
+          test "$metrics_content_type" = 'text/plain; version=0.0.4; charset=utf-8'
+          grep --fixed-strings 'text/plain; version=0.0.4; charset=utf-8' "$metrics_headers_file"
+          grep --fixed-strings 'qhb_mcp_submit_duration_seconds' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
+          grep --fixed-strings 'qhb_connector_online' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
+          grep --fixed-strings 'qhb_job_queue_age_seconds' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
+          if grep -E -i 'owner[_-]?id|job[_-]?id|repository|prompt|path|https?://|url|secret|error:|stack trace|ECONNREFUSED|SQLSTATE' "$RUNTIME_HEALTH_METRICS_BODY_FILE"; then exit 1; fi
+          privacy=passed
+          {
+            printf 'live_status=%s\n' "$live_status"
+            printf 'live_body=%s\n' "$live_body"
+            printf 'ready_status=%s\n' "$ready_status"
+            printf 'ready_body=%s\n' "$ready_body"
+            printf 'metrics_status=%s\n' "$metrics_status"
+            printf 'metrics_content_type=%s\n' "$metrics_content_type"
+            printf 'privacy=%s\n' "$privacy"
+          } > "$RUNTIME_HEALTH_OBSERVATIONS_FILE"
+          cat "$RUNTIME_HEALTH_METRICS_BODY_FILE" >> "$RUNTIME_HEALTH_OBSERVATIONS_FILE"
+          chmod 600 "$RUNTIME_HEALTH_OBSERVATIONS_FILE"
+
+      - name: Inspect effective runtime image
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_id=$(docker compose --env-file "$RUNTIME_ENV_FILE" ps -q control-plane)
+          image_ref=$(docker inspect --format '{{.Config.Image}}' "$container_id")
+          docker image inspect "$image_ref" >/dev/null
+          runtime_workdir="/app"
+          docker export "$container_id" -o "$RUNTIME_ARCHIVE"
+          archive_listing="$RUNTIME_DIR/runtime-image.list"
+          tar -tf "$RUNTIME_ARCHIVE" > "$archive_listing"
+          runtime_workdir_name="${runtime_workdir#/}"
+          if grep -E '\.test\.(js|d\.ts)(/|$)' "$archive_listing"; then exit 1; fi
+          while IFS= read -r archive_entry; do
+            case "$archive_entry" in
+              "$runtime_workdir_name"|"$runtime_workdir_name/"|\
+              "$runtime_workdir_name/node_modules"|"$runtime_workdir_name/node_modules/"*|\
+              "$runtime_workdir_name/package.json"|"$runtime_workdir_name/pnpm-lock.yaml"|"$runtime_workdir_name/pnpm-workspace.yaml"|\
+              "$runtime_workdir_name/apps"|"$runtime_workdir_name/apps/"|\
+              "$runtime_workdir_name/apps/control-plane"|"$runtime_workdir_name/apps/control-plane/"|\
+              "$runtime_workdir_name/apps/control-plane/package.json"|\
+              "$runtime_workdir_name/apps/control-plane/dist"|"$runtime_workdir_name/apps/control-plane/dist/"*|\
+              "$runtime_workdir_name/packages"|"$runtime_workdir_name/packages/"|\
+              "$runtime_workdir_name/packages/protocol"|"$runtime_workdir_name/packages/protocol/"|\
+              "$runtime_workdir_name/packages/protocol/package.json"|\
+              "$runtime_workdir_name/packages/protocol/dist"|"$runtime_workdir_name/packages/protocol/dist/"*) ;;
+              *) exit 1 ;;
+            esac
+          done < "$archive_listing"
+          RUNTIME_CONTAINER_ID="$container_id"
+          RUNTIME_IMAGE_REF="$image_ref"
+          printf 'RUNTIME_CONTAINER_ID=%s\n' "$RUNTIME_CONTAINER_ID" >> "$GITHUB_ENV"
+          printf 'RUNTIME_IMAGE_REF=%s\n' "$RUNTIME_IMAGE_REF" >> "$GITHUB_ENV"
+
+      - name: Verify database failure separation
+        shell: bash
+        run: |
+          set -euo pipefail
+          runtime_url="https://127.0.0.1:8443"
+          db_loss_cleanup() {
+            docker compose --env-file "$RUNTIME_ENV_FILE" down --remove-orphans >/dev/null 2>&1 || true
+          }
+          trap db_loss_cleanup EXIT
+          docker compose --env-file "$RUNTIME_ENV_FILE" stop postgres
+          for attempt in $(seq 1 30); do
+            readiness_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready" || true)
+            live_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live" || true)
+            test "$readiness_status" = "503" && break
+            test "$attempt" = "30" && exit 1
+            sleep 1
+          done
+          readiness_body=$(curl --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready" || true)
+          live_body=$(curl --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")
+          test "$readiness_status" = "503"
+          test "$live_status" = "200"
+          test "$live_body" = '{"status":"ok"}'
+          {
+            printf 'db_loss_readiness_status=%s\n' "$readiness_status"
+            printf 'db_loss_readiness_body=%s\n' "$readiness_body"
+            printf 'db_loss_live_status=%s\n' "$live_status"
+            printf 'db_loss_live_body=%s\n' "$live_body"
+          } > "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
+          docker compose --env-file "$RUNTIME_ENV_FILE" start postgres
+          for attempt in $(seq 1 60); do
+            readiness_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready" || true)
+            test "$readiness_status" = "200" && break
+            test "$attempt" = "60" && exit 1
+            sleep 1
+          done
+          ready_body=$(curl --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready")
+          test "$readiness_status" = "200"
+          test "$ready_body" = '{"status":"ready"}'
+          {
+            printf 'recovery_readiness_status=%s\n' "$readiness_status"
+            printf 'recovery_ready_body=%s\n' "$ready_body"
+          } >> "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
+          chmod 600 "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
+          trap - EXIT
+
+      - name: Capture runtime evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          live_status=$(sed -n 's/^live_status=//p' "$RUNTIME_HEALTH_OBSERVATIONS_FILE" | head -n 1)
+          live_body=$(sed -n 's/^live_body=//p' "$RUNTIME_HEALTH_OBSERVATIONS_FILE" | head -n 1)
+          ready_status=$(sed -n 's/^ready_status=//p' "$RUNTIME_HEALTH_OBSERVATIONS_FILE" | head -n 1)
+          ready_body=$(sed -n 's/^ready_body=//p' "$RUNTIME_HEALTH_OBSERVATIONS_FILE" | head -n 1)
+          metrics_status=$(sed -n 's/^metrics_status=//p' "$RUNTIME_HEALTH_OBSERVATIONS_FILE" | head -n 1)
+          metrics_body=$(cat "$RUNTIME_HEALTH_METRICS_BODY_FILE")
+          metrics_content_type=$(sed -n 's/^metrics_content_type=//p' "$RUNTIME_HEALTH_OBSERVATIONS_FILE" | head -n 1)
+          readiness_status=$(sed -n 's/^db_loss_readiness_status=//p' "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" | head -n 1)
+          recovery_readiness_status=$(sed -n 's/^recovery_readiness_status=//p' "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" | head -n 1)
+          source_runtime_observations=$(cat "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE")
+          test -n "$source_runtime_observations"
+          test "$metrics_content_type" = 'text/plain; version=0.0.4; charset=utf-8'
+          grep --fixed-strings 'qhb_mcp_submit_duration_seconds' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
+          grep --fixed-strings 'qhb_connector_online' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
+          grep --fixed-strings 'qhb_job_queue_age_seconds' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
+          set -a
+          source "$RUNTIME_ENV_FILE"
+          set +a
+          migration_tag=0002_result_acknowledgement
+          migration_when=$(docker compose --env-file "$RUNTIME_ENV_FILE" exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc 'SELECT created_at FROM drizzle.__drizzle_migrations ORDER BY created_at DESC LIMIT 1' | tr -d '\r')
+          migration_sha256=$(docker compose --env-file "$RUNTIME_ENV_FILE" exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc 'SELECT hash FROM drizzle.__drizzle_migrations ORDER BY created_at DESC LIMIT 1' | tr -d '\r')
+          test "$migration_tag" = "0002_result_acknowledgement"
+          test "$migration_when" = "1788244364352"
+          test "$migration_sha256" = "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89"
+          image_digest="$(docker image inspect --format '{{.Id}}' "$RUNTIME_IMAGE_REF")"
+          config_digest="sha256:$(docker compose --env-file "$RUNTIME_ENV_FILE" config --hash control-plane)" # config--hash
+          if ! printf '%s\n' "$image_digest" | grep -E '^sha256:[0-9a-f]{64}$'; then exit 1; fi
+          if ! printf '%s\n' "$config_digest" | grep -E '^sha256:[0-9a-f]{64}$'; then exit 1; fi
+          {
+            printf 'live_status=%s\n' "$live_status"
+            printf 'live_body=%s\n' "$live_body"
+            printf 'ready_status=%s\n' "$ready_status"
+            printf 'ready_body=%s\n' "$ready_body"
+            printf 'metrics_status=%s\n' "$metrics_status"
+            printf 'metrics_body=%s\n' "$metrics_body"
+            printf 'metrics_content_type=%s\n' "$metrics_content_type"
+            printf 'privacy=passed\n'
+            printf 'database_loss_readiness_status=%s\n' "$readiness_status"
+            printf 'recovery_readiness_status=%s\n' "$recovery_readiness_status"
+            printf 'migration_table=__drizzle_migrations\n'
+            printf 'migration_tag=%s\n' "$migration_tag"
+            printf 'migration_when=%s\n' "$migration_when"
+            printf 'migration_sha256=%s\n' "$migration_sha256"
+            printf 'image_digest=%s\n' "$image_digest"
+            printf 'config_digest=%s\n' "$config_digest"
+            cat "$RUNTIME_HEALTH_OBSERVATIONS_FILE"
+            cat "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
+          } >> "$RUNTIME_EVIDENCE_FILE"
+
+      - name: Upload runtime evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-evidence
+          path: ${{ env.RUNTIME_EVIDENCE_FILE }}
+
+      - name: Cleanup runtime
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -n "${RUNTIME_ENV_FILE:-}" ]; then docker compose --env-file "$RUNTIME_ENV_FILE" down --volumes --remove-orphans; fi
+          if [ -n "${RUNTIME_CONTAINER_ID:-}" ]; then docker rm -f "$RUNTIME_CONTAINER_ID" >/dev/null 2>&1 || true; fi
+          if [ -n "${RUNTIME_IMAGE_REF:-}" ]; then docker image rm "$RUNTIME_IMAGE_REF" >/dev/null 2>&1 || true; fi
+          rm -f -- "${RUNTIME_ARCHIVE:-}" "${RUNTIME_EVIDENCE_FILE:-}"
+          if [ -n "${RUNTIME_DIR:-}" ] && [ -d "$RUNTIME_DIR" ] && [[ "$RUNTIME_DIR" == /tmp/* ]]; then rm -rf -- "$RUNTIME_DIR"; fi

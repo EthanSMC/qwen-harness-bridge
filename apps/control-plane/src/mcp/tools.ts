@@ -26,6 +26,7 @@ import {
   publicMessageFor,
 } from "../domain/errors.js";
 import { sanitizePublicText } from "../domain/presenters.js";
+import type { MetricsRegistry } from "../http/metrics.js";
 import type { McpOwnerContext } from "./auth.js";
 
 export type McpCoordinator = Readonly<{
@@ -351,6 +352,7 @@ export function registerMcpTools(
   server: McpServer,
   coordinator: McpCoordinator,
   owner: McpOwnerContext,
+  metrics?: MetricsRegistry,
 ): void {
   register(
     server,
@@ -358,7 +360,14 @@ export function registerMcpTools(
     SubmitTaskMcpInputSchema,
     SubmitTaskOutputSchema,
     owner,
-    (boundOwner, input) => coordinator.submit(boundOwner, input),
+    async (boundOwner, input) => {
+      const stopMcpSubmit = metrics?.startMcpSubmit();
+      try {
+        return await coordinator.submit(boundOwner, input);
+      } finally {
+        stopMcpSubmit?.();
+      }
+    },
   );
   register(
     server,
