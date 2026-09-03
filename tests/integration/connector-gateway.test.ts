@@ -1983,11 +1983,22 @@ describe("Connector gateway authentication and handshake", () => {
       PostgresConnectorStore.prototype.acceptClientMessage;
     let releaseHeartbeat: (() => void) | undefined;
     let heartbeatStarted!: () => void;
+    let heartbeatStoreSettled!: () => void;
+    let heartbeatStoreIsSettled = false;
+    let closeResolved = false;
+    let closeResolvedBeforeHeartbeatStore = false;
+    let app: Awaited<ReturnType<typeof startApp>> | undefined;
+    let socket: Duplex | undefined;
+    let gatewaySocket: Socket | undefined;
+    let closing: Promise<void> | undefined;
     const heartbeatGate = new Promise<void>((resolve) => {
       releaseHeartbeat = resolve;
     });
     const heartbeatWorkStarted = new Promise<void>((resolve) => {
       heartbeatStarted = resolve;
+    });
+    const heartbeatWorkSettled = new Promise<void>((resolve) => {
+      heartbeatStoreSettled = resolve;
     });
     vi.spyOn(
       PostgresConnectorStore.prototype,
@@ -1997,27 +2008,101 @@ describe("Connector gateway authentication and handshake", () => {
         heartbeatStarted();
         await heartbeatGate;
       }
-      return originalAcceptClientMessage.call(this, identity, message, now);
+      const result = await originalAcceptClientMessage.call(
+        this,
+        identity,
+        message,
+        now,
+      );
+      if (message.type === "connector.heartbeat") {
+        heartbeatStoreIsSettled = true;
+        heartbeatStoreSettled();
+      }
+      return result;
     });
 
-    const app = await startApp(5_000);
-    const credentials = await seedConnector(db);
-    const connector = await FakeConnector.connect(app, credentials);
     try {
-      const heartbeat = connector.send("connector.heartbeat", {});
+      const runningApp = await startApp(5_000);
+      app = runningApp;
+      runningApp.server.once("secureConnection", (acceptedSocket: Socket) => {
+        gatewaySocket = acceptedSocket;
+      });
+      const credentials = await seedConnector(db);
+      const connectorSocket = await rawConnectorSocket(runningApp, credentials);
+      socket = connectorSocket;
+      (connectorSocket as Duplex & { allowHalfOpen?: boolean }).allowHalfOpen =
+        true;
+      const hello = JSON.stringify({
+        protocol_version: "1.0",
+        message_id: crypto.randomUUID(),
+        sequence: 1,
+        sent_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        correlation_id: crypto.randomUUID(),
+        type: "connector.hello",
+        payload: {
+          connector_id: credentials.connector_id,
+          connector_version: "shutdown-evidence-test/1.0",
+          capabilities: ["harness", "integration-test"],
+          last_server_sequence: 0,
+          last_client_sequence: 0,
+        },
+      });
+      sendRawFrame(connectorSocket, 0x1, Buffer.from(hello));
+      await expect(
+        waitForServerMessage(
+          connectorSocket,
+          (message) => message.type === "connector.welcome",
+        ),
+      ).resolves.toMatchObject({
+        type: "connector.welcome",
+        payload: { connector_id: credentials.connector_id },
+      });
+
+      sendRawFrame(
+        connectorSocket,
+        0x1,
+        Buffer.from(
+          JSON.stringify({
+            protocol_version: "1.0",
+            message_id: crypto.randomUUID(),
+            sequence: 2,
+            sent_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 60_000).toISOString(),
+            correlation_id: crypto.randomUUID(),
+            type: "connector.heartbeat",
+            payload: {},
+          }),
+        ),
+      );
       await heartbeatWorkStarted;
-      const closing = app.close();
-      await connector.waitForClose();
-      let closeResolved = false;
+
+      // Do not answer Gateway's close frame. The raw socket close event is the
+      // observable boundary for the Gateway's close-I/O deadline.
+      connectorSocket.on("data", () => undefined);
+      const socketClosed = new Promise<void>((resolve, reject) => {
+        if (gatewaySocket === undefined) {
+          reject(new Error("Gateway secure socket was not observed"));
+          return;
+        }
+        gatewaySocket.once("close", () => resolve());
+      });
+      closing = runningApp.close();
       void closing.then(() => {
         closeResolved = true;
+        if (!heartbeatStoreIsSettled) closeResolvedBeforeHeartbeatStore = true;
       });
+
+      await socketClosed;
+      expect(gatewaySocket?.destroyed).toBe(true);
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect(closeResolved).toBe(false);
 
       releaseHeartbeat?.();
-      await heartbeat;
+      await heartbeatWorkSettled;
+      expect(closeResolved).toBe(false);
       await closing;
+      expect(closeResolvedBeforeHeartbeatStore).toBe(false);
       await expect(
         db.query<{ last_client_sequence: number }>(
           "SELECT last_client_sequence::integer AS last_client_sequence FROM connectors WHERE id = $1",
@@ -2026,9 +2111,13 @@ describe("Connector gateway authentication and handshake", () => {
       ).resolves.toMatchObject({ rows: [{ last_client_sequence: 2 }] });
     } finally {
       releaseHeartbeat?.();
-      await connector.close();
+      socket?.destroy();
       vi.restoreAllMocks();
-      if (app.server.listening) await app.close();
+      if (closing !== undefined) {
+        await closing;
+      } else if (app?.server.listening) {
+        await app.close();
+      }
     }
   });
 
