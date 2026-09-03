@@ -28,30 +28,31 @@ const bodyFor = ({
   fixRounds = "Round 1: addressed all findings",
   verdict = "PASS",
   ciEvidence = "https://github.com/EthanSMC/qwen-harness-bridge/actions/runs/123456789",
-} = {}) => [
-  "## Review evidence",
-  "",
-  `- [${mode === "formal" ? "x" : " "}] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.`,
-  `- [${mode === "solo" ? "x" : " "}] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.`,
-  "",
-  `- Formal GitHub review URL (required for formal mode): ${formalUrl}`,
-  `- Formal reviewer GitHub identity (required for formal mode): ${formalIdentity}`,
-  `- Solo eligibility evidence URL or repository-status reference (required for solo mode): ${soloRef}`,
-  `- Solo eligibility verification date (required for solo mode): ${soloDate}`,
-  "",
-  `- Implementer agent ID: ${implementer}`,
-  `- Reviewer agent ID: ${reviewer}`,
-  `- Reviewer identity (agent/account): ${reviewerIdentity}`,
-  `- Reviewer is distinct from implementer: ${distinct}`,
-  `- Fresh review of this exact commit range: ${fresh}`,
-  `- Independent review (no author self-approval or fabricated evidence): ${independent}`,
-  "",
-  `- Commit range reviewed (base..head; use the exact event base.sha..head.sha): ${commitRange}`,
-  `- Findings: ${findings}`,
-  `- Fix rounds: ${fixRounds}`,
-  `- Final verdict: ${verdict}`,
-  `- CI run URL(s) / PR checks URL(s) and required-check results: ${ciEvidence}`,
-].join("\n");
+} = {}) =>
+  [
+    "## Review evidence",
+    "",
+    `- [${mode === "formal" ? "x" : " "}] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.`,
+    `- [${mode === "solo" ? "x" : " "}] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.`,
+    "",
+    `- Formal GitHub review URL (required for formal mode): ${formalUrl}`,
+    `- Formal reviewer GitHub identity (required for formal mode): ${formalIdentity}`,
+    `- Solo eligibility evidence URL or repository-status reference (required for solo mode): ${soloRef}`,
+    `- Solo eligibility verification date (required for solo mode): ${soloDate}`,
+    "",
+    `- Implementer agent ID: ${implementer}`,
+    `- Reviewer agent ID: ${reviewer}`,
+    `- Reviewer identity (agent/account): ${reviewerIdentity}`,
+    `- Reviewer is distinct from implementer: ${distinct}`,
+    `- Fresh review of this exact commit range: ${fresh}`,
+    `- Independent review (no author self-approval or fabricated evidence): ${independent}`,
+    "",
+    `- Commit range reviewed (base..head; use the exact event base.sha..head.sha): ${commitRange}`,
+    `- Findings: ${findings}`,
+    `- Fix rounds: ${fixRounds}`,
+    `- Final verdict: ${verdict}`,
+    `- CI run URL(s) / PR checks URL(s) and required-check results: ${ciEvidence}`,
+  ].join("\n");
 
 test("accepts a complete solo-maintainer review body from the PR event", () => {
   const result = validatePullRequestEvent(eventWithBody(bodyFor()));
@@ -60,14 +61,19 @@ test("accepts a complete solo-maintainer review body from the PR event", () => {
 });
 
 test("accepts a complete formal review body with a distinct GitHub reviewer", () => {
-  const result = validatePullRequestEvent(eventWithBody(bodyFor({
-    mode: "formal",
-    formalUrl: "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#pullrequestreview-123456789",
-    formalIdentity: "eligible-reviewer",
-    soloRef: "",
-    soloDate: "",
-    reviewerIdentity: "eligible-reviewer",
-  })));
+  const result = validatePullRequestEvent(
+    eventWithBody(
+      bodyFor({
+        mode: "formal",
+        formalUrl:
+          "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#pullrequestreview-123456789",
+        formalIdentity: "eligible-reviewer",
+        soloRef: "",
+        soloDate: "",
+        reviewerIdentity: "eligible-reviewer",
+      }),
+    ),
+  );
 
   assert.equal(result.mode, "formal");
 });
@@ -89,7 +95,10 @@ test("rejects a PR body that selects both review modes", () => {
 });
 
 test("rejects formal evidence in a solo-mode body", () => {
-  const body = bodyFor({ formalUrl: "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#pullrequestreview-123456789" });
+  const body = bodyFor({
+    formalUrl:
+      "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#pullrequestreview-123456789",
+  });
 
   assert.throws(
     () => validatePullRequestEvent(eventWithBody(body)),
@@ -145,7 +154,8 @@ test("rejects a solo review whose final verdict is not PASS", () => {
 test("rejects formal self-approval by comparing reviewer identity with PR author", () => {
   const body = bodyFor({
     mode: "formal",
-    formalUrl: "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#pullrequestreview-123456789",
+    formalUrl:
+      "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#pullrequestreview-123456789",
     formalIdentity: "EthanSMC",
     soloRef: "",
     soloDate: "",
@@ -161,7 +171,8 @@ test("rejects formal self-approval by comparing reviewer identity with PR author
 test("rejects a formal review with a placeholder reviewer identity", () => {
   const body = bodyFor({
     mode: "formal",
-    formalUrl: "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#pullrequestreview-123456789",
+    formalUrl:
+      "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#pullrequestreview-123456789",
     formalIdentity: "N/A",
     soloRef: "",
     soloDate: "",
@@ -203,7 +214,8 @@ test("rejects non-GitHub CI evidence URLs", () => {
 
 test("accepts a PR checks URL as CI evidence", () => {
   const body = bodyFor({
-    ciEvidence: "https://github.com/EthanSMC/qwen-harness-bridge/pull/37/checks",
+    ciEvidence:
+      "https://github.com/EthanSMC/qwen-harness-bridge/pull/37/checks",
   });
 
   assert.equal(validatePullRequestEvent(eventWithBody(body)).mode, "solo");

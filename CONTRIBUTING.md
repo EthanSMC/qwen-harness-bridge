@@ -1,6 +1,6 @@
 # Contributing
 
-This is a private, issue-driven repository. The approved Spec and linked implementation plan are authoritative for scope.
+This is a public, issue-driven repository. The approved Spec and linked implementation plan are authoritative for scope.
 
 ## Start work
 
