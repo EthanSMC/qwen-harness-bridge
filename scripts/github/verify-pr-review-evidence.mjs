@@ -145,6 +145,9 @@ const validateCiEvidence = (value) => {
 
 const normalizeRepository = (value) => value.trim().toLowerCase();
 
+const GITHUB_PAGE_SIZE = 100;
+const GITHUB_MAX_PAGES = 100;
+
 const requiredPositiveNumber = (value, label) => {
   const number = Number(value);
   if (!Number.isInteger(number) || number < 1)
@@ -196,6 +199,32 @@ const requireArray = (value, label) => {
   return value;
 };
 
+const apiJsonPages = async (fetchImpl, repository, path, token, label) => {
+  const items = [];
+  const separator = path.includes("?") ? "&" : "?";
+  for (let page = 1; page <= GITHUB_MAX_PAGES; page += 1) {
+    const pageItems = requireArray(
+      await apiJson(
+        fetchImpl,
+        repository,
+        `${path}${separator}per_page=${GITHUB_PAGE_SIZE}&page=${page}`,
+        token,
+      ),
+      `${label} page ${page}`,
+    );
+    if (pageItems.length > GITHUB_PAGE_SIZE) {
+      throw new Error(
+        `${label} page ${page} exceeded the requested page size; failing closed`,
+      );
+    }
+    items.push(...pageItems);
+    if (pageItems.length < GITHUB_PAGE_SIZE) return items;
+  }
+  throw new Error(
+    `${label} pagination reached the ${GITHUB_MAX_PAGES}-page safety cap without a short page; failing closed`,
+  );
+};
+
 const requireEqual = (actual, expected, label) => {
   if (actual !== expected)
     throw new Error(
@@ -203,17 +232,35 @@ const requireEqual = (actual, expected, label) => {
     );
 };
 
-const eligibleCollaborators = (collaborators, authorLogin) => {
+export const eligibleCollaborators = (collaborators, authorLogin) => {
   // Repository visibility is irrelevant to direct-collaborator eligibility.
   const eligibleRoles = new Set(["admin", "maintain", "push"]);
-  return collaborators.filter((collaborator) => {
-    const login =
-      typeof collaborator.login === "string" ? collaborator.login : "";
-    const role =
-      typeof collaborator.role_name === "string"
-        ? collaborator.role_name.toLowerCase()
-        : "";
-    const permissions = collaborator.permissions ?? {};
+  return collaborators.filter((value, index) => {
+    const label = `direct collaborator ${index + 1}`;
+    const collaborator = requireObject(value, label);
+    if (
+      typeof collaborator.login !== "string" ||
+      collaborator.login.trim() === ""
+    ) {
+      throw new Error(`${label} login must be a non-empty string`);
+    }
+    if (
+      typeof collaborator.role_name !== "string" ||
+      collaborator.role_name.trim() === ""
+    ) {
+      throw new Error(`${label} role_name must be a non-empty string`);
+    }
+    const permissions = requireObject(
+      collaborator.permissions,
+      `${label} permissions`,
+    );
+    for (const permission of ["admin", "maintain", "push"]) {
+      if (typeof permissions[permission] !== "boolean") {
+        throw new Error(`${label} permissions.${permission} must be boolean`);
+      }
+    }
+    const login = collaborator.login;
+    const role = collaborator.role_name.toLowerCase();
     const hasEligibleRole = eligibleRoles.has(role);
     const hasEligiblePermission =
       permissions.admin === true ||
@@ -496,13 +543,11 @@ export async function validatePullRequestState({
     ),
     eventPullRequest.head.sha,
   );
-  const collaborators = requireArray(
-    await apiJson(
-      fetchImpl,
-      repository,
-      "/collaborators?affiliation=direct&per_page=100",
-      token,
-    ),
+  const collaborators = await apiJsonPages(
+    fetchImpl,
+    repository,
+    "/collaborators?affiliation=direct",
+    token,
     "direct collaborators",
   );
   const eligible = eligibleCollaborators(
@@ -525,13 +570,11 @@ export async function validatePullRequestState({
     ) {
       throw new Error("formal reviewer is not a current eligible collaborator");
     }
-    const reviews = requireArray(
-      await apiJson(
-        fetchImpl,
-        repository,
-        `/pulls/${eventPullRequest.number}/reviews?per_page=100`,
-        token,
-      ),
+    const reviews = await apiJsonPages(
+      fetchImpl,
+      repository,
+      `/pulls/${eventPullRequest.number}/reviews`,
+      token,
       "pull request reviews",
     );
     const latestReview = latestReviewFor(reviews, formalIdentity);

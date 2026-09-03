@@ -38,7 +38,7 @@ The product must therefore solve five problems:
 - Restore job state after control-plane restart or Connector reconnect.
 - Keep complete terminal output, source files, credentials, and environment variables off the cloud control plane.
 - Provide an experimental RTC mode for session-scoped spoken progress without coupling stable-mode availability to RTC.
-- Manage source, product progress, milestones, versions, release notes, and decisions in a private GitHub repository.
+- Manage source, product progress, milestones, versions, release notes, and decisions in a public GitHub repository.
 
 ### 3.2 V1 non-goals
 
@@ -472,7 +472,7 @@ qwen-harness-bridge/
 
 ### 15.3 GitHub workflow
 
-- Private repository named `qwen-harness-bridge`.
+- Public repository named `qwen-harness-bridge`.
 - Protected `main`; short-lived branches and pull requests.
 - Conventional Commits and a single synchronized SemVer version in V1.
 - Automated `CHANGELOG.md` and GitHub Release notes from Changesets.
@@ -596,4 +596,4 @@ Primary references:
 - Stable asynchronous mode is the release-critical path.
 - RTC is experimental and isolated behind a feature flag.
 - Repository-scoped development tasks only; high-risk operations require approval and denied actions remain denied.
-- Private GitHub monorepo with unified versioning, milestones, protected main, CI, ADRs, and release notes.
+- Public GitHub monorepo with unified versioning, milestones, protected main, CI, ADRs, and release notes.

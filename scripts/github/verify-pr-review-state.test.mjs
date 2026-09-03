@@ -10,6 +10,7 @@ const PR_NUMBER = 37;
 const AUTHOR = "EthanSMC";
 const BASE_SHA = "base-sha-37";
 const HEAD_SHA = "head-sha-37";
+const PAGE_SIZE = 100;
 
 const bodyFor = ({
   mode = "solo",
@@ -115,10 +116,33 @@ const collaboratorsFor = ({ secondReviewer = false } = {}) => [
         {
           login: "eligible-reviewer",
           role_name: "push",
-          permissions: { push: true, pull: true },
+          permissions: {
+            admin: false,
+            maintain: false,
+            push: true,
+            pull: true,
+            triage: false,
+          },
         },
       ]
     : []),
+];
+
+const eligibleCollaborator = collaboratorsFor({ secondReviewer: true })[1];
+
+const fullIneligibleCollaboratorPage = () => [
+  collaboratorsFor()[0],
+  ...Array.from({ length: PAGE_SIZE - 1 }, (_, index) => ({
+    login: `read-only-${index + 1}`,
+    role_name: "pull",
+    permissions: {
+      admin: false,
+      maintain: false,
+      push: false,
+      pull: true,
+      triage: false,
+    },
+  })),
 ];
 
 const reviewsFor = ({
@@ -132,6 +156,16 @@ const reviewsFor = ({
     commit_id: commitId,
     submitted_at: "2026-09-01T01:00:00Z",
   },
+];
+
+const fullReviewPage = () => [
+  ...reviewsFor(),
+  ...Array.from({ length: PAGE_SIZE - 1 }, (_, index) => ({
+    user: { login: `other-reviewer-${index + 1}` },
+    state: "COMMENTED",
+    commit_id: HEAD_SHA,
+    submitted_at: "2026-08-31T01:00:00Z",
+  })),
 ];
 
 const checkRunsFor = ({
@@ -182,23 +216,46 @@ const fixtureFetch =
 
 const fixturesFor = ({
   secondReviewer = false,
+  collaboratorPages,
   reviews,
+  reviewPages,
   pullRequest,
   checkRuns = checkRunsFor(),
-} = {}) => ({
-  [`/repos/${REPOSITORY}/pulls/${PR_NUMBER}`]: pullRequest ?? pullRequestFor(),
-  [`/repos/${REPOSITORY}/actions/runs/${RUN_ID}`]: runFor(),
-  [`/repos/${REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100`]:
-    checkRuns,
-  [`/repos/${REPOSITORY}/collaborators?affiliation=direct&per_page=100`]:
+} = {}) => {
+  const resolvedCollaboratorPages = collaboratorPages ?? [
     collaboratorsFor({ secondReviewer }),
-  ...(reviews === undefined
-    ? {}
-    : {
-        [`/repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100`]:
-          reviews,
-      }),
-});
+  ];
+  const resolvedReviewPages =
+    reviewPages ?? (reviews === undefined ? undefined : [reviews]);
+
+  return {
+    [`/repos/${REPOSITORY}/pulls/${PR_NUMBER}`]:
+      pullRequest ?? pullRequestFor(),
+    [`/repos/${REPOSITORY}/actions/runs/${RUN_ID}`]: runFor(),
+    [`/repos/${REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100`]:
+      checkRuns,
+    [`/repos/${REPOSITORY}/collaborators?affiliation=direct&per_page=100`]:
+      resolvedCollaboratorPages[0],
+    ...Object.fromEntries(
+      resolvedCollaboratorPages.map((page, index) => [
+        `/repos/${REPOSITORY}/collaborators?affiliation=direct&per_page=100&page=${index + 1}`,
+        page,
+      ]),
+    ),
+    ...(resolvedReviewPages === undefined
+      ? {}
+      : {
+          [`/repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100`]:
+            resolvedReviewPages[0],
+          ...Object.fromEntries(
+            resolvedReviewPages.map((page, index) => [
+              `/repos/${REPOSITORY}/pulls/${PR_NUMBER}/reviews?per_page=100&page=${index + 1}`,
+              page,
+            ]),
+          ),
+        }),
+  };
+};
 
 const stateFor = (event, fixtures, { staticResult = "success" } = {}) =>
   validatePullRequestState({
@@ -371,6 +428,142 @@ test("rejects solo mode for a public repository when a distinct eligible collabo
     ),
     /solo mode.*eligible reviewer|eligible reviewer.*solo/i,
   );
+});
+
+test("rejects solo mode when an eligible collaborator is on page two", async () => {
+  await assert.rejects(
+    stateFor(
+      eventFor(),
+      fixturesFor({
+        collaboratorPages: [
+          fullIneligibleCollaboratorPage(),
+          [eligibleCollaborator],
+        ],
+      }),
+    ),
+    /solo mode.*eligible reviewer|eligible reviewer.*solo/i,
+  );
+});
+
+test("accepts formal mode when its eligible collaborator is on page two", async () => {
+  const event = eventFor({
+    body: bodyFor({
+      mode: "formal",
+      formalIdentity: "eligible-reviewer",
+      formalUrl: `https://github.com/${REPOSITORY}/pull/${PR_NUMBER}#pullrequestreview-123`,
+      soloRef: "",
+      soloDate: "",
+    }),
+  });
+
+  const result = await stateFor(
+    event,
+    fixturesFor({
+      collaboratorPages: [
+        fullIneligibleCollaboratorPage(),
+        [eligibleCollaborator],
+      ],
+      reviews: reviewsFor(),
+      pullRequest: pullRequestFor({ body: event.pull_request.body }),
+    }),
+  );
+
+  assert.equal(result.mode, "formal");
+  assert.deepEqual(result.eligibleReviewerLogins, ["eligible-reviewer"]);
+});
+
+test("rejects formal mode when a later review page supersedes the approval", async (t) => {
+  for (const state of ["CHANGES_REQUESTED", "DISMISSED"]) {
+    await t.test(state, async () => {
+      const event = eventFor({
+        body: bodyFor({
+          mode: "formal",
+          formalIdentity: "eligible-reviewer",
+          formalUrl: `https://github.com/${REPOSITORY}/pull/${PR_NUMBER}#pullrequestreview-123`,
+          soloRef: "",
+          soloDate: "",
+        }),
+      });
+
+      await assert.rejects(
+        stateFor(
+          event,
+          fixturesFor({
+            secondReviewer: true,
+            reviewPages: [
+              fullReviewPage(),
+              [
+                {
+                  user: { login: "eligible-reviewer" },
+                  state,
+                  commit_id: HEAD_SHA,
+                  submitted_at: "2026-09-01T02:00:00Z",
+                },
+              ],
+            ],
+            pullRequest: pullRequestFor({ body: event.pull_request.body }),
+          }),
+        ),
+        /APPROVED.*current head|current-head.*approval/i,
+      );
+    });
+  }
+});
+
+test("fails closed when collaborator pagination reaches its safety cap without a short page", async () => {
+  const fullPage = fullIneligibleCollaboratorPage();
+
+  await assert.rejects(
+    stateFor(
+      eventFor(),
+      fixturesFor({ collaboratorPages: Array(100).fill(fullPage) }),
+    ),
+    /collaborator.*pagination.*(?:cap|limit)|pagination.*collaborator/i,
+  );
+});
+
+test("fails closed on malformed direct collaborator metadata", async (t) => {
+  const cases = [
+    [
+      "missing role_name",
+      {
+        login: "unknown-collaborator",
+        permissions: { admin: false, maintain: false, push: false },
+      },
+    ],
+    [
+      "missing permissions",
+      { login: "unknown-collaborator", role_name: "pull" },
+    ],
+    [
+      "malformed login",
+      {
+        login: 41,
+        role_name: "pull",
+        permissions: { admin: false, maintain: false, push: false },
+      },
+    ],
+    [
+      "incomplete permissions",
+      {
+        login: "unknown-collaborator",
+        role_name: "pull",
+        permissions: { admin: false, push: false },
+      },
+    ],
+  ];
+
+  for (const [name, collaborator] of cases) {
+    await t.test(name, async () => {
+      await assert.rejects(
+        stateFor(
+          eventFor(),
+          fixturesFor({ collaboratorPages: [[collaborator]] }),
+        ),
+        /direct collaborator.*(?:login|role_name|permissions)|collaborator metadata/i,
+      );
+    });
+  }
 });
 
 test("rejects formal mode with a stale approval", async () => {

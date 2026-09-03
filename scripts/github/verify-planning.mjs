@@ -65,6 +65,56 @@ const requireSourceField = (source, file, pattern, message) => {
     throw new Error(`${file} governance gate is missing ${message}`);
 };
 
+for (const [file, pattern, message] of [
+  ["README.md", /public GitHub repository/i, "the public repository state"],
+  [
+    "CHANGELOG.md",
+    /Public-repository governance/,
+    "the public repository governance entry",
+  ],
+  [
+    "README.md",
+    /branch protection is enabled on `main`/i,
+    "the enabled main-branch protection state",
+  ],
+  [
+    spec,
+    /Manage source, product progress, milestones, versions, release notes, and decisions in a public GitHub repository/,
+    "the public repository V1 goal",
+  ],
+  [
+    spec,
+    /Public repository named `qwen-harness-bridge`/,
+    "the public repository workflow decision",
+  ],
+  [
+    spec,
+    /Public GitHub monorepo with unified versioning, milestones, protected main/,
+    "the approved public repository design decision",
+  ],
+])
+  requireGovernanceField(file, pattern, message);
+
+for (const [file, pattern] of [
+  [
+    "README.md",
+    /after the private GitHub repository exists|private-repository branch-protection limitation/i,
+  ],
+  ["CHANGELOG.md", /Private-repository governance/i],
+  [
+    spec,
+    /in a private GitHub repository|Private repository named `qwen-harness-bridge`|Private GitHub monorepo/i,
+  ],
+  [
+    syncManagement,
+    /private-repository|private repository|make this repository public/i,
+  ],
+]) {
+  if (pattern.test(contents.get(file))) {
+    throw new Error(`${file} contradicts the current public protected state`);
+  }
+}
+
 const prTemplate = ".github/pull_request_template.md";
 for (const [pattern, message] of [
   [/Do not check both boxes/, "the prohibition on selecting both review modes"],
@@ -143,14 +193,11 @@ for (const [pattern, message] of [
     /collaborators\?affiliation=direct&per_page=100/,
     "the direct-collaborator query",
   ],
-  [/role_name/, "collaborator role eligibility"],
+  [/--paginate/, "complete GitHub API pagination"],
+  [/--slurp/, "paginated GitHub API page collection"],
   [
-    /permissions\.(?:admin|maintain|push)/,
-    "collaborator permission eligibility",
-  ],
-  [
-    /login\.toLowerCase\(\) !== ownerLogin/,
-    "exclusion of the repository owner",
+    /eligibleCollaborators\(directCollaborators, owner\)/,
+    "shared strict collaborator eligibility and owner exclusion",
   ],
   [/eligibleReviewers\.length > 0/, "distinct eligible reviewer detection"],
   [
@@ -158,7 +205,7 @@ for (const [pattern, message] of [
     "conditional formal/solo mode selection",
   ],
   [
-    /const requiredPullRequestReviews = reviewMode === "formal" \? formalReviewRequirements : null;/,
+    /const requiredPullRequestReviews =\s*reviewMode === "formal" \? formalReviewRequirements : null;/,
     "conditional formal review payload",
   ],
   [
@@ -236,8 +283,8 @@ for (const [pattern, message] of [
     "the actual pull-request body validator command",
   ],
   [
-    /node --test scripts\/github\/verify-pr-review-evidence\.test\.mjs scripts\/github\/verify-pr-review-state\.test\.mjs/,
-    "the review evidence node:test commands",
+    /node --test scripts\/github\/verify-pr-review-evidence\.test\.mjs scripts\/github\/verify-pr-review-state\.test\.mjs scripts\/github\/sync-management\.test\.mjs/,
+    "the review evidence and management-sync node:test commands",
   ],
   [/needs: static/, "the final gate dependency on static"],
   [/name: governance/, "the final governance job name"],
@@ -288,6 +335,22 @@ for (const [pattern, message] of [
   [
     /repository visibility is irrelevant to direct-collaborator eligibility/i,
     "visibility-independent direct-collaborator eligibility",
+  ],
+  [/GITHUB_MAX_PAGES/, "a GitHub pagination safety cap"],
+  [/page=\$\{page\}/, "explicit GitHub API page traversal"],
+  [
+    /pagination reached.*safety cap.*failing closed/,
+    "fail-closed pagination cap handling",
+  ],
+  [/direct collaborator \$\{index \+ 1\}/, "indexed collaborator validation"],
+  [/collaborator\.role_name/, "collaborator role validation"],
+  [
+    /typeof permissions\[permission\] !== "boolean"/,
+    "strict collaborator permission validation",
+  ],
+  [
+    /pulls\/\$\{eventPullRequest\.number\}\/reviews/,
+    "paginated pull-request review traversal",
   ],
   [
     /const reviewMode = eligible\.length > 0 \? "formal" : "solo";/,
