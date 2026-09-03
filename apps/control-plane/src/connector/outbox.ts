@@ -5,7 +5,7 @@ import type {
   JobStatus,
 } from "@qhb/protocol";
 import { ConnectorServerMessageSchema, rfc3339InstantKey } from "@qhb/protocol";
-import { and, asc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import {
   connectorMessages,
@@ -64,6 +64,7 @@ export type ConnectorStoreErrorCode =
   | "CLIENT_REPLAY_MISMATCH"
   | "CLAIM_REJECTED"
   | "EVENT_REJECTED"
+  | "MESSAGE_EXPIRED"
   | "INTERNAL";
 
 export class ConnectorStoreError extends Error {
@@ -126,15 +127,21 @@ const SOURCE_LIKE_EVENT_TEXT =
   /\b(?:(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=|function\s+[A-Za-z_$][\w$]*\s*\(|class\s+[A-Za-z_$][\w$]*\s*[{<]|def\s+[A-Za-z_]\w*\s*\(|(?:import|export)\s+(?:[\w*{]|from\b))/u;
 const SECRET_LIKE_CONNECTOR_TEXT =
   /\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9]{12,}|xox[baprs]-[A-Za-z0-9-]{12,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b/giu;
+const UNSAFE_CONNECTOR_TEXT_PATTERNS = [
+  /\bprocess\s*\.\s*env\b/iu,
+  /\bconsole\s*\.\s*(?:log|error|warn|debug)\s*\(/iu,
+  /\b(?:api[_ -]?key|access[_ -]?token|auth(?:orization)?|credential|password|passwd|secret|token)\s*[:=]/iu,
+  /\b(?:sk|rk|pk|gh[pousr]|xox[baprs])-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\b/iu,
+  /\b(?:https?|ftp):\/\/[^\s"'<>]*:[^\s"'<>@/]+@[^\s"'<>]+/iu,
+  /\b(?:https?|ftp):\/\/[^\s"'<>]*[?#][^\s"'<>]*/iu,
+];
+
+const containsUnsafeConnectorText = (value: string): boolean =>
+  SOURCE_LIKE_EVENT_TEXT.test(value) ||
+  UNSAFE_CONNECTOR_TEXT_PATTERNS.some((pattern) => pattern.test(value));
 
 const sanitizeEventValue = (value: unknown): unknown => {
-  if (typeof value === "string") {
-    const sanitized = sanitizePublicText(value, 500, 500, 500);
-    if (SOURCE_LIKE_EVENT_TEXT.test(sanitized)) {
-      return "[redacted source content]";
-    }
-    return sanitized || "[redacted]";
-  }
+  if (typeof value === "string") return sanitizeConnectorText(value, 500);
   if (
     value === null ||
     typeof value === "number" ||
@@ -164,8 +171,10 @@ const sanitizeConnectorText = (value: string, maxLength = 800): string => {
     maxLength,
     maxLength,
   );
-  if (SOURCE_LIKE_EVENT_TEXT.test(sanitized)) {
-    return "[redacted source content]";
+  if (containsUnsafeConnectorText(sanitized)) {
+    return SOURCE_LIKE_EVENT_TEXT.test(sanitized)
+      ? "[redacted source content]"
+      : "[redacted credential content]";
   }
   return sanitized || "[redacted]";
 };
@@ -245,13 +254,25 @@ const findOriginalResponse = async (
         eq(connectorMessages.connectorId, connectorId),
         eq(connectorMessages.direction, "server"),
         eq(connectorMessages.correlationId, message.correlation_id),
-        eq(connectorMessages.type, expectedType),
+        expectedType === "ack"
+          ? or(
+              eq(connectorMessages.type, "ack"),
+              eq(connectorMessages.type, "protocol.error"),
+            )
+          : eq(connectorMessages.type, expectedType),
       ),
     )
     .orderBy(asc(connectorMessages.sequence));
   const row = rows.find((candidate) => {
     if (expectedType === "connector.welcome") return true;
-    return candidate.payload.sequence === message.sequence;
+    if (candidate.type === "ack") {
+      return candidate.payload.sequence === message.sequence;
+    }
+    return (
+      message.type === "job.claim" &&
+      candidate.type === "protocol.error" &&
+      candidate.payload.code === "CLAIM_REJECTED"
+    );
   });
   if (row === undefined) {
     throw new ConnectorStoreError("INTERNAL", "Original response is missing");
@@ -281,64 +302,132 @@ const toStoredServerMessage = (
   };
 };
 
-const tombstoneExpiredOffers = async (
+const expiredTombstonePayload = (): Record<string, string> => ({
+  code: "MESSAGE_EXPIRED",
+  message: "A Connector message expired before delivery.",
+});
+
+const cancelledTombstonePayload = (): Record<string, string> => ({
+  code: "JOB_CANCELLED",
+  message: "The offered job was cancelled before it was claimed.",
+});
+
+const replaceServerMessage = async (
+  database: QueryDatabase,
+  row: ConnectorMessageRow,
+  now: Date,
+  payload: Record<string, string>,
+  expectedType?: ConnectorMessageRow["type"],
+  expired = false,
+): Promise<void> => {
+  await database
+    .update(connectorMessages)
+    .set({
+      messageId: crypto.randomUUID(),
+      type: "protocol.error",
+      payload,
+      expiresAt: new Date(now.getTime() + REPLAY_TOMBSTONE_RETENTION_MS),
+    })
+    .where(
+      and(
+        eq(connectorMessages.id, row.id),
+        eq(connectorMessages.messageId, row.messageId),
+        eq(connectorMessages.direction, "server"),
+        isNull(connectorMessages.acknowledgedAt),
+        expectedType === undefined
+          ? undefined
+          : eq(connectorMessages.type, expectedType),
+        expired ? lte(connectorMessages.expiresAt, now) : undefined,
+      ),
+    );
+};
+
+/*
+ * Durable cursor contract: hello last_server_sequence=N means N was durably
+ * received, so N is not replayed even when its ACK was lost. With N-1, an
+ * expired actionable row at N is the first durable receipt and is replaced
+ * in place by a fresh-ID, same-sequence tombstone. Ordinary replay rows keep
+ * their stored identity.
+ */
+const tombstoneExpiredServerMessages = async (
   database: QueryDatabase,
   connectorId: string,
   afterSequence: number,
   now: Date,
 ): Promise<void> => {
-  const expiredOffers = await database
-    .select()
-    .from(connectorMessages)
-    .where(
-      and(
-        eq(connectorMessages.connectorId, connectorId),
-        eq(connectorMessages.direction, "server"),
-        eq(connectorMessages.type, "job.offer"),
-        gt(connectorMessages.sequence, afterSequence),
-        lte(connectorMessages.expiresAt, now),
-      ),
-    )
-    .orderBy(asc(connectorMessages.sequence))
-    .limit(SERVER_REPLAY_BATCH_SIZE)
-    .for("update");
-
-  const tombstoneExpiresAt = new Date(
-    now.getTime() + REPLAY_TOMBSTONE_RETENTION_MS,
-  );
-  for (const offer of expiredOffers) {
-    await database
-      .update(connectorMessages)
-      .set({
-        messageId: crypto.randomUUID(),
-        type: "protocol.error",
-        payload: {
-          code: "MESSAGE_EXPIRED",
-          message: "A Connector message expired before delivery.",
-        },
-        expiresAt: tombstoneExpiresAt,
-      })
+  while (true) {
+    const expiredMessages = await database
+      .select()
+      .from(connectorMessages)
       .where(
         and(
-          eq(connectorMessages.id, offer.id),
-          eq(connectorMessages.messageId, offer.messageId),
-          eq(connectorMessages.type, "job.offer"),
+          eq(connectorMessages.connectorId, connectorId),
+          eq(connectorMessages.direction, "server"),
+          isNull(connectorMessages.acknowledgedAt),
+          gt(connectorMessages.sequence, afterSequence),
           lte(connectorMessages.expiresAt, now),
         ),
+      )
+      .orderBy(asc(connectorMessages.sequence))
+      .limit(SERVER_REPLAY_BATCH_SIZE)
+      .for("update");
+    if (expiredMessages.length === 0) return;
+    for (const message of expiredMessages) {
+      await replaceServerMessage(
+        database,
+        message,
+        now,
+        expiredTombstonePayload(),
+        undefined,
+        true,
       );
+    }
   }
 };
 
-const lockConnector = async (
+const tombstoneCancelledOffers = async (
   database: QueryDatabase,
+  connectorId: string,
+  afterSequence: number,
+  now: Date,
+): Promise<void> => {
+  while (true) {
+    const cancelledOffers = await database
+      .select({ message: connectorMessages })
+      .from(connectorMessages)
+      .innerJoin(
+        jobs,
+        sql`${jobs.id}::text = ${connectorMessages.payload}->>'job_id'`,
+      )
+      .where(
+        and(
+          eq(connectorMessages.connectorId, connectorId),
+          eq(connectorMessages.direction, "server"),
+          eq(connectorMessages.type, "job.offer"),
+          isNull(connectorMessages.acknowledgedAt),
+          gt(connectorMessages.sequence, afterSequence),
+          eq(jobs.status, "cancelled"),
+        ),
+      )
+      .orderBy(asc(connectorMessages.sequence))
+      .limit(SERVER_REPLAY_BATCH_SIZE);
+    if (cancelledOffers.length === 0) return;
+    for (const { message } of cancelledOffers) {
+      await replaceServerMessage(
+        database,
+        message,
+        now,
+        cancelledTombstonePayload(),
+        "job.offer",
+      );
+    }
+  }
+};
+
+const validateConnector = (
+  row: ConnectorRow | undefined,
   identity: ConnectorIdentity,
-): Promise<ConnectorRow> => {
-  const rows = await database
-    .select()
-    .from(connectors)
-    .where(eq(connectors.id, identity.connectorId))
-    .for("update");
-  const row = rows[0];
+): ConnectorRow => {
   if (
     row === undefined ||
     row.ownerId !== identity.ownerId ||
@@ -350,6 +439,49 @@ const lockConnector = async (
   assertSafeSequence(row.lastClientSequence);
   assertSafeSequence(row.lastServerSequence);
   return row;
+};
+
+const readConnector = async (
+  database: QueryDatabase,
+  identity: ConnectorIdentity,
+): Promise<ConnectorRow> => {
+  const rows = await database
+    .select()
+    .from(connectors)
+    .where(eq(connectors.id, identity.connectorId))
+    .limit(1);
+  return validateConnector(rows[0], identity);
+};
+
+const lockConnector = async (
+  database: QueryDatabase,
+  identity: ConnectorIdentity,
+): Promise<ConnectorRow> => {
+  const rows = await database
+    .select()
+    .from(connectors)
+    .where(eq(connectors.id, identity.connectorId))
+    .for("update");
+  return validateConnector(rows[0], identity);
+};
+
+const lockClientJob = async (
+  database: QueryDatabase,
+  identity: ConnectorIdentity,
+  jobId: string,
+): Promise<JobRow | undefined> => {
+  const rows = await database
+    .select()
+    .from(jobs)
+    .where(
+      and(
+        eq(jobs.id, jobId),
+        eq(jobs.ownerId, identity.ownerId),
+        eq(jobs.connectorId, identity.connectorId),
+      ),
+    )
+    .for("update");
+  return rows[0];
 };
 
 const enqueueServerMessage = async (
@@ -438,26 +570,70 @@ const appendJobEvent = async (
   });
 };
 
-const claimOfferedJob = async (
+const withdrawCancelledOffer = async (
   database: QueryDatabase,
-  identity: ConnectorIdentity,
-  message: Extract<ConnectorClientMessage, { type: "job.claim" }>,
+  connectorId: string,
+  jobId: string,
+  leaseId: string,
   now: Date,
 ): Promise<void> => {
   const rows = await database
     .select()
-    .from(jobs)
-    .where(eq(jobs.id, message.payload.job_id))
+    .from(connectorMessages)
+    .where(
+      and(
+        eq(connectorMessages.connectorId, connectorId),
+        eq(connectorMessages.direction, "server"),
+        eq(connectorMessages.type, "job.offer"),
+        isNull(connectorMessages.acknowledgedAt),
+        sql`${connectorMessages.payload}->>'job_id' = ${jobId}`,
+        sql`${connectorMessages.payload}->>'lease_id' = ${leaseId}`,
+      ),
+    )
+    .limit(1)
     .for("update");
-  const job = rows[0];
+  const offer = rows[0];
+  if (offer !== undefined) {
+    await replaceServerMessage(
+      database,
+      offer,
+      now,
+      cancelledTombstonePayload(),
+      "job.offer",
+    );
+  }
+};
+
+const claimOfferedJob = async (
+  database: QueryDatabase,
+  identity: ConnectorIdentity,
+  message: Extract<ConnectorClientMessage, { type: "job.claim" }>,
+  job: JobRow | undefined,
+  now: Date,
+): Promise<"claimed" | "cancelled"> => {
+  if (
+    job !== undefined &&
+    job.status === "cancelled" &&
+    job.expiresAt.getTime() > now.getTime() &&
+    job.leaseId === message.payload.lease_id &&
+    message.payload.attempt === job.attempt + 1
+  ) {
+    await withdrawCancelledOffer(
+      database,
+      identity.connectorId,
+      job.id,
+      message.payload.lease_id,
+      now,
+    );
+    return "cancelled";
+  }
   if (
     job === undefined ||
-    job.ownerId !== identity.ownerId ||
-    job.connectorId !== identity.connectorId ||
     job.status !== "dispatched" ||
     job.leaseId !== message.payload.lease_id ||
     job.leaseExpiresAt === null ||
     job.leaseExpiresAt.getTime() <= now.getTime() ||
+    job.expiresAt.getTime() <= now.getTime() ||
     message.payload.attempt !== job.attempt + 1
   ) {
     throw new ConnectorStoreError("CLAIM_REJECTED");
@@ -491,6 +667,7 @@ const claimOfferedJob = async (
     messageId: message.message_id,
     correlationId: message.correlation_id,
   });
+  return "claimed";
 };
 
 const statusForEvent = (
@@ -515,21 +692,14 @@ const statusForEvent = (
 
 const ingestJobEvent = async (
   database: QueryDatabase,
-  identity: ConnectorIdentity,
   message: Extract<ConnectorClientMessage, { type: "job.event" }>,
+  job: JobRow | undefined,
   now: Date,
 ): Promise<void> => {
-  const rows = await database
-    .select()
-    .from(jobs)
-    .where(eq(jobs.id, message.payload.job_id))
-    .for("update");
-  const job = rows[0];
   if (
     job === undefined ||
-    job.ownerId !== identity.ownerId ||
-    job.connectorId !== identity.connectorId ||
     job.attempt !== message.payload.attempt ||
+    job.expiresAt.getTime() <= now.getTime() ||
     TERMINAL_JOB_STATES.has(job.status)
   ) {
     throw new ConnectorStoreError("EVENT_REJECTED");
@@ -627,6 +797,10 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
       );
     }
     return this.#db.transaction(async (tx) => {
+      const lockedJob =
+        message.type === "job.claim" || message.type === "job.event"
+          ? await lockClientJob(tx, identity, message.payload.job_id)
+          : undefined;
       const connector = await lockConnector(tx, identity);
       const existingRows = await tx
         .select()
@@ -664,6 +838,25 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
       ) {
         throw new ConnectorStoreError("CLIENT_REPLAY_MISMATCH");
       }
+      if (message.type === "ack") {
+        const serverRows = await tx
+          .select({ id: connectorMessages.id })
+          .from(connectorMessages)
+          .where(
+            and(
+              eq(connectorMessages.connectorId, connector.id),
+              eq(connectorMessages.direction, "server"),
+              eq(connectorMessages.sequence, message.payload.sequence),
+            ),
+          )
+          .limit(1);
+        if (serverRows[0] === undefined) {
+          throw new ConnectorStoreError(
+            "CLIENT_REPLAY_MISMATCH",
+            "ACK references a missing server message",
+          );
+        }
+      }
 
       await tx.insert(connectorMessages).values({
         connectorId: connector.id,
@@ -676,10 +869,17 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         expiresAt: new Date(message.expires_at),
       });
 
+      let claimResult: "claimed" | "cancelled" | undefined;
       if (message.type === "job.claim") {
-        await claimOfferedJob(tx, identity, message, now);
+        claimResult = await claimOfferedJob(
+          tx,
+          identity,
+          message,
+          lockedJob,
+          now,
+        );
       } else if (message.type === "job.event") {
-        await ingestJobEvent(tx, identity, message, now);
+        await ingestJobEvent(tx, message, lockedJob, now);
       } else if (message.type === "ack") {
         await tx
           .update(connectorMessages)
@@ -732,7 +932,13 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
               ),
             ),
           );
-        await tombstoneExpiredOffers(
+        await tombstoneCancelledOffers(
+          tx,
+          connector.id,
+          message.payload.last_server_sequence,
+          now,
+        );
+        await tombstoneExpiredServerMessages(
           tx,
           connector.id,
           message.payload.last_server_sequence,
@@ -775,14 +981,27 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
       const response =
         message.type === "ack"
           ? null
-          : await enqueueServerMessage(
-              tx,
-              connector,
-              "ack",
-              { sequence: message.sequence },
-              new Date(now.getTime() + 60_000),
-              message.correlation_id,
-            );
+          : claimResult === "cancelled"
+            ? await enqueueServerMessage(
+                tx,
+                connector,
+                "protocol.error",
+                {
+                  code: "CLAIM_REJECTED",
+                  message:
+                    "The offered job was cancelled before it was claimed.",
+                },
+                new Date(now.getTime() + 60_000),
+                message.correlation_id,
+              )
+            : await enqueueServerMessage(
+                tx,
+                connector,
+                "ack",
+                { sequence: message.sequence },
+                new Date(now.getTime() + 60_000),
+                message.correlation_id,
+              );
       return { duplicate: false, replay: [], response };
     });
   }
@@ -792,7 +1011,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
     now = new Date(),
   ): Promise<StoredServerMessage | null> {
     return this.#db.transaction(async (tx) => {
-      const connector = await lockConnector(tx, identity);
+      await readConnector(tx, identity);
       const policies = await tx
         .select({
           id: repositoryPolicies.id,
@@ -859,6 +1078,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         .for("update", { skipLocked: true });
       const job = jobRows[0];
       if (job === undefined) return null;
+      const connector = await lockConnector(tx, identity);
       if (job.requestCiphertext === null) {
         throw new ConnectorStoreError("INTERNAL", "Queued request is missing");
       }
@@ -930,7 +1150,13 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
     assertSafeSequence(afterSequence);
     return this.#db.transaction(async (tx) => {
       const connector = await lockConnector(tx, identity);
-      await tombstoneExpiredOffers(tx, connector.id, afterSequence, now);
+      await tombstoneCancelledOffers(tx, connector.id, afterSequence, now);
+      await tombstoneExpiredServerMessages(
+        tx,
+        connector.id,
+        afterSequence,
+        now,
+      );
       const rows = await tx
         .select()
         .from(connectorMessages)
@@ -970,7 +1196,18 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
   async materializeServerMessage(
     stored: StoredServerMessage,
     decryptor?: RequestDecryptor,
+    now = new Date(),
+    currentTime: () => Date = () => new Date(),
   ): Promise<ConnectorServerMessage> {
+    const assertNotExpired = (at: Date): void => {
+      if (stored.expiresAt.getTime() <= at.getTime()) {
+        throw new ConnectorStoreError(
+          "MESSAGE_EXPIRED",
+          "The Connector message expired before materialization",
+        );
+      }
+    };
+    assertNotExpired(now);
     let payload = stored.payload;
     if (stored.type === "job.offer") {
       const jobId = stored.payload.job_id;
@@ -991,6 +1228,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         request: await decryptor.decrypt(ciphertext),
       };
     }
+    assertNotExpired(currentTime());
     return ConnectorServerMessageSchema.parse({
       protocol_version: "1.0",
       message_id: stored.messageId,
