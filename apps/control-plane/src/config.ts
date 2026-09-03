@@ -46,10 +46,30 @@ const environmentSchema = z
     QHB_OWNER_ID: z.string().trim().min(1).optional(),
     QHB_MCP_BEARER_TOKEN: optionalSecretSchema,
     QHB_REQUEST_ENCRYPTION_KEY: optionalSecretSchema,
+    QHB_CONNECTOR_SESSION_SIGNING_KEY: optionalSecretSchema,
     QHB_TLS_CERT_PATH: optionalPathSchema,
     QHB_TLS_KEY_PATH: optionalPathSchema,
   })
   .superRefine((value, context) => {
+    const secretPairs = [
+      ["QHB_MCP_BEARER_TOKEN", "QHB_REQUEST_ENCRYPTION_KEY"],
+      ["QHB_MCP_BEARER_TOKEN", "QHB_CONNECTOR_SESSION_SIGNING_KEY"],
+      ["QHB_REQUEST_ENCRYPTION_KEY", "QHB_CONNECTOR_SESSION_SIGNING_KEY"],
+    ] as const;
+
+    for (const [firstSecret, secondSecret] of secretPairs) {
+      if (
+        value[firstSecret] !== undefined &&
+        value[firstSecret] === value[secondSecret]
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [secondSecret],
+          message: `${firstSecret} and ${secondSecret} must be different`,
+        });
+      }
+    }
+
     const hasCertificate = value.QHB_TLS_CERT_PATH !== undefined;
     const hasKey = value.QHB_TLS_KEY_PATH !== undefined;
     if (hasCertificate !== hasKey) {
@@ -72,6 +92,7 @@ export type AppConfig = {
   ownerId?: string;
   mcpBearerToken?: string;
   requestEncryptionKey?: string;
+  connectorSessionSigningKey?: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
 };
@@ -102,6 +123,11 @@ export function loadConfig(
     ...(parsed.QHB_REQUEST_ENCRYPTION_KEY === undefined
       ? {}
       : { requestEncryptionKey: parsed.QHB_REQUEST_ENCRYPTION_KEY }),
+    ...(parsed.QHB_CONNECTOR_SESSION_SIGNING_KEY === undefined
+      ? {}
+      : {
+          connectorSessionSigningKey: parsed.QHB_CONNECTOR_SESSION_SIGNING_KEY,
+        }),
     ...(parsed.QHB_TLS_CERT_PATH === undefined
       ? {}
       : { tlsCertPath: parsed.QHB_TLS_CERT_PATH }),

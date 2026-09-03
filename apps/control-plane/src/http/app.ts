@@ -1,6 +1,15 @@
-import type { ServerOptions as HttpsServerOptions } from "node:https";
+import type {
+  Server as HttpsServer,
+  ServerOptions as HttpsServerOptions,
+} from "node:https";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import Fastify, { type FastifyInstance } from "fastify";
+import { createConnectorBootstrapAuthenticator } from "../connector/auth.js";
+import {
+  type ConnectorGatewayOptions,
+  connectorSessionExpiry,
+  createConnectorGateway,
+} from "../connector/gateway.js";
 import { createMcpAuthenticator, McpAuthenticationError } from "../mcp/auth.js";
 import { createMcpServer } from "../mcp/server.js";
 import type { McpCoordinator } from "../mcp/tools.js";
@@ -10,6 +19,7 @@ export type CreateAppOptions = Readonly<{
   ownerId: string;
   mcpBearerToken: string;
   https: HttpsServerOptions;
+  connectorGateway?: ConnectorGatewayOptions;
 }>;
 
 const authenticationFailure = {
@@ -52,6 +62,66 @@ export async function createApp(
     expectedToken: options.mcpBearerToken,
     ownerId: options.ownerId,
   });
+  const connectorGateway =
+    options.connectorGateway === undefined
+      ? undefined
+      : createConnectorGateway(
+          app.server as unknown as HttpsServer,
+          options.connectorGateway,
+        );
+
+  if (connectorGateway !== undefined) {
+    const bootstrap = createConnectorBootstrapAuthenticator({
+      credentialStore: connectorGateway.store,
+    });
+    app.post("/connector/v1/session", async (request, reply) => {
+      try {
+        const body = request.body;
+        if (body === null || typeof body !== "object" || Array.isArray(body)) {
+          throw new Error("invalid");
+        }
+        const input = body as Record<string, unknown>;
+        if (
+          Object.keys(input).length !== 3 ||
+          typeof input.connector_id !== "string" ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+            input.connector_id,
+          ) ||
+          typeof input.credential_id !== "string" ||
+          input.credential_id.length < 1 ||
+          input.credential_id.length > 256 ||
+          typeof input.credential_secret !== "string" ||
+          input.credential_secret.length < 16 ||
+          input.credential_secret.length > 1024
+        ) {
+          throw new Error("invalid");
+        }
+        const identity = await bootstrap.exchange({
+          credentialId: input.credential_id,
+          credentialSecret: input.credential_secret,
+        });
+        if (identity.connectorId !== input.connector_id.toLowerCase()) {
+          throw new Error("invalid");
+        }
+        const token = connectorGateway.sessionService.issue(identity);
+        const claims = connectorGateway.sessionService.verify(token);
+        return reply.type("application/json").send({
+          token,
+          expires_at: connectorSessionExpiry(claims),
+        });
+      } catch {
+        return reply
+          .code(401)
+          .type("application/json")
+          .send(authenticationFailure);
+      }
+    });
+    const closeConnectorGateway = async (): Promise<void> => {
+      await connectorGateway.close(app.server as unknown as HttpsServer);
+    };
+    app.addHook("preClose", closeConnectorGateway);
+    app.addHook("onClose", closeConnectorGateway);
+  }
 
   app.get("/healthz", async (_request, reply) =>
     reply.type("application/json").send({ status: "ok" }),

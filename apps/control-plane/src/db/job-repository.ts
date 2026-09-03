@@ -358,6 +358,22 @@ const readJob = async (
   return rows[0];
 };
 
+const readDatabaseTime = async (database: QueryDatabase): Promise<Date> => {
+  const rows = await database.execute(
+    sql`select clock_timestamp() as "currentTime"`,
+  );
+  const value = (rows[0] as { currentTime?: Date | string } | undefined)
+    ?.currentTime;
+  if (value === undefined) {
+    throw new Error("Current database time is missing");
+  }
+  const currentTime = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(currentTime.getTime())) {
+    throw new Error("Current database time is invalid");
+  }
+  return currentTime;
+};
+
 const isTerminal = (status: JobStatus): boolean =>
   TERMINAL_JOB_STATES.has(status);
 
@@ -970,6 +986,9 @@ export class JobRepository {
       if (
         current === undefined ||
         current.status !== "dispatched" ||
+        current.connectorId !== input.connectorId ||
+        current.leaseId !== input.leaseId ||
+        current.leaseExpiresAt === null ||
         input.attempt !== current.attempt + 1
       ) {
         return null;
@@ -985,6 +1004,14 @@ export class JobRepository {
         return null;
       }
 
+      const currentTime = await readDatabaseTime(tx);
+      if (
+        current.leaseExpiresAt.getTime() <= currentTime.getTime() ||
+        current.expiresAt.getTime() <= currentTime.getTime()
+      ) {
+        return null;
+      }
+
       const updatedRows = await tx
         .update(jobs)
         .set({
@@ -993,7 +1020,7 @@ export class JobRepository {
           connectorId: input.connectorId,
           attempt: input.attempt,
           leaseId: input.leaseId,
-          leaseExpiresAt: sql`now() + interval '30 seconds'`,
+          leaseExpiresAt: sql`least(clock_timestamp() + interval '30 seconds', ${jobs.expiresAt})`,
           revision: sql`${jobs.revision} + 1`,
           updatedAt: sql`now()`,
         })
@@ -1003,6 +1030,10 @@ export class JobRepository {
             eq(jobs.status, "dispatched"),
             eq(jobs.revision, current.revision),
             eq(jobs.attempt, input.attempt - 1),
+            eq(jobs.connectorId, input.connectorId),
+            eq(jobs.leaseId, input.leaseId),
+            sql`${jobs.leaseExpiresAt} > clock_timestamp()`,
+            sql`${jobs.expiresAt} > clock_timestamp()`,
           ),
         )
         .returning();

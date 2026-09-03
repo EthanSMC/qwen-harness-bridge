@@ -6,7 +6,12 @@ export default defineWorkspace([
   {
     test: {
       name: "integration",
-      include: ["tests/integration/job-repository.test.ts"],
+      include: [
+        "tests/integration/job-repository.test.ts",
+        "tests/integration/connector-outbox.test.ts",
+        "tests/integration/connector-gateway.test.ts",
+        "tests/integration/foundation-e2e.test.ts",
+      ],
     },
   },
   {

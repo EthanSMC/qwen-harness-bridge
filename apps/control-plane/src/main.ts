@@ -17,6 +17,7 @@ export type RuntimeConfiguration = Readonly<{
   ownerId: string;
   mcpBearerToken: string;
   requestEncryptionKey: string;
+  connectorSessionSigningKey: string;
   tlsCertPath: string;
   tlsKeyPath: string;
 }>;
@@ -27,10 +28,11 @@ export const requiredConfiguration = (
   if (
     value.ownerId === undefined ||
     value.mcpBearerToken === undefined ||
-    value.requestEncryptionKey === undefined
+    value.requestEncryptionKey === undefined ||
+    value.connectorSessionSigningKey === undefined
   ) {
     throw new Error(
-      "QHB_OWNER_ID, QHB_MCP_BEARER_TOKEN, and QHB_REQUEST_ENCRYPTION_KEY are required",
+      "QHB_OWNER_ID, QHB_MCP_BEARER_TOKEN, QHB_REQUEST_ENCRYPTION_KEY, and QHB_CONNECTOR_SESSION_SIGNING_KEY are required",
     );
   }
   const tls = requireTlsPaths(value);
@@ -38,6 +40,7 @@ export const requiredConfiguration = (
     ownerId: value.ownerId,
     mcpBearerToken: value.mcpBearerToken,
     requestEncryptionKey: value.requestEncryptionKey,
+    connectorSessionSigningKey: value.connectorSessionSigningKey,
     tlsCertPath: tls.certPath,
     tlsKeyPath: tls.keyPath,
   };
@@ -59,13 +62,12 @@ export const readTlsOptions = (
 export async function start() {
   const runtime = requiredConfiguration();
   const https = readTlsOptions(runtime);
+  const cipher = new Aes256GcmEncryptor(
+    createHash("sha256").update(runtime.requestEncryptionKey, "utf8").digest(),
+  );
   const coordinator = new JobCoordinator({
     repository: new JobRepository(db),
-    encryptor: new Aes256GcmEncryptor(
-      createHash("sha256")
-        .update(runtime.requestEncryptionKey, "utf8")
-        .digest(),
-    ),
+    encryptor: cipher,
     now: () => new Date(),
   });
   const app = await createApp({
@@ -73,6 +75,11 @@ export async function start() {
     ownerId: runtime.ownerId,
     mcpBearerToken: runtime.mcpBearerToken,
     https,
+    connectorGateway: {
+      database: db,
+      sessionSigningKey: runtime.connectorSessionSigningKey,
+      requestDecryptor: cipher,
+    },
   });
   await app.listen({ port: config.port, host: config.host });
   return app;

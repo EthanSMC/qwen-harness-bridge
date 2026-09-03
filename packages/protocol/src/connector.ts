@@ -1,7 +1,10 @@
 import { z } from "zod";
 import { RepositoryIdSchema } from "./job.js";
 
-const UuidSchema = z.string().uuid();
+const UuidSchema = z
+  .string()
+  .uuid()
+  .transform((value) => value.toLowerCase());
 const PositiveIntegerSchema = z
   .number()
   .int()
@@ -163,6 +166,13 @@ const parseRfc3339Instant = (value: string): ParsedRfc3339Instant | null => {
     wholeSeconds: localSeconds - offsetSeconds,
     fraction: fraction ?? "",
   };
+};
+
+export const rfc3339InstantKey = (value: string): string | null => {
+  const instant = parseRfc3339Instant(value);
+  if (instant === null) return null;
+  const fraction = instant.fraction.replace(/0+$/, "");
+  return `${instant.wholeSeconds}.${fraction}`;
 };
 
 const compareRfc3339Instants = (left: string, right: string): number | null => {
