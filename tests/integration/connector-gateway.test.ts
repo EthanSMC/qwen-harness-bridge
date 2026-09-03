@@ -1978,7 +1978,7 @@ describe("Connector gateway authentication and handshake", () => {
     }
   });
 
-  it("waits for in-flight store work before app.close resolves", async () => {
+  it("bounds app.close while preserving eventual in-flight store cleanup", async () => {
     const originalAcceptClientMessage =
       PostgresConnectorStore.prototype.acceptClientMessage;
     let releaseHeartbeat: (() => void) | undefined;
@@ -2096,13 +2096,12 @@ describe("Connector gateway authentication and handshake", () => {
       await socketClosed;
       expect(gatewaySocket?.destroyed).toBe(true);
       await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(closeResolved).toBe(false);
+      await expect(closing).resolves.toBeUndefined();
+      expect(closeResolved).toBe(true);
+      expect(closeResolvedBeforeHeartbeatStore).toBe(true);
 
       releaseHeartbeat?.();
       await heartbeatWorkSettled;
-      expect(closeResolved).toBe(false);
-      await closing;
-      expect(closeResolvedBeforeHeartbeatStore).toBe(false);
       await expect(
         db.query<{ last_client_sequence: number }>(
           "SELECT last_client_sequence::integer AS last_client_sequence FROM connectors WHERE id = $1",

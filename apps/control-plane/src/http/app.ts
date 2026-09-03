@@ -119,6 +119,7 @@ export async function createApp(
           expires_at: connectorSessionExpiry(claims),
         });
       } catch {
+        options.metrics?.recordError("AUTHORIZATION_FAILED");
         return reply
           .code(401)
           .type("application/json")
@@ -150,6 +151,7 @@ export async function createApp(
       await options.readinessProbe.assertReady();
       return reply.type("application/json").send({ status: "ready" });
     } catch {
+      options.metrics?.recordError("INTERNAL");
       return reply
         .code(503)
         .type("application/json")
@@ -168,6 +170,7 @@ export async function createApp(
       const body = await options.metrics.render();
       return reply.type("text/plain; version=0.0.4; charset=utf-8").send(body);
     } catch {
+      options.metrics.recordError("INTERNAL");
       return reply
         .code(503)
         .type("application/json")
@@ -183,6 +186,7 @@ export async function createApp(
       }
       owner = authenticator.authenticate(request.headers);
     } catch {
+      options.metrics?.recordError("UNAUTHENTICATED");
       return reply
         .code(401)
         .type("application/json")

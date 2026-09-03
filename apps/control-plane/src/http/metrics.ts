@@ -268,7 +268,9 @@ const AGGREGATE_METRICS_SQL = `
 
 const isQueryRunner = (
   database: AggregateMetricsQueryRunner | AggregateMetricsExecutor,
-): database is AggregateMetricsQueryRunner => "query" in database;
+): database is AggregateMetricsQueryRunner =>
+  typeof (database as Partial<AggregateMetricsQueryRunner>).query ===
+  "function";
 
 const asNumber = (value: unknown, fallback: number): number => {
   const number = typeof value === "number" ? value : Number(value);

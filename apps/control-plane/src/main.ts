@@ -17,6 +17,7 @@ import {
   createMetricsRegistry,
   createPostgresMetricsAdapter,
 } from "./http/metrics.js";
+import { closeRuntimeResources } from "./http/shutdown.js";
 
 export type RuntimeConfiguration = Readonly<{
   ownerId: string;
@@ -105,10 +106,7 @@ export async function start() {
       return shutdownPromise;
     }
     draining = true;
-    shutdownPromise = (async () => {
-      await app.close();
-      await closeDatabase();
-    })();
+    shutdownPromise = closeRuntimeResources(() => app.close(), closeDatabase);
     return shutdownPromise;
   };
   const onSignal = (): void => {

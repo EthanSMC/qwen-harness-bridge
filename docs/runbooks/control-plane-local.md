@@ -37,6 +37,13 @@ runtime_env_file="/absolute/path/to/control-plane.env"
 set -a
 source "$runtime_env_file"
 set +a
+
+case "${POSTGRES_PASSWORD:-}" in
+  ""|*[!A-Za-z0-9._~-]*)
+    echo "POSTGRES_PASSWORD must be URL-safe for DATABASE_URL interpolation" >&2
+    exit 1
+    ;;
+esac
 ```
 
 Never run or publish resolved `docker compose config` output because it contains environment values. `docker compose --env-file "$runtime_env_file" config --quiet` is the only configuration-validation command used here.
@@ -83,9 +90,9 @@ runtime_url="https://127.0.0.1:${CONTROL_PLANE_PORT:-8443}"
 metrics_headers=$(mktemp)
 metrics_body=$(mktemp)
 trap 'rm -f "$metrics_headers" "$metrics_body"' EXIT
-test "$(curl --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")" = '{"status":"ok"}'
-test "$(curl --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready")" = '{"status":"ready"}'
-curl --fail --silent --show-error --dump-header "$metrics_headers" --output "$metrics_body" --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/metrics"
+test "$(curl --connect-timeout 2 --max-time 5 --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")" = '{"status":"ok"}'
+test "$(curl --connect-timeout 2 --max-time 5 --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready")" = '{"status":"ready"}'
+curl --connect-timeout 2 --max-time 5 --fail --silent --show-error --dump-header "$metrics_headers" --output "$metrics_body" --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/metrics"
 grep --ignore-case --fixed-strings 'content-type: text/plain; version=0.0.4; charset=utf-8' "$metrics_headers"
 grep --fixed-strings 'qhb_mcp_submit_duration_seconds' "$metrics_body"
 grep --fixed-strings 'qhb_connector_online' "$metrics_body"
@@ -118,20 +125,28 @@ db_loss_cleanup() {
 trap db_loss_cleanup EXIT
 docker compose --env-file "$runtime_env_file" stop postgres
 for attempt in $(seq 1 30); do
-  readiness_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready" || true)
+  readiness_status=$(curl --connect-timeout 2 --max-time 5 --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready" || true)
   test "$readiness_status" = "503" && break
   test "$attempt" = "30" && exit 1
   sleep 1
 done
-test "$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")" = "200"
-test "$(curl --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")" = '{"status":"ok"}'
+readiness_headers=$(mktemp)
+readiness_body=$(mktemp)
+test "$(curl --connect-timeout 2 --max-time 5 --silent --show-error --dump-header "$readiness_headers" --output "$readiness_body" --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready" || true)" = "503"
+test "$(curl --connect-timeout 2 --max-time 5 --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")" = "200"
+test "$(curl --connect-timeout 2 --max-time 5 --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/live")" = '{"status":"ok"}'
+test "$(cat "$readiness_body")" = '{"status":"not_ready"}'
+grep --ignore-case --fixed-strings 'content-type: application/json; charset=utf-8' "$readiness_headers"
+if grep -E -i 'owner[_-]?id|job[_-]?id|repository|prompt|path|https?://|url|secret|error:|stack trace|ECONNREFUSED|SQLSTATE' "$readiness_body"; then exit 1; fi
 docker compose --env-file "$runtime_env_file" start postgres
 for attempt in $(seq 1 60); do
-  readiness_status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready" || true)
+  readiness_status=$(curl --connect-timeout 2 --max-time 5 --silent --show-error --output /dev/null --write-out '%{http_code}' --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready" || true)
   test "$readiness_status" = "200" && break
   test "$attempt" = "60" && exit 1
   sleep 1
 done
+test "$(curl --connect-timeout 2 --max-time 5 --fail --silent --show-error --cacert "$QHB_TLS_CERT_FILE" "$runtime_url/health/ready")" = '{"status":"ready"}'
+rm -f -- "$readiness_headers" "$readiness_body"
 trap - EXIT
 ```
 

@@ -19,8 +19,6 @@ const repositoryRoot = dirname(
 );
 const absolute = (path: string): string => join(repositoryRoot, path);
 const read = (path: string): string => readFileSync(absolute(path), "utf8");
-const escapeRegExp = (value: string): string =>
-  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const yamlMappingBlock = (
   source: string,
@@ -234,16 +232,7 @@ const dockerCopyOperands = (
   };
 };
 
-const runtimeCopyAllowlist = new Set([
-  "node_modules",
-  "package.json",
-  "pnpm-lock.yaml",
-  "pnpm-workspace.yaml",
-  "apps/control-plane/package.json",
-  "apps/control-plane/dist",
-  "packages/protocol/package.json",
-  "packages/protocol/dist",
-]);
+const runtimeCopyAllowlist = new Set(["runtime"]);
 
 const runtimeCopyKey = (source: string): string | undefined => {
   const normalized = normalizeDockerPath(source);
@@ -380,10 +369,68 @@ describe("release runtime build contract", () => {
       expect(controlPlane.scripts?.build).toMatch(/migration/i);
       expect(controlPlane.scripts?.migrate).toMatch(/dist\/db\/migrate\.js/);
       expect(controlPlane.scripts?.start).toMatch(/dist\/main\.js/);
+
+      const runtimeRoot = join(buildRoot, "runtime");
+      execFileSync(
+        "pnpm",
+        [
+          "--filter",
+          "@qhb/control-plane",
+          "deploy",
+          "--prod",
+          "--legacy",
+          runtimeRoot,
+        ],
+        { cwd: buildRoot, env: environment, stdio: "pipe" },
+      );
+      for (const path of [
+        "dist/main.js",
+        "dist/db/migrate.js",
+        "node_modules/fastify",
+        "node_modules/drizzle-orm",
+        "node_modules/postgres",
+        "node_modules/zod",
+        "node_modules/@qhb/protocol",
+      ]) {
+        expect(existsSync(join(runtimeRoot, path)), path).toBe(true);
+      }
+      expect(existsSync(join(runtimeRoot, "src"))).toBe(false);
+      expect(existsSync(join(runtimeRoot, "tests"))).toBe(false);
+      execFileSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          "for (const name of ['fastify', 'drizzle-orm', 'postgres', 'zod', '@qhb/protocol']) await import.meta.resolve(name)",
+        ],
+        { cwd: runtimeRoot, env: environment, stdio: "pipe" },
+      );
     } finally {
       rmSync(buildRoot, { recursive: true, force: true });
     }
   }, 15_000);
+
+  it("builds a self-contained production deployment for both runtime entrypoints", () => {
+    const dockerfile = read("apps/control-plane/Dockerfile");
+    const controlPlane = JSON.parse(
+      read("apps/control-plane/package.json"),
+    ) as {
+      files?: string[];
+    };
+    const protocol = JSON.parse(read("packages/protocol/package.json")) as {
+      files?: string[];
+    };
+    expect(dockerfile).toMatch(
+      /pnpm\s+--filter\s+@qhb\/control-plane\s+deploy\s+--prod\s+--legacy\s+\/app\/runtime/,
+    );
+    expect(dockerfile).toContain("COPY --from=build /app/runtime/ /app/");
+    expect(dockerfile).toContain('CMD ["node", "dist/main.js"]');
+    expect(controlPlane.files).toEqual(["dist"]);
+    expect(protocol.files).toEqual(["dist"]);
+    const compose = read("docker-compose.yml");
+    expect(compose).toContain('command: ["node", "dist/db/migrate.js"]');
+    expect(compose).toContain('command: ["node", "dist/main.js"]');
+  });
 
   it("uses a pinned multi-stage image whose final stage is non-root", () => {
     const dockerfile = read("apps/control-plane/Dockerfile");
@@ -394,9 +441,7 @@ describe("release runtime build contract", () => {
     const command = instructions.filter((line) => /^CMD\s+/i.test(line)).at(-1);
 
     expect(user).toMatch(/^USER\s+(?!root(?:\s|$)|0(?:\s|$))\S+/i);
-    expect(command).toMatch(
-      /^CMD\s+\[\s*"node"\s*,\s*"apps\/control-plane\/dist\/main\.js"\s*\]$/i,
-    );
+    expect(command).toMatch(/^CMD\s+\[\s*"node"\s*,\s*"dist\/main\.js"\s*\]$/i);
     expect(finalStage).not.toMatch(/\b(tsx|ts-node)\b/i);
     expect(finalStage).not.toMatch(
       /(?:^|[/\s])(?:src|tests|\.git|\.env)(?:[/\s]|$)/m,
@@ -453,7 +498,7 @@ describe("release runtime build contract", () => {
         expect(
           target,
           `disallowed final-stage COPY destination: ${target}`,
-        ).toBe(expectedTarget);
+        ).toBe(sourceKey === "runtime" ? finalWorkdir : expectedTarget);
         expect(
           observedCopies.has(sourceKey ?? ""),
           `duplicate final-stage COPY source: ${sourceKey}`,
@@ -532,10 +577,20 @@ describe("release runtime build contract", () => {
       "QHB_TLS_KEY_PATH: /run/secrets/qhb_tls_key",
     );
     expect(controlPlane).not.toMatch(/QHB_TLS_(?:CERT|KEY)\s*:/);
+    expect(controlPlane).toMatch(
+      /target:\s*qhb_tls_cert[\s\S]*mode:\s*["']?0440/,
+    );
+    expect(controlPlane).toMatch(
+      /target:\s*qhb_tls_key[\s\S]*mode:\s*["']?0400/,
+    );
+    expect(controlPlane).not.toMatch(/mode:\s*["']?0444/);
+    expect(controlPlane).toMatch(/uid:\s*["']?1000/);
+    expect(controlPlane).toMatch(/gid:\s*["']?1000/);
   });
 
   it("has an executable PR Docker gate with evidence and unconditional cleanup", () => {
     const workflow = read(".github/workflows/runtime.yml");
+    const runbook = read("docs/runbooks/control-plane-local.md");
     const runtimeJob = yamlMappingBlock(workflow, "jobs", "runtime");
     const orderedSteps = [
       "Generate ephemeral runtime material",
@@ -569,6 +624,11 @@ describe("release runtime build contract", () => {
     const cleanup = workflowStep(runtimeJob, "Cleanup runtime");
 
     expect(workflow).toMatch(/^\s*pull_request:\s*$/m);
+    expect(workflow).toContain(
+      `ref: \${{ github.event.pull_request.head.sha }}`,
+    );
+    expect(workflow).toContain("RUNTIME_TESTED_COMMIT");
+    expect(material).toContain("trap cleanup_material EXIT");
     expect(material).toContain("set -euo pipefail");
     expect(material).toMatch(
       /(?:runtime_dir|RUNTIME_DIR)\s*=\s*["']?\$\(mktemp\s+-d/,
@@ -605,6 +665,9 @@ describe("release runtime build contract", () => {
       expect(randomAssignment, `${name} must use openssl rand`).not.toBeNull();
       expect(Number(randomAssignment?.[1])).toBeGreaterThanOrEqual(32);
     }
+    expect(material).toMatch(
+      /POSTGRES_PASSWORD\s*=\s*\$\(openssl\s+rand\s+-hex\s+32\b/,
+    );
     const uniquenessOffset = material.indexOf("sort -u");
     expect(uniquenessOffset).toBeGreaterThan(-1);
     const uniquenessWindow = material.slice(
@@ -638,6 +701,10 @@ describe("release runtime build contract", () => {
     );
     expect(start).toContain("set -euo pipefail");
     expect(start).toMatch(/pnpm\s+(?:--[^\n]+\s+)?build/);
+    expect(start).toMatch(/pnpm\s+check/);
+    expect(start).toMatch(
+      /vitest\s+run[\s\S]*health-metrics\.test\.ts[\s\S]*readiness\.test\.ts/,
+    );
     expect(start).toMatch(
       /docker compose[^\n]*--env-file\s+["']?\$RUNTIME_ENV_FILE["']?[^\n]*config\s+--quiet/,
     );
@@ -682,27 +749,13 @@ describe("release runtime build contract", () => {
       finalDockerStage(read("apps/control-plane/Dockerfile")),
     );
     expect(runtimeWorkdir).toBeDefined();
-    expect(image).toContain(runtimeWorkdir ?? "");
-    for (const allowed of [
-      "node_modules",
-      "package.json",
-      "pnpm-lock.yaml",
-      "pnpm-workspace.yaml",
-      "apps/control-plane/package.json",
-      "apps/control-plane/dist",
-      "packages/protocol/package.json",
-      "packages/protocol/dist",
-    ]) {
-      expect(image).toContain(allowed);
-    }
+    expect(image).toContain("runtime_workdir");
+    expect(image).toContain("Config.WorkingDir");
     expect(image).toMatch(/grep\s+-E/);
-    expect(image).toContain("\\.test\\.(js|d\\.ts)");
+    expect(image).toContain("\\\\.test\\\\.(js|d\\\\.ts)");
     expect(image).toMatch(/while[\s\S]*read[\s\S]*case[\s\S]*exit\s+1/);
     expect(image).toMatch(
-      new RegExp(
-        `(?:runtime_workdir_name|${escapeRegExp(runtimeWorkdir ?? "")})[\\s\\S]*node_modules[\\s\\S]*(?:apps/control-plane/dist|packages/protocol/dist)`,
-        "i",
-      ),
+      /runtime_workdir_name[\s\S]*node_modules[\s\S]*dist/i,
     );
 
     expect(healthy).toContain("set -euo pipefail");
@@ -796,6 +849,12 @@ describe("release runtime build contract", () => {
       /test\s+["']?\$live_body["']?\s*=\s*['"]\{"status":"ok"\}['"]/,
     );
     expect(whileStopped).toMatch(
+      /test\s+["']?\$readiness_body["']?\s*=\s*['"]\{"status":"not_ready"\}['"]/,
+    );
+    expect(whileStopped).toContain("readiness_content_type");
+    expect(whileStopped).toContain("db_loss_privacy");
+    expect(whileStopped).toContain("owner[_-]?id");
+    expect(whileStopped).toMatch(
       /live_body\s*=\s*["']?\$\(curl[^\n]*--cacert[^\n]*\/health\/live/,
     );
     expectBoundedPolling(whileStopped);
@@ -843,6 +902,10 @@ describe("release runtime build contract", () => {
     expect(evidence).toContain(
       "printf 'metrics_status=%s\\n' \"$metrics_status\"",
     );
+    expect(evidence).toContain(
+      "privacy=$(sed -n 's/^privacy=//p' \"$RUNTIME_HEALTH_OBSERVATIONS_FILE\"",
+    );
+    expect(evidence).toContain('test "$privacy" = passed');
     expect(evidence).toMatch(/(?:cat|source)[^\n]*RUNTIME_[A-Z_]*OBSERV/i);
     expect(evidence).toMatch(/live_body/);
     expect(evidence).toMatch(/ready_body/);
@@ -868,10 +931,11 @@ describe("release runtime build contract", () => {
       expect(evidence).toMatch(
         new RegExp(`printf\\s+'${name}=%s\\\\n'\\s+["']?\\$${name}["']?`),
       );
-      if (name === "migration_tag") {
-        expect(evidence).toContain(`${name}=${value}`);
-      }
     }
+    expect(evidence).toMatch(
+      /migration_tag=\$\(docker compose[\s\S]*_journal\.json/,
+    );
+    expect(evidence).not.toMatch(/migration_tag=0002_result_acknowledgement/);
     expect(evidence).toMatch(
       /image_digest\s*=\s*["']?\$\(docker\s+image\s+inspect[\s\S]*--format\s+["']?\{\{\.Id\}\}/i,
     );
@@ -921,5 +985,7 @@ describe("release runtime build contract", () => {
       /if\s+(?:\[\[?|\[)[\s\S]*-n[\s\S]*RUNTIME_DIR[\s\S]*-d[\s\S]*RUNTIME_DIR[\s\S]*(?:\/tmp\/|RUNTIME_DIR\s*==)[\s\S]*rm\s+-rf\s+--[\s\S]*RUNTIME_DIR/,
     );
     expect(workflow).not.toMatch(/curl[^\n]*(?:\s-k(?:\s|$)|--insecure)/);
+    expect(runbook).toContain("POSTGRES_PASSWORD must be URL-safe");
+    expect(runbook).toMatch(/curl\s+--connect-timeout\s+2\s+--max-time\s+5/);
   });
 });

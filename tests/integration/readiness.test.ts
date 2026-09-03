@@ -65,6 +65,7 @@ type ReadinessTransactionContext = Readonly<{
 type ReadinessTransactionPort = Readonly<{
   withTransaction(
     callback: (context: ReadinessTransactionContext) => Promise<void>,
+    signal?: AbortSignal,
   ): Promise<void>;
 }>;
 
@@ -80,6 +81,7 @@ type FakeReadinessTransaction = Readonly<{
   events: string[];
   identities: number[];
   writtenSentinel: { value: string | undefined };
+  abortObserved: { value: boolean };
   withTransaction: ReturnType<typeof vi.fn>;
 }>;
 
@@ -97,6 +99,16 @@ const createFakeReadinessTransaction = (
   const events: string[] = [];
   const identities: number[] = [];
   const writtenSentinel = { value: undefined as string | undefined };
+  const abortObserved = { value: false };
+  let transactionSignal: AbortSignal | undefined;
+  const abortableHang = (): Promise<never> =>
+    new Promise<never>((_resolve, reject) => {
+      const onAbort = (): void => {
+        abortObserved.value = true;
+        reject(new Error("READINESS_ABORTED"));
+      };
+      transactionSignal?.addEventListener("abort", onAbort, { once: true });
+    });
   const context: ReadinessTransactionContext = {
     backendPid,
     async readMigrationMetadata() {
@@ -117,7 +129,7 @@ const createFakeReadinessTransaction = (
         throw options.writeError;
       }
       if (options.hangOnWrite) {
-        await new Promise<void>(() => {});
+        await abortableHang();
       }
       writtenSentinel.value = value;
     },
@@ -125,7 +137,7 @@ const createFakeReadinessTransaction = (
       events.push("read-probe-sentinel");
       identities.push(backendPid);
       if (options.hangOnRead) {
-        return new Promise<string>(() => {});
+        return abortableHang();
       }
       if (options.readError !== undefined) {
         throw options.readError;
@@ -134,7 +146,8 @@ const createFakeReadinessTransaction = (
     },
   };
   const withTransaction = vi.fn<ReadinessTransactionPort["withTransaction"]>(
-    async (callback) => {
+    async (callback, signal) => {
+      transactionSignal = signal;
       events.push("begin");
       try {
         await callback(context);
@@ -144,6 +157,7 @@ const createFakeReadinessTransaction = (
         throw error;
       } finally {
         events.push("cleanup");
+        transactionSignal = undefined;
       }
     },
   );
@@ -154,6 +168,7 @@ const createFakeReadinessTransaction = (
     events,
     identities,
     writtenSentinel,
+    abortObserved,
     withTransaction,
   };
 };
@@ -346,7 +361,13 @@ describe("readiness transaction orchestrator contract", () => {
     [
       "write",
       { hangOnWrite: true },
-      ["begin", "read-migration-metadata", "write-probe-sentinel"],
+      [
+        "begin",
+        "read-migration-metadata",
+        "write-probe-sentinel",
+        "rollback",
+        "cleanup",
+      ],
     ],
     [
       "read",
@@ -356,6 +377,8 @@ describe("readiness transaction orchestrator contract", () => {
         "read-migration-metadata",
         "write-probe-sentinel",
         "read-probe-sentinel",
+        "rollback",
+        "cleanup",
       ],
     ],
   ] as const)(
@@ -379,7 +402,13 @@ describe("readiness transaction orchestrator contract", () => {
         expect(fake.events).toEqual(expectedEvents);
         expect(fake.identities).toEqual(
           expectedEvents
-            .filter((event) => event !== "begin")
+            .filter((event) =>
+              [
+                "read-migration-metadata",
+                "write-probe-sentinel",
+                "read-probe-sentinel",
+              ].includes(event),
+            )
             .map(() => fake.backendPid),
         );
       } finally {
@@ -387,6 +416,28 @@ describe("readiness transaction orchestrator contract", () => {
       }
     },
   );
+
+  it("cancels a timed-out transaction and waits for cleanup before settling", async () => {
+    vi.useFakeTimers();
+    try {
+      const health = await loadHealthModule();
+      const fake = createFakeReadinessTransaction({ hangOnWrite: true });
+      const pending = health.assertReadinessTransaction(fake.port, {
+        deadlineMs: 40,
+      });
+      const observed = pending.catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(40);
+      await expect(observed).resolves.toMatchObject({
+        message: "Readiness probe deadline exceeded",
+      });
+      expect(fake.abortObserved.value).toBe(true);
+      expect(fake.events.at(-2)).toBe("rollback");
+      expect(fake.events.at(-1)).toBe("cleanup");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("PostgreSQL readiness probe", () => {

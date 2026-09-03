@@ -1,11 +1,50 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { sql } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 
-export const EXPECTED_MIGRATION = {
-  tag: "0002_result_acknowledgement",
-  createdAt: 1788244364352,
-  hash: "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
-} as const;
+export type MigrationIdentity = Readonly<{
+  tag: string;
+  createdAt: number;
+  hash: string;
+}>;
+
+type MigrationJournal = Readonly<{
+  entries?: readonly Readonly<{
+    tag?: unknown;
+    when?: unknown;
+  }>[];
+}>;
+
+const readBundledMigrationIdentity = (): MigrationIdentity => {
+  const journal = JSON.parse(
+    readFileSync(
+      new URL("../db/migrations/meta/_journal.json", import.meta.url),
+      "utf8",
+    ),
+  ) as MigrationJournal;
+  const entry = journal.entries?.at(-1);
+  if (
+    entry === undefined ||
+    typeof entry.tag !== "string" ||
+    !/^[a-z0-9_]+$/u.test(entry.tag) ||
+    typeof entry.when !== "number" ||
+    !Number.isSafeInteger(entry.when)
+  ) {
+    throw new Error("Serving image migration journal is invalid");
+  }
+  const migrationSql = readFileSync(
+    new URL(`../db/migrations/${entry.tag}.sql`, import.meta.url),
+    "utf8",
+  );
+  return {
+    tag: entry.tag,
+    createdAt: entry.when,
+    hash: createHash("sha256").update(migrationSql, "utf8").digest("hex"),
+  };
+};
+
+export const EXPECTED_MIGRATION = readBundledMigrationIdentity();
 
 const PROBE_SENTINEL = "qhb_health_probe";
 const DEFAULT_DEADLINE_MS = 1_000;
@@ -28,6 +67,7 @@ type ReadinessTransactionContext = Readonly<{
 export type ReadinessTransactionPort = Readonly<{
   withTransaction(
     callback: (context: ReadinessTransactionContext) => Promise<void>,
+    signal?: AbortSignal,
   ): Promise<void>;
 }>;
 
@@ -60,25 +100,42 @@ export async function assertReadinessTransaction(
   options: ReadinessTransactionOptions = { deadlineMs: DEFAULT_DEADLINE_MS },
 ): Promise<void> {
   assertPositiveInteger(options.deadlineMs, "Readiness deadline");
+  const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
   const operation = port.withTransaction(async (context) => {
+    const throwIfAborted = (): void => {
+      if (controller.signal.aborted) {
+        throw new Error("Readiness probe aborted");
+      }
+    };
+    throwIfAborted();
     const migration = await context.readMigrationMetadata();
+    throwIfAborted();
     assertExpectedMigration(migration);
     await context.writeProbeSentinel(PROBE_SENTINEL);
+    throwIfAborted();
     const sentinel = await context.readProbeSentinel();
+    throwIfAborted();
     if (sentinel !== PROBE_SENTINEL) {
       throw new Error("Readiness probe sentinel did not round-trip");
     }
-  });
+  }, controller.signal);
   const deadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(
-      () => reject(new Error("Readiness probe deadline exceeded")),
-      options.deadlineMs,
-    );
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      reject(new Error("Readiness probe deadline exceeded"));
+    }, options.deadlineMs);
   });
 
   try {
     await Promise.race([operation, deadline]);
+  } catch (error) {
+    if (timedOut) {
+      await operation.catch(() => undefined);
+    }
+    throw error;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
@@ -95,8 +152,11 @@ export function createPostgresReadinessTransactionPort(
 ): ReadinessTransactionPort {
   assertPositiveInteger(options.statementTimeoutMs, "Statement timeout");
   return {
-    async withTransaction(callback) {
+    async withTransaction(callback, signal) {
       await database.transaction(async (transaction) => {
+        if (signal?.aborted) {
+          throw new Error("Readiness transaction aborted");
+        }
         await transaction.execute(
           sql.raw(
             `SET LOCAL statement_timeout = ${options.statementTimeoutMs}`,
@@ -111,6 +171,17 @@ export function createPostgresReadinessTransactionPort(
         if (backendPid === undefined) {
           throw new Error("Readiness backend identity is unavailable");
         }
+
+        let cancelPromise: Promise<void> | undefined;
+        const cancelBackend = (): void => {
+          if (cancelPromise !== undefined) return;
+          cancelPromise = database
+            .execute(sql`SELECT pg_terminate_backend(${backendPid})`)
+            .then(() => undefined)
+            .catch(() => undefined);
+        };
+        const onAbort = (): void => cancelBackend();
+        signal?.addEventListener("abort", onAbort, { once: true });
 
         const context: ReadinessTransactionContext = {
           backendPid,
@@ -156,7 +227,13 @@ export function createPostgresReadinessTransactionPort(
             return value;
           },
         };
-        await callback(context);
+        try {
+          if (signal?.aborted) cancelBackend();
+          await callback(context);
+        } finally {
+          signal?.removeEventListener("abort", onAbort);
+          await cancelPromise;
+        }
       });
     },
   };

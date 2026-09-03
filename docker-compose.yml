@@ -28,7 +28,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["node", "apps/control-plane/dist/db/migrate.js"]
+    command: ["node", "dist/db/migrate.js"]
 
   control-plane:
     image: qwen-harness-bridge-control-plane
@@ -50,15 +50,20 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    command: ["node", "dist/main.js"]
     ports:
       - "127.0.0.1:${CONTROL_PLANE_PORT:-8443}:8443"
     secrets:
       - source: qhb_tls_cert
         target: qhb_tls_cert
-        mode: "0444"
+        uid: "1000"
+        gid: "1000"
+        mode: "0440"
       - source: qhb_tls_key
         target: qhb_tls_key
-        mode: "0444"
+        uid: "1000"
+        gid: "1000"
+        mode: "0400"
     healthcheck:
       test:
         - CMD

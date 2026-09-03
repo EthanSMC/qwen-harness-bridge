@@ -711,6 +711,39 @@ describe("bounded Prometheus metrics", () => {
     });
   });
 
+  it("uses execute for a schema-bound Drizzle database with a non-callable query object", async () => {
+    const metrics = await loadMetricsModule();
+    const execute = vi.fn(
+      async () =>
+        [
+          {
+            connector_online: true,
+            queue_age_seconds: "2.5",
+            status: "queued",
+            status_count: "3",
+          },
+        ] as const,
+    );
+    const schemaBoundDatabase = {
+      query: {
+        connectors: {},
+        jobs: {},
+      },
+      execute,
+    };
+
+    const adapter = metrics.createPostgresMetricsAdapter(
+      schemaBoundDatabase as never,
+    );
+
+    await expect(adapter.readSnapshot()).resolves.toEqual({
+      connectorOnline: true,
+      queueAgeSeconds: 2.5,
+      jobsByStatus: { queued: 3 },
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects every value outside the bounded status/message/error allowlists", async () => {
     const createMetricsRegistry = await loadRegistry();
     const registry = createMetricsRegistry({

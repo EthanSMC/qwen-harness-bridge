@@ -27,6 +27,7 @@ export default defineWorkspace([
         "tests/contract/mcp-auth.test.ts",
         "tests/contract/health-metrics.test.ts",
         "tests/contract/runtime-build.test.ts",
+        "tests/contract/shutdown.test.ts",
       ],
     },
   },

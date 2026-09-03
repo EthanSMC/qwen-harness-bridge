@@ -298,9 +298,11 @@ const execute = async (
   args: unknown,
   owner: McpOwnerContext,
   invoke: (owner: McpOwnerContext, input: unknown) => Promise<unknown>,
+  metrics?: Pick<MetricsRegistry, "recordError">,
 ): Promise<CallToolResult> => {
   const parsed = schema.safeParse(args);
   if (!parsed.success) {
+    metrics?.recordError("INTERNAL");
     return failure("INTERNAL");
   }
 
@@ -323,7 +325,9 @@ const execute = async (
       if (timeout !== undefined) clearTimeout(timeout);
     }
   } catch (error) {
-    return failure(stableErrorCode(error));
+    const code = stableErrorCode(error);
+    metrics?.recordError(code);
+    return failure(code);
   }
 };
 
@@ -336,6 +340,7 @@ const register = <TInput extends ToolSchema, TOutput extends ToolSchema>(
   outputSchema: TOutput,
   owner: McpOwnerContext,
   invoke: (owner: McpOwnerContext, input: z.infer<TInput>) => Promise<unknown>,
+  metrics?: Pick<MetricsRegistry, "recordError">,
 ): void => {
   server.registerTool(
     name,
@@ -344,7 +349,7 @@ const register = <TInput extends ToolSchema, TOutput extends ToolSchema>(
       outputSchema,
     },
     (async (args: z.infer<TInput>) =>
-      execute(inputSchema, args, owner, invoke)) as never,
+      execute(inputSchema, args, owner, invoke, metrics)) as never,
   );
 };
 
@@ -368,6 +373,7 @@ export function registerMcpTools(
         stopMcpSubmit?.();
       }
     },
+    metrics,
   );
   register(
     server,
@@ -378,6 +384,7 @@ export function registerMcpTools(
     async (boundOwner, input) => ({
       tasks: await coordinator.list(boundOwner, input),
     }),
+    metrics,
   );
   register(
     server,
@@ -386,6 +393,7 @@ export function registerMcpTools(
     GetTaskOutputSchema,
     owner,
     (boundOwner, input) => coordinator.get(boundOwner, input),
+    metrics,
   );
   register(
     server,
@@ -394,6 +402,7 @@ export function registerMcpTools(
     CancelTaskOutputSchema,
     owner,
     (boundOwner, input) => coordinator.cancel(boundOwner, input),
+    metrics,
   );
   register(
     server,
@@ -404,6 +413,7 @@ export function registerMcpTools(
     async (boundOwner, input) => ({
       approvals: await coordinator.listApprovals(boundOwner, input),
     }),
+    metrics,
   );
   register(
     server,
@@ -412,6 +422,7 @@ export function registerMcpTools(
     DecideApprovalOutputSchema,
     owner,
     (boundOwner, input) => coordinator.decideApproval(boundOwner, input),
+    metrics,
   );
   register(
     server,
@@ -420,5 +431,6 @@ export function registerMcpTools(
     GetTaskResultOutputSchema,
     owner,
     (boundOwner, input) => coordinator.getResult(boundOwner, input),
+    metrics,
   );
 }
