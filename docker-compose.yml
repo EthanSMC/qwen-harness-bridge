@@ -56,14 +56,8 @@ services:
     secrets:
       - source: qhb_tls_cert
         target: qhb_tls_cert
-        uid: "1000"
-        gid: "1000"
-        mode: "0440"
       - source: qhb_tls_key
         target: qhb_tls_key
-        uid: "1000"
-        gid: "1000"
-        mode: "0400"
     healthcheck:
       test:
         - CMD

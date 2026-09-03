@@ -27,7 +27,7 @@ QHB_TLS_KEY_FILE=<absolute path to local private key>
 CONTROL_PLANE_PORT=8443
 ```
 
-`QHB_TLS_CERT_FILE` and `QHB_TLS_KEY_FILE` are host-side Compose source paths. Compose mounts them as secrets and explicitly sets the container-side `QHB_TLS_CERT_PATH=/run/secrets/qhb_tls_cert` and `QHB_TLS_KEY_PATH=/run/secrets/qhb_tls_key`; users must not set the container-side variables directly.
+`QHB_TLS_CERT_FILE` and `QHB_TLS_KEY_FILE` initially name operator-owned source files. Compose implements local file secrets as bind mounts, so its long syntax cannot change their ownership or mode. The setup below creates dedicated host copies that UID/GID 1000 can read and then exports those paths. Compose sets the container-side `QHB_TLS_CERT_PATH=/run/secrets/qhb_tls_cert` and `QHB_TLS_KEY_PATH=/run/secrets/qhb_tls_key`; users must not set the container-side variables directly.
 
 Load the external file into the current shell without printing its values. Keep this variable for the commands below; the path is quoted at the `source` boundary:
 
@@ -44,6 +44,17 @@ case "${POSTGRES_PASSWORD:-}" in
     exit 1
     ;;
 esac
+
+runtime_tls_dir=$(mktemp -d)
+chmod 700 "$runtime_tls_dir"
+runtime_tls_key_file="$runtime_tls_dir/qhb-runtime.key"
+runtime_tls_cert_file="$runtime_tls_dir/qhb-runtime.crt"
+sudo install -o 1000 -g 1000 -m 0400 "$QHB_TLS_KEY_FILE" "$runtime_tls_key_file"
+sudo install -o 1000 -g 1000 -m 0444 "$QHB_TLS_CERT_FILE" "$runtime_tls_cert_file"
+export QHB_TLS_KEY_FILE="$runtime_tls_key_file"
+export QHB_TLS_CERT_FILE="$runtime_tls_cert_file"
+test "$(stat -c '%u:%g:%a' "$QHB_TLS_KEY_FILE")" = "1000:1000:400"
+test "$(stat -c '%u:%g:%a' "$QHB_TLS_CERT_FILE")" = "1000:1000:444"
 ```
 
 Never run or publish resolved `docker compose config` output because it contains environment values. `docker compose --env-file "$runtime_env_file" config --quiet` is the only configuration-validation command used here.
@@ -53,8 +64,8 @@ Never run or publish resolved `docker compose config` output because it contains
 ```bash
 set -euo pipefail
 pnpm install --frozen-lockfile
-pnpm check
 pnpm build
+pnpm check
 docker compose --env-file "$runtime_env_file" config --quiet
 docker compose --env-file "$runtime_env_file" build --pull=false control-plane migrate
 docker compose --env-file "$runtime_env_file" up -d
@@ -172,6 +183,8 @@ This is backend/fake-Connector evidence. It is not proof of real Harness, Qwen g
 ```bash
 set -euo pipefail
 docker compose --env-file "$runtime_env_file" down
+rm -f -- "$QHB_TLS_KEY_FILE" "$QHB_TLS_CERT_FILE"
+rmdir "$runtime_tls_dir"
 ```
 
 Add `--volumes` only when intentionally deleting the local PostgreSQL data volume. The pull-request workflow always tears down its disposable runtime in an `always()` cleanup step.

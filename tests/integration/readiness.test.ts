@@ -73,6 +73,19 @@ type ReadinessTransactionOptions = Readonly<{
   deadlineMs: number;
 }>;
 
+type ReadinessSqlClient = Readonly<{
+  begin(callback: (transaction: unknown) => Promise<void>): Promise<void>;
+  end(options: { timeout: number }): Promise<void>;
+  options?: Readonly<{
+    max: number;
+    connect_timeout: number;
+    idle_timeout: number;
+    prepare: boolean;
+  }>;
+}>;
+
+type ReadinessSqlClientFactory = () => ReadinessSqlClient;
+
 const READINESS_PROBE_SENTINEL = "qhb_health_probe";
 
 type FakeReadinessTransaction = Readonly<{
@@ -183,6 +196,14 @@ type HealthModule = Readonly<{
     database: typeof database.client,
     options: { statementTimeoutMs: number },
   ): ReadinessTransactionPort;
+  createCancellablePostgresReadinessTransactionPort(
+    createClient: ReadinessSqlClientFactory,
+    options: { statementTimeoutMs: number },
+  ): ReadinessTransactionPort;
+  createReadinessSqlClientFactory(
+    databaseUrl: string,
+    options: { connectTimeoutSeconds: number },
+  ): ReadinessSqlClientFactory;
   createPostgresReadinessProbe(
     database: typeof database.client,
     options?: { statementTimeoutMs: number; deadlineMs?: number },
@@ -209,6 +230,22 @@ const applicationRowCount = async (): Promise<number> => {
 };
 
 describe("readiness transaction orchestrator contract", () => {
+  it("creates an isolated one-slot client with bounded acquisition settings", async () => {
+    const health = await loadHealthModule();
+    const client = health.createReadinessSqlClientFactory(
+      "postgresql://readiness:readiness@127.0.0.1:1/readiness",
+      { connectTimeoutSeconds: 1 },
+    )();
+
+    expect(client.options).toMatchObject({
+      max: 1,
+      connect_timeout: 1,
+      idle_timeout: 1,
+      prepare: false,
+    });
+    await client.end({ timeout: 0 });
+  });
+
   it("begins one transaction and uses one context identity in contract order", async () => {
     const health = await loadHealthModule();
     const fake = createFakeReadinessTransaction();
@@ -434,6 +471,53 @@ describe("readiness transaction orchestrator contract", () => {
       expect(fake.abortObserved.value).toBe(true);
       expect(fake.events.at(-2)).toBe("rollback");
       expect(fake.events.at(-1)).toBe("cleanup");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("destroys a single-slot acquisition-hung client without a second pool query before settling", async () => {
+    vi.useFakeTimers();
+    try {
+      const health = await loadHealthModule();
+      const events: string[] = [];
+      let rejectAcquisition!: (error: Error) => void;
+      const client: ReadinessSqlClient = {
+        begin: vi.fn(
+          () =>
+            new Promise<void>((_resolve, reject) => {
+              events.push("acquisition:pending");
+              rejectAcquisition = reject;
+            }),
+        ),
+        end: vi.fn(async (options) => {
+          expect(options).toEqual({ timeout: 0 });
+          events.push("client:end");
+          rejectAcquisition(new Error("readiness client destroyed"));
+          await Promise.resolve();
+          events.push("client:released");
+        }),
+      };
+      const port = health.createCancellablePostgresReadinessTransactionPort(
+        () => client,
+        { statementTimeoutMs: 250 },
+      );
+
+      const observed = health
+        .assertReadinessTransaction(port, { deadlineMs: 40 })
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(40);
+
+      await expect(observed).resolves.toMatchObject({
+        message: "Readiness probe deadline exceeded",
+      });
+      expect(client.begin).toHaveBeenCalledTimes(1);
+      expect(client.end).toHaveBeenCalledTimes(1);
+      expect(events).toEqual([
+        "acquisition:pending",
+        "client:end",
+        "client:released",
+      ]);
     } finally {
       vi.useRealTimers();
     }

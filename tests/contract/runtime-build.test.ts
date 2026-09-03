@@ -5,9 +5,11 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -383,6 +385,11 @@ describe("release runtime build contract", () => {
         ],
         { cwd: buildRoot, env: environment, stdio: "pipe" },
       );
+      execFileSync(
+        process.execPath,
+        ["scripts/runtime/prune-production-dependencies.mjs", runtimeRoot],
+        { cwd: buildRoot, env: environment, stdio: "pipe" },
+      );
       for (const path of [
         "dist/main.js",
         "dist/db/migrate.js",
@@ -396,6 +403,19 @@ describe("release runtime build contract", () => {
       }
       expect(existsSync(join(runtimeRoot, "src"))).toBe(false);
       expect(existsSync(join(runtimeRoot, "tests"))).toBe(false);
+      const forbiddenDependencyTests = readdirSync(
+        join(runtimeRoot, "node_modules"),
+        { recursive: true, withFileTypes: true },
+      )
+        .filter((entry) => {
+          const name = entry.name.toLowerCase();
+          return entry.isDirectory()
+            ? ["test", "tests", "__tests__"].includes(name)
+            : /\.(?:test|spec)\.[^/]+(?:\.map)?$/u.test(name);
+        })
+        .map((entry) => entry.name)
+        .sort();
+      expect(forbiddenDependencyTests).toEqual([]);
       execFileSync(
         process.execPath,
         [
@@ -403,12 +423,91 @@ describe("release runtime build contract", () => {
           "-e",
           "for (const name of ['fastify', 'drizzle-orm', 'postgres', 'zod', '@qhb/protocol']) await import.meta.resolve(name)",
         ],
-        { cwd: runtimeRoot, env: environment, stdio: "pipe" },
+        {
+          cwd: runtimeRoot,
+          env: {
+            ...environment,
+            DATABASE_URL: "postgresql://qhb:qhb@127.0.0.1:1/qhb",
+          },
+          stdio: "pipe",
+        },
+      );
+      execFileSync(
+        process.execPath,
+        ["--input-type=module", "-e", "await import('./dist/main.js')"],
+        {
+          cwd: runtimeRoot,
+          env: {
+            ...environment,
+            DATABASE_URL: "postgresql://qhb:qhb@127.0.0.1:1/qhb",
+          },
+          stdio: "pipe",
+        },
       );
     } finally {
       rmSync(buildRoot, { recursive: true, force: true });
     }
   }, 15_000);
+
+  it("accepts base CA certificates while rejecting application secrets and tests", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-image-audit-"));
+    try {
+      const safeListing = join(fixtureRoot, "safe.list");
+      writeFileSync(
+        safeListing,
+        [
+          "etc/ssl/certs/ca-certificates.crt",
+          "usr/bin/node",
+          "app/package.json",
+          "app/dist/main.js",
+          "app/node_modules/fastify/package.json",
+        ].join("\n"),
+      );
+      expect(() =>
+        execFileSync(
+          process.execPath,
+          [
+            "scripts/runtime/audit-image-listing.mjs",
+            "--workdir",
+            "/app",
+            "--listing",
+            safeListing,
+          ],
+          { cwd: repositoryRoot, stdio: "pipe" },
+        ),
+      ).not.toThrow();
+
+      for (const forbidden of [
+        "app/private/runtime.key",
+        "app/src/main.ts",
+        "app/node_modules/pkg/__tests__/secret.spec.js",
+      ]) {
+        const unsafeListing = join(
+          fixtureRoot,
+          `unsafe-${forbidden.replaceAll("/", "-")}.list`,
+        );
+        writeFileSync(
+          unsafeListing,
+          `${readFileSync(safeListing, "utf8")}\n${forbidden}\n`,
+        );
+        expect(() =>
+          execFileSync(
+            process.execPath,
+            [
+              "scripts/runtime/audit-image-listing.mjs",
+              "--workdir",
+              "/app",
+              "--listing",
+              unsafeListing,
+            ],
+            { cwd: repositoryRoot, stdio: "pipe" },
+          ),
+        ).toThrow();
+      }
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
 
   it("builds a self-contained production deployment for both runtime entrypoints", () => {
     const dockerfile = read("apps/control-plane/Dockerfile");
@@ -577,15 +676,7 @@ describe("release runtime build contract", () => {
       "QHB_TLS_KEY_PATH: /run/secrets/qhb_tls_key",
     );
     expect(controlPlane).not.toMatch(/QHB_TLS_(?:CERT|KEY)\s*:/);
-    expect(controlPlane).toMatch(
-      /target:\s*qhb_tls_cert[\s\S]*mode:\s*["']?0440/,
-    );
-    expect(controlPlane).toMatch(
-      /target:\s*qhb_tls_key[\s\S]*mode:\s*["']?0400/,
-    );
-    expect(controlPlane).not.toMatch(/mode:\s*["']?0444/);
-    expect(controlPlane).toMatch(/uid:\s*["']?1000/);
-    expect(controlPlane).toMatch(/gid:\s*["']?1000/);
+    expect(controlPlane).not.toMatch(/(?:uid|gid|mode):/);
   });
 
   it("has an executable PR Docker gate with evidence and unconditional cleanup", () => {
@@ -637,6 +728,12 @@ describe("release runtime build contract", () => {
     expect(material).toMatch(/chmod\s+700\b/);
     expect(material).toMatch(/chmod\s+600[^\n]*RUNTIME_ENV_FILE/i);
     expect(material).toMatch(/chmod\s+600[^\n]*(?:cert|key)/i);
+    expect(material).toMatch(
+      /sudo\s+install[^\n]*-o\s+1000[^\n]*-g\s+1000[^\n]*-m\s+0400[^\n]*QHB_TLS_KEY/i,
+    );
+    expect(material).toMatch(
+      /stat[^\n]*QHB_TLS_KEY_FILE[\s\S]*(?:1000:1000:400|1000\s+1000\s+400)/i,
+    );
     expect(material).toMatch(/openssl\s+req[\s\S]*-x509/i);
     expect(material).toMatch(
       /openssl\s+req[\s\S]*-keyout[\s\S]*-out[\s\S]*127\.0\.0\.1/i,
@@ -700,6 +797,12 @@ describe("release runtime build contract", () => {
       /RUNTIME_ENV_FILE[\s\S]*\}[^\n]*(?:>>|tee\s+-a|>)[^\n]*(?:GITHUB_ENV|GITHUB_OUTPUT)/,
     );
     expect(start).toContain("set -euo pipefail");
+    expect(start.indexOf("pnpm install --frozen-lockfile")).toBeLessThan(
+      start.indexOf("pnpm build"),
+    );
+    expect(start.indexOf("pnpm build")).toBeLessThan(
+      start.indexOf("pnpm check"),
+    );
     expect(start).toMatch(/pnpm\s+(?:--[^\n]+\s+)?build/);
     expect(start).toMatch(/pnpm\s+check/);
     expect(start).toMatch(
@@ -751,11 +854,8 @@ describe("release runtime build contract", () => {
     expect(runtimeWorkdir).toBeDefined();
     expect(image).toContain("runtime_workdir");
     expect(image).toContain("Config.WorkingDir");
-    expect(image).toMatch(/grep\s+-E/);
-    expect(image).toContain("\\\\.test\\\\.(js|d\\\\.ts)");
-    expect(image).toMatch(/while[\s\S]*read[\s\S]*case[\s\S]*exit\s+1/);
     expect(image).toMatch(
-      /runtime_workdir_name[\s\S]*node_modules[\s\S]*dist/i,
+      /node\s+scripts\/runtime\/audit-image-listing\.mjs[^\n]*--workdir[^\n]*runtime_workdir[^\n]*--listing[^\n]*archive_listing/i,
     );
 
     expect(healthy).toContain("set -euo pipefail");
@@ -892,6 +992,16 @@ describe("release runtime build contract", () => {
       "privacy",
       "image_digest",
       "config_digest",
+      "run_url",
+      "observed_at_utc",
+      "node_version",
+      "pnpm_version",
+      "docker_version",
+      "docker_compose_version",
+      "repository_test_result",
+      "repository_test_count",
+      "focused_test_result",
+      "focused_test_count",
     ]) {
       expect(evidence, `evidence must record ${observation}`).toContain(
         observation,
@@ -971,6 +1081,7 @@ describe("release runtime build contract", () => {
     expect(cleanup).toMatch(
       /docker compose[^\n]*--env-file\s+["']?\$RUNTIME_ENV_FILE["']?[^\n]*down/,
     );
+    expect(cleanup).toMatch(/docker compose[^\n]*down[^\n]*--rmi\s+local/);
     expect(cleanup).toMatch(
       /docker\s+rm[^\n]*(?:RUNTIME_CONTAINER_ID|container_id)/i,
     );
@@ -987,5 +1098,14 @@ describe("release runtime build contract", () => {
     expect(workflow).not.toMatch(/curl[^\n]*(?:\s-k(?:\s|$)|--insecure)/);
     expect(runbook).toContain("POSTGRES_PASSWORD must be URL-safe");
     expect(runbook).toMatch(/curl\s+--connect-timeout\s+2\s+--max-time\s+5/);
+    const runbookInstall = runbook.indexOf("pnpm install --frozen-lockfile");
+    const runbookBuild = runbook.indexOf("pnpm build", runbookInstall);
+    const runbookCheck = runbook.indexOf("pnpm check", runbookBuild);
+    expect(runbookInstall).toBeGreaterThan(-1);
+    expect(runbookBuild).toBeGreaterThan(runbookInstall);
+    expect(runbookCheck).toBeGreaterThan(runbookBuild);
+    expect(runbook).toMatch(
+      /sudo\s+install[^\n]*-o\s+1000[^\n]*-g\s+1000[^\n]*-m\s+0400[^\n]*QHB_TLS_KEY/i,
+    );
   });
 });

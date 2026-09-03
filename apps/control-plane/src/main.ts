@@ -5,14 +5,17 @@ import { resolve } from "node:path";
 import { createSecureContext } from "node:tls";
 import { fileURLToPath } from "node:url";
 import { type AppConfig, config, requireTlsPaths } from "./config.js";
-import { closeDatabase, db } from "./db/client.js";
+import { closeDatabase, db, terminateDatabaseOperations } from "./db/client.js";
 import { JobRepository } from "./db/job-repository.js";
 import {
   Aes256GcmEncryptor,
   JobCoordinator,
 } from "./domain/job-coordinator.js";
 import { createApp } from "./http/app.js";
-import { createPostgresReadinessProbe } from "./http/health.js";
+import {
+  createCancellablePostgresReadinessProbe,
+  createReadinessSqlClientFactory,
+} from "./http/health.js";
 import {
   createMetricsRegistry,
   createPostgresMetricsAdapter,
@@ -80,9 +83,12 @@ export async function start() {
   const metrics = createMetricsRegistry({
     readSnapshot: createPostgresMetricsAdapter(db).readSnapshot,
   });
-  const readinessProbe = createPostgresReadinessProbe(db, {
-    statementTimeoutMs: 250,
-  });
+  const readinessProbe = createCancellablePostgresReadinessProbe(
+    createReadinessSqlClientFactory(config.databaseUrl, {
+      connectTimeoutSeconds: 1,
+    }),
+    { statementTimeoutMs: 250 },
+  );
   const app = await createApp({
     coordinator,
     ownerId: runtime.ownerId,
@@ -94,6 +100,7 @@ export async function start() {
     connectorGateway: {
       database: db,
       sessionSigningKey: runtime.connectorSessionSigningKey,
+      terminateStoreOperations: terminateDatabaseOperations,
       requestDecryptor: cipher,
       metrics,
     },

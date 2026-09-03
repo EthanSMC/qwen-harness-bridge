@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { sql } from "drizzle-orm";
+import postgres, { type Sql } from "postgres";
 import type { Database } from "../db/client.js";
 
 export type MigrationIdentity = Readonly<{
@@ -74,6 +75,8 @@ export type ReadinessTransactionPort = Readonly<{
 export type ReadinessTransactionOptions = Readonly<{
   deadlineMs: number;
 }>;
+
+export type ReadinessSqlClientFactory = () => Sql;
 
 const assertPositiveInteger = (value: number, name: string): void => {
   if (!Number.isSafeInteger(value) || value < 1) {
@@ -172,17 +175,6 @@ export function createPostgresReadinessTransactionPort(
           throw new Error("Readiness backend identity is unavailable");
         }
 
-        let cancelPromise: Promise<void> | undefined;
-        const cancelBackend = (): void => {
-          if (cancelPromise !== undefined) return;
-          cancelPromise = database
-            .execute(sql`SELECT pg_terminate_backend(${backendPid})`)
-            .then(() => undefined)
-            .catch(() => undefined);
-        };
-        const onAbort = (): void => cancelBackend();
-        signal?.addEventListener("abort", onAbort, { once: true });
-
         const context: ReadinessTransactionContext = {
           backendPid,
           async readMigrationMetadata() {
@@ -227,15 +219,128 @@ export function createPostgresReadinessTransactionPort(
             return value;
           },
         };
-        try {
-          if (signal?.aborted) cancelBackend();
-          await callback(context);
-        } finally {
-          signal?.removeEventListener("abort", onAbort);
-          await cancelPromise;
-        }
+        await callback(context);
       });
     },
+  };
+}
+
+export function createReadinessSqlClientFactory(
+  databaseUrl: string,
+  options: Readonly<{ connectTimeoutSeconds: number }>,
+): ReadinessSqlClientFactory {
+  assertPositiveInteger(options.connectTimeoutSeconds, "Connect timeout");
+  return () =>
+    postgres(databaseUrl, {
+      max: 1,
+      connect_timeout: options.connectTimeoutSeconds,
+      idle_timeout: 1,
+      prepare: false,
+    });
+}
+
+export function createCancellablePostgresReadinessTransactionPort(
+  createClient: ReadinessSqlClientFactory,
+  options: Readonly<{ statementTimeoutMs: number }>,
+): ReadinessTransactionPort {
+  assertPositiveInteger(options.statementTimeoutMs, "Statement timeout");
+  return {
+    async withTransaction(callback, signal) {
+      const client = createClient();
+      let closePromise: Promise<void> | undefined;
+      const closeClient = (): Promise<void> => {
+        closePromise ??= client.end({ timeout: 0 });
+        return closePromise;
+      };
+      const onAbort = (): void => {
+        void closeClient().catch(() => undefined);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        await client.begin(async (transaction) => {
+          if (signal?.aborted) {
+            throw new Error("Readiness transaction aborted");
+          }
+          await transaction.unsafe(
+            `SET LOCAL statement_timeout = ${options.statementTimeoutMs}`,
+          );
+          const pidRows = await transaction.unsafe<
+            { backendPid: number | string }[]
+          >('SELECT pg_backend_pid() AS "backendPid"');
+          const backendPid = numericRowValue(pidRows[0]?.backendPid);
+          if (backendPid === undefined) {
+            throw new Error("Readiness backend identity is unavailable");
+          }
+          const context: ReadinessTransactionContext = {
+            backendPid,
+            async readMigrationMetadata() {
+              const rows = await transaction.unsafe<
+                { hash: string; createdAt: number | string }[]
+              >(`
+                SELECT hash, created_at AS "createdAt"
+                FROM drizzle.__drizzle_migrations
+                ORDER BY created_at DESC
+                LIMIT 1
+              `);
+              const row = rows[0];
+              const createdAt = numericRowValue(row?.createdAt);
+              if (typeof row?.hash !== "string" || createdAt === undefined) {
+                throw new Error("Readiness migration metadata is unavailable");
+              }
+              return {
+                tag: EXPECTED_MIGRATION.tag,
+                createdAt,
+                hash: row.hash,
+              };
+            },
+            async writeProbeSentinel(sentinel) {
+              await transaction.unsafe(`
+                CREATE TEMP TABLE qhb_health_probe (
+                  sentinel text NOT NULL
+                ) ON COMMIT DROP
+              `);
+              await transaction.unsafe(
+                "INSERT INTO qhb_health_probe (sentinel) VALUES ($1)",
+                [sentinel],
+              );
+            },
+            async readProbeSentinel() {
+              const rows = await transaction.unsafe<{ sentinel: string }[]>(
+                "SELECT sentinel FROM qhb_health_probe LIMIT 1",
+              );
+              const value = rows[0]?.sentinel;
+              if (typeof value !== "string") {
+                throw new Error("Readiness probe sentinel is unavailable");
+              }
+              return value;
+            },
+          };
+          await callback(context);
+        });
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+        await closeClient();
+      }
+    },
+  };
+}
+
+export function createCancellablePostgresReadinessProbe(
+  createClient: ReadinessSqlClientFactory,
+  options: Readonly<{
+    statementTimeoutMs: number;
+    deadlineMs?: number;
+  }>,
+): ReadinessProbe {
+  const port = createCancellablePostgresReadinessTransactionPort(
+    createClient,
+    options,
+  );
+  return {
+    assertReady: () =>
+      assertReadinessTransaction(port, {
+        deadlineMs: options.deadlineMs ?? DEFAULT_DEADLINE_MS,
+      }),
   };
 }
 

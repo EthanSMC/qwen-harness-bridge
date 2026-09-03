@@ -1,4 +1,4 @@
-const SHUTDOWN_TIMEOUT_MS = 2_000;
+const SHUTDOWN_TIMEOUT_MS = 5_000;
 
 const withDeadline = async <T>(
   operation: Promise<T>,

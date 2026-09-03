@@ -71,6 +71,7 @@ const awaitBeforeDeadline = async <T>(
 export type ConnectorGatewayOptions = Readonly<{
   database: Database;
   sessionSigningKey: string | Uint8Array;
+  terminateStoreOperations?: () => Promise<void>;
   requestDecryptor?: RequestDecryptor;
   dispatchIntervalMs?: number;
   now?: () => Date;
@@ -527,6 +528,7 @@ export class ConnectorGateway {
     | Pick<MetricsRegistry, "recordConnectorMessage" | "recordError">
     | undefined;
   readonly #dispatchIntervalMs: number;
+  readonly #terminateStoreOperations: (() => Promise<void>) | undefined;
   readonly #connections = new Set<ServerWebSocket>();
   readonly #activeConnections = new Map<string, ActiveConnectorConnection>();
   readonly #storeOperations = new Set<Promise<unknown>>();
@@ -546,6 +548,7 @@ export class ConnectorGateway {
       now: options.now ?? (() => new Date()),
     });
     this.#requestDecryptor = options.requestDecryptor;
+    this.#terminateStoreOperations = options.terminateStoreOperations;
     this.#metrics = options.metrics;
     this.#dispatchIntervalMs =
       options.dispatchIntervalMs === undefined
@@ -600,7 +603,16 @@ export class ConnectorGateway {
           connection.closeGracefully(undefined, deadline),
         ),
       );
-      await this.#waitForStoreOperations(deadline);
+      const drained = await this.#waitForStoreOperations(deadline);
+      if (!drained) {
+        if (this.#terminateStoreOperations === undefined) {
+          throw new Error(
+            "Connector store operations exceeded the shutdown deadline",
+          );
+        }
+        await this.#terminateStoreOperations();
+        await this.#drainTerminatedStoreOperations();
+      }
     })();
     return this.#closePromise;
   }
@@ -614,10 +626,10 @@ export class ConnectorGateway {
     return operation;
   }
 
-  async #waitForStoreOperations(deadline: number): Promise<void> {
+  async #waitForStoreOperations(deadline: number): Promise<boolean> {
     while (this.#storeOperations.size > 0) {
       const remaining = deadline - Date.now();
-      if (remaining <= 0) return;
+      if (remaining <= 0) return false;
       await Promise.race([
         Promise.allSettled([...this.#storeOperations]),
         new Promise<void>((resolve) => {
@@ -625,6 +637,13 @@ export class ConnectorGateway {
           timer.unref();
         }),
       ]);
+    }
+    return true;
+  }
+
+  async #drainTerminatedStoreOperations(): Promise<void> {
+    while (this.#storeOperations.size > 0) {
+      await Promise.allSettled([...this.#storeOperations]);
     }
   }
 

@@ -48,20 +48,30 @@ jobs:
           RUNTIME_EVIDENCE_FILE="$runtime_dir/runtime-evidence.txt"
           RUNTIME_HEALTH_OBSERVATIONS_FILE="$runtime_dir/health-observations.txt"
           RUNTIME_DB_LOSS_OBSERVATIONS_FILE="$runtime_dir/db-loss-observations.txt"
+          RUNTIME_GATE_OBSERVATIONS_FILE="$runtime_dir/gate-observations.txt"
+          RUNTIME_REPOSITORY_GATE_LOG="$runtime_dir/repository-gate.log"
+          RUNTIME_FOCUSED_GATE_LOG="$runtime_dir/focused-gate.log"
           RUNTIME_HEALTH_METRICS_BODY_FILE="$runtime_dir/health-metrics.body"
           RUNTIME_ARCHIVE="$runtime_dir/runtime-image.tar"
           QHB_TLS_KEY_FILE="$runtime_dir/qhb-runtime.key"
           QHB_TLS_CERT_FILE="$runtime_dir/qhb-runtime.crt"
-          touch "$RUNTIME_ENV_FILE" "$RUNTIME_EVIDENCE_FILE" "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
-          chmod 600 "$RUNTIME_ENV_FILE" "$RUNTIME_EVIDENCE_FILE" "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
+          runtime_tls_key_file="$runtime_dir/qhb-runtime.uid-1000.key"
+          runtime_tls_cert_file="$runtime_dir/qhb-runtime.uid-1000.crt"
+          RUNTIME_IMAGE_REF=qwen-harness-bridge-control-plane
+          touch "$RUNTIME_ENV_FILE" "$RUNTIME_EVIDENCE_FILE" "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" "$RUNTIME_GATE_OBSERVATIONS_FILE" "$RUNTIME_REPOSITORY_GATE_LOG" "$RUNTIME_FOCUSED_GATE_LOG"
+          chmod 600 "$RUNTIME_ENV_FILE" "$RUNTIME_EVIDENCE_FILE" "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" "$RUNTIME_GATE_OBSERVATIONS_FILE" "$RUNTIME_REPOSITORY_GATE_LOG" "$RUNTIME_FOCUSED_GATE_LOG"
           {
             printf 'RUNTIME_DIR=%s\n' "$RUNTIME_DIR"
             printf 'RUNTIME_ENV_FILE=%s\n' "$RUNTIME_ENV_FILE"
             printf 'RUNTIME_EVIDENCE_FILE=%s\n' "$RUNTIME_EVIDENCE_FILE"
             printf 'RUNTIME_HEALTH_OBSERVATIONS_FILE=%s\n' "$RUNTIME_HEALTH_OBSERVATIONS_FILE"
             printf 'RUNTIME_DB_LOSS_OBSERVATIONS_FILE=%s\n' "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
+            printf 'RUNTIME_GATE_OBSERVATIONS_FILE=%s\n' "$RUNTIME_GATE_OBSERVATIONS_FILE"
+            printf 'RUNTIME_REPOSITORY_GATE_LOG=%s\n' "$RUNTIME_REPOSITORY_GATE_LOG"
+            printf 'RUNTIME_FOCUSED_GATE_LOG=%s\n' "$RUNTIME_FOCUSED_GATE_LOG"
             printf 'RUNTIME_HEALTH_METRICS_BODY_FILE=%s\n' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
             printf 'RUNTIME_ARCHIVE=%s\n' "$RUNTIME_ARCHIVE"
+            printf 'RUNTIME_IMAGE_REF=%s\n' "$RUNTIME_IMAGE_REF"
             printf 'QHB_TLS_CERT_FILE=%s\n' "$QHB_TLS_CERT_FILE"
             printf 'QHB_TLS_KEY_FILE=%s\n' "$QHB_TLS_KEY_FILE"
           } >> "$GITHUB_ENV"
@@ -78,7 +88,18 @@ jobs:
 
           openssl req -x509 -newkey rsa:2048 -nodes -keyout "$QHB_TLS_KEY_FILE" -out "$QHB_TLS_CERT_FILE" -days 1 -subj "/CN=127.0.0.1" -addext "subjectAltName = IP:127.0.0.1"
           chmod 600 "$QHB_TLS_KEY_FILE" "$QHB_TLS_CERT_FILE"
+          sudo install -o 1000 -g 1000 -m 0400 "$QHB_TLS_KEY_FILE" "$runtime_tls_key_file"
+          sudo install -o 1000 -g 1000 -m 0444 "$QHB_TLS_CERT_FILE" "$runtime_tls_cert_file"
+          rm -f -- "$QHB_TLS_KEY_FILE" "$QHB_TLS_CERT_FILE"
+          QHB_TLS_KEY_FILE="$runtime_tls_key_file"
+          QHB_TLS_CERT_FILE="$runtime_tls_cert_file"
+          test "$(stat -c '%u:%g:%a' "$QHB_TLS_KEY_FILE")" = "1000:1000:400"
+          test "$(stat -c '%u:%g:%a' "$QHB_TLS_CERT_FILE")" = "1000:1000:444"
           openssl x509 -in "$QHB_TLS_CERT_FILE" -noout -subject -ext subjectAltName | grep --fixed-strings 127.0.0.1
+          {
+            printf 'QHB_TLS_CERT_FILE=%s\n' "$QHB_TLS_CERT_FILE"
+            printf 'QHB_TLS_KEY_FILE=%s\n' "$QHB_TLS_KEY_FILE"
+          } >> "$GITHUB_ENV"
 
           {
             printf 'POSTGRES_DB=%s\n' "$POSTGRES_DB"
@@ -98,10 +119,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export NO_COLOR=1
           pnpm install --frozen-lockfile
           pnpm build
-          pnpm check
-          pnpm exec vitest run --config /dev/null tests/contract/health-metrics.test.ts tests/integration/readiness.test.ts tests/contract/runtime-build.test.ts
+          pnpm check 2>&1 | tee "$RUNTIME_REPOSITORY_GATE_LOG"
+          repository_test_count=$(sed -nE 's/.*Tests[[:space:]]+([0-9]+)[[:space:]]+passed.*/\1/p' "$RUNTIME_REPOSITORY_GATE_LOG" | tail -n 1)
+          test "$repository_test_count" -gt 0
+          {
+            printf 'repository_test_result=passed\n'
+            printf 'repository_test_count=%s\n' "$repository_test_count"
+          } > "$RUNTIME_GATE_OBSERVATIONS_FILE"
+          pnpm exec vitest run --config /dev/null tests/contract/health-metrics.test.ts tests/integration/readiness.test.ts tests/contract/runtime-build.test.ts tests/contract/shutdown.test.ts tests/integration/connector-gateway.test.ts 2>&1 | tee "$RUNTIME_FOCUSED_GATE_LOG"
+          focused_test_count=$(sed -nE 's/.*Tests[[:space:]]+([0-9]+)[[:space:]]+passed.*/\1/p' "$RUNTIME_FOCUSED_GATE_LOG" | tail -n 1)
+          test "$focused_test_count" -gt 0
+          {
+            printf 'focused_test_result=passed\n'
+            printf 'focused_test_count=%s\n' "$focused_test_count"
+          } >> "$RUNTIME_GATE_OBSERVATIONS_FILE"
           docker compose --env-file "$RUNTIME_ENV_FILE" config --quiet # config--quiet
           docker compose --env-file "$RUNTIME_ENV_FILE" build --pull=false control-plane migrate
           docker compose --env-file "$RUNTIME_ENV_FILE" up -d
@@ -172,28 +206,7 @@ jobs:
           docker export "$container_id" -o "$RUNTIME_ARCHIVE"
           archive_listing="$RUNTIME_DIR/runtime-image.list"
           tar -tf "$RUNTIME_ARCHIVE" > "$archive_listing"
-          runtime_workdir_name="${runtime_workdir#/}"
-          if grep -E '(^|/)(\.env(?:\..*)?|.*\.(?:key|pem|crt|cert|p12))$' "$archive_listing"; then exit 1; fi
-          if grep -E "^${runtime_workdir_name}/dist/.*\\.test\\.(js|d\\.ts)(/|$)" "$archive_listing"; then exit 1; fi
-          while IFS= read -r archive_entry; do
-            case "$archive_entry" in
-              "$runtime_workdir_name"|"$runtime_workdir_name/"|\
-              "$runtime_workdir_name/node_modules"|"$runtime_workdir_name/node_modules/"*|\
-              "$runtime_workdir_name/package.json"|\
-              "$runtime_workdir_name/dist"|"$runtime_workdir_name/dist/"*)
-                case "$archive_entry" in
-                  "$runtime_workdir_name/dist/"*.test.js|"$runtime_workdir_name/dist/"*.test.d.ts|\
-                  "$runtime_workdir_name/src"|"$runtime_workdir_name/src/"*|\
-                  "$runtime_workdir_name/tests"|"$runtime_workdir_name/tests/"*) exit 1 ;;
-                esac ;;
-              *)
-                case "$archive_entry" in
-                  .git|.git/*|*/.git|*/.git/*|.env|.env.*|*/.env|*/.env.*|\
-                  src|src/*|*/src|*/src/*|tests|tests/*|*/tests|*/tests/*|\
-                  *.key|*.pem|*.crt|*.cert|*.p12) exit 1 ;;
-                esac ;;
-            esac
-          done < "$archive_listing"
+          node scripts/runtime/audit-image-listing.mjs --workdir "$runtime_workdir" --listing "$archive_listing"
           trap - EXIT
 
       - name: Verify database failure separation
@@ -268,7 +281,11 @@ jobs:
           readiness_content_type=$(sed -n 's/^db_loss_readiness_content_type=//p' "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" | head -n 1)
           db_loss_privacy=$(sed -n 's/^db_loss_privacy=//p' "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" | head -n 1)
           recovery_readiness_status=$(sed -n 's/^recovery_readiness_status=//p' "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" | head -n 1)
-          source_runtime_observations=$(cat "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE")
+          repository_test_result=$(sed -n 's/^repository_test_result=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          repository_test_count=$(sed -n 's/^repository_test_count=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          focused_test_result=$(sed -n 's/^focused_test_result=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          focused_test_count=$(sed -n 's/^focused_test_count=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          source_runtime_observations=$(cat "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" "$RUNTIME_GATE_OBSERVATIONS_FILE")
           test -n "$source_runtime_observations"
           test "$metrics_content_type" = 'text/plain; version=0.0.4; charset=utf-8'
           test "$privacy" = passed
@@ -276,6 +293,10 @@ jobs:
           test "$readiness_body" = '{"status":"not_ready"}'
           test "$readiness_content_type" = 'application/json; charset=utf-8'
           test "$db_loss_privacy" = passed
+          test "$repository_test_result" = passed
+          test "$focused_test_result" = passed
+          [[ "$repository_test_count" =~ ^[1-9][0-9]*$ ]]
+          [[ "$focused_test_count" =~ ^[1-9][0-9]*$ ]]
           grep --fixed-strings 'qhb_mcp_submit_duration_seconds' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
           grep --fixed-strings 'qhb_connector_online' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
           grep --fixed-strings 'qhb_job_queue_age_seconds' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
@@ -298,6 +319,18 @@ jobs:
           config_digest="sha256:$(docker compose --env-file "$RUNTIME_ENV_FILE" config --hash control-plane)" # config--hash
           if ! printf '%s\n' "$image_digest" | grep -E '^sha256:[0-9a-f]{64}$'; then exit 1; fi
           if ! printf '%s\n' "$config_digest" | grep -E '^sha256:[0-9a-f]{64}$'; then exit 1; fi
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          observed_at_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          node_version=$(node --version)
+          pnpm_version=$(pnpm --version)
+          docker_version=$(docker version --format '{{.Server.Version}}')
+          docker_compose_version=$(docker compose --env-file "$RUNTIME_ENV_FILE" version --short)
+          [[ "$run_url" =~ ^https://github\.com/[^/]+/[^/]+/actions/runs/[0-9]+$ ]]
+          [[ "$observed_at_utc" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+          [[ "$node_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$pnpm_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$docker_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.-]+)?$ ]]
+          [[ "$docker_compose_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.+-][A-Za-z0-9.-]+)?$ ]]
           {
             printf 'live_status=%s\n' "$live_status"
             printf 'live_body=%s\n' "$live_body"
@@ -320,8 +353,19 @@ jobs:
             printf 'migration_sha256=%s\n' "$migration_sha256"
             printf 'image_digest=%s\n' "$image_digest"
             printf 'config_digest=%s\n' "$config_digest"
+            printf 'run_url=%s\n' "$run_url"
+            printf 'observed_at_utc=%s\n' "$observed_at_utc"
+            printf 'node_version=%s\n' "$node_version"
+            printf 'pnpm_version=%s\n' "$pnpm_version"
+            printf 'docker_version=%s\n' "$docker_version"
+            printf 'docker_compose_version=%s\n' "$docker_compose_version"
+            printf 'repository_test_result=%s\n' "$repository_test_result"
+            printf 'repository_test_count=%s\n' "$repository_test_count"
+            printf 'focused_test_result=%s\n' "$focused_test_result"
+            printf 'focused_test_count=%s\n' "$focused_test_count"
             cat "$RUNTIME_HEALTH_OBSERVATIONS_FILE"
             cat "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
+            cat "$RUNTIME_GATE_OBSERVATIONS_FILE"
           } >> "$RUNTIME_EVIDENCE_FILE"
 
       - name: Upload runtime evidence
@@ -335,7 +379,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          if [ -n "${RUNTIME_ENV_FILE:-}" ]; then docker compose --env-file "$RUNTIME_ENV_FILE" down --volumes --remove-orphans; fi
+          if [ -n "${RUNTIME_ENV_FILE:-}" ]; then docker compose --env-file "$RUNTIME_ENV_FILE" down --volumes --remove-orphans --rmi local; fi
           if [ -n "${RUNTIME_CONTAINER_ID:-}" ]; then docker rm -f "$RUNTIME_CONTAINER_ID" >/dev/null 2>&1 || true; fi
           if [ -n "${RUNTIME_IMAGE_REF:-}" ]; then docker image rm "$RUNTIME_IMAGE_REF" >/dev/null 2>&1 || true; fi
           rm -f -- "${RUNTIME_ARCHIVE:-}" "${RUNTIME_EVIDENCE_FILE:-}"
