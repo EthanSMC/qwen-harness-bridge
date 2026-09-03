@@ -8,6 +8,7 @@ import { ConnectorServerMessageSchema, rfc3339InstantKey } from "@qhb/protocol";
 import { and, asc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import {
+  approvals,
   connectorMessages,
   connectors,
   jobEvents,
@@ -57,6 +58,7 @@ type StoredResponseMetadata = Readonly<{
 const STORED_RESPONSE_KEY = "__qhb_original_response";
 const CLAIM_REJECTED_MESSAGE =
   "The offered job was cancelled before it was claimed.";
+const APPROVAL_SUMMARY_MAX_LENGTH = 800;
 
 export type ConnectorIdentity = Readonly<{
   ownerId: string;
@@ -184,8 +186,16 @@ const sanitizeEventValue = (value: unknown): unknown => {
 
 const sanitizeConnectorEventPayload = (
   payload: Record<string, unknown>,
-): Record<string, unknown> =>
-  sanitizeEventValue(payload) as Record<string, unknown>;
+): Record<string, unknown> => {
+  const sanitized = sanitizeEventValue(payload) as Record<string, unknown>;
+  if (
+    typeof payload.summary === "string" &&
+    payload.summary.trim().length === 0
+  ) {
+    delete sanitized.summary;
+  }
+  return sanitized;
+};
 
 const sanitizeConnectorText = (value: string, maxLength = 800): string => {
   const sanitized = sanitizePublicText(
@@ -677,6 +687,29 @@ const readDatabaseTime = async (database: QueryDatabase): Promise<Date> => {
   return currentTime;
 };
 
+const assertDeadlinesAfterWrite = async (
+  database: QueryDatabase,
+  deadlines: readonly Date[],
+): Promise<void> => {
+  const currentTime = await readDatabaseTime(database);
+  if (
+    deadlines.some((deadline) => deadline.getTime() <= currentTime.getTime())
+  ) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
+};
+
+const databaseErrorCode = (error: unknown): string | undefined => {
+  let candidate = error;
+  for (let depth = 0; depth < 5; depth += 1) {
+    if (candidate === null || typeof candidate !== "object") return;
+    const code = (candidate as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+    candidate = (candidate as { cause?: unknown }).cause;
+  }
+  return;
+};
+
 const enqueueServerMessage = async (
   database: QueryDatabase,
   connector: ConnectorRow,
@@ -764,6 +797,173 @@ const appendJobEvent = async (
       ? {}
       : { correlationId: input.correlationId }),
   });
+};
+
+const hasUsableTerminalSummary = (
+  payload: Record<string, unknown>,
+): boolean => {
+  if (typeof payload.summary === "string") {
+    return payload.summary.trim().length > 0;
+  }
+  return (
+    payload.summary !== null &&
+    typeof payload.summary === "object" &&
+    !Array.isArray(payload.summary) &&
+    Object.keys(payload.summary).length > 0
+  );
+};
+
+const ingestApprovalRequested = async (
+  database: QueryDatabase,
+  message: Extract<ConnectorClientMessage, { type: "approval.requested" }>,
+  job: JobRow | undefined,
+  now: Date,
+): Promise<void> => {
+  if (
+    job === undefined ||
+    !["running", "waiting_approval"].includes(job.status) ||
+    job.attempt !== message.payload.attempt ||
+    message.payload.job_revision !== job.revision + 1 ||
+    job.expiresAt.getTime() <= now.getTime() ||
+    Date.parse(message.payload.expires_at) <= now.getTime()
+  ) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
+
+  const actionSummary = sanitizeConnectorText(
+    message.payload.action_summary,
+    400,
+  );
+  const impactSummary = sanitizeConnectorText(
+    message.payload.impact_summary,
+    APPROVAL_SUMMARY_MAX_LENGTH,
+  );
+  const riskClass = sanitizeConnectorText(message.payload.risk_class, 64);
+  const updatedRows = await database
+    .update(jobs)
+    .set({
+      status: "waiting_approval",
+      currentStage: "waiting_approval",
+      revision: sql`${jobs.revision} + 1`,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(jobs.id, job.id),
+        eq(jobs.revision, job.revision),
+        eq(jobs.attempt, message.payload.attempt),
+        sql`${jobs.expiresAt} > clock_timestamp()`,
+        sql`${new Date(message.payload.expires_at).toISOString()}::timestamptz > clock_timestamp()`,
+        sql`${new Date(message.expires_at).toISOString()}::timestamptz > clock_timestamp()`,
+      ),
+    )
+    .returning({ id: jobs.id });
+  if (updatedRows.length !== 1) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
+
+  try {
+    await database.insert(approvals).values({
+      id: message.payload.approval_id,
+      jobId: job.id,
+      attempt: message.payload.attempt,
+      jobRevision: message.payload.job_revision,
+      actionSummary,
+      impactSummary,
+      actionFingerprint: message.payload.action_fingerprint,
+      riskClass,
+      expiresAt: new Date(message.payload.expires_at),
+    });
+  } catch (error) {
+    if (databaseErrorCode(error) === "23505") {
+      throw new ConnectorStoreError("EVENT_REJECTED");
+    }
+    throw error;
+  }
+  await appendJobEvent(database, job.id, {
+    type: "approval.requested",
+    payload: {
+      approval_id: message.payload.approval_id,
+      attempt: message.payload.attempt,
+      job_revision: message.payload.job_revision,
+      action_summary: actionSummary,
+      impact_summary: impactSummary,
+      risk_class: riskClass,
+      action_fingerprint: message.payload.action_fingerprint,
+      expires_at: message.payload.expires_at,
+    },
+    source: "connector",
+    messageId: message.message_id,
+    correlationId: message.correlation_id,
+  });
+  await assertDeadlinesAfterWrite(database, [
+    new Date(message.expires_at),
+    job.expiresAt,
+    new Date(message.payload.expires_at),
+  ]);
+};
+
+const ingestJobCancelled = async (
+  database: QueryDatabase,
+  message: Extract<ConnectorClientMessage, { type: "job.cancelled" }>,
+  job: JobRow | undefined,
+  now: Date,
+): Promise<void> => {
+  if (job === undefined || job.attempt !== message.payload.attempt) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
+
+  const reason = sanitizeConnectorText(message.payload.reason, 400);
+  const active = job.status === "cancelling";
+  if (active) {
+    if (job.expiresAt.getTime() <= now.getTime()) {
+      throw new ConnectorStoreError("EVENT_REJECTED");
+    }
+    const updatedRows = await database
+      .update(jobs)
+      .set({
+        status: "cancelled",
+        currentStage: "cancelled",
+        revision: sql`${jobs.revision} + 1`,
+        terminalAt: sql`coalesce(${jobs.terminalAt}, clock_timestamp())`,
+        requestDeleteAt: sql`coalesce(${jobs.requestDeleteAt}, clock_timestamp() + interval '24 hours')`,
+        unreadTerminal: true,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(jobs.id, job.id),
+          eq(jobs.status, "cancelling"),
+          eq(jobs.attempt, message.payload.attempt),
+          sql`${jobs.expiresAt} > clock_timestamp()`,
+          sql`${new Date(message.expires_at).toISOString()}::timestamptz > clock_timestamp()`,
+        ),
+      )
+      .returning({ id: jobs.id });
+    if (updatedRows.length !== 1) {
+      throw new ConnectorStoreError("EVENT_REJECTED");
+    }
+  } else if (!TERMINAL_JOB_STATES.has(job.status)) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
+
+  await appendJobEvent(database, job.id, {
+    type: "job.cancelled",
+    payload: {
+      job_id: message.payload.job_id,
+      attempt: message.payload.attempt,
+      reason,
+    },
+    source: "connector",
+    messageId: message.message_id,
+    correlationId: message.correlation_id,
+  });
+  await assertDeadlinesAfterWrite(
+    database,
+    active
+      ? [new Date(message.expires_at), job.expiresAt]
+      : [new Date(message.expires_at)],
+  );
 };
 
 const withdrawCancelledOffer = async (
@@ -868,11 +1068,10 @@ const claimOfferedJob = async (
   return "claimed";
 };
 
-const statusForEvent = (
-  current: JobStatus,
+const terminalStatusForEvent = (
   eventType: string,
   payload: Record<string, unknown>,
-): JobStatus => {
+): JobStatus | null => {
   const explicit = payload.status;
   const candidate =
     typeof explicit === "string" ? explicit : eventType.toLowerCase();
@@ -883,6 +1082,19 @@ const statusForEvent = (
   if (["failed", "failure", "job.failed"].includes(candidate)) return "failed";
   if (["cancelled", "canceled", "job.cancelled"].includes(candidate))
     return "cancelled";
+  return null;
+};
+
+const statusForEvent = (
+  current: JobStatus,
+  eventType: string,
+  payload: Record<string, unknown>,
+): JobStatus => {
+  const terminal = terminalStatusForEvent(eventType, payload);
+  if (terminal !== null) return terminal;
+  const explicit = payload.status;
+  const candidate =
+    typeof explicit === "string" ? explicit : eventType.toLowerCase();
   if (candidate === "waiting_approval") return "waiting_approval";
   if (candidate === "running" || candidate === "resumed") return "running";
   return current;
@@ -894,13 +1106,7 @@ const ingestJobEvent = async (
   job: JobRow | undefined,
   now: Date,
 ): Promise<void> => {
-  if (
-    job === undefined ||
-    !CLAIMED_JOB_STATES.has(job.status) ||
-    job.attempt !== message.payload.attempt ||
-    job.expiresAt.getTime() <= now.getTime() ||
-    TERMINAL_JOB_STATES.has(job.status)
-  ) {
+  if (job === undefined || job.attempt !== message.payload.attempt) {
     throw new ConnectorStoreError("EVENT_REJECTED");
   }
   const sanitizedPayload = sanitizeConnectorEventPayload(
@@ -916,6 +1122,26 @@ const ingestJobEvent = async (
     sanitizedEventType,
     sanitizedPayload,
   );
+  const terminal =
+    terminalStatusForEvent(sanitizedEventType, sanitizedPayload) !== null;
+  if (TERMINAL_JOB_STATES.has(job.status)) {
+    if (!terminal) throw new ConnectorStoreError("EVENT_REJECTED");
+    await appendJobEvent(database, job.id, {
+      type: sanitizedEventType,
+      payload: sanitizedPayload,
+      source: sanitizedSource,
+      messageId: message.message_id,
+      correlationId: message.correlation_id,
+    });
+    await assertDeadlinesAfterWrite(database, [new Date(message.expires_at)]);
+    return;
+  }
+  if (!CLAIMED_JOB_STATES.has(job.status)) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
+  if (job.expiresAt.getTime() <= now.getTime()) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
   if (nextStatus !== job.status) {
     try {
       assertTransition(job.status, nextStatus);
@@ -928,7 +1154,6 @@ const ingestJobEvent = async (
     typeof stage === "string" && stage.length <= 128
       ? stage
       : sanitizedEventType;
-  const terminal = TERMINAL_JOB_STATES.has(nextStatus);
   const updated = await database
     .update(jobs)
     .set({
@@ -941,7 +1166,9 @@ const ingestJobEvent = async (
             terminalAt: now,
             requestDeleteAt: new Date(now.getTime() + 24 * 60 * 60 * 1000),
             unreadTerminal: true,
-            summary: sanitizedPayload,
+            summary: hasUsableTerminalSummary(sanitizedPayload)
+              ? sanitizedPayload
+              : null,
           }
         : {}),
     })
@@ -962,6 +1189,10 @@ const ingestJobEvent = async (
     messageId: message.message_id,
     correlationId: message.correlation_id,
   });
+  await assertDeadlinesAfterWrite(database, [
+    new Date(message.expires_at),
+    job.expiresAt,
+  ]);
 };
 
 export class PostgresConnectorStore implements ConnectorCredentialStore {
@@ -998,7 +1229,10 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
   ): Promise<ClientMessageAcceptance> {
     return this.#db.transaction(async (tx) => {
       const lockedJob =
-        message.type === "job.claim" || message.type === "job.event"
+        message.type === "job.claim" ||
+        message.type === "job.event" ||
+        message.type === "approval.requested" ||
+        message.type === "job.cancelled"
           ? await lockClientJob(tx, identity, message.payload.job_id)
           : undefined;
       const connector = await lockConnector(tx, identity);
@@ -1118,6 +1352,10 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         );
       } else if (message.type === "job.event") {
         await ingestJobEvent(tx, message, lockedJob, currentTime);
+      } else if (message.type === "approval.requested") {
+        await ingestApprovalRequested(tx, message, lockedJob, currentTime);
+      } else if (message.type === "job.cancelled") {
+        await ingestJobCancelled(tx, message, lockedJob, currentTime);
       } else if (message.type === "ack") {
         await tx
           .update(connectorMessages)

@@ -38,15 +38,20 @@ const envelope = <T extends ConnectorClientMessage["type"]>(
     messageId?: string;
     correlationId?: string;
     sentAt?: Date;
+    expiresAt?: Date | string;
   } = {},
 ): Extract<ConnectorClientMessage, { type: T }> => {
   const sentAt = overrides.sentAt ?? new Date();
+  const expiresAt = overrides.expiresAt ?? new Date(sentAt.getTime() + 60_000);
   return ConnectorClientMessageSchema.parse({
     protocol_version: "1.0",
     message_id: overrides.messageId ?? crypto.randomUUID(),
     sequence,
     sent_at: sentAt.toISOString(),
-    expires_at: new Date(sentAt.getTime() + 60_000).toISOString(),
+    expires_at:
+      expiresAt instanceof Date
+        ? expiresAt.toISOString()
+        : new Date(expiresAt).toISOString(),
     correlation_id: overrides.correlationId ?? crypto.randomUUID(),
     type,
     payload,
@@ -206,6 +211,72 @@ const expiryAfter = async (milliseconds: number): Promise<Date> => {
   const expiresAt = result.rows[0]?.expires_at;
   if (expiresAt === undefined) throw new Error("expected a database expiry");
   return expiresAt;
+};
+
+const waitForTableWriteWaiter = async (
+  table: "approvals" | "connector_messages" | "job_events" | "jobs",
+  timeoutMs = 2_000,
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const waiters = await database.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM pg_locks l
+         JOIN pg_class c ON c.oid = l.relation
+        WHERE c.relname = $1
+          AND l.mode = 'RowExclusiveLock'
+          AND l.granted = false`,
+      [table],
+    );
+    if (Number(waiters.rows[0]?.count ?? 0) > 0) return;
+    await delay(10);
+  }
+  throw new Error(`Timed out waiting for a ${table} write lock waiter`);
+};
+
+const createWriteBoundaryGate = async (
+  table: "connector_messages" | "job_events" | "jobs",
+  expiresAt: Date,
+): Promise<{
+  waitUntilBlocked(): Promise<void>;
+  releaseAtExpiry(): Promise<void>;
+  dispose(): Promise<void>;
+}> => {
+  let signalReady!: () => void;
+  let releaseHolder!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    signalReady = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    releaseHolder = resolve;
+  });
+  const holder = database.client.transaction(async (tx) => {
+    await tx.execute(
+      table === "jobs"
+        ? drizzleSql`LOCK TABLE jobs IN SHARE MODE`
+        : table === "job_events"
+          ? drizzleSql`LOCK TABLE job_events IN SHARE MODE`
+          : drizzleSql`LOCK TABLE connector_messages IN SHARE MODE`,
+    );
+    signalReady();
+    await released;
+    await tx.execute(
+      drizzleSql`SELECT pg_sleep_until(${expiresAt}::timestamptz + interval '25 milliseconds')`,
+    );
+  });
+  await ready;
+
+  return {
+    waitUntilBlocked: () => waitForTableWriteWaiter(table),
+    releaseAtExpiry: async () => {
+      releaseHolder();
+      await holder;
+    },
+    dispose: async () => {
+      releaseHolder();
+      await holder;
+    },
+  };
 };
 
 const holdConnectorRowUntil = (
@@ -2746,13 +2817,930 @@ describe("PostgreSQL Connector outbox", () => {
     }
   });
 
+  it("avoids approval/job lock inversion when a Connector reuses an approval id", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const repository = new JobRepository(database.client);
+    const approvalJob = await insertConnectedJob(
+      testIdentity.connectorId,
+      "running",
+      await expiryAfter(120_000),
+      1,
+      crypto.randomUUID(),
+      await expiryAfter(60_000),
+    );
+    const approvalId = crypto.randomUUID();
+    const fingerprint = `sha256:${"a".repeat(64)}`;
+    const approvalExpiresAt = new Date(
+      String(await expiryAfter(120_000)),
+    ).toISOString();
+    const first = envelope("approval.requested", 1, {
+      approval_id: approvalId,
+      job_id: approvalJob.jobId,
+      attempt: 1,
+      job_revision: 1,
+      action_summary: "Original approval",
+      impact_summary: "Original approval impact",
+      risk_class: "approval_required",
+      action_fingerprint: fingerprint,
+      expires_at: approvalExpiresAt,
+    });
+    await expect(
+      store.acceptClientMessage(testIdentity, first),
+    ).resolves.toMatchObject({ response: { type: "ack" } });
+
+    const duplicateJob = await insertConnectedJob(
+      testIdentity.connectorId,
+      "running",
+      await expiryAfter(120_000),
+      1,
+      crypto.randomUUID(),
+      await expiryAfter(60_000),
+    );
+
+    const duplicateId = envelope("approval.requested", 2, {
+      approval_id: approvalId,
+      job_id: duplicateJob.jobId,
+      attempt: 1,
+      job_revision: 1,
+      action_summary: "Conflicting approval",
+      impact_summary: "Must not replace the original binding",
+      risk_class: "approval_required",
+      action_fingerprint: `sha256:${"b".repeat(64)}`,
+      expires_at: approvalExpiresAt,
+    });
+    const lockKey = 800_000_000 + Math.floor(Math.random() * 100_000);
+    const suffix = crypto.randomUUID().replaceAll("-", "");
+    const approvalFunction = `qhb_approval_gate_${suffix}`;
+    const approvalTrigger = `qhb_approval_trigger_${suffix}`;
+    await database.query(
+      `CREATE FUNCTION ${approvalFunction}() RETURNS trigger
+       LANGUAGE plpgsql AS $function$
+       BEGIN
+         IF NEW.job_id = '${duplicateJob.jobId}'::uuid THEN
+           PERFORM pg_advisory_xact_lock(${lockKey}::bigint);
+         END IF;
+         RETURN NEW;
+       END
+       $function$;
+       CREATE TRIGGER ${approvalTrigger}
+       BEFORE INSERT ON approvals
+       FOR EACH ROW EXECUTE FUNCTION ${approvalFunction}();`,
+    );
+    let releaseApprovalGate!: () => void;
+    let signalApprovalGateReady!: () => void;
+    const approvalGateReady = new Promise<void>((resolve) => {
+      signalApprovalGateReady = resolve;
+    });
+    const approvalGateReleased = new Promise<void>((resolve) => {
+      releaseApprovalGate = resolve;
+    });
+    const approvalGateHolder = database.client.transaction(async (tx) => {
+      await tx.execute(
+        drizzleSql`SELECT pg_advisory_xact_lock(${lockKey}::bigint)`,
+      );
+      signalApprovalGateReady();
+      await approvalGateReleased;
+    });
+    await approvalGateReady;
+
+    const duplicateAcceptance = store.acceptClientMessage(
+      testIdentity,
+      duplicateId,
+    );
+    let outcomes: PromiseSettledResult<unknown>[] = [];
+    let approvalProbe: PromiseSettledResult<unknown> | undefined;
+    let decision: Promise<unknown> | undefined;
+    try {
+      await waitForAdvisoryWaiters([lockKey], 1);
+      decision = repository.recordApprovalDecision({
+        ownerId: OWNER_ID,
+        approvalId,
+        decision: "approve",
+        expectedJobRevision: 1,
+        expectedAttempt: 1,
+        actionFingerprint: fingerprint,
+      });
+      await waitForRowLockWaiter("connectors");
+      [approvalProbe] = await Promise.allSettled([
+        database.client.transaction((tx) =>
+          tx.execute(
+            drizzleSql`SELECT id FROM approvals WHERE id = ${approvalId} FOR UPDATE NOWAIT`,
+          ),
+        ),
+      ]);
+      releaseApprovalGate();
+      await approvalGateHolder;
+      outcomes = await Promise.allSettled([duplicateAcceptance, decision]);
+    } finally {
+      releaseApprovalGate();
+      await approvalGateHolder;
+      if (outcomes.length === 0) {
+        outcomes = await Promise.allSettled(
+          decision === undefined
+            ? [duplicateAcceptance]
+            : [duplicateAcceptance, decision],
+        );
+      }
+      await database.query(
+        `DROP TRIGGER IF EXISTS ${approvalTrigger} ON approvals;
+         DROP FUNCTION IF EXISTS ${approvalFunction}();`,
+      );
+    }
+
+    const errorCode = (error: unknown): string | undefined => {
+      let candidate = error;
+      for (let depth = 0; depth < 5; depth += 1) {
+        if (candidate === null || typeof candidate !== "object") return;
+        const code = (candidate as { code?: unknown }).code;
+        if (typeof code === "string") return code;
+        candidate = (candidate as { cause?: unknown }).cause;
+      }
+      return;
+    };
+    expect(approvalProbe).toMatchObject({ status: "fulfilled" });
+    expect(outcomes.map((outcome) => outcome.status)).toEqual([
+      "rejected",
+      "fulfilled",
+    ]);
+    expect(
+      outcomes.some(
+        (outcome) =>
+          outcome.status === "rejected" &&
+          errorCode(outcome.reason) === "40P01",
+      ),
+    ).toBe(false);
+    expect(outcomes[0]).toMatchObject({
+      status: "rejected",
+      reason: { code: "EVENT_REJECTED" },
+    });
+
+    const effects = await database.query<{
+      approval_count: string;
+      approval_requested_events: string;
+      client_messages: string;
+      duplicate_events: string;
+      last_client_sequence: string;
+      revision: number;
+      status: string;
+    }>(
+      `SELECT j.status, j.revision, c.last_client_sequence,
+              (SELECT count(*)::text FROM approvals WHERE id = $1) AS approval_count,
+              (SELECT count(*)::text FROM job_events
+                WHERE job_id = $2 AND event_type = 'approval.requested')
+                AS approval_requested_events,
+              (SELECT count(*)::text FROM job_events WHERE message_id = $3)
+                AS duplicate_events,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE direction = 'client' AND message_id = $3) AS client_messages
+         FROM jobs j
+         JOIN connectors c ON c.id = j.connector_id
+        WHERE j.id = $4`,
+      [
+        approvalId,
+        approvalJob.jobId,
+        duplicateId.message_id,
+        duplicateJob.jobId,
+      ],
+    );
+    expect(effects.rows).toEqual([
+      {
+        approval_count: "1",
+        approval_requested_events: "1",
+        client_messages: "0",
+        duplicate_events: "0",
+        last_client_sequence: "1",
+        revision: 0,
+        status: "running",
+      },
+    ]);
+  });
+
+  it("rejects approval.requested when its envelope expires at the job mutation boundary", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const job = await insertConnectedJob(
+      testIdentity.connectorId,
+      "running",
+      await expiryAfter(120_000),
+      1,
+      crypto.randomUUID(),
+      await expiryAfter(60_000),
+    );
+    const approvalId = crypto.randomUUID();
+    const envelopeExpiresAt = await expiryAfter(500);
+    const message = envelope(
+      "approval.requested",
+      1,
+      {
+        approval_id: approvalId,
+        job_id: job.jobId,
+        attempt: 1,
+        job_revision: 1,
+        action_summary: "Boundary-expiring approval",
+        impact_summary: "Must not persist after envelope expiry",
+        risk_class: "approval_required",
+        action_fingerprint: `sha256:${"a".repeat(64)}`,
+        expires_at: new Date(String(await expiryAfter(120_000))).toISOString(),
+      },
+      { expiresAt: envelopeExpiresAt },
+    );
+    const gate = await createWriteBoundaryGate("jobs", envelopeExpiresAt);
+    const acceptance = store.acceptClientMessage(testIdentity, message);
+    let outcome: PromiseSettledResult<unknown> | undefined;
+    try {
+      await gate.waitUntilBlocked();
+      await gate.releaseAtExpiry();
+      [outcome] = await Promise.allSettled([acceptance]);
+    } finally {
+      await gate.dispose();
+    }
+
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      reason: { code: "EVENT_REJECTED" },
+    });
+    const effects = await database.query<{
+      acknowledgements: string;
+      approvals: string;
+      client_messages: string;
+      events: string;
+      last_client_sequence: string;
+      revision: number;
+      status: string;
+    }>(
+      `SELECT j.status, j.revision, c.last_client_sequence,
+              (SELECT count(*)::text FROM approvals WHERE id = $1) AS approvals,
+              (SELECT count(*)::text FROM job_events WHERE message_id = $2) AS events,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE direction = 'client' AND message_id = $2) AS client_messages,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE connector_id = $3 AND direction = 'server' AND type = 'ack'
+                  AND payload->>'sequence' = '1') AS acknowledgements
+         FROM jobs j
+         JOIN connectors c ON c.id = j.connector_id
+        WHERE j.id = $4`,
+      [approvalId, message.message_id, testIdentity.connectorId, job.jobId],
+    );
+    expect(effects.rows).toEqual([
+      {
+        acknowledgements: "0",
+        approvals: "0",
+        client_messages: "0",
+        events: "0",
+        last_client_sequence: "0",
+        revision: 0,
+        status: "running",
+      },
+    ]);
+  });
+
+  it("rejects job.cancelled when its envelope expires at the cancellation mutation boundary", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const job = await insertConnectedJob(
+      testIdentity.connectorId,
+      "cancelling",
+      await expiryAfter(120_000),
+      1,
+      crypto.randomUUID(),
+      await expiryAfter(60_000),
+    );
+    const envelopeExpiresAt = await expiryAfter(500);
+    const message = envelope(
+      "job.cancelled",
+      1,
+      {
+        job_id: job.jobId,
+        attempt: 1,
+        reason: "Boundary-expiring cancellation",
+      },
+      { expiresAt: envelopeExpiresAt },
+    );
+    const gate = await createWriteBoundaryGate("jobs", envelopeExpiresAt);
+    const acceptance = store.acceptClientMessage(testIdentity, message);
+    let outcome: PromiseSettledResult<unknown> | undefined;
+    try {
+      await gate.waitUntilBlocked();
+      await gate.releaseAtExpiry();
+      [outcome] = await Promise.allSettled([acceptance]);
+    } finally {
+      await gate.dispose();
+    }
+
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      reason: { code: "EVENT_REJECTED" },
+    });
+    const effects = await database.query<{
+      acknowledgements: string;
+      client_messages: string;
+      events: string;
+      last_client_sequence: string;
+      revision: number;
+      status: string;
+    }>(
+      `SELECT j.status, j.revision, c.last_client_sequence,
+              (SELECT count(*)::text FROM job_events WHERE message_id = $1) AS events,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE direction = 'client' AND message_id = $1) AS client_messages,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE connector_id = $2 AND direction = 'server' AND type = 'ack'
+                  AND payload->>'sequence' = '1') AS acknowledgements
+         FROM jobs j
+         JOIN connectors c ON c.id = j.connector_id
+        WHERE j.id = $3`,
+      [message.message_id, testIdentity.connectorId, job.jobId],
+    );
+    expect(effects.rows).toEqual([
+      {
+        acknowledgements: "0",
+        client_messages: "0",
+        events: "0",
+        last_client_sequence: "0",
+        revision: 0,
+        status: "cancelling",
+      },
+    ]);
+  });
+
+  it("rejects a terminal cancellation audit when its envelope expires at the event write boundary", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const job = await insertConnectedJob(
+      testIdentity.connectorId,
+      "running",
+      await expiryAfter(120_000),
+      1,
+      crypto.randomUUID(),
+      await expiryAfter(60_000),
+    );
+    await database.query(
+      `UPDATE jobs
+          SET status = 'succeeded'::job_status,
+              current_stage = 'succeeded',
+              revision = 1,
+              terminal_at = clock_timestamp(),
+              unread_terminal = true
+        WHERE id = $1`,
+      [job.jobId],
+    );
+    const envelopeExpiresAt = await expiryAfter(500);
+    const message = envelope(
+      "job.cancelled",
+      1,
+      {
+        job_id: job.jobId,
+        attempt: 1,
+        reason: "Late boundary-expiring cancellation",
+      },
+      { expiresAt: envelopeExpiresAt },
+    );
+    const gate = await createWriteBoundaryGate("job_events", envelopeExpiresAt);
+    const acceptance = store.acceptClientMessage(testIdentity, message);
+    let outcome: PromiseSettledResult<unknown> | undefined;
+    try {
+      await gate.waitUntilBlocked();
+      await gate.releaseAtExpiry();
+      [outcome] = await Promise.allSettled([acceptance]);
+    } finally {
+      await gate.dispose();
+    }
+
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      reason: { code: "EVENT_REJECTED" },
+    });
+    const effects = await database.query<{
+      acknowledgements: string;
+      client_messages: string;
+      events: string;
+      last_client_sequence: string;
+      revision: number;
+      status: string;
+    }>(
+      `SELECT j.status, j.revision, c.last_client_sequence,
+              (SELECT count(*)::text FROM job_events WHERE message_id = $1) AS events,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE direction = 'client' AND message_id = $1) AS client_messages,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE connector_id = $2 AND direction = 'server' AND type = 'ack'
+                  AND payload->>'sequence' = '1') AS acknowledgements
+         FROM jobs j
+         JOIN connectors c ON c.id = j.connector_id
+        WHERE j.id = $3`,
+      [message.message_id, testIdentity.connectorId, job.jobId],
+    );
+    expect(effects.rows).toEqual([
+      {
+        acknowledgements: "0",
+        client_messages: "0",
+        events: "0",
+        last_client_sequence: "0",
+        revision: 1,
+        status: "succeeded",
+      },
+    ]);
+  });
+
+  it.each(["job", "approval payload"] as const)(
+    "rolls back approval.requested when the %s deadline crosses at the final audit write",
+    async (deadline) => {
+      const testIdentity = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      const boundaryExpiresAt = await expiryAfter(500);
+      const jobExpiresAt =
+        deadline === "job" ? boundaryExpiresAt : await expiryAfter(120_000);
+      const approvalExpiresAt =
+        deadline === "approval payload"
+          ? boundaryExpiresAt
+          : await expiryAfter(120_000);
+      const job = await insertConnectedJob(
+        testIdentity.connectorId,
+        "running",
+        jobExpiresAt,
+        1,
+        crypto.randomUUID(),
+        await expiryAfter(60_000),
+      );
+      const approvalId = crypto.randomUUID();
+      const message = envelope("approval.requested", 1, {
+        approval_id: approvalId,
+        job_id: job.jobId,
+        attempt: 1,
+        job_revision: 1,
+        action_summary: "Final audit boundary approval",
+        impact_summary: "Must roll back after the authoritative deadline",
+        risk_class: "approval_required",
+        action_fingerprint: `sha256:${"c".repeat(64)}`,
+        expires_at: new Date(String(approvalExpiresAt)).toISOString(),
+      });
+      const gate = await createWriteBoundaryGate(
+        "job_events",
+        boundaryExpiresAt,
+      );
+      const acceptance = store.acceptClientMessage(testIdentity, message);
+      let outcome: PromiseSettledResult<unknown> | undefined;
+      try {
+        await gate.waitUntilBlocked();
+        await gate.releaseAtExpiry();
+        [outcome] = await Promise.allSettled([acceptance]);
+      } finally {
+        await gate.dispose();
+      }
+
+      expect(outcome).toMatchObject({
+        status: "rejected",
+        reason: { code: "EVENT_REJECTED" },
+      });
+      const effects = await database.query<{
+        acknowledgements: string;
+        approvals: string;
+        client_messages: string;
+        events: string;
+        last_client_sequence: string;
+        revision: number;
+        status: string;
+      }>(
+        `SELECT j.status, j.revision, c.last_client_sequence,
+                (SELECT count(*)::text FROM approvals WHERE id = $1) AS approvals,
+                (SELECT count(*)::text FROM job_events WHERE message_id = $2) AS events,
+                (SELECT count(*)::text FROM connector_messages
+                  WHERE direction = 'client' AND message_id = $2) AS client_messages,
+                (SELECT count(*)::text FROM connector_messages
+                  WHERE connector_id = $3 AND direction = 'server' AND type = 'ack'
+                    AND payload->>'sequence' = '1') AS acknowledgements
+           FROM jobs j
+           JOIN connectors c ON c.id = j.connector_id
+          WHERE j.id = $4`,
+        [approvalId, message.message_id, testIdentity.connectorId, job.jobId],
+      );
+      expect(effects.rows).toEqual([
+        {
+          acknowledgements: "0",
+          approvals: "0",
+          client_messages: "0",
+          events: "0",
+          last_client_sequence: "0",
+          revision: 0,
+          status: "running",
+        },
+      ]);
+    },
+  );
+
+  it("rolls back active job.cancelled when the job deadline crosses at the final audit write", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const jobExpiresAt = await expiryAfter(500);
+    const job = await insertConnectedJob(
+      testIdentity.connectorId,
+      "cancelling",
+      jobExpiresAt,
+      1,
+      crypto.randomUUID(),
+      await expiryAfter(60_000),
+    );
+    const message = envelope("job.cancelled", 1, {
+      job_id: job.jobId,
+      attempt: 1,
+      reason: "Final audit boundary cancellation",
+    });
+    const gate = await createWriteBoundaryGate("job_events", jobExpiresAt);
+    const acceptance = store.acceptClientMessage(testIdentity, message);
+    let outcome: PromiseSettledResult<unknown> | undefined;
+    try {
+      await gate.waitUntilBlocked();
+      await gate.releaseAtExpiry();
+      [outcome] = await Promise.allSettled([acceptance]);
+    } finally {
+      await gate.dispose();
+    }
+
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      reason: { code: "EVENT_REJECTED" },
+    });
+    const effects = await database.query<{
+      acknowledgements: string;
+      client_messages: string;
+      events: string;
+      last_client_sequence: string;
+      revision: number;
+      status: string;
+    }>(
+      `SELECT j.status, j.revision, c.last_client_sequence,
+              (SELECT count(*)::text FROM job_events WHERE message_id = $1) AS events,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE direction = 'client' AND message_id = $1) AS client_messages,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE connector_id = $2 AND direction = 'server' AND type = 'ack'
+                  AND payload->>'sequence' = '1') AS acknowledgements
+         FROM jobs j
+         JOIN connectors c ON c.id = j.connector_id
+        WHERE j.id = $3`,
+      [message.message_id, testIdentity.connectorId, job.jobId],
+    );
+    expect(effects.rows).toEqual([
+      {
+        acknowledgements: "0",
+        client_messages: "0",
+        events: "0",
+        last_client_sequence: "0",
+        revision: 0,
+        status: "cancelling",
+      },
+    ]);
+  });
+
+  it.each(["envelope", "job"] as const)(
+    "rolls back an active job.event when its %s deadline crosses at the final audit write",
+    async (deadline) => {
+      const testIdentity = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      const boundaryExpiresAt = await expiryAfter(500);
+      const jobExpiresAt =
+        deadline === "job" ? boundaryExpiresAt : await expiryAfter(120_000);
+      const envelopeExpiresAt =
+        deadline === "envelope"
+          ? boundaryExpiresAt
+          : await expiryAfter(120_000);
+      const job = await insertConnectedJob(
+        testIdentity.connectorId,
+        "running",
+        jobExpiresAt,
+        1,
+        crypto.randomUUID(),
+        await expiryAfter(60_000),
+      );
+      const message = envelope(
+        "job.event",
+        1,
+        {
+          job_id: job.jobId,
+          attempt: 1,
+          event_type: "progress",
+          source: "connector",
+          payload: { stage: "boundary-progress" },
+        },
+        { expiresAt: envelopeExpiresAt },
+      );
+      const gate = await createWriteBoundaryGate(
+        "job_events",
+        boundaryExpiresAt,
+      );
+      const acceptance = store.acceptClientMessage(testIdentity, message);
+      let outcome: PromiseSettledResult<unknown> | undefined;
+      try {
+        await gate.waitUntilBlocked();
+        await gate.releaseAtExpiry();
+        [outcome] = await Promise.allSettled([acceptance]);
+      } finally {
+        await gate.dispose();
+      }
+
+      expect(outcome).toMatchObject({
+        status: "rejected",
+        reason: { code: "EVENT_REJECTED" },
+      });
+      const effects = await database.query<{
+        acknowledgements: string;
+        client_messages: string;
+        current_stage: string;
+        events: string;
+        last_client_sequence: string;
+        revision: number;
+        status: string;
+      }>(
+        `SELECT j.status, j.revision, j.current_stage, c.last_client_sequence,
+                (SELECT count(*)::text FROM job_events WHERE message_id = $1) AS events,
+                (SELECT count(*)::text FROM connector_messages
+                  WHERE direction = 'client' AND message_id = $1) AS client_messages,
+                (SELECT count(*)::text FROM connector_messages
+                  WHERE connector_id = $2 AND direction = 'server' AND type = 'ack'
+                    AND payload->>'sequence' = '1') AS acknowledgements
+           FROM jobs j
+           JOIN connectors c ON c.id = j.connector_id
+          WHERE j.id = $3`,
+        [message.message_id, testIdentity.connectorId, job.jobId],
+      );
+      expect(effects.rows).toEqual([
+        {
+          acknowledgements: "0",
+          client_messages: "0",
+          current_stage: "running",
+          events: "0",
+          last_client_sequence: "0",
+          revision: 0,
+          status: "running",
+        },
+      ]);
+    },
+  );
+
+  it("rolls back a late terminal job.event when its envelope expires at the final audit write", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const job = await insertConnectedJob(
+      testIdentity.connectorId,
+      "running",
+      await expiryAfter(120_000),
+      1,
+      crypto.randomUUID(),
+      await expiryAfter(60_000),
+    );
+    await database.query(
+      `UPDATE jobs
+          SET status = 'succeeded'::job_status,
+              current_stage = 'succeeded',
+              revision = 1,
+              terminal_at = clock_timestamp(),
+              summary = '{"summary":"winner"}'::jsonb,
+              unread_terminal = true
+        WHERE id = $1`,
+      [job.jobId],
+    );
+    const envelopeExpiresAt = await expiryAfter(500);
+    const message = envelope(
+      "job.event",
+      1,
+      {
+        job_id: job.jobId,
+        attempt: 1,
+        event_type: "job.failed",
+        source: "connector",
+        payload: { summary: "late terminal" },
+      },
+      { expiresAt: envelopeExpiresAt },
+    );
+    const gate = await createWriteBoundaryGate("job_events", envelopeExpiresAt);
+    const acceptance = store.acceptClientMessage(testIdentity, message);
+    let outcome: PromiseSettledResult<unknown> | undefined;
+    try {
+      await gate.waitUntilBlocked();
+      await gate.releaseAtExpiry();
+      [outcome] = await Promise.allSettled([acceptance]);
+    } finally {
+      await gate.dispose();
+    }
+
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      reason: { code: "EVENT_REJECTED" },
+    });
+    const effects = await database.query<{
+      acknowledgements: string;
+      client_messages: string;
+      events: string;
+      last_client_sequence: string;
+      revision: number;
+      status: string;
+      summary: Record<string, unknown>;
+    }>(
+      `SELECT j.status, j.revision, j.summary, c.last_client_sequence,
+              (SELECT count(*)::text FROM job_events WHERE message_id = $1) AS events,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE direction = 'client' AND message_id = $1) AS client_messages,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE connector_id = $2 AND direction = 'server' AND type = 'ack'
+                  AND payload->>'sequence' = '1') AS acknowledgements
+         FROM jobs j
+         JOIN connectors c ON c.id = j.connector_id
+        WHERE j.id = $3`,
+      [message.message_id, testIdentity.connectorId, job.jobId],
+    );
+    expect(effects.rows).toEqual([
+      {
+        acknowledgements: "0",
+        client_messages: "0",
+        events: "0",
+        last_client_sequence: "0",
+        revision: 1,
+        status: "succeeded",
+        summary: { summary: "winner" },
+      },
+    ]);
+  });
+
+  it("rolls back an approval decision when its command expires at the final outbox write", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const repository = new JobRepository(database.client);
+    const job = await insertConnectedJob(
+      testIdentity.connectorId,
+      "running",
+      await expiryAfter(120_000),
+      1,
+      crypto.randomUUID(),
+      await expiryAfter(60_000),
+    );
+    const approvalId = crypto.randomUUID();
+    const fingerprint = `sha256:${"d".repeat(64)}`;
+    const requested = envelope("approval.requested", 1, {
+      approval_id: approvalId,
+      job_id: job.jobId,
+      attempt: 1,
+      job_revision: 1,
+      action_summary: "Expiring outbox decision",
+      impact_summary: "No undeliverable command may commit",
+      risk_class: "approval_required",
+      action_fingerprint: fingerprint,
+      expires_at: new Date(String(await expiryAfter(120_000))).toISOString(),
+    });
+    await expect(
+      store.acceptClientMessage(testIdentity, requested),
+    ).resolves.toMatchObject({ response: { type: "ack" } });
+
+    const commandExpiresAt = await expiryAfter(750);
+    await database.query("UPDATE jobs SET expires_at = $1 WHERE id = $2", [
+      commandExpiresAt,
+      job.jobId,
+    ]);
+    const gate = await createWriteBoundaryGate(
+      "connector_messages",
+      commandExpiresAt,
+    );
+    const decision = repository.recordApprovalDecision({
+      ownerId: OWNER_ID,
+      approvalId,
+      decision: "approve",
+      expectedJobRevision: 1,
+      expectedAttempt: 1,
+      actionFingerprint: fingerprint,
+    });
+    let outcome: PromiseSettledResult<unknown> | undefined;
+    try {
+      await gate.waitUntilBlocked();
+      await gate.releaseAtExpiry();
+      [outcome] = await Promise.allSettled([decision]);
+    } finally {
+      await gate.dispose();
+    }
+
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      reason: { code: "APPROVAL_EXPIRED" },
+    });
+    const effects = await database.query<{
+      approval_decided_events: string;
+      commands: string;
+      decision: string | null;
+      last_server_sequence: string;
+      revision: number;
+      status: string;
+    }>(
+      `SELECT a.decision, j.status, j.revision, c.last_server_sequence,
+              (SELECT count(*)::text FROM job_events
+                WHERE job_id = j.id AND event_type = 'approval.decided')
+                AS approval_decided_events,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE connector_id = c.id AND direction = 'server'
+                  AND type = 'approval.decision'
+                  AND payload->>'approval_id' = a.id::text) AS commands
+         FROM approvals a
+         JOIN jobs j ON j.id = a.job_id
+         JOIN connectors c ON c.id = j.connector_id
+        WHERE a.id = $1`,
+      [approvalId],
+    );
+    expect(effects.rows).toEqual([
+      {
+        approval_decided_events: "0",
+        commands: "0",
+        decision: null,
+        last_server_sequence: "1",
+        revision: 1,
+        status: "waiting_approval",
+      },
+    ]);
+  });
+
+  it("rolls back cancellation when its command expires at the final outbox write", async () => {
+    const testIdentity = await insertConnector();
+    const repository = new JobRepository(database.client);
+    const commandExpiresAt = await expiryAfter(750);
+    const job = await insertConnectedJob(
+      testIdentity.connectorId,
+      "running",
+      commandExpiresAt,
+      1,
+      crypto.randomUUID(),
+      await expiryAfter(60_000),
+    );
+    const gate = await createWriteBoundaryGate(
+      "connector_messages",
+      commandExpiresAt,
+    );
+    const cancellation = repository.cancelAtomically({
+      ownerId: OWNER_ID,
+      jobId: job.jobId,
+      expectedRevision: 0,
+      reason: "Final outbox boundary cancellation",
+    });
+    let outcome: PromiseSettledResult<unknown> | undefined;
+    try {
+      await gate.waitUntilBlocked();
+      await gate.releaseAtExpiry();
+      [outcome] = await Promise.allSettled([cancellation]);
+    } finally {
+      await gate.dispose();
+    }
+
+    expect(outcome).toMatchObject({ status: "rejected" });
+    const effects = await database.query<{
+      cancellation_events: string;
+      commands: string;
+      last_server_sequence: string;
+      revision: number;
+      status: string;
+    }>(
+      `SELECT j.status, j.revision, c.last_server_sequence,
+              (SELECT count(*)::text FROM job_events
+                WHERE job_id = j.id AND event_type = 'job.cancelling')
+                AS cancellation_events,
+              (SELECT count(*)::text FROM connector_messages
+                WHERE connector_id = c.id AND direction = 'server'
+                  AND type = 'job.cancel' AND payload->>'job_id' = j.id::text)
+                AS commands
+         FROM jobs j
+         JOIN connectors c ON c.id = j.connector_id
+        WHERE j.id = $1`,
+      [job.jobId],
+    );
+    expect(effects.rows).toEqual([
+      {
+        cancellation_events: "0",
+        commands: "0",
+        last_server_sequence: "0",
+        revision: 0,
+        status: "running",
+      },
+    ]);
+  });
+
   it("sanitizes all untrusted client text before durable persistence", async () => {
     const testIdentity = await insertConnector();
     const store = new PostgresConnectorStore(database.client);
     const approvalExpiresAt = new Date(Date.now() + 120_000).toISOString();
+    const approvalJob = await insertConnectedJob(
+      testIdentity.connectorId,
+      "running",
+      new Date(Date.now() + 120_000),
+      1,
+      crypto.randomUUID(),
+      new Date(Date.now() + 60_000),
+    );
+    const cancellationJob = await insertConnectedJob(
+      testIdentity.connectorId,
+      "cancelling",
+      new Date(Date.now() + 120_000),
+      1,
+      crypto.randomUUID(),
+      new Date(Date.now() + 60_000),
+    );
     const approval = envelope("approval.requested", 1, {
       approval_id: crypto.randomUUID(),
-      job_id: crypto.randomUUID(),
+      job_id: approvalJob.jobId,
       attempt: 1,
       job_revision: 1,
       action_summary: "Run with sk-abcdefghijklmnop",
@@ -2762,7 +3750,7 @@ describe("PostgreSQL Connector outbox", () => {
       expires_at: approvalExpiresAt,
     });
     const cancelled = envelope("job.cancelled", 2, {
-      job_id: crypto.randomUUID(),
+      job_id: cancellationJob.jobId,
       attempt: 1,
       reason: "Authorization: Bearer abcdefghijklmnop",
     });

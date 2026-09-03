@@ -290,9 +290,19 @@ const asStringArray = (value: unknown): string[] =>
     ? value.filter((item): item is string => typeof item === "string")
     : [];
 
+const asNonNegativeInteger = (value: unknown): number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : 0;
+
 const toJobResultRecord = (row: JobRow): JobResultRecord | null => {
   const summary = asRecord(row.summary);
-  if (summary === null || row.acknowledgedAt === null) {
+  if (
+    summary === null ||
+    typeof summary.summary !== "string" ||
+    summary.summary.trim().length === 0 ||
+    row.acknowledgedAt === null
+  ) {
     return null;
   }
   const testSummary = asRecord(summary.tests);
@@ -327,14 +337,8 @@ const toJobResultRecord = (row: JobRow): JobResultRecord | null => {
     summary: typeof summary.summary === "string" ? summary.summary : "",
     changedFiles: asStringArray(summary.changed_files ?? summary.changedFiles),
     tests: {
-      passed:
-        testSummary !== null && typeof testSummary.passed === "number"
-          ? testSummary.passed
-          : 0,
-      failed:
-        testSummary !== null && typeof testSummary.failed === "number"
-          ? testSummary.failed
-          : 0,
+      passed: asNonNegativeInteger(testSummary?.passed),
+      failed: asNonNegativeInteger(testSummary?.failed),
       summary:
         testSummary !== null && typeof testSummary.summary === "string"
           ? testSummary.summary
@@ -374,6 +378,9 @@ const readDatabaseTime = async (database: QueryDatabase): Promise<Date> => {
   return currentTime;
 };
 
+const commandExpiresAt = (jobExpiresAt: Date, now: Date): Date =>
+  new Date(Math.min(jobExpiresAt.getTime(), now.getTime() + 60_000));
+
 const isTerminal = (status: JobStatus): boolean =>
   TERMINAL_JOB_STATES.has(status);
 
@@ -399,6 +406,25 @@ const enqueueServerCommand = async (
       "The connector is not owned by the job owner",
     );
   }
+
+  const expiryError = (): JobRepositoryError =>
+    type === "approval.decision"
+      ? new JobRepositoryError(
+          "APPROVAL_EXPIRED",
+          "The approval job expired before its decision could be delivered",
+        )
+      : new JobRepositoryError(
+          "REVISION_CONFLICT",
+          "The job expired before cancellation could be delivered",
+        );
+  const currentTime = await readDatabaseTime(database);
+  if (expiresAt.getTime() <= currentTime.getTime()) {
+    throw expiryError();
+  }
+  const effectiveExpiresAt =
+    type === "approval.decision"
+      ? commandExpiresAt(expiresAt, currentTime)
+      : expiresAt;
 
   const sequence = connector.lastServerSequence + 1;
   if (!Number.isSafeInteger(sequence) || sequence < 1) {
@@ -434,8 +460,13 @@ const enqueueServerCommand = async (
     sequence,
     type,
     payload,
-    expiresAt,
+    expiresAt: effectiveExpiresAt,
   });
+  if (
+    effectiveExpiresAt.getTime() <= (await readDatabaseTime(database)).getTime()
+  ) {
+    throw expiryError();
+  }
 };
 
 const nextEventSequence = async (
@@ -729,7 +760,7 @@ export class JobRepository {
   async listPendingApprovals(
     ownerId: string,
     limit = MAX_LIST_LIMIT,
-    now = new Date(),
+    _callerNow = new Date(),
   ): Promise<ApprovalRecord[]> {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_LIST_LIMIT) {
       throw new JobRepositoryError(
@@ -749,8 +780,11 @@ export class JobRepository {
         and(
           eq(jobs.ownerId, ownerId),
           eq(jobs.status, "waiting_approval"),
+          eq(approvals.attempt, jobs.attempt),
+          eq(approvals.jobRevision, jobs.revision),
           isNull(approvals.decision),
-          gt(approvals.expiresAt, now),
+          sql`${approvals.expiresAt} > clock_timestamp()`,
+          sql`${jobs.expiresAt} > clock_timestamp()`,
         ),
       )
       .orderBy(asc(approvals.expiresAt), asc(approvals.createdAt))
@@ -763,7 +797,7 @@ export class JobRepository {
   async getPendingApproval(
     ownerId: string,
     jobId: string,
-    now = new Date(),
+    _callerNow = new Date(),
   ): Promise<ApprovalRecord | null> {
     const rows = await this.#db
       .select({
@@ -778,8 +812,11 @@ export class JobRepository {
           eq(jobs.ownerId, ownerId),
           eq(jobs.id, jobId),
           eq(jobs.status, "waiting_approval"),
+          eq(approvals.attempt, jobs.attempt),
+          eq(approvals.jobRevision, jobs.revision),
           isNull(approvals.decision),
-          gt(approvals.expiresAt, now),
+          sql`${approvals.expiresAt} > clock_timestamp()`,
+          sql`${jobs.expiresAt} > clock_timestamp()`,
         ),
       )
       .orderBy(desc(approvals.createdAt))
@@ -1056,21 +1093,21 @@ export class JobRepository {
   async recordApprovalDecision(
     input: RecordApprovalDecisionInput,
   ): Promise<ApprovalRecord> {
-    return this.#db.transaction(async (tx) => {
-      const approvalRows = await tx
-        .select()
+    const outcome = await this.#db.transaction(async (tx) => {
+      const approvalIdentityRows = await tx
+        .select({ jobId: approvals.jobId })
         .from(approvals)
         .where(eq(approvals.id, input.approvalId))
-        .for("update");
-      const approval = approvalRows[0];
-      if (approval === undefined) {
+        .limit(1);
+      const approvalIdentity = approvalIdentityRows[0];
+      if (approvalIdentity === undefined) {
         throw new JobRepositoryError("NOT_FOUND", "Approval not found");
       }
 
       const jobRows = await tx
         .select()
         .from(jobs)
-        .where(eq(jobs.id, approval.jobId))
+        .where(eq(jobs.id, approvalIdentity.jobId))
         .for("update");
       const job = jobRows[0];
       if (
@@ -1081,18 +1118,57 @@ export class JobRepository {
       }
 
       const task4 = input.ownerId !== undefined;
+      if (task4 && job.connectorId !== null) {
+        await tx
+          .select({ id: connectors.id })
+          .from(connectors)
+          .where(eq(connectors.id, job.connectorId))
+          .for("update");
+      }
+
+      const approvalRows = await tx
+        .select()
+        .from(approvals)
+        .where(
+          and(eq(approvals.id, input.approvalId), eq(approvals.jobId, job.id)),
+        )
+        .for("update");
+      const approval = approvalRows[0];
+      if (approval === undefined) {
+        throw new JobRepositoryError("NOT_FOUND", "Approval not found");
+      }
+
+      const currentTime = task4
+        ? await readDatabaseTime(tx)
+        : (input.now ?? new Date());
+      if (task4 && job.expiresAt.getTime() <= currentTime.getTime()) {
+        throw new JobRepositoryError(
+          "APPROVAL_EXPIRED",
+          "The approval job has expired",
+        );
+      }
       if (approval.decision !== null) {
         const sameDecision = approval.decision === input.decision;
         const sameFingerprint =
           input.actionFingerprint === undefined ||
           input.actionFingerprint === approval.actionFingerprint;
+        const currentBinding =
+          job.status === "waiting_approval" &&
+          job.revision === approval.jobRevision &&
+          job.attempt === approval.attempt &&
+          (input.expectedAttempt === undefined ||
+            input.expectedAttempt === approval.attempt);
         if (
           task4 &&
           sameDecision &&
           sameFingerprint &&
+          currentBinding &&
           approval.jobRevision === input.expectedJobRevision
         ) {
-          return toApprovalRecord(approval, job.ownerId, job.shortId);
+          return {
+            approval: toApprovalRecord(approval, job.ownerId, job.shortId),
+            expired: false,
+          };
         }
         if (task4) {
           throw new JobRepositoryError(
@@ -1103,13 +1179,6 @@ export class JobRepository {
         throw new JobRepositoryError(
           "APPROVAL_ALREADY_DECIDED",
           "The approval already has a decision",
-        );
-      }
-      const now = input.now ?? new Date();
-      if (approval.expiresAt.getTime() <= now.getTime()) {
-        throw new JobRepositoryError(
-          "APPROVAL_EXPIRED",
-          "The approval has expired",
         );
       }
       if (
@@ -1130,23 +1199,80 @@ export class JobRepository {
         );
       }
 
-      const updatedRows = await tx
-        .update(approvals)
-        .set({
-          decision: input.decision,
-          decidedAt: sql`now()`,
-          updatedAt: sql`now()`,
-        })
-        .where(
-          and(
-            eq(approvals.id, input.approvalId),
-            isNull(approvals.decision),
-            gt(approvals.expiresAt, now),
-            eq(approvals.jobRevision, input.expectedJobRevision),
-          ),
-        )
-        .returning();
-      const updated = updatedRows[0];
+      let expired = approval.expiresAt.getTime() <= currentTime.getTime();
+      if (expired && !task4) {
+        throw new JobRepositoryError(
+          "APPROVAL_EXPIRED",
+          "The approval has expired",
+        );
+      }
+
+      const recordDecision = async (
+        decision: ApprovalDecision,
+      ): Promise<ApprovalRow> => {
+        const updatedRows = await tx
+          .update(approvals)
+          .set({
+            decision,
+            decidedAt: sql`clock_timestamp()`,
+            updatedAt: sql`clock_timestamp()`,
+          })
+          .where(
+            and(
+              eq(approvals.id, input.approvalId),
+              isNull(approvals.decision),
+              eq(approvals.jobRevision, input.expectedJobRevision),
+              task4
+                ? sql`${approvals.expiresAt} > clock_timestamp()`
+                : gt(approvals.expiresAt, currentTime),
+              task4
+                ? sql`${job.expiresAt.toISOString()}::timestamptz > clock_timestamp()`
+                : undefined,
+            ),
+          )
+          .returning();
+        return updatedRows[0];
+      };
+
+      const recordExpired = async (): Promise<ApprovalRow | undefined> => {
+        const expiredRows = await tx
+          .update(approvals)
+          .set({
+            decision: "reject",
+            decidedAt: sql`clock_timestamp()`,
+            updatedAt: sql`clock_timestamp()`,
+          })
+          .where(
+            and(
+              eq(approvals.id, input.approvalId),
+              isNull(approvals.decision),
+              eq(approvals.jobRevision, input.expectedJobRevision),
+              sql`${approvals.expiresAt} <= clock_timestamp()`,
+              task4
+                ? sql`${job.expiresAt.toISOString()}::timestamptz > clock_timestamp()`
+                : undefined,
+            ),
+          )
+          .returning();
+        return expiredRows[0];
+      };
+
+      let updated: ApprovalRow | undefined;
+      if (expired) {
+        updated = await recordExpired();
+      } else {
+        updated = await recordDecision(input.decision);
+        if (updated === undefined && task4) {
+          updated = await recordExpired();
+          expired = updated !== undefined;
+        }
+        if (updated === undefined) {
+          throw new JobRepositoryError(
+            "APPROVAL_EXPIRED",
+            "The approval expired before it could be decided",
+          );
+        }
+      }
       if (updated === undefined) {
         throw new JobRepositoryError(
           "APPROVAL_EXPIRED",
@@ -1186,12 +1312,22 @@ export class JobRepository {
             action_fingerprint: updated.actionFingerprint,
             decision: updated.decision,
           },
-          updated.expiresAt,
+          job.expiresAt,
         );
       }
 
-      return toApprovalRecord(updated, job.ownerId, job.shortId);
+      return {
+        approval: toApprovalRecord(updated, job.ownerId, job.shortId),
+        expired,
+      };
     });
+    if (outcome.expired) {
+      throw new JobRepositoryError(
+        "APPROVAL_EXPIRED",
+        "The approval has expired and was rejected",
+      );
+    }
+    return outcome.approval;
   }
 
   async acknowledgeResult(
@@ -1205,10 +1341,13 @@ export class JobRepository {
         .where(and(eq(jobs.id, jobId), eq(jobs.ownerId, ownerId)))
         .for("update");
       const current = lockedRows[0];
+      const summary = asRecord(current?.summary);
       if (
         current === undefined ||
         !isTerminal(current.status) ||
-        asRecord(current.summary) === null
+        summary === null ||
+        typeof summary.summary !== "string" ||
+        summary.summary.trim().length === 0
       ) {
         return null;
       }
@@ -1218,7 +1357,7 @@ export class JobRepository {
         const updatedRows = await tx
           .update(jobs)
           .set({
-            acknowledgedAt: sql`now()`,
+            acknowledgedAt: sql`clock_timestamp()`,
             unreadTerminal: false,
           })
           .where(and(eq(jobs.id, jobId), isNull(jobs.acknowledgedAt)))

@@ -492,13 +492,11 @@ export class JobCoordinator {
         Math.min(Math.max(input.limit ?? MAX_LIST_LIMIT, 1), MAX_LIST_LIMIT),
         this.#now(),
       );
-      const now = this.#now().getTime();
       return presentPendingApprovals(
         approvals.filter(
           (approval) =>
             (approval.ownerId === undefined || approval.ownerId === owner.id) &&
-            approval.decision === null &&
-            approval.expiresAt.getTime() > now,
+            approval.decision === null,
         ),
       );
     } catch (error) {

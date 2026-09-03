@@ -295,6 +295,9 @@ const prepareApproval = async (
       job_revision: running.revision + 1,
     }),
   );
+  await database.query("UPDATE jobs SET attempt = 1 WHERE id = $1", [
+    waiting.jobId,
+  ]);
   const fixture: ApprovalFixture = {
     approvalId,
     jobId: waiting.jobId,
