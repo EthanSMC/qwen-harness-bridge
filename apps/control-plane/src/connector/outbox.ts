@@ -186,8 +186,16 @@ const sanitizeEventValue = (value: unknown): unknown => {
 
 const sanitizeConnectorEventPayload = (
   payload: Record<string, unknown>,
-): Record<string, unknown> =>
-  sanitizeEventValue(payload) as Record<string, unknown>;
+): Record<string, unknown> => {
+  const sanitized = sanitizeEventValue(payload) as Record<string, unknown>;
+  if (
+    typeof payload.summary === "string" &&
+    payload.summary.trim().length === 0
+  ) {
+    delete sanitized.summary;
+  }
+  return sanitized;
+};
 
 const sanitizeConnectorText = (value: string, maxLength = 800): string => {
   const sanitized = sanitizePublicText(

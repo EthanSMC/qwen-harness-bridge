@@ -833,4 +833,68 @@ describe("authenticated Connector terminal results through production MCP", () =
       await closeResultFixture(fixture);
     }
   });
+
+  it.each([
+    ["empty string", ""],
+    ["whitespace-only", "   \t  "],
+  ] as const)(
+    "does not acknowledge or expose a blank terminal summary (%s)",
+    async (_case, summary) => {
+      const fixture = await startResultFixture();
+      try {
+        const { job, terminal } = await submitTerminalResult(fixture, {
+          status: "succeeded",
+          summary,
+        });
+        const result = await fixture.mcp.client.callTool({
+          name: "get_task_result",
+          arguments: { job_id: job.job_id },
+        });
+        expect(result.isError).toBe(true);
+        expect(result.structuredContent).toMatchObject({
+          error: { code: "JOB_NOT_FOUND" },
+        });
+
+        const stored = await db.query<{
+          acknowledged_at: Date | null;
+          client_summary: string | null;
+          event_count: string;
+          event_summary: string | null;
+          job_summary: Record<string, unknown> | null;
+          status: string;
+          unread_terminal: boolean;
+        }>(
+          `SELECT j.status, j.summary AS job_summary, j.acknowledged_at,
+                  j.unread_terminal,
+                  (SELECT count(*)::text
+                     FROM job_events
+                    WHERE job_id = j.id AND message_id = $2) AS event_count,
+                  (SELECT payload->>'summary'
+                     FROM job_events
+                    WHERE job_id = j.id AND message_id = $2) AS event_summary,
+                  (SELECT payload #>> '{payload,payload,summary}'
+                     FROM connector_messages
+                    WHERE direction = 'client' AND message_id = $2)
+                    AS client_summary
+             FROM jobs j
+            WHERE j.id = $1`,
+          [job.job_id, terminal.event.message_id],
+        );
+        const state = stored.rows[0];
+        expect(state).toMatchObject({
+          acknowledged_at: null,
+          event_count: "1",
+          job_summary: null,
+          status: "succeeded",
+          unread_terminal: true,
+        });
+        expect(state?.event_summary?.trim() ?? "").toBe("");
+        expect(state?.client_summary?.trim() ?? "").toBe("");
+        expect(state?.event_summary).not.toBe("[redacted]");
+        expect(state?.client_summary).not.toBe("[redacted]");
+      } finally {
+        await closeResultFixture(fixture);
+      }
+    },
+  );
 });
