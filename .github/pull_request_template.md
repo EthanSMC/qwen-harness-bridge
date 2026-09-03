@@ -11,7 +11,7 @@
 ## Review evidence
 
 <!-- Complete exactly one review mode. Do not check both boxes. The solo fallback is valid when no distinct eligible direct GitHub collaborator exists, regardless of repository visibility. -->
-<!-- CI evidence must be this PR's https://github.com/<owner>/<repo>/pull/<number>/checks URL. The PR number is unavailable before creation, so create the PR, immediately edit this body with the current checks URL, and rerun the edited gate. A first opened run may fail; the final merge gate must be green. -->
+<!-- CI evidence must be this PR's https://github.com/<owner>/<repo>/pull/<number>/checks URL. The PR number is unavailable before creation, so create the PR, immediately edit this body with the current checks URL, and rerun the edited gate. A first opened run may fail; the final merge gate must be green, and the controller re-verifies the GitHub checks API before merge. -->
 
 ### Review mode (check exactly one)
 
@@ -40,7 +40,7 @@
 - Findings:
 - Fix rounds:
 - Final verdict: PASS / FAIL
-- CI run URL(s) / PR checks URL(s) and required-check results (controller re-verifies GitHub checks API before merge):
+- CI run URL(s) / PR checks URL(s) and required-check results:
 
 ## Verification
 
