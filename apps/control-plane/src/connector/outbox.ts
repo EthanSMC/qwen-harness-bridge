@@ -823,6 +823,7 @@ const ingestApprovalRequested = async (
         eq(jobs.attempt, message.payload.attempt),
         sql`${jobs.expiresAt} > clock_timestamp()`,
         sql`${new Date(message.payload.expires_at).toISOString()}::timestamptz > clock_timestamp()`,
+        sql`${new Date(message.expires_at).toISOString()}::timestamptz > clock_timestamp()`,
       ),
     )
     .returning({ id: jobs.id });
@@ -857,6 +858,12 @@ const ingestApprovalRequested = async (
     messageId: message.message_id,
     correlationId: message.correlation_id,
   });
+  if (
+    Date.parse(message.expires_at) <=
+    (await readDatabaseTime(database)).getTime()
+  ) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
 };
 
 const ingestJobCancelled = async (
@@ -892,6 +899,7 @@ const ingestJobCancelled = async (
           eq(jobs.status, "cancelling"),
           eq(jobs.attempt, message.payload.attempt),
           sql`${jobs.expiresAt} > clock_timestamp()`,
+          sql`${new Date(message.expires_at).toISOString()}::timestamptz > clock_timestamp()`,
         ),
       )
       .returning({ id: jobs.id });
@@ -913,6 +921,12 @@ const ingestJobCancelled = async (
     messageId: message.message_id,
     correlationId: message.correlation_id,
   });
+  if (
+    Date.parse(message.expires_at) <=
+    (await readDatabaseTime(database)).getTime()
+  ) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
 };
 
 const withdrawCancelledOffer = async (
@@ -1017,11 +1031,10 @@ const claimOfferedJob = async (
   return "claimed";
 };
 
-const statusForEvent = (
-  current: JobStatus,
+const terminalStatusForEvent = (
   eventType: string,
   payload: Record<string, unknown>,
-): JobStatus => {
+): JobStatus | null => {
   const explicit = payload.status;
   const candidate =
     typeof explicit === "string" ? explicit : eventType.toLowerCase();
@@ -1032,6 +1045,19 @@ const statusForEvent = (
   if (["failed", "failure", "job.failed"].includes(candidate)) return "failed";
   if (["cancelled", "canceled", "job.cancelled"].includes(candidate))
     return "cancelled";
+  return null;
+};
+
+const statusForEvent = (
+  current: JobStatus,
+  eventType: string,
+  payload: Record<string, unknown>,
+): JobStatus => {
+  const terminal = terminalStatusForEvent(eventType, payload);
+  if (terminal !== null) return terminal;
+  const explicit = payload.status;
+  const candidate =
+    typeof explicit === "string" ? explicit : eventType.toLowerCase();
   if (candidate === "waiting_approval") return "waiting_approval";
   if (candidate === "running" || candidate === "resumed") return "running";
   return current;
@@ -1063,7 +1089,8 @@ const ingestJobEvent = async (
     sanitizedEventType,
     sanitizedPayload,
   );
-  const terminal = TERMINAL_JOB_STATES.has(nextStatus);
+  const terminal =
+    terminalStatusForEvent(sanitizedEventType, sanitizedPayload) !== null;
   if (TERMINAL_JOB_STATES.has(job.status)) {
     if (!terminal) throw new ConnectorStoreError("EVENT_REJECTED");
     await appendJobEvent(database, job.id, {

@@ -1,5 +1,6 @@
 import type { ConnectorClientMessage } from "@qhb/protocol";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { sql as drizzleSql } from "../../apps/control-plane/node_modules/drizzle-orm";
 import { hashConnectorCredential } from "../../apps/control-plane/src/connector/auth.js";
 import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js";
 import {
@@ -424,6 +425,107 @@ describe("approval flow", () => {
     ]);
   });
 
+  it("rejects an exact retry of a decided approval after its job binding is superseded", async () => {
+    const job = await claimJob();
+    const approvalA = await requestApproval(job, {
+      jobRevision: job.runningRevision + 1,
+      fingerprint: FINGERPRINT_A,
+      actionSummary: "Install dependency version A",
+    });
+    const inputA = {
+      approval_id: approvalA.approvalId,
+      decision: "approve" as const,
+      expected_job_revision: approvalA.jobRevision,
+    };
+    await coordinator.decideApproval({ id: OWNER_ID }, inputA);
+    const commandA = await job.connector.next("approval.decision");
+    await job.connector.ack(commandA);
+
+    const approvalB = await requestApproval(job, {
+      jobRevision: approvalA.jobRevision + 1,
+      fingerprint: FINGERPRINT_B,
+      actionSummary: "Install dependency version B",
+    });
+    const beforeRetry = await db.query<{
+      approval_decided_events: string;
+      attempt: number;
+      revision: number;
+      status: string;
+    }>(
+      `SELECT j.attempt, j.revision, j.status,
+              (SELECT count(*)::text
+                 FROM job_events
+                WHERE job_id = j.id AND event_type = 'approval.decided')
+                AS approval_decided_events
+         FROM jobs j
+        WHERE j.id = $1`,
+      [job.jobId],
+    );
+
+    await expect(
+      coordinator.decideApproval({ id: OWNER_ID }, inputA),
+    ).rejects.toMatchObject({ code: "APPROVAL_MISMATCH" });
+
+    await expect(readDecisionEffects(approvalA.approvalId)).resolves.toEqual({
+      decision: "approve",
+      command_count: "1",
+    });
+    await expect(readDecisionEffects(approvalB.approvalId)).resolves.toEqual({
+      decision: null,
+      command_count: "0",
+    });
+    await expect(
+      db.query<{
+        approval_decided_events: string;
+        attempt: number;
+        revision: number;
+        status: string;
+      }>(
+        `SELECT j.attempt, j.revision, j.status,
+                (SELECT count(*)::text
+                   FROM job_events
+                  WHERE job_id = j.id AND event_type = 'approval.decided')
+                  AS approval_decided_events
+           FROM jobs j
+          WHERE j.id = $1`,
+        [job.jobId],
+      ),
+    ).resolves.toEqual(beforeRetry);
+    expect(beforeRetry.rows).toEqual([
+      {
+        approval_decided_events: "1",
+        attempt: job.attempt,
+        revision: approvalB.jobRevision,
+        status: "waiting_approval",
+      },
+    ]);
+  });
+
+  it("hides pending approvals whose jobs have expired in PostgreSQL", async () => {
+    const job = await claimJob();
+    const approval = await requestApproval(job, {
+      jobRevision: job.runningRevision + 1,
+      fingerprint: FINGERPRINT_A,
+    });
+    await db.query(
+      `UPDATE jobs
+          SET expires_at = clock_timestamp() - interval '1 second'
+        WHERE id = $1`,
+      [job.jobId],
+    );
+
+    await expect(
+      repository.listPendingApprovals(OWNER_ID, 5, new Date(0)),
+    ).resolves.not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ approvalId: approval.approvalId }),
+      ]),
+    );
+    await expect(
+      repository.getPendingApproval(OWNER_ID, job.jobId, new Date(0)),
+    ).resolves.toBeNull();
+  });
+
   it("rejects owner, attempt, revision, and fingerprint mismatches without decision effects", async () => {
     const job = await claimJob();
     const approval = await requestApproval(job, {
@@ -593,5 +695,178 @@ describe("approval flow", () => {
     } finally {
       await other.connector.close();
     }
+  });
+
+  it("rejects decisions for expired jobs without approval, event, or outbox effects", async () => {
+    const job = await claimJob();
+    const approval = await requestApproval(job, {
+      jobRevision: job.runningRevision + 1,
+      fingerprint: FINGERPRINT_A,
+    });
+    await db.query(
+      `UPDATE jobs
+          SET expires_at = clock_timestamp() - interval '1 second'
+        WHERE id = $1`,
+      [job.jobId],
+    );
+    const before = await db.query<{
+      approval_decided_events: string;
+      last_server_sequence: number;
+    }>(
+      `SELECT c.last_server_sequence,
+              (SELECT count(*)::text
+                 FROM job_events
+                WHERE job_id = $1 AND event_type = 'approval.decided')
+                AS approval_decided_events
+         FROM connectors c
+        WHERE c.id = $2`,
+      [job.jobId, job.connectorId],
+    );
+
+    await expect(
+      repository.recordApprovalDecision({
+        ownerId: OWNER_ID,
+        approvalId: approval.approvalId,
+        decision: "approve",
+        expectedJobRevision: approval.jobRevision,
+        expectedAttempt: job.attempt,
+        actionFingerprint: FINGERPRINT_A,
+        now: new Date(0),
+      }),
+    ).rejects.toMatchObject({ code: "APPROVAL_EXPIRED" });
+
+    await expect(readDecisionEffects(approval.approvalId)).resolves.toEqual({
+      decision: null,
+      command_count: "0",
+    });
+    await expect(
+      db.query<{
+        approval_decided_events: string;
+        last_server_sequence: number;
+      }>(
+        `SELECT c.last_server_sequence,
+                (SELECT count(*)::text
+                   FROM job_events
+                  WHERE job_id = $1 AND event_type = 'approval.decided')
+                  AS approval_decided_events
+           FROM connectors c
+          WHERE c.id = $2`,
+        [job.jobId, job.connectorId],
+      ),
+    ).resolves.toEqual(before);
+  });
+
+  it("rolls back a decision when its job expires while waiting for the Connector command lock", async () => {
+    const job = await claimJob();
+    const approval = await requestApproval(job, {
+      jobRevision: job.runningRevision + 1,
+      fingerprint: FINGERPRINT_A,
+    });
+    const expiry = await db.query<{ expires_at: string }>(
+      `SELECT clock_timestamp() + interval '500 milliseconds' AS expires_at`,
+    );
+    const expiresAt = expiry.rows[0]?.expires_at;
+    if (expiresAt === undefined) throw new Error("Expected a job expiry");
+    await db.query("UPDATE jobs SET expires_at = $1 WHERE id = $2", [
+      expiresAt,
+      job.jobId,
+    ]);
+    const before = await db.query<{
+      approval_decided_events: string;
+      last_server_sequence: number;
+    }>(
+      `SELECT c.last_server_sequence,
+              (SELECT count(*)::text
+                 FROM job_events
+                WHERE job_id = $1 AND event_type = 'approval.decided')
+                AS approval_decided_events
+         FROM connectors c
+        WHERE c.id = $2`,
+      [job.jobId, job.connectorId],
+    );
+
+    let signalHolderReady!: (backendPid: number) => void;
+    let releaseHolder!: () => void;
+    const holderReady = new Promise<number>((resolve) => {
+      signalHolderReady = resolve;
+    });
+    const holderReleased = new Promise<void>((resolve) => {
+      releaseHolder = resolve;
+    });
+    const holder = db.client.transaction(async (tx) => {
+      const backend = await tx.execute(
+        drizzleSql`SELECT pg_backend_pid() AS "backendPid"`,
+      );
+      const backendPid = Number(
+        (backend[0] as { backendPid?: number | string } | undefined)
+          ?.backendPid,
+      );
+      if (!Number.isSafeInteger(backendPid) || backendPid < 1) {
+        throw new Error("Connector lock holder PID is invalid");
+      }
+      await tx.execute(
+        drizzleSql`SELECT id FROM connectors WHERE id = ${job.connectorId} FOR UPDATE`,
+      );
+      signalHolderReady(backendPid);
+      await holderReleased;
+      await tx.execute(
+        drizzleSql`SELECT pg_sleep_until(${expiresAt}::timestamptz + interval '25 milliseconds')`,
+      );
+    });
+    const holderBackendPid = await holderReady;
+    const decision = repository.recordApprovalDecision({
+      ownerId: OWNER_ID,
+      approvalId: approval.approvalId,
+      decision: "approve",
+      expectedJobRevision: approval.jobRevision,
+      expectedAttempt: job.attempt,
+      actionFingerprint: FINGERPRINT_A,
+      now: new Date(0),
+    });
+    let outcome: PromiseSettledResult<unknown> | undefined;
+    try {
+      await expect
+        .poll(async () => {
+          const waiters = await db.query<{ count: string }>(
+            `SELECT count(*)::text AS count
+               FROM pg_stat_activity
+              WHERE datname = current_database()
+                AND $1::integer = ANY(pg_blocking_pids(pid))`,
+            [holderBackendPid],
+          );
+          return Number(waiters.rows[0]?.count ?? 0);
+        })
+        .toBeGreaterThan(0);
+      releaseHolder();
+      await holder;
+      [outcome] = await Promise.allSettled([decision]);
+    } finally {
+      releaseHolder();
+      await holder;
+    }
+
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      reason: { code: "APPROVAL_EXPIRED" },
+    });
+    await expect(readDecisionEffects(approval.approvalId)).resolves.toEqual({
+      decision: null,
+      command_count: "0",
+    });
+    await expect(
+      db.query<{
+        approval_decided_events: string;
+        last_server_sequence: number;
+      }>(
+        `SELECT c.last_server_sequence,
+                (SELECT count(*)::text
+                   FROM job_events
+                  WHERE job_id = $1 AND event_type = 'approval.decided')
+                  AS approval_decided_events
+           FROM connectors c
+          WHERE c.id = $2`,
+        [job.jobId, job.connectorId],
+      ),
+    ).resolves.toEqual(before);
   });
 });

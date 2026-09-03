@@ -504,6 +504,102 @@ describe("authenticated Connector terminal results through production MCP", () =
     }
   });
 
+  it("rejects a fresh nonterminal event after a terminal winner without acknowledgement or mutation", async () => {
+    const fixture = await startResultFixture();
+    try {
+      const { job } = await submitTerminalResult(fixture, resultPayload());
+      const before = await db.query<{
+        acknowledged_at: Date | null;
+        current_stage: string;
+        last_client_sequence: number;
+        revision: number;
+        status: string;
+        summary: Record<string, unknown> | null;
+        terminal_at: Date | null;
+        unread_terminal: boolean;
+      }>(
+        `SELECT j.acknowledged_at, j.current_stage, c.last_client_sequence,
+                j.revision, j.status, j.summary, j.terminal_at,
+                j.unread_terminal
+           FROM jobs j
+           JOIN connectors c ON c.id = j.connector_id
+          WHERE j.id = $1`,
+        [job.job_id],
+      );
+      expect(before.rows).toHaveLength(1);
+
+      const responseStart = fixture.connector.wireReceived.length;
+      const progress = await fixture.connector.send("job.event", {
+        job_id: job.job_id,
+        attempt: job.offer.payload.attempt,
+        event_type: "progress",
+        payload: { stage: "must-not-run-after-terminal" },
+        source: "fake-connector",
+      });
+      const response = await (async () => {
+        for (let attempt = 0; attempt < 200; attempt += 1) {
+          const candidate = fixture.connector.wireReceived
+            .slice(responseStart)
+            .find(
+              (message) =>
+                (message.type === "ack" &&
+                  message.payload.sequence === progress.sequence) ||
+                message.type === "protocol.error",
+            );
+          if (candidate !== undefined) return candidate;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        throw new Error("Timed out waiting for the late progress response");
+      })();
+
+      expect(response).toMatchObject({
+        type: "protocol.error",
+        payload: { code: "EVENT_REJECTED" },
+      });
+      expect(
+        fixture.connector.wireReceived
+          .slice(responseStart)
+          .some(
+            (message) =>
+              message.type === "ack" &&
+              message.payload.sequence === progress.sequence,
+          ),
+      ).toBe(false);
+
+      const after = await db.query<{
+        acknowledged_at: Date | null;
+        current_stage: string;
+        last_client_sequence: number;
+        revision: number;
+        status: string;
+        summary: Record<string, unknown> | null;
+        terminal_at: Date | null;
+        unread_terminal: boolean;
+      }>(
+        `SELECT j.acknowledged_at, j.current_stage, c.last_client_sequence,
+                j.revision, j.status, j.summary, j.terminal_at,
+                j.unread_terminal
+           FROM jobs j
+           JOIN connectors c ON c.id = j.connector_id
+          WHERE j.id = $1`,
+        [job.job_id],
+      );
+      expect(after.rows).toEqual(before.rows);
+      await expect(
+        db.query<{ count: string }>(
+          `SELECT (
+             SELECT count(*) FROM connector_messages WHERE message_id = $1
+           ) + (
+             SELECT count(*) FROM job_events WHERE message_id = $1
+           ) AS count`,
+          [progress.message_id],
+        ),
+      ).resolves.toMatchObject({ rows: [{ count: "0" }] });
+    } finally {
+      await closeResultFixture(fixture);
+    }
+  });
+
   it("lists a terminal result as unread until the first result acknowledgement", async () => {
     const fixture = await startResultFixture();
     try {

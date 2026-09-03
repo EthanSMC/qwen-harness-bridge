@@ -408,6 +408,18 @@ const enqueueServerCommand = async (
     );
   }
 
+  let effectiveExpiresAt = expiresAt;
+  if (type === "approval.decision") {
+    const currentTime = await readDatabaseTime(database);
+    if (expiresAt.getTime() <= currentTime.getTime()) {
+      throw new JobRepositoryError(
+        "APPROVAL_EXPIRED",
+        "The approval job expired before its decision could be delivered",
+      );
+    }
+    effectiveExpiresAt = commandExpiresAt(expiresAt, currentTime);
+  }
+
   const sequence = connector.lastServerSequence + 1;
   if (!Number.isSafeInteger(sequence) || sequence < 1) {
     throw new JobRepositoryError(
@@ -442,7 +454,7 @@ const enqueueServerCommand = async (
     sequence,
     type,
     payload,
-    expiresAt,
+    expiresAt: effectiveExpiresAt,
   });
 };
 
@@ -761,6 +773,7 @@ export class JobRepository {
           eq(approvals.jobRevision, jobs.revision),
           isNull(approvals.decision),
           sql`${approvals.expiresAt} > clock_timestamp()`,
+          sql`${jobs.expiresAt} > clock_timestamp()`,
         ),
       )
       .orderBy(asc(approvals.expiresAt), asc(approvals.createdAt))
@@ -792,6 +805,7 @@ export class JobRepository {
           eq(approvals.jobRevision, jobs.revision),
           isNull(approvals.decision),
           sql`${approvals.expiresAt} > clock_timestamp()`,
+          sql`${jobs.expiresAt} > clock_timestamp()`,
         ),
       )
       .orderBy(desc(approvals.createdAt))
@@ -1093,15 +1107,31 @@ export class JobRepository {
       }
 
       const task4 = input.ownerId !== undefined;
+      const currentTime = task4
+        ? await readDatabaseTime(tx)
+        : (input.now ?? new Date());
+      if (task4 && job.expiresAt.getTime() <= currentTime.getTime()) {
+        throw new JobRepositoryError(
+          "APPROVAL_EXPIRED",
+          "The approval job has expired",
+        );
+      }
       if (approval.decision !== null) {
         const sameDecision = approval.decision === input.decision;
         const sameFingerprint =
           input.actionFingerprint === undefined ||
           input.actionFingerprint === approval.actionFingerprint;
+        const currentBinding =
+          job.status === "waiting_approval" &&
+          job.revision === approval.jobRevision &&
+          job.attempt === approval.attempt &&
+          (input.expectedAttempt === undefined ||
+            input.expectedAttempt === approval.attempt);
         if (
           task4 &&
           sameDecision &&
           sameFingerprint &&
+          currentBinding &&
           approval.jobRevision === input.expectedJobRevision
         ) {
           return {
@@ -1120,9 +1150,6 @@ export class JobRepository {
           "The approval already has a decision",
         );
       }
-      const currentTime = task4
-        ? await readDatabaseTime(tx)
-        : (input.now ?? new Date());
       if (
         approval.jobRevision !== input.expectedJobRevision ||
         job.revision !== input.expectedJobRevision ||
@@ -1167,6 +1194,9 @@ export class JobRepository {
               task4
                 ? sql`${approvals.expiresAt} > clock_timestamp()`
                 : gt(approvals.expiresAt, currentTime),
+              task4
+                ? sql`${job.expiresAt.toISOString()}::timestamptz > clock_timestamp()`
+                : undefined,
             ),
           )
           .returning();
@@ -1187,6 +1217,9 @@ export class JobRepository {
               isNull(approvals.decision),
               eq(approvals.jobRevision, input.expectedJobRevision),
               sql`${approvals.expiresAt} <= clock_timestamp()`,
+              task4
+                ? sql`${job.expiresAt.toISOString()}::timestamptz > clock_timestamp()`
+                : undefined,
             ),
           )
           .returning();
@@ -1248,7 +1281,7 @@ export class JobRepository {
             action_fingerprint: updated.actionFingerprint,
             decision: updated.decision,
           },
-          commandExpiresAt(job.expiresAt, currentTime),
+          job.expiresAt,
         );
       }
 
