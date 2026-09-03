@@ -1,7 +1,10 @@
 import { z } from "zod";
 import { RepositoryIdSchema } from "./job.js";
 
-const UuidSchema = z.string().uuid();
+const UuidSchema = z
+  .string()
+  .uuid()
+  .transform((value) => value.toLowerCase());
 const PositiveIntegerSchema = z
   .number()
   .int()

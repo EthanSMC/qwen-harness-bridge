@@ -354,6 +354,120 @@ describe("connector envelope", () => {
     ).toThrow();
   });
 
+  it("normalizes uppercase UUIDs at the shared protocol schema boundary", () => {
+    const canonical = {
+      connector: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      job: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      lease: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      approval: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      nonce: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      message: "abcdefab-cdef-4abc-8def-abcdefabcdef",
+      correlation: "fedcbafe-dcba-4fed-8cba-fedcbafedcba",
+    };
+    const uppercase = Object.fromEntries(
+      Object.entries(canonical).map(([key, value]) => [
+        key,
+        value.toUpperCase(),
+      ]),
+    ) as typeof canonical;
+
+    expect(
+      EnvelopeSchema.parse({
+        ...commonEnvelope,
+        message_id: uppercase.message,
+        correlation_id: uppercase.correlation,
+        type: "ack",
+        payload: { sequence: 1 },
+      }),
+    ).toMatchObject({
+      message_id: canonical.message,
+      correlation_id: canonical.correlation,
+    });
+    expect(
+      ConnectorHelloPayloadSchema.parse({
+        connector_id: uppercase.connector,
+        last_server_sequence: 0,
+      }).connector_id,
+    ).toBe(canonical.connector);
+    expect(
+      JobClaimPayloadSchema.parse({
+        job_id: uppercase.job,
+        attempt: 1,
+        lease_id: uppercase.lease,
+      }),
+    ).toMatchObject({ job_id: canonical.job, lease_id: canonical.lease });
+    expect(
+      JobEventPayloadSchema.parse({
+        job_id: uppercase.job,
+        attempt: 1,
+        event_type: "progress",
+        payload: {},
+        source: "harness",
+      }).job_id,
+    ).toBe(canonical.job);
+    expect(
+      ApprovalRequestedPayloadSchema.parse({
+        approval_id: uppercase.approval,
+        job_id: uppercase.job,
+        attempt: 1,
+        job_revision: 0,
+        action_summary: "Install a package",
+        impact_summary: "Changes dependencies",
+        risk_class: "approval_required",
+        action_fingerprint: validActionFingerprint,
+        expires_at: "2026-09-01T00:05:00.000Z",
+      }),
+    ).toMatchObject({
+      approval_id: canonical.approval,
+      job_id: canonical.job,
+    });
+    expect(
+      JobCancelledPayloadSchema.parse({
+        job_id: uppercase.job,
+        attempt: 1,
+        reason: "cancelled",
+      }).job_id,
+    ).toBe(canonical.job);
+    expect(
+      ConnectorWelcomePayloadSchema.parse({
+        connector_id: uppercase.connector,
+        server_sequence: 1,
+        replay_from: 1,
+      }).connector_id,
+    ).toBe(canonical.connector);
+    expect(
+      JobOfferPayloadSchema.parse({
+        job_id: uppercase.job,
+        attempt: 1,
+        lease_id: uppercase.lease,
+        repository_id: "novelty-studio",
+        request: "run the tests",
+      }),
+    ).toMatchObject({ job_id: canonical.job, lease_id: canonical.lease });
+    expect(
+      JobCancelPayloadSchema.parse({
+        job_id: uppercase.job,
+        attempt: 1,
+        job_revision: 0,
+        reason: "expired",
+        nonce: uppercase.nonce,
+      }),
+    ).toMatchObject({ job_id: canonical.job, nonce: canonical.nonce });
+    expect(
+      ApprovalDecisionPayloadSchema.parse({
+        approval_id: uppercase.approval,
+        job_id: uppercase.job,
+        attempt: 1,
+        job_revision: 0,
+        action_fingerprint: validActionFingerprint,
+        decision: "approve",
+      }),
+    ).toMatchObject({
+      approval_id: canonical.approval,
+      job_id: canonical.job,
+    });
+  });
+
   it("requires approval expiry to be later than the envelope sent_at", () => {
     const approval = {
       ...commonEnvelope,

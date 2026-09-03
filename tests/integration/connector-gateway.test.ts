@@ -461,6 +461,63 @@ describe("Connector gateway authentication and handshake", () => {
     }
   });
 
+  it("accepts uppercase UUIDs through session exchange and a raw WebSocket hello", async () => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    const uppercaseCredentials = {
+      ...credentials,
+      connector_id: credentials.connector_id.toUpperCase(),
+    };
+    const hello = JSON.stringify({
+      protocol_version: "1.0",
+      message_id: "abcdefab-cdef-4abc-8def-abcdefabcdef".toUpperCase(),
+      sequence: 1,
+      sent_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      correlation_id: "fedcbafe-dcba-4fed-8cba-fedcbafedcba".toUpperCase(),
+      type: "connector.hello",
+      payload: {
+        connector_id: uppercaseCredentials.connector_id,
+        connector_version: "uppercase-uuid-test/1.0",
+        capabilities: ["harness", "integration-test"],
+        last_server_sequence: 0,
+        last_client_sequence: 0,
+      },
+    });
+
+    try {
+      const session = await FakeConnector.exchangeSession(
+        app,
+        uppercaseCredentials,
+      );
+      expect(session.token).toEqual(expect.any(String));
+
+      const socket = await rawConnectorSocketWithCoalescedHead(
+        app,
+        uppercaseCredentials,
+        encodeRawFrame(0x1, Buffer.from(hello), {
+          mask: Buffer.from([0x01, 0x23, 0x45, 0x67]),
+        }),
+      );
+      try {
+        await expect(
+          waitForServerMessage(
+            socket,
+            (message) => message.type === "connector.welcome",
+            { upgradeResponse: true },
+          ),
+        ).resolves.toMatchObject({
+          type: "connector.welcome",
+          payload: { connector_id: credentials.connector_id },
+        });
+      } finally {
+        socket.destroy();
+      }
+    } finally {
+      await app.close();
+    }
+  });
+
   it("exchanges a device credential, rejects the Qwen MCP bearer, and completes TLS hello/welcome", async () => {
     const app = await startApp();
     const credentials = await seedConnector(db);
