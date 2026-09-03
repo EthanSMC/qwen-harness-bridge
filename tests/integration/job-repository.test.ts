@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { sql as drizzleSql } from "../../apps/control-plane/node_modules/drizzle-orm";
 import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js";
 import {
   Aes256GcmEncryptor,
@@ -79,6 +80,64 @@ const seedConnector = async (
     `,
     [connectorId, ownerId, connectorId],
   );
+};
+
+const delay = (milliseconds: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+const waitForRowLockWaiter = async (timeoutMs = 2_000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await db.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM pg_stat_activity
+        WHERE datname = current_database()
+          AND wait_event_type = 'Lock'
+          AND query ILIKE '%"jobs"%'
+          AND query ILIKE '%for update%'`,
+    );
+    if (Number(result.rows[0]?.count ?? 0) > 0) return;
+    await delay(10);
+  }
+  throw new Error("Timed out waiting for a PostgreSQL row lock waiter");
+};
+
+const expiryAfter = async (milliseconds: number): Promise<Date> => {
+  const result = await db.query<{ expires_at: Date }>(
+    `SELECT clock_timestamp() + interval '${milliseconds} milliseconds' AS expires_at`,
+  );
+  const expiresAt = result.rows[0]?.expires_at;
+  if (expiresAt === undefined) throw new Error("expected a database expiry");
+  return expiresAt;
+};
+
+const holdJobRowUntil = (
+  jobId: string,
+  expiresAt: Date,
+): {
+  ready: Promise<void>;
+  releaseToExpiry: () => void;
+  done: Promise<void>;
+} => {
+  let signalReady!: () => void;
+  let releaseToExpiry!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    signalReady = resolve;
+  });
+  const waitForExpiry = new Promise<void>((resolve) => {
+    releaseToExpiry = resolve;
+  });
+  const done = db.client.transaction(async (tx) => {
+    await tx.execute(
+      drizzleSql`SELECT id FROM jobs WHERE id = ${jobId} FOR UPDATE`,
+    );
+    signalReady();
+    await waitForExpiry;
+    await tx.execute(
+      drizzleSql`SELECT pg_sleep_until(${expiresAt}::timestamptz + interval '25 milliseconds')`,
+    );
+  });
+  return { ready, releaseToExpiry, done };
 };
 
 const createJob = async (
@@ -715,6 +774,59 @@ describe("JobRepository offer claims", () => {
       status: "dispatched",
       attempt: 0,
       revision: 1,
+    });
+    await expect(repository.events(job.jobId)).resolves.toMatchObject([
+      { sequence: 1, type: "job.dispatched" },
+    ]);
+    await db.query(
+      "UPDATE jobs SET status = 'expired'::job_status WHERE id = $1",
+      [job.jobId],
+    );
+  });
+
+  it("rejects a claim that waits past the job and lease expiry", async () => {
+    const repository = new JobRepository(db.client);
+    const connectorId = crypto.randomUUID();
+    const job = await createJob(repository);
+    await seedConnector(db, connectorId, job.ownerId);
+    await repository.transitionAndAppend(
+      job.jobId,
+      job.revision,
+      "dispatched",
+      event("job.dispatched"),
+    );
+    const leaseId = crypto.randomUUID();
+    const expiresAt = await expiryAfter(250);
+    await db.query(
+      `UPDATE jobs
+          SET connector_id = $2,
+              lease_id = $3,
+              lease_expires_at = $4,
+              expires_at = $4
+        WHERE id = $1`,
+      [job.jobId, connectorId, leaseId, expiresAt],
+    );
+
+    const holder = holdJobRowUntil(job.jobId, expiresAt);
+    await holder.ready;
+    const claim = repository.claimOffer(job.jobId, {
+      connectorId,
+      attempt: 1,
+      leaseId,
+    });
+    try {
+      await waitForRowLockWaiter();
+    } finally {
+      holder.releaseToExpiry();
+    }
+    await holder.done;
+
+    await expect(claim).resolves.toBeNull();
+    await expect(repository.get(job.jobId)).resolves.toMatchObject({
+      status: "dispatched",
+      attempt: 0,
+      revision: 1,
+      leaseId,
     });
     await expect(repository.events(job.jobId)).resolves.toMatchObject([
       { sequence: 1, type: "job.dispatched" },

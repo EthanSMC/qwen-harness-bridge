@@ -491,6 +491,31 @@ const lockClientJob = async (
   return rows[0];
 };
 
+const readCurrentTimeAtLeast = async (
+  database: QueryDatabase,
+  atLeast: Date,
+): Promise<Date> => {
+  const rows = await database.execute(
+    sql`select greatest(clock_timestamp(), ${atLeast.toISOString()}::timestamptz) as "currentTime"`,
+  );
+  const value = (rows[0] as { currentTime?: Date | string } | undefined)
+    ?.currentTime;
+  if (value === undefined) {
+    throw new ConnectorStoreError(
+      "INTERNAL",
+      "Current database time is missing",
+    );
+  }
+  const currentTime = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(currentTime.getTime())) {
+    throw new ConnectorStoreError(
+      "INTERNAL",
+      "Current database time is invalid",
+    );
+  }
+  return currentTime.getTime() >= atLeast.getTime() ? currentTime : atLeast;
+};
+
 const enqueueServerMessage = async (
   database: QueryDatabase,
   connector: ConnectorRow,
@@ -659,7 +684,9 @@ const claimOfferedJob = async (
         eq(jobs.status, "dispatched"),
         eq(jobs.revision, job.revision),
         eq(jobs.leaseId, message.payload.lease_id),
-        gt(jobs.expiresAt, now),
+        sql`${jobs.leaseExpiresAt} > clock_timestamp()`,
+        sql`${jobs.expiresAt} > clock_timestamp()`,
+        sql`${new Date(message.expires_at).toISOString()}::timestamptz > clock_timestamp()`,
       ),
     )
     .returning({ id: jobs.id });
@@ -754,7 +781,14 @@ const ingestJobEvent = async (
           }
         : {}),
     })
-    .where(and(eq(jobs.id, job.id), eq(jobs.revision, job.revision)))
+    .where(
+      and(
+        eq(jobs.id, job.id),
+        eq(jobs.revision, job.revision),
+        sql`${jobs.expiresAt} > clock_timestamp()`,
+        sql`${new Date(message.expires_at).toISOString()}::timestamptz > clock_timestamp()`,
+      ),
+    )
     .returning({ id: jobs.id });
   if (updated.length !== 1) throw new ConnectorStoreError("EVENT_REJECTED");
   await appendJobEvent(database, job.id, {
@@ -810,6 +844,13 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
           ? await lockClientJob(tx, identity, message.payload.job_id)
           : undefined;
       const connector = await lockConnector(tx, identity);
+      const currentTime = await readCurrentTimeAtLeast(tx, now);
+      if (Date.parse(message.expires_at) <= currentTime.getTime()) {
+        throw new ConnectorStoreError(
+          "CLIENT_REPLAY_MISMATCH",
+          "Expired message",
+        );
+      }
       const existingRows = await tx
         .select()
         .from(connectorMessages)
@@ -884,14 +925,14 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
           identity,
           message,
           lockedJob,
-          now,
+          currentTime,
         );
       } else if (message.type === "job.event") {
-        await ingestJobEvent(tx, message, lockedJob, now);
+        await ingestJobEvent(tx, message, lockedJob, currentTime);
       } else if (message.type === "ack") {
         await tx
           .update(connectorMessages)
-          .set({ acknowledgedAt: now })
+          .set({ acknowledgedAt: currentTime })
           .where(
             and(
               eq(connectorMessages.connectorId, connector.id),
@@ -907,14 +948,18 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
               sanitizeConnectorText(capability, 64),
             ) ?? connector.capabilities)
           : connector.capabilities;
+      const isHeartbeat =
+        message.type === "connector.hello" ||
+        message.type === "connector.heartbeat";
       await tx
         .update(connectors)
         .set({
           lastClientSequence: message.sequence,
-          lastHeartbeatAt: now,
-          health: "fresh",
+          ...(isHeartbeat
+            ? { lastHeartbeatAt: currentTime, health: "fresh" as const }
+            : {}),
           capabilities,
-          updatedAt: now,
+          updatedAt: currentTime,
         })
         .where(
           and(
@@ -923,13 +968,15 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
           ),
         );
       connector.lastClientSequence = message.sequence;
-      connector.lastHeartbeatAt = now;
-      connector.health = "fresh";
+      if (isHeartbeat) {
+        connector.lastHeartbeatAt = currentTime;
+        connector.health = "fresh";
+      }
 
       if (message.type === "connector.hello") {
         await tx
           .update(connectorMessages)
-          .set({ acknowledgedAt: now })
+          .set({ acknowledgedAt: currentTime })
           .where(
             and(
               eq(connectorMessages.connectorId, connector.id),
@@ -944,13 +991,13 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
           tx,
           connector.id,
           message.payload.last_server_sequence,
-          now,
+          currentTime,
         );
         await tombstoneExpiredServerMessages(
           tx,
           connector.id,
           message.payload.last_server_sequence,
-          now,
+          currentTime,
         );
         const replayRows = await tx
           .select()
@@ -976,7 +1023,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
             server_sequence: connector.lastServerSequence + 1,
             replay_from: message.payload.last_server_sequence + 1,
           },
-          new Date(now.getTime() + 60_000),
+          new Date(currentTime.getTime() + 60_000),
           message.correlation_id,
         );
         return {
@@ -999,7 +1046,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
                   message:
                     "The offered job was cancelled before it was claimed.",
                 },
-                new Date(now.getTime() + 60_000),
+                new Date(currentTime.getTime() + 60_000),
                 message.correlation_id,
               )
             : await enqueueServerMessage(
@@ -1007,7 +1054,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
                 connector,
                 "ack",
                 { sequence: message.sequence },
-                new Date(now.getTime() + 60_000),
+                new Date(currentTime.getTime() + 60_000),
                 message.correlation_id,
               );
       return { duplicate: false, replay: [], response };

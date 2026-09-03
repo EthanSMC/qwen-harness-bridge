@@ -358,6 +358,25 @@ const readJob = async (
   return rows[0];
 };
 
+const readCurrentTimeAtLeast = async (
+  database: QueryDatabase,
+  atLeast: Date,
+): Promise<Date> => {
+  const rows = await database.execute(
+    sql`select greatest(clock_timestamp(), ${atLeast.toISOString()}::timestamptz) as "currentTime"`,
+  );
+  const value = (rows[0] as { currentTime?: Date | string } | undefined)
+    ?.currentTime;
+  if (value === undefined) {
+    throw new Error("Current database time is missing");
+  }
+  const currentTime = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(currentTime.getTime())) {
+    throw new Error("Current database time is invalid");
+  }
+  return currentTime.getTime() >= atLeast.getTime() ? currentTime : atLeast;
+};
+
 const isTerminal = (status: JobStatus): boolean =>
   TERMINAL_JOB_STATES.has(status);
 
@@ -961,7 +980,7 @@ export class JobRepository {
   ): Promise<JobRecord | null> {
     validateClaim(input);
     return this.#db.transaction(async (tx) => {
-      const now = new Date();
+      const validationStart = new Date();
       const lockedRows = await tx
         .select()
         .from(jobs)
@@ -974,8 +993,6 @@ export class JobRepository {
         current.connectorId !== input.connectorId ||
         current.leaseId !== input.leaseId ||
         current.leaseExpiresAt === null ||
-        current.leaseExpiresAt.getTime() <= now.getTime() ||
-        current.expiresAt.getTime() <= now.getTime() ||
         input.attempt !== current.attempt + 1
       ) {
         return null;
@@ -991,6 +1008,14 @@ export class JobRepository {
         return null;
       }
 
+      const currentTime = await readCurrentTimeAtLeast(tx, validationStart);
+      if (
+        current.leaseExpiresAt.getTime() <= currentTime.getTime() ||
+        current.expiresAt.getTime() <= currentTime.getTime()
+      ) {
+        return null;
+      }
+
       const updatedRows = await tx
         .update(jobs)
         .set({
@@ -999,7 +1024,7 @@ export class JobRepository {
           connectorId: input.connectorId,
           attempt: input.attempt,
           leaseId: input.leaseId,
-          leaseExpiresAt: sql`least(now() + interval '30 seconds', ${jobs.expiresAt})`,
+          leaseExpiresAt: sql`least(clock_timestamp() + interval '30 seconds', ${jobs.expiresAt})`,
           revision: sql`${jobs.revision} + 1`,
           updatedAt: sql`now()`,
         })
@@ -1011,8 +1036,8 @@ export class JobRepository {
             eq(jobs.attempt, input.attempt - 1),
             eq(jobs.connectorId, input.connectorId),
             eq(jobs.leaseId, input.leaseId),
-            gt(jobs.leaseExpiresAt, now),
-            gt(jobs.expiresAt, now),
+            sql`${jobs.leaseExpiresAt} > clock_timestamp()`,
+            sql`${jobs.expiresAt} > clock_timestamp()`,
           ),
         )
         .returning();
