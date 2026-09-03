@@ -5,10 +5,9 @@ import { type Duplex, PassThrough } from "node:stream";
 import { connect as connectTls } from "node:tls";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hashConnectorCredential } from "../../apps/control-plane/src/connector/auth.js";
-import {
-  ConnectorStoreError,
-  PostgresConnectorStore,
-} from "../../apps/control-plane/src/connector/outbox.js";
+import { PostgresConnectorStore } from "../../apps/control-plane/src/connector/outbox.js";
+import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js";
+import { Aes256GcmEncryptor } from "../../apps/control-plane/src/domain/job-coordinator.js";
 import { createApp } from "../../apps/control-plane/src/http/app.js";
 import {
   type ConnectorCredentials,
@@ -25,6 +24,7 @@ const SESSION_SIGNING_KEY = "qhb-connector-session-signing-key-fixture-only";
 type ConnectorGatewayOptions = {
   database: unknown;
   sessionSigningKey: string;
+  requestDecryptor?: Aes256GcmEncryptor;
 };
 
 type GatewayAppOptions = Parameters<typeof createApp>[0] & {
@@ -291,7 +291,10 @@ const seedConnector = async (
   };
 };
 
-const startApp = async (dispatchIntervalMs?: number) => {
+const startApp = async (
+  dispatchIntervalMs?: number,
+  requestDecryptor?: Aes256GcmEncryptor,
+) => {
   const app = await createGatewayApp({
     coordinator: noOpCoordinator as never,
     ownerId: OWNER_ID,
@@ -301,6 +304,7 @@ const startApp = async (dispatchIntervalMs?: number) => {
       database: db.client,
       sessionSigningKey: SESSION_SIGNING_KEY,
       ...(dispatchIntervalMs === undefined ? {} : { dispatchIntervalMs }),
+      ...(requestDecryptor === undefined ? {} : { requestDecryptor }),
     },
   });
   await app.listen({ host: "127.0.0.1", port: 0 });
@@ -885,84 +889,141 @@ describe("Connector gateway authentication and handshake", () => {
 
   it("refetches an offer that expires during materialization as a same-sequence tombstone", async () => {
     const credentials = await seedConnector(db);
-    const store = new PostgresConnectorStore(db.client);
-    const offer = await store.enqueueServer(
-      {
-        ownerId: OWNER_ID,
-        connectorId: credentials.connector_id,
-        protocolVersion: "1.0",
-      },
-      "job.offer",
-      {
-        job_id: crypto.randomUUID(),
-        attempt: 1,
-        lease_id: crypto.randomUUID(),
-        repository_id: crypto.randomUUID(),
-      },
-      new Date(Date.now() + 60_000),
+    const plaintextRequest =
+      "gateway expiry integration request must never be emitted";
+    const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(57));
+    const repositoryId = `gateway-expiry-${crypto.randomUUID()}`;
+    await db.query(
+      `INSERT INTO repository_policies
+         (id, owner_id, display_name, canonical_path, allowed_action_classes)
+       VALUES ($1, $2, 'Gateway expiry repository', '/private/redacted', '[]'::jsonb)`,
+      [repositoryId, OWNER_ID],
     );
-    const tombstone = {
-      ...offer,
-      messageId: crypto.randomUUID(),
-      type: "protocol.error" as const,
-      payload: {
-        code: "MESSAGE_EXPIRED",
-        message: "A Connector message expired before delivery.",
-      },
-      expiresAt: new Date(Date.now() + 60_000),
-    };
-    const originalMaterializeServerMessage =
-      PostgresConnectorStore.prototype.materializeServerMessage;
-    const originalPendingServerMessages =
-      PostgresConnectorStore.prototype.pendingServerMessages;
-    let threwExpired = false;
-    vi.spyOn(
-      PostgresConnectorStore.prototype,
-      "materializeServerMessage",
-    ).mockImplementation(async function (stored, decryptor) {
-      if (!threwExpired && stored.sequence === offer.sequence) {
-        threwExpired = true;
-        throw new ConnectorStoreError("MESSAGE_EXPIRED" as never);
-      }
-      return originalMaterializeServerMessage.call(this, stored, decryptor);
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      clientRequestId: crypto.randomUUID(),
+      repositoryId,
+      requestCiphertext: cipher.encrypt(plaintextRequest),
+      requestDigest: `sha256:${"7".repeat(64)}`,
     });
-    vi.spyOn(
-      PostgresConnectorStore.prototype,
-      "pendingServerMessages",
-    ).mockImplementation(async function (identity, afterSequence, now) {
-      const pending = await originalPendingServerMessages.call(
-        this,
-        identity,
-        afterSequence,
-        now,
-      );
-      if (!threwExpired || afterSequence >= offer.sequence) return pending;
-      return pending.map((message) =>
-        message.sequence === offer.sequence ? tombstone : message,
-      );
-    });
-
-    const app = await startApp(50);
+    const leaseId = crypto.randomUUID();
+    const jobExpiresAt = new Date(Date.now() + 60_000);
+    await db.query(
+      `UPDATE jobs
+          SET connector_id = $1,
+              status = 'running'::job_status,
+              attempt = 1,
+              lease_id = $2,
+              lease_expires_at = $3,
+              expires_at = $4,
+              current_stage = 'running'
+        WHERE id = $5`,
+      [
+        credentials.connector_id,
+        leaseId,
+        jobExpiresAt,
+        jobExpiresAt,
+        job.jobId,
+      ],
+    );
+    const app = await startApp(50, cipher);
     let connector: FakeConnector | undefined;
     try {
       connector = await FakeConnector.connect(app, credentials);
-      expect(
-        connector.wireReceived.filter(
-          (message) => message.type === "protocol.error",
-        ),
-      ).toEqual([
-        expect.objectContaining({
-          message_id: tombstone.messageId,
-          sequence: offer.sequence,
-          type: "protocol.error",
-          payload: expect.objectContaining({ code: "MESSAGE_EXPIRED" }),
-        }),
-      ]);
+      const store = new PostgresConnectorStore(db.client);
+      const originalMaterializeServerMessage =
+        PostgresConnectorStore.prototype.materializeServerMessage;
+      let expiryMutationCount = 0;
+      vi.spyOn(
+        PostgresConnectorStore.prototype,
+        "materializeServerMessage",
+      ).mockImplementation(async function (stored, decryptor) {
+        if (stored.type === "job.offer" && expiryMutationCount === 0) {
+          const expired = await db.query(
+            `UPDATE connector_messages
+                SET expires_at = now() - interval '1 second'
+              WHERE connector_id = $1
+                AND direction = 'server'
+                AND sequence = $2
+                AND message_id = $3
+              RETURNING message_id`,
+            [stored.connectorId, stored.sequence, stored.messageId],
+          );
+          expiryMutationCount += expired.rows.length;
+        }
+        return originalMaterializeServerMessage.call(this, stored, decryptor);
+      });
 
+      const offer = await store.enqueueServer(
+        {
+          ownerId: OWNER_ID,
+          connectorId: credentials.connector_id,
+          protocolVersion: "1.0",
+        },
+        "job.offer",
+        {
+          job_id: job.jobId,
+          attempt: 1,
+          lease_id: leaseId,
+          repository_id: repositoryId,
+        },
+        jobExpiresAt,
+      );
+
+      const tombstone = await connector.next("protocol.error");
+      expect(tombstone).toMatchObject({
+        sequence: offer.sequence,
+        type: "protocol.error",
+        payload: {
+          code: "MESSAGE_EXPIRED",
+          message: "A Connector message expired before delivery.",
+        },
+      });
+      expect(tombstone.message_id).not.toBe(offer.messageId);
+      expect(expiryMutationCount).toBe(1);
+      expect(
+        connector.wireReceived.some((message) => message.type === "job.offer"),
+      ).toBe(false);
+      expect(JSON.stringify(connector.wireReceived)).not.toContain(
+        plaintextRequest,
+      );
+
+      const persisted = await db.query<{
+        sequence: number;
+        message_id: string;
+        type: string;
+        payload: { code: string; message: string };
+        acknowledged_at: Date | null;
+      }>(
+        `SELECT sequence::integer AS sequence, message_id, type, payload, acknowledged_at
+           FROM connector_messages
+          WHERE connector_id = $1 AND direction = 'server' AND sequence = $2`,
+        [credentials.connector_id, offer.sequence],
+      );
+      expect(persisted.rows).toHaveLength(1);
+      expect(persisted.rows[0]).toMatchObject({
+        sequence: offer.sequence,
+        message_id: tombstone.message_id,
+        type: "protocol.error",
+        payload: {
+          code: "MESSAGE_EXPIRED",
+          message: "A Connector message expired before delivery.",
+        },
+        acknowledged_at: null,
+      });
+
+      await connector.ack(tombstone);
       const heartbeat = await connector.send("connector.heartbeat", {});
       await expect(connector.next("ack")).resolves.toMatchObject({
         payload: { sequence: heartbeat.sequence },
       });
+      const acknowledged = await db.query<{ acknowledged_at: Date | null }>(
+        `SELECT acknowledged_at
+           FROM connector_messages
+          WHERE connector_id = $1 AND direction = 'server' AND sequence = $2`,
+        [credentials.connector_id, offer.sequence],
+      );
+      expect(acknowledged.rows[0]?.acknowledged_at).not.toBeNull();
     } finally {
       if (connector !== undefined) await connector.close();
       await app.close();
