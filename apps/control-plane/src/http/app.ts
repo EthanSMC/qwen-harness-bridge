@@ -100,7 +100,7 @@ export async function createApp(
           credentialId: input.credential_id,
           credentialSecret: input.credential_secret,
         });
-        if (identity.connectorId !== input.connector_id) {
+        if (identity.connectorId !== input.connector_id.toLowerCase()) {
           throw new Error("invalid");
         }
         const token = connectorGateway.sessionService.issue(identity);

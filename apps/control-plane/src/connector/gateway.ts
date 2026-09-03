@@ -483,6 +483,12 @@ class ServerWebSocket {
   }
 }
 
+type ActiveConnectorConnection = Readonly<{
+  connection: ServerWebSocket;
+  generation: symbol;
+  invalidate(): void;
+}>;
+
 const authorizationHeaderCount = (request: IncomingMessage): number => {
   let count = 0;
   for (let index = 0; index < request.rawHeaders.length; index += 2) {
@@ -514,6 +520,7 @@ export class ConnectorGateway {
   readonly #dispatchIntervalMs: number;
   readonly #now: () => Date;
   readonly #connections = new Set<ServerWebSocket>();
+  readonly #activeConnections = new Map<string, ActiveConnectorConnection>();
   readonly #upgradeListener: (
     request: IncomingMessage,
     socket: Duplex,
@@ -568,6 +575,7 @@ export class ConnectorGateway {
     server.off("upgrade", this.#upgradeListener);
     const connections = [...this.#connections];
     this.#connections.clear();
+    this.#activeConnections.clear();
     this.#closePromise = Promise.allSettled(
       connections.map((connection) => connection.closeGracefully()),
     ).then(() => undefined);
@@ -626,6 +634,7 @@ export class ConnectorGateway {
     head: Buffer,
     identity: ConnectorIdentity,
   ): void {
+    const connectionGeneration = Symbol("connector websocket generation");
     let initialized = false;
     let accepting = true;
     let scanAfterSequence = 0;
@@ -637,6 +646,7 @@ export class ConnectorGateway {
     let storeOperationTail = Promise.resolve();
     let failureGeneration = 0;
     let timer: ReturnType<typeof setInterval> | undefined;
+    let connection!: ServerWebSocket;
     const runStoreBeforeDeadline = async <T>(
       operation: () => Promise<T>,
       deadline: number,
@@ -685,11 +695,17 @@ export class ConnectorGateway {
       void operationPromise.then(finishStoreOperation, finishStoreOperation);
       return awaitBeforeDeadline(() => operationPromise, deadline);
     };
+    const isCurrentConnection = (): boolean => {
+      const active = this.#activeConnections.get(identity.connectorId);
+      return (
+        !this.#closed &&
+        active?.connection === connection &&
+        active.generation === connectionGeneration &&
+        !connection.isClosing
+      );
+    };
     const canContinue = (generation: number): boolean =>
-      accepting &&
-      generation === failureGeneration &&
-      !this.#closed &&
-      !connection.isClosing;
+      accepting && generation === failureGeneration && isCurrentConnection();
     const sendStored = async (
       connection: ServerWebSocket,
       stored: StoredServerMessage,
@@ -790,23 +806,35 @@ export class ConnectorGateway {
       if (timer !== undefined) clearInterval(timer);
       void connection.closeGracefully(1013).catch(() => undefined);
     };
+    const invalidate = (): void => {
+      if (!accepting) return;
+      accepting = false;
+      failureGeneration += 1;
+      if (timer !== undefined) clearInterval(timer);
+      void connection.closeGracefully().catch(() => undefined);
+    };
     const closeConnection = (): void => {
       accepting = false;
       failureGeneration += 1;
       if (timer !== undefined) clearInterval(timer);
       this.#connections.delete(connection);
+      const active = this.#activeConnections.get(identity.connectorId);
+      if (
+        active?.connection === connection &&
+        active.generation === connectionGeneration
+      ) {
+        this.#activeConnections.delete(identity.connectorId);
+      }
     };
     const failProtocol = async (code: string): Promise<void> => {
-      if (!accepting) return;
+      if (!accepting || !isCurrentConnection()) return;
       accepting = false;
       failureGeneration += 1;
-      const generation = failureGeneration;
+      const failureGenerationAtStart = failureGeneration;
       if (timer !== undefined) clearInterval(timer);
       const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
       const canContinueFailure = (): boolean =>
-        generation === failureGeneration &&
-        !this.#closed &&
-        !connection.isClosing;
+        failureGenerationAtStart === failureGeneration && isCurrentConnection();
       try {
         const errorMessage = await runStoreBeforeDeadline(
           () =>
@@ -832,7 +860,7 @@ export class ConnectorGateway {
             deadline,
             canContinueFailure,
           );
-          if (error !== DEADLINE_EXCEEDED) {
+          if (error !== DEADLINE_EXCEEDED && canContinueFailure()) {
             await awaitBeforeDeadline(
               () => connection.sendJson(error, deadline),
               deadline,
@@ -844,8 +872,8 @@ export class ConnectorGateway {
       }
     };
     const handle = async (serialized: string): Promise<void> => {
-      if (!accepting) return;
       const generation = failureGeneration;
+      if (!canContinue(generation)) return;
       let message: ConnectorClientMessage;
       try {
         message = ConnectorClientMessageSchema.parse(JSON.parse(serialized));
@@ -949,9 +977,9 @@ export class ConnectorGateway {
         await failProtocol(code);
       }
     };
-    const connection = new ServerWebSocket(socket, {
+    connection = new ServerWebSocket(socket, {
       message: (value) => {
-        if (!accepting || connection.isClosing || this.#closed) return;
+        if (!canContinue(failureGeneration)) return;
         const messageBytes = Buffer.byteLength(value, "utf8");
         if (
           pendingMessageCount >= MAX_PENDING_MESSAGES ||
@@ -978,6 +1006,13 @@ export class ConnectorGateway {
       close: closeConnection,
     });
     this.#connections.add(connection);
+    const previous = this.#activeConnections.get(identity.connectorId);
+    this.#activeConnections.set(identity.connectorId, {
+      connection,
+      generation: connectionGeneration,
+      invalidate,
+    });
+    previous?.invalidate();
     connection.initialize(head);
   }
 }

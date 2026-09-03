@@ -519,6 +519,218 @@ describe("Connector gateway authentication and handshake", () => {
     }
   });
 
+  it("accepts an uppercase connector UUID during session exchange", async () => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    try {
+      const session = await FakeConnector.exchangeSession(app, {
+        ...credentials,
+        connector_id: credentials.connector_id.toUpperCase(),
+      });
+
+      expect(session.token).toEqual(expect.any(String));
+      expect(session.expires_at).toEqual(expect.any(String));
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("keeps the replacement generation usable while stopping old pump and receive work", async () => {
+    const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(83));
+    const originalAcceptClientMessage =
+      PostgresConnectorStore.prototype.acceptClientMessage;
+    const originalMaterializeServerMessage =
+      PostgresConnectorStore.prototype.materializeServerMessage;
+    let releaseFirstHeartbeat: (() => void) | undefined;
+    let firstHeartbeatStartedResolve!: () => void;
+    let firstHeartbeatFinishedResolve!: () => void;
+    const firstHeartbeatStarted = new Promise<void>((resolve) => {
+      firstHeartbeatStartedResolve = resolve;
+    });
+    const firstHeartbeatFinished = new Promise<void>((resolve) => {
+      firstHeartbeatFinishedResolve = resolve;
+    });
+    const firstHeartbeatGate = new Promise<void>((resolve) => {
+      releaseFirstHeartbeat = resolve;
+    });
+    let secondHeartbeatStarted = false;
+    let releaseSecondHeartbeat: (() => void) | undefined;
+    const secondHeartbeatGate = new Promise<void>((resolve) => {
+      releaseSecondHeartbeat = resolve;
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "acceptClientMessage",
+    ).mockImplementation(async function (identity, message, now) {
+      if (message.type === "connector.heartbeat" && message.sequence === 2) {
+        firstHeartbeatStartedResolve();
+        await firstHeartbeatGate;
+      }
+      if (message.type === "connector.heartbeat" && message.sequence === 3) {
+        secondHeartbeatStarted = true;
+        await secondHeartbeatGate;
+      }
+      const accepted = await originalAcceptClientMessage.call(
+        this,
+        identity,
+        message,
+        now,
+      );
+      if (message.type === "connector.heartbeat" && message.sequence === 2) {
+        firstHeartbeatFinishedResolve();
+      }
+      return accepted;
+    });
+
+    let releaseOfferMaterialization: (() => void) | undefined;
+    let offerMaterializationStartedResolve!: () => void;
+    let offerMaterializationFinishedResolve!: () => void;
+    const offerMaterializationStarted = new Promise<void>((resolve) => {
+      offerMaterializationStartedResolve = resolve;
+    });
+    const offerMaterializationFinished = new Promise<void>((resolve) => {
+      offerMaterializationFinishedResolve = resolve;
+    });
+    const offerMaterializationGate = new Promise<void>((resolve) => {
+      releaseOfferMaterialization = resolve;
+    });
+    let blockOfferMaterialization = false;
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "materializeServerMessage",
+    ).mockImplementation(async function (stored, decryptor) {
+      if (stored.type === "job.offer" && blockOfferMaterialization) {
+        blockOfferMaterialization = false;
+        offerMaterializationStartedResolve();
+        await offerMaterializationGate;
+        offerMaterializationFinishedResolve();
+      }
+      return originalMaterializeServerMessage.call(this, stored, decryptor);
+    });
+
+    let app: Awaited<ReturnType<typeof startApp>> | undefined;
+    let oldConnector: FakeConnector | undefined;
+    let replacementSocket: Duplex | undefined;
+    try {
+      app = await startApp(10, cipher);
+      const credentials = await seedConnector(db);
+      oldConnector = await FakeConnector.connect(app, credentials);
+
+      await oldConnector.send("connector.heartbeat", {});
+      await firstHeartbeatStarted;
+      releaseFirstHeartbeat?.();
+      await firstHeartbeatFinished;
+      await expect(oldConnector.next("ack")).resolves.toMatchObject({
+        payload: { sequence: 2 },
+      });
+
+      const repositoryId = crypto.randomUUID();
+      await db.query(
+        `INSERT INTO repository_policies
+           (id, owner_id, display_name, canonical_path, allowed_action_classes)
+         VALUES ($1, $2, 'Gateway reconnect repository', '/private/redacted', '[]'::jsonb)`,
+        [repositoryId, OWNER_ID],
+      );
+      await new JobRepository(db.client).createIdempotent({
+        ownerId: OWNER_ID,
+        clientRequestId: crypto.randomUUID(),
+        repositoryId,
+        requestCiphertext: cipher.encrypt(
+          "gateway reconnect request must be delivered once",
+        ),
+        requestDigest: `sha256:${"8".repeat(64)}`,
+      });
+      blockOfferMaterialization = true;
+      await offerMaterializationStarted;
+
+      await oldConnector.send("connector.heartbeat", {});
+      replacementSocket = await rawConnectorSocket(app, credentials);
+
+      releaseOfferMaterialization?.();
+      await offerMaterializationFinished;
+
+      sendRawFrame(
+        replacementSocket,
+        0x1,
+        Buffer.from(
+          JSON.stringify({
+            protocol_version: "1.0",
+            message_id: crypto.randomUUID(),
+            sequence: 3,
+            sent_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 60_000).toISOString(),
+            correlation_id: crypto.randomUUID(),
+            type: "connector.hello",
+            payload: {
+              connector_id: credentials.connector_id,
+              connector_version: "replacement-generation-test/1.0",
+              capabilities: ["harness", "integration-test"],
+              last_server_sequence: 2,
+              last_client_sequence: 2,
+            },
+          }),
+        ),
+      );
+      await expect(
+        waitForServerMessage(
+          replacementSocket,
+          (message) => message.type === "connector.welcome",
+        ),
+      ).resolves.toMatchObject({
+        type: "connector.welcome",
+        payload: { connector_id: credentials.connector_id },
+      });
+
+      sendRawFrame(
+        replacementSocket,
+        0x1,
+        Buffer.from(
+          JSON.stringify({
+            protocol_version: "1.0",
+            message_id: crypto.randomUUID(),
+            sequence: 4,
+            sent_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 60_000).toISOString(),
+            correlation_id: crypto.randomUUID(),
+            type: "connector.heartbeat",
+            payload: {},
+          }),
+        ),
+      );
+      await expect(
+        waitForServerMessage(
+          replacementSocket,
+          (message) =>
+            message.type === "ack" &&
+            (message.payload as { sequence?: unknown }).sequence === 4,
+        ),
+      ).resolves.toMatchObject({
+        type: "ack",
+        payload: { sequence: 4 },
+      });
+
+      expect(secondHeartbeatStarted).toBe(false);
+      expect(
+        oldConnector.wireReceived.filter(
+          (message) => message.type === "job.offer",
+        ),
+      ).toHaveLength(0);
+      const state = await db.query<{ last_client_sequence: number }>(
+        "SELECT last_client_sequence FROM connectors WHERE id = $1",
+        [credentials.connector_id],
+      );
+      expect(Number(state.rows[0]?.last_client_sequence)).toBe(4);
+    } finally {
+      releaseFirstHeartbeat?.();
+      releaseOfferMaterialization?.();
+      releaseSecondHeartbeat?.();
+      replacementSocket?.destroy();
+      if (oldConnector !== undefined) await oldConnector.disconnectWithoutAck();
+      if (app !== undefined) await app.close();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("persists and returns protocol.error before closing a sequence gap", async () => {
     const app = await startApp();
     const credentials = await seedConnector(db);
