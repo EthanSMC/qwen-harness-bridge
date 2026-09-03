@@ -16,10 +16,11 @@ import { Aes256GcmEncryptor } from "../../apps/control-plane/src/domain/job-coor
 import { createTestDatabase } from "./support/postgres.js";
 
 const database = createTestDatabase();
-const OWNER_ID = "connector-outbox-owner";
-const REPOSITORY_ID = "connector-outbox-repository";
-const CONNECTOR_ID = "00000000-0000-4000-8000-000000000051";
-const CREDENTIAL_ID = "connector-outbox-credential";
+const FIXTURE_NAMESPACE = crypto.randomUUID().replaceAll("-", "").slice(0, 16);
+const OWNER_ID = `connector-outbox-owner-${FIXTURE_NAMESPACE}`;
+const REPOSITORY_ID = `connector-outbox-repository-${FIXTURE_NAMESPACE}`;
+const CONNECTOR_ID = crypto.randomUUID();
+const CREDENTIAL_ID = `connector-outbox-credential-${FIXTURE_NAMESPACE}`;
 const REQUEST = "Run the focused connector outbox integration tests";
 const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(51));
 
@@ -371,6 +372,77 @@ describe("PostgreSQL Connector outbox", () => {
     expect(
       new Date(stored.rows[0]?.lease_expires_at ?? 0).getTime(),
     ).toBeLessThanOrEqual(new Date(stored.rows[0]?.expires_at ?? 0).getTime());
+    await database.query(
+      "UPDATE jobs SET status = 'expired'::job_status WHERE id = $1",
+      [job.jobId],
+    );
+  });
+
+  it("does not dispatch a job that expires while waiting for the connector row lock", async () => {
+    const testIdentity = await insertConnector();
+    const job = await createJob(
+      `dispatch-expiry-lock-${crypto.randomUUID()}`,
+      "Dispatch expiry lock",
+    );
+    const callerNow = new Date();
+    const expiresAt = await expiryAfter(250);
+    await database.query("UPDATE jobs SET expires_at = $1 WHERE id = $2", [
+      expiresAt,
+      job.jobId,
+    ]);
+    const store = new PostgresConnectorStore(database.client);
+    const holder = holdConnectorRowUntil(testIdentity.connectorId, expiresAt);
+    await holder.ready;
+    const dispatch = store.dispatchNext(testIdentity, callerNow);
+    try {
+      await waitForRowLockWaiter("connectors");
+    } finally {
+      holder.releaseToExpiry();
+    }
+    await holder.done;
+
+    await expect(dispatch).resolves.toBeNull();
+    await expect(
+      database.query<{
+        status: string;
+        connector_id: string | null;
+        lease_id: string | null;
+        lease_expires_at: string | null;
+        revision: number;
+        attempt: number;
+      }>(
+        `SELECT status, connector_id, lease_id, lease_expires_at, revision, attempt
+           FROM jobs
+          WHERE id = $1`,
+        [job.jobId],
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        {
+          status: "queued",
+          connector_id: null,
+          lease_id: null,
+          lease_expires_at: null,
+          revision: 0,
+          attempt: 0,
+        },
+      ],
+    });
+    await expect(
+      database.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM job_events WHERE job_id = $1",
+        [job.jobId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: "0" }] });
+    await expect(
+      database.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM connector_messages
+          WHERE connector_id = $1 AND direction = 'server' AND type = 'job.offer'`,
+        [testIdentity.connectorId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: "0" }] });
+    await expectClientCursor(testIdentity.connectorId, 0);
     await database.query(
       "UPDATE jobs SET status = 'expired'::job_status WHERE id = $1",
       [job.jobId],

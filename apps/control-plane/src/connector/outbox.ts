@@ -1134,6 +1134,8 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
       const job = jobRows[0];
       if (job === undefined) return null;
       const connector = await lockConnector(tx, identity);
+      const currentTime = await readCurrentTimeAtLeast(tx, now);
+      if (job.expiresAt.getTime() <= currentTime.getTime()) return null;
       if (job.requestCiphertext === null) {
         throw new ConnectorStoreError("INTERNAL", "Queued request is missing");
       }
@@ -1142,13 +1144,16 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         redispatch &&
         (job.leaseId === null ||
           job.leaseExpiresAt === null ||
-          job.leaseExpiresAt.getTime() > now.getTime())
+          job.leaseExpiresAt.getTime() > currentTime.getTime())
       ) {
         throw new ConnectorStoreError("INTERNAL", "Offer lease is invalid");
       }
       const leaseId = crypto.randomUUID();
       const leaseExpiresAt = new Date(
-        Math.min(now.getTime() + OFFER_LEASE_MS, job.expiresAt.getTime()),
+        Math.min(
+          currentTime.getTime() + OFFER_LEASE_MS,
+          job.expiresAt.getTime(),
+        ),
       );
       const attempt = job.attempt + 1;
       const updated = await tx
@@ -1160,7 +1165,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
           leaseId,
           leaseExpiresAt,
           revision: sql`${jobs.revision} + 1`,
-          updatedAt: now,
+          updatedAt: currentTime,
         })
         .where(
           and(
@@ -1169,6 +1174,10 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
             eq(jobs.revision, job.revision),
             redispatch && job.leaseId !== null
               ? eq(jobs.leaseId, job.leaseId)
+              : undefined,
+            sql`${jobs.expiresAt} > clock_timestamp()`,
+            redispatch
+              ? sql`${jobs.leaseExpiresAt} <= clock_timestamp()`
               : undefined,
           ),
         )
