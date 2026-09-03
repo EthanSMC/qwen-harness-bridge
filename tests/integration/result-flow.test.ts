@@ -288,6 +288,36 @@ describe("authenticated Connector terminal results through production MCP", () =
     }
   });
 
+  it("omits negative and fractional Connector test counts from the public result", async () => {
+    const fixture = await startResultFixture();
+    try {
+      const { job } = await submitTerminalResult(fixture, {
+        ...resultPayload(),
+        tests: {
+          passed: -1,
+          failed: 0.5,
+          summary: "invalid Connector counts",
+        },
+      });
+      const result = await fixture.mcp.client.callTool({
+        name: "get_task_result",
+        arguments: { job_id: job.job_id },
+      });
+
+      expect(result.isError).not.toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        job_id: job.job_id,
+        tests: {
+          passed: 0,
+          failed: 0,
+          summary: "invalid Connector counts",
+        },
+      });
+    } finally {
+      await closeResultFixture(fixture);
+    }
+  });
+
   it("deduplicates an exact terminal event and rejects a modified same-ID replay without mutation", async () => {
     const fixture = await startResultFixture();
     try {
@@ -398,6 +428,12 @@ describe("authenticated Connector terminal results through production MCP", () =
         arguments: { job_id: job.job_id },
       });
       expect(committedResult.isError).not.toBe(true);
+      await db.query(
+        `UPDATE jobs
+            SET expires_at = clock_timestamp() - interval '1 second'
+          WHERE id = $1`,
+        [job.job_id],
+      );
 
       const beforeLaterEvent = await db.query<{
         acknowledged_at: Date | null;
@@ -449,6 +485,21 @@ describe("authenticated Connector terminal results through production MCP", () =
         type: "ack",
         payload: { sequence: laterEvent.sequence },
       });
+      await fixture.connector.send("job.event", laterEvent.payload, {
+        message_id: laterEvent.message_id,
+        sequence: laterEvent.sequence,
+        correlation_id: laterEvent.correlation_id,
+        sent_at: laterEvent.sent_at,
+        expires_at: laterEvent.expires_at,
+      });
+      await expect
+        .poll(
+          () =>
+            fixture.connector.wireReceived.filter(
+              (message) => message.message_id === laterResponse.message_id,
+            ).length,
+        )
+        .toBe(2);
 
       const laterAudit = await db.query<{
         event_type: string;

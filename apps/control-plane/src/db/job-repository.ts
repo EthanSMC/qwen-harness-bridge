@@ -290,6 +290,11 @@ const asStringArray = (value: unknown): string[] =>
     ? value.filter((item): item is string => typeof item === "string")
     : [];
 
+const asNonNegativeInteger = (value: unknown): number =>
+  typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : 0;
+
 const toJobResultRecord = (row: JobRow): JobResultRecord | null => {
   const summary = asRecord(row.summary);
   if (
@@ -332,14 +337,8 @@ const toJobResultRecord = (row: JobRow): JobResultRecord | null => {
     summary: typeof summary.summary === "string" ? summary.summary : "",
     changedFiles: asStringArray(summary.changed_files ?? summary.changedFiles),
     tests: {
-      passed:
-        testSummary !== null && typeof testSummary.passed === "number"
-          ? testSummary.passed
-          : 0,
-      failed:
-        testSummary !== null && typeof testSummary.failed === "number"
-          ? testSummary.failed
-          : 0,
+      passed: asNonNegativeInteger(testSummary?.passed),
+      failed: asNonNegativeInteger(testSummary?.failed),
       summary:
         testSummary !== null && typeof testSummary.summary === "string"
           ? testSummary.summary
@@ -408,17 +407,24 @@ const enqueueServerCommand = async (
     );
   }
 
-  let effectiveExpiresAt = expiresAt;
-  if (type === "approval.decision") {
-    const currentTime = await readDatabaseTime(database);
-    if (expiresAt.getTime() <= currentTime.getTime()) {
-      throw new JobRepositoryError(
-        "APPROVAL_EXPIRED",
-        "The approval job expired before its decision could be delivered",
-      );
-    }
-    effectiveExpiresAt = commandExpiresAt(expiresAt, currentTime);
+  const expiryError = (): JobRepositoryError =>
+    type === "approval.decision"
+      ? new JobRepositoryError(
+          "APPROVAL_EXPIRED",
+          "The approval job expired before its decision could be delivered",
+        )
+      : new JobRepositoryError(
+          "REVISION_CONFLICT",
+          "The job expired before cancellation could be delivered",
+        );
+  const currentTime = await readDatabaseTime(database);
+  if (expiresAt.getTime() <= currentTime.getTime()) {
+    throw expiryError();
   }
+  const effectiveExpiresAt =
+    type === "approval.decision"
+      ? commandExpiresAt(expiresAt, currentTime)
+      : expiresAt;
 
   const sequence = connector.lastServerSequence + 1;
   if (!Number.isSafeInteger(sequence) || sequence < 1) {
@@ -456,6 +462,11 @@ const enqueueServerCommand = async (
     payload,
     expiresAt: effectiveExpiresAt,
   });
+  if (
+    effectiveExpiresAt.getTime() <= (await readDatabaseTime(database)).getTime()
+  ) {
+    throw expiryError();
+  }
 };
 
 const nextEventSequence = async (
@@ -1083,20 +1094,20 @@ export class JobRepository {
     input: RecordApprovalDecisionInput,
   ): Promise<ApprovalRecord> {
     const outcome = await this.#db.transaction(async (tx) => {
-      const approvalRows = await tx
-        .select()
+      const approvalIdentityRows = await tx
+        .select({ jobId: approvals.jobId })
         .from(approvals)
         .where(eq(approvals.id, input.approvalId))
-        .for("update");
-      const approval = approvalRows[0];
-      if (approval === undefined) {
+        .limit(1);
+      const approvalIdentity = approvalIdentityRows[0];
+      if (approvalIdentity === undefined) {
         throw new JobRepositoryError("NOT_FOUND", "Approval not found");
       }
 
       const jobRows = await tx
         .select()
         .from(jobs)
-        .where(eq(jobs.id, approval.jobId))
+        .where(eq(jobs.id, approvalIdentity.jobId))
         .for("update");
       const job = jobRows[0];
       if (
@@ -1107,6 +1118,26 @@ export class JobRepository {
       }
 
       const task4 = input.ownerId !== undefined;
+      if (task4 && job.connectorId !== null) {
+        await tx
+          .select({ id: connectors.id })
+          .from(connectors)
+          .where(eq(connectors.id, job.connectorId))
+          .for("update");
+      }
+
+      const approvalRows = await tx
+        .select()
+        .from(approvals)
+        .where(
+          and(eq(approvals.id, input.approvalId), eq(approvals.jobId, job.id)),
+        )
+        .for("update");
+      const approval = approvalRows[0];
+      if (approval === undefined) {
+        throw new JobRepositoryError("NOT_FOUND", "Approval not found");
+      }
+
       const currentTime = task4
         ? await readDatabaseTime(tx)
         : (input.now ?? new Date());

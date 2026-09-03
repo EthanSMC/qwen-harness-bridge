@@ -177,16 +177,34 @@ describe("PostgreSQL cancellation flow", () => {
         fixture.jobId,
       );
       if (winner === null) throw new Error("expected a terminal winner");
+      await database.query(
+        `UPDATE jobs
+            SET expires_at = clock_timestamp() - interval '1 second'
+          WHERE id = $1`,
+        [fixture.jobId],
+      );
 
       const lateCancellation = clientEnvelope("job.cancelled", 3, {
         job_id: fixture.jobId,
         attempt: fixture.attempt,
         reason: "late cancellation acknowledgement",
       });
+      const first = await fixture.store.acceptClientMessage(
+        fixture.identity,
+        lateCancellation,
+      );
+      expect(first).toMatchObject({
+        response: { type: "ack", payload: { sequence: 3 } },
+      });
       await expect(
         fixture.store.acceptClientMessage(fixture.identity, lateCancellation),
       ).resolves.toMatchObject({
-        response: { type: "ack", payload: { sequence: 3 } },
+        duplicate: true,
+        response: {
+          messageId: first.response?.messageId,
+          type: "ack",
+          payload: { sequence: 3 },
+        },
       });
 
       const afterArbitration = await fixture.repository.get(

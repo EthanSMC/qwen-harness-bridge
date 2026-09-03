@@ -679,6 +679,29 @@ const readDatabaseTime = async (database: QueryDatabase): Promise<Date> => {
   return currentTime;
 };
 
+const assertDeadlinesAfterWrite = async (
+  database: QueryDatabase,
+  deadlines: readonly Date[],
+): Promise<void> => {
+  const currentTime = await readDatabaseTime(database);
+  if (
+    deadlines.some((deadline) => deadline.getTime() <= currentTime.getTime())
+  ) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
+};
+
+const databaseErrorCode = (error: unknown): string | undefined => {
+  let candidate = error;
+  for (let depth = 0; depth < 5; depth += 1) {
+    if (candidate === null || typeof candidate !== "object") return;
+    const code = (candidate as { code?: unknown }).code;
+    if (typeof code === "string") return code;
+    candidate = (candidate as { cause?: unknown }).cause;
+  }
+  return;
+};
+
 const enqueueServerMessage = async (
   database: QueryDatabase,
   connector: ConnectorRow,
@@ -831,17 +854,24 @@ const ingestApprovalRequested = async (
     throw new ConnectorStoreError("EVENT_REJECTED");
   }
 
-  await database.insert(approvals).values({
-    id: message.payload.approval_id,
-    jobId: job.id,
-    attempt: message.payload.attempt,
-    jobRevision: message.payload.job_revision,
-    actionSummary,
-    impactSummary,
-    actionFingerprint: message.payload.action_fingerprint,
-    riskClass,
-    expiresAt: new Date(message.payload.expires_at),
-  });
+  try {
+    await database.insert(approvals).values({
+      id: message.payload.approval_id,
+      jobId: job.id,
+      attempt: message.payload.attempt,
+      jobRevision: message.payload.job_revision,
+      actionSummary,
+      impactSummary,
+      actionFingerprint: message.payload.action_fingerprint,
+      riskClass,
+      expiresAt: new Date(message.payload.expires_at),
+    });
+  } catch (error) {
+    if (databaseErrorCode(error) === "23505") {
+      throw new ConnectorStoreError("EVENT_REJECTED");
+    }
+    throw error;
+  }
   await appendJobEvent(database, job.id, {
     type: "approval.requested",
     payload: {
@@ -858,12 +888,11 @@ const ingestApprovalRequested = async (
     messageId: message.message_id,
     correlationId: message.correlation_id,
   });
-  if (
-    Date.parse(message.expires_at) <=
-    (await readDatabaseTime(database)).getTime()
-  ) {
-    throw new ConnectorStoreError("EVENT_REJECTED");
-  }
+  await assertDeadlinesAfterWrite(database, [
+    new Date(message.expires_at),
+    job.expiresAt,
+    new Date(message.payload.expires_at),
+  ]);
 };
 
 const ingestJobCancelled = async (
@@ -872,16 +901,16 @@ const ingestJobCancelled = async (
   job: JobRow | undefined,
   now: Date,
 ): Promise<void> => {
-  if (
-    job === undefined ||
-    job.attempt !== message.payload.attempt ||
-    job.expiresAt.getTime() <= now.getTime()
-  ) {
+  if (job === undefined || job.attempt !== message.payload.attempt) {
     throw new ConnectorStoreError("EVENT_REJECTED");
   }
 
   const reason = sanitizeConnectorText(message.payload.reason, 400);
-  if (job.status === "cancelling") {
+  const active = job.status === "cancelling";
+  if (active) {
+    if (job.expiresAt.getTime() <= now.getTime()) {
+      throw new ConnectorStoreError("EVENT_REJECTED");
+    }
     const updatedRows = await database
       .update(jobs)
       .set({
@@ -921,12 +950,12 @@ const ingestJobCancelled = async (
     messageId: message.message_id,
     correlationId: message.correlation_id,
   });
-  if (
-    Date.parse(message.expires_at) <=
-    (await readDatabaseTime(database)).getTime()
-  ) {
-    throw new ConnectorStoreError("EVENT_REJECTED");
-  }
+  await assertDeadlinesAfterWrite(
+    database,
+    active
+      ? [new Date(message.expires_at), job.expiresAt]
+      : [new Date(message.expires_at)],
+  );
 };
 
 const withdrawCancelledOffer = async (
@@ -1069,11 +1098,7 @@ const ingestJobEvent = async (
   job: JobRow | undefined,
   now: Date,
 ): Promise<void> => {
-  if (
-    job === undefined ||
-    job.attempt !== message.payload.attempt ||
-    job.expiresAt.getTime() <= now.getTime()
-  ) {
+  if (job === undefined || job.attempt !== message.payload.attempt) {
     throw new ConnectorStoreError("EVENT_REJECTED");
   }
   const sanitizedPayload = sanitizeConnectorEventPayload(
@@ -1100,9 +1125,13 @@ const ingestJobEvent = async (
       messageId: message.message_id,
       correlationId: message.correlation_id,
     });
+    await assertDeadlinesAfterWrite(database, [new Date(message.expires_at)]);
     return;
   }
   if (!CLAIMED_JOB_STATES.has(job.status)) {
+    throw new ConnectorStoreError("EVENT_REJECTED");
+  }
+  if (job.expiresAt.getTime() <= now.getTime()) {
     throw new ConnectorStoreError("EVENT_REJECTED");
   }
   if (nextStatus !== job.status) {
@@ -1152,6 +1181,10 @@ const ingestJobEvent = async (
     messageId: message.message_id,
     correlationId: message.correlation_id,
   });
+  await assertDeadlinesAfterWrite(database, [
+    new Date(message.expires_at),
+    job.expiresAt,
+  ]);
 };
 
 export class PostgresConnectorStore implements ConnectorCredentialStore {
