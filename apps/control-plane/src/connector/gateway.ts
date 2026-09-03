@@ -86,7 +86,7 @@ type OutboundWrite = {
 class ServerWebSocket {
   readonly #socket: Duplex;
   readonly #handlers: FrameHandlers;
-  #buffer: Buffer;
+  #buffer = Buffer.alloc(0);
   #closed = false;
   #closing = false;
   #closePromise: Promise<void> | undefined;
@@ -100,14 +100,16 @@ class ServerWebSocket {
   #pendingPong: Buffer | undefined;
   #pongDraining = false;
 
-  constructor(socket: Duplex, head: Buffer, handlers: FrameHandlers) {
+  constructor(socket: Duplex, handlers: FrameHandlers) {
     this.#socket = socket;
-    this.#buffer = head;
     this.#handlers = handlers;
     socket.on("data", (chunk: Buffer) => this.#read(chunk));
     socket.once("close", () => this.#finish());
     socket.once("error", () => this.#finish());
-    if (head.length > 0) this.#read(Buffer.alloc(0));
+  }
+
+  initialize(head: Buffer): void {
+    if (head.length > 0) this.#read(head);
   }
 
   get isClosing(): boolean {
@@ -781,7 +783,6 @@ export class ConnectorGateway {
         dispatching = false;
       }
     };
-    let connection: ServerWebSocket;
     const rejectPendingOverflow = (): void => {
       if (!accepting) return;
       accepting = false;
@@ -948,7 +949,7 @@ export class ConnectorGateway {
         await failProtocol(code);
       }
     };
-    connection = new ServerWebSocket(socket, head, {
+    const connection = new ServerWebSocket(socket, {
       message: (value) => {
         if (!accepting || connection.isClosing || this.#closed) return;
         const messageBytes = Buffer.byteLength(value, "utf8");
@@ -977,6 +978,7 @@ export class ConnectorGateway {
       close: closeConnection,
     });
     this.#connections.add(connection);
+    connection.initialize(head);
   }
 }
 

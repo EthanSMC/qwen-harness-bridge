@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import * as https from "node:https";
 import { type AddressInfo, Socket } from "node:net";
-import type { Duplex } from "node:stream";
+import { type Duplex, PassThrough } from "node:stream";
+import { connect as connectTls } from "node:tls";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hashConnectorCredential } from "../../apps/control-plane/src/connector/auth.js";
 import {
@@ -41,16 +42,35 @@ const sendRawFrame = (
   options: {
     fin?: boolean;
     masked?: boolean;
+    mask?: Buffer;
     rsv?: number;
     lengthCode?: 126 | 127;
   } = {},
 ): void => {
+  socket.write(encodeRawFrame(opcode, payload, options));
+};
+
+const encodeRawFrame = (
+  opcode: number,
+  payload: Buffer,
+  options: {
+    fin?: boolean;
+    masked?: boolean;
+    mask?: Buffer;
+    rsv?: number;
+    lengthCode?: 126 | 127;
+  } = {},
+): Buffer => {
   const fin = options.fin ?? true;
   const masked = options.masked ?? true;
   const rsv = options.rsv ?? 0;
   const mask = masked
-    ? Buffer.from(crypto.randomUUID().replaceAll("-", "")).subarray(0, 4)
+    ? (options.mask ??
+      Buffer.from(crypto.randomUUID().replaceAll("-", "")).subarray(0, 4))
     : undefined;
+  if (mask !== undefined && mask.length !== 4) {
+    throw new Error("Raw WebSocket test mask must be four bytes");
+  }
   const length = payload.length;
   const lengthCode =
     options.lengthCode ?? (length < 126 ? 0 : length <= 0xffff ? 126 : 127);
@@ -73,26 +93,45 @@ const sendRawFrame = (
       ? (payload[index] ?? 0) ^ (mask?.[index % 4] ?? 0)
       : (payload[index] ?? 0);
   }
-  socket.write(frame);
+  return frame;
 };
 
 const waitForServerMessage = async (
   socket: Duplex,
   predicate: (message: Record<string, unknown>) => boolean,
+  options: { upgradeResponse?: boolean } = {},
 ): Promise<Record<string, unknown>> => {
   let buffer = Buffer.alloc(0);
+  let upgradeResponseSeen = !options.upgradeResponse;
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      socket.off("data", onData);
-      reject(new Error("Timed out waiting for server message"));
-    }, 2_000);
-    const finish = (message: Record<string, unknown>): void => {
+    let timeout: ReturnType<typeof setTimeout>;
+    const cleanup = (): void => {
       clearTimeout(timeout);
       socket.off("data", onData);
+    };
+    const finish = (message: Record<string, unknown>): void => {
+      cleanup();
       resolve(message);
+    };
+    const fail = (error: Error): void => {
+      cleanup();
+      reject(error);
     };
     const onData = (chunk: Buffer): void => {
       buffer = Buffer.concat([buffer, chunk]);
+      if (!upgradeResponseSeen) {
+        const headerEnd = buffer.indexOf("\r\n\r\n");
+        if (headerEnd < 0) return;
+        const responseHead = buffer
+          .subarray(0, headerEnd + 4)
+          .toString("ascii");
+        if (!responseHead.startsWith("HTTP/1.1 101 Switching Protocols\r\n")) {
+          fail(new Error(`Connector upgrade returned: ${responseHead}`));
+          return;
+        }
+        upgradeResponseSeen = true;
+        buffer = buffer.subarray(headerEnd + 4);
+      }
       while (buffer.length >= 2) {
         const first = buffer[0] ?? 0;
         const second = buffer[1] ?? 0;
@@ -107,7 +146,7 @@ const waitForServerMessage = async (
           if (buffer.length < 10) return;
           const extended = buffer.readBigUInt64BE(2);
           if (extended > BigInt(Number.MAX_SAFE_INTEGER)) {
-            reject(new Error("Server frame is too large for test parser"));
+            fail(new Error("Server frame is too large for test parser"));
             return;
           }
           length = Number(extended);
@@ -122,7 +161,7 @@ const waitForServerMessage = async (
         try {
           parsed = JSON.parse(payload.toString("utf8"));
         } catch {
-          reject(new Error("Server text frame was not JSON"));
+          fail(new Error("Server text frame was not JSON"));
           return;
         }
         if (
@@ -135,8 +174,62 @@ const waitForServerMessage = async (
         }
       }
     };
+    timeout = setTimeout(() => {
+      fail(new Error("Timed out waiting for server message"));
+    }, 2_000);
     socket.on("data", onData);
   });
+};
+
+const rawConnectorSocketWithCoalescedHead = async (
+  app: Awaited<ReturnType<typeof startApp>>,
+  credentials: ConnectorCredentials,
+  head: Buffer,
+): Promise<Duplex> => {
+  const address = app.server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("Gateway app is not listening on a TCP address");
+  }
+  const session = await FakeConnector.exchangeSession(app, credentials);
+  const key = Buffer.from(
+    crypto.randomUUID().replaceAll("-", ""),
+    "hex",
+  ).toString("base64");
+  const socket = connectTls({
+    host: "127.0.0.1",
+    port: (address as AddressInfo).port,
+    ca: LOCALHOST_TLS.cert,
+    rejectUnauthorized: true,
+    servername: "localhost",
+  });
+  await new Promise<void>((resolve, reject) => {
+    const onSecureConnect = (): void => {
+      socket.off("error", onError);
+      resolve();
+    };
+    const onError = (error: Error): void => {
+      socket.off("secureConnect", onSecureConnect);
+      reject(error);
+    };
+    socket.once("secureConnect", onSecureConnect);
+    socket.once("error", onError);
+  });
+  socket.write(
+    Buffer.concat([
+      Buffer.from(
+        "GET /connector/v1 HTTP/1.1\r\n" +
+          "Host: localhost\r\n" +
+          "Connection: Upgrade\r\n" +
+          "Upgrade: websocket\r\n" +
+          `Authorization: Bearer ${session.token}\r\n` +
+          "Sec-WebSocket-Version: 13\r\n" +
+          `Sec-WebSocket-Key: ${key}\r\n\r\n`,
+        "ascii",
+      ),
+      head,
+    ]),
+  );
+  return socket;
 };
 
 const readClosePayload = (chunks: readonly Buffer[]): Buffer | undefined => {
@@ -310,6 +403,60 @@ afterAll(async () => {
 });
 
 describe("Connector gateway authentication and handshake", () => {
+  it("rejects a non-101 Upgrade response and removes its data listener", async () => {
+    const socket = new PassThrough();
+    const result = waitForServerMessage(socket, () => true, {
+      upgradeResponse: true,
+    });
+    socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n");
+
+    await expect(result).rejects.toThrow("Connector upgrade returned");
+    expect(socket.listenerCount("data")).toBe(0);
+  });
+
+  it("processes a masked hello coalesced into the HTTP Upgrade head", async () => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    const hello = JSON.stringify({
+      protocol_version: "1.0",
+      message_id: crypto.randomUUID(),
+      sequence: 1,
+      sent_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      correlation_id: crypto.randomUUID(),
+      type: "connector.hello",
+      payload: {
+        connector_id: credentials.connector_id,
+        connector_version: "coalesced-head-test/1.0",
+        capabilities: ["harness", "integration-test"],
+        last_server_sequence: 0,
+        last_client_sequence: 0,
+      },
+    });
+    const socket = await rawConnectorSocketWithCoalescedHead(
+      app,
+      credentials,
+      encodeRawFrame(0x1, Buffer.from(hello), {
+        mask: Buffer.from([0x01, 0x23, 0x45, 0x67]),
+      }),
+    );
+    try {
+      await expect(
+        waitForServerMessage(
+          socket,
+          (message) => message.type === "connector.welcome",
+          { upgradeResponse: true },
+        ),
+      ).resolves.toMatchObject({
+        type: "connector.welcome",
+        payload: { connector_id: credentials.connector_id },
+      });
+    } finally {
+      socket.destroy();
+      await app.close();
+    }
+  });
+
   it("exchanges a device credential, rejects the Qwen MCP bearer, and completes TLS hello/welcome", async () => {
     const app = await startApp();
     const credentials = await seedConnector(db);
@@ -1201,6 +1348,12 @@ describe("Connector gateway authentication and handshake", () => {
     let writesInFlight = 0;
     let maximumWritesInFlight = 0;
     let heldWrites = 0;
+    const pongPayloads: Buffer[] = [];
+    const pingPayloads = Array.from({ length: 63 }, (_, index) =>
+      Buffer.from(`ping-${index}`),
+    );
+    const latestPingPayload = Buffer.from("latest-ping-application-payload");
+    pingPayloads.push(latestPingPayload);
     const writeSpy = vi
       .spyOn(Socket.prototype, "write")
       .mockImplementation(function (this: Socket, ...args) {
@@ -1211,6 +1364,22 @@ describe("Connector gateway authentication and handshake", () => {
           Buffer.isBuffer(chunk) &&
           ((chunk[0] ?? 0) & 0x80) !== 0
         ) {
+          if (((chunk[0] ?? 0) & 0x0f) === 0xa) {
+            const lengthCode = (chunk[1] ?? 0) & 0x7f;
+            const payloadOffset =
+              lengthCode === 126 ? 4 : lengthCode === 127 ? 10 : 2;
+            const payloadLength =
+              lengthCode === 126
+                ? chunk.readUInt16BE(2)
+                : lengthCode === 127
+                  ? Number(chunk.readBigUInt64BE(2))
+                  : lengthCode;
+            pongPayloads.push(
+              Buffer.from(
+                chunk.subarray(payloadOffset, payloadOffset + payloadLength),
+              ),
+            );
+          }
           writesInFlight += 1;
           maximumWritesInFlight = Math.max(
             maximumWritesInFlight,
@@ -1220,6 +1389,7 @@ describe("Connector gateway authentication and handshake", () => {
           const timer = setTimeout(() => {
             writesInFlight -= 1;
             callbackFn?.();
+            this.emit("drain");
           }, 25);
           timer.unref();
           return false;
@@ -1227,13 +1397,20 @@ describe("Connector gateway authentication and handshake", () => {
         return originalWrite.apply(this, args);
       });
     try {
-      for (let index = 0; index < 64; index += 1) {
-        sendRawFrame(socket, 0x9, Buffer.from([index]));
+      for (const payload of pingPayloads) {
+        sendRawFrame(socket, 0x9, payload);
       }
-      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      await vi.waitFor(
+        () => {
+          expect(pongPayloads.at(-1)).toEqual(latestPingPayload);
+        },
+        { timeout: 2_000, interval: 10 },
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 75));
 
       expect(heldWrites).toBeGreaterThan(0);
       expect(maximumWritesInFlight).toBe(1);
+      expect(pongPayloads.at(-1)).toEqual(latestPingPayload);
     } finally {
       writeSpy.mockRestore();
       socket.destroy();
