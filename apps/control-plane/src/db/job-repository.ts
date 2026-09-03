@@ -358,12 +358,9 @@ const readJob = async (
   return rows[0];
 };
 
-const readCurrentTimeAtLeast = async (
-  database: QueryDatabase,
-  atLeast: Date,
-): Promise<Date> => {
+const readDatabaseTime = async (database: QueryDatabase): Promise<Date> => {
   const rows = await database.execute(
-    sql`select greatest(clock_timestamp(), ${atLeast.toISOString()}::timestamptz) as "currentTime"`,
+    sql`select clock_timestamp() as "currentTime"`,
   );
   const value = (rows[0] as { currentTime?: Date | string } | undefined)
     ?.currentTime;
@@ -374,7 +371,7 @@ const readCurrentTimeAtLeast = async (
   if (Number.isNaN(currentTime.getTime())) {
     throw new Error("Current database time is invalid");
   }
-  return currentTime.getTime() >= atLeast.getTime() ? currentTime : atLeast;
+  return currentTime;
 };
 
 const isTerminal = (status: JobStatus): boolean =>
@@ -980,7 +977,6 @@ export class JobRepository {
   ): Promise<JobRecord | null> {
     validateClaim(input);
     return this.#db.transaction(async (tx) => {
-      const validationStart = new Date();
       const lockedRows = await tx
         .select()
         .from(jobs)
@@ -1008,7 +1004,7 @@ export class JobRepository {
         return null;
       }
 
-      const currentTime = await readCurrentTimeAtLeast(tx, validationStart);
+      const currentTime = await readDatabaseTime(tx);
       if (
         current.leaseExpiresAt.getTime() <= currentTime.getTime() ||
         current.expiresAt.getTime() <= currentTime.getTime()

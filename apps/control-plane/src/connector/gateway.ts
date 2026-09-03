@@ -35,6 +35,9 @@ const SOCKET_WRITE_TIMEOUT_MS = 1_000;
 const DEFAULT_DISPATCH_INTERVAL_MS = 250;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const DEADLINE_EXCEEDED = Symbol("connector gateway deadline exceeded");
+const STORE_OPERATION_NOT_STARTED = Symbol(
+  "connector store operation not started",
+);
 
 const isValidCloseStatusCode = (code: number): boolean =>
   (code >= 1000 && code <= 1003) ||
@@ -518,9 +521,9 @@ export class ConnectorGateway {
   readonly #sessionService: ReturnType<typeof createConnectorSessionService>;
   readonly #requestDecryptor: RequestDecryptor | undefined;
   readonly #dispatchIntervalMs: number;
-  readonly #now: () => Date;
   readonly #connections = new Set<ServerWebSocket>();
   readonly #activeConnections = new Map<string, ActiveConnectorConnection>();
+  readonly #storeOperations = new Set<Promise<unknown>>();
   readonly #upgradeListener: (
     request: IncomingMessage,
     socket: Duplex,
@@ -537,7 +540,6 @@ export class ConnectorGateway {
       now: options.now ?? (() => new Date()),
     });
     this.#requestDecryptor = options.requestDecryptor;
-    this.#now = options.now ?? (() => new Date());
     this.#dispatchIntervalMs =
       options.dispatchIntervalMs === undefined
         ? DEFAULT_DISPATCH_INTERVAL_MS
@@ -550,11 +552,15 @@ export class ConnectorGateway {
       throw new Error("Connector dispatch interval must be 10..5000 ms");
     }
     this.#upgradeListener = (request, socket, head) => {
-      void this.#upgrade(request, socket, head);
+      void this.#upgrade(request, socket, head).catch(() => {
+        if (!socket.destroyed) socket.destroy();
+      });
     };
     server.on("upgrade", this.#upgradeListener);
     this.#healthTimer = setInterval(() => {
-      void this.#store.refreshHealth(this.#now()).catch(() => undefined);
+      void this.#trackStoreOperation(this.#store.refreshHealth()).catch(
+        () => undefined,
+      );
     }, HEARTBEAT_INTERVAL_MS);
     this.#healthTimer.unref();
   }
@@ -576,10 +582,28 @@ export class ConnectorGateway {
     const connections = [...this.#connections];
     this.#connections.clear();
     this.#activeConnections.clear();
-    this.#closePromise = Promise.allSettled(
-      connections.map((connection) => connection.closeGracefully()),
-    ).then(() => undefined);
+    this.#closePromise = (async () => {
+      await Promise.allSettled(
+        connections.map((connection) => connection.closeGracefully()),
+      );
+      await this.#waitForStoreOperations();
+    })();
     return this.#closePromise;
+  }
+
+  #trackStoreOperation<T>(operation: Promise<T>): Promise<T> {
+    this.#storeOperations.add(operation);
+    const remove = (): void => {
+      this.#storeOperations.delete(operation);
+    };
+    void operation.then(remove, remove);
+    return operation;
+  }
+
+  async #waitForStoreOperations(): Promise<void> {
+    while (this.#storeOperations.size > 0) {
+      await Promise.allSettled([...this.#storeOperations]);
+    }
   }
 
   async #upgrade(
@@ -587,46 +611,54 @@ export class ConnectorGateway {
     socket: Duplex,
     head: Buffer,
   ): Promise<void> {
-    let pathname: string;
     try {
-      pathname = new URL(request.url ?? "", "https://localhost").pathname;
+      socket.once("error", () => {
+        if (!socket.destroyed) socket.destroy();
+      });
+      if (this.#closed) return rejectUpgrade(socket);
+      let pathname: string;
+      try {
+        pathname = new URL(request.url ?? "", "https://localhost").pathname;
+      } catch {
+        return rejectUpgrade(socket, 404);
+      }
+      if (pathname !== "/connector/v1") return rejectUpgrade(socket, 404);
+      let claims: ConnectorSessionClaims;
+      try {
+        if (authorizationHeaderCount(request) !== 1) throw new Error("auth");
+        claims = this.#sessionService.authenticate(request.headers);
+      } catch {
+        return rejectUpgrade(socket);
+      }
+      const key = request.headers["sec-websocket-key"];
+      const decodedKey =
+        typeof key === "string" ? Buffer.from(key, "base64") : undefined;
+      const connectionTokens = request.headers.connection
+        ?.split(",")
+        .map((token) => token.trim().toLowerCase());
+      if (
+        request.headers.upgrade?.toLowerCase() !== "websocket" ||
+        !connectionTokens?.includes("upgrade") ||
+        request.headers["sec-websocket-version"] !== "13" ||
+        typeof key !== "string" ||
+        decodedKey?.length !== 16 ||
+        decodedKey.toString("base64") !== key
+      ) {
+        return rejectUpgrade(socket);
+      }
+      const accept = createHash("sha1")
+        .update(`${key}${WEBSOCKET_GUID}`, "ascii")
+        .digest("base64");
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\n" +
+          "Upgrade: websocket\r\n" +
+          "Connection: Upgrade\r\n" +
+          `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+      );
+      this.#openConnection(socket, head, identityFromClaims(claims));
     } catch {
-      return rejectUpgrade(socket, 404);
+      if (!socket.destroyed) socket.destroy();
     }
-    if (pathname !== "/connector/v1") return rejectUpgrade(socket, 404);
-    let claims: ConnectorSessionClaims;
-    try {
-      if (authorizationHeaderCount(request) !== 1) throw new Error("auth");
-      claims = this.#sessionService.authenticate(request.headers);
-    } catch {
-      return rejectUpgrade(socket);
-    }
-    const key = request.headers["sec-websocket-key"];
-    const decodedKey =
-      typeof key === "string" ? Buffer.from(key, "base64") : undefined;
-    const connectionTokens = request.headers.connection
-      ?.split(",")
-      .map((token) => token.trim().toLowerCase());
-    if (
-      request.headers.upgrade?.toLowerCase() !== "websocket" ||
-      !connectionTokens?.includes("upgrade") ||
-      request.headers["sec-websocket-version"] !== "13" ||
-      typeof key !== "string" ||
-      decodedKey?.length !== 16 ||
-      decodedKey.toString("base64") !== key
-    ) {
-      return rejectUpgrade(socket);
-    }
-    const accept = createHash("sha1")
-      .update(`${key}${WEBSOCKET_GUID}`, "ascii")
-      .digest("base64");
-    socket.write(
-      "HTTP/1.1 101 Switching Protocols\r\n" +
-        "Upgrade: websocket\r\n" +
-        "Connection: Upgrade\r\n" +
-        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-    );
-    this.#openConnection(socket, head, identityFromClaims(claims));
   }
 
   #openConnection(
@@ -657,43 +689,31 @@ export class ConnectorGateway {
       }
       scheduledStoreOperations += 1;
       const previousOperation = storeOperationTail;
-      let releaseStoreSlot!: () => void;
-      const storeSlot = new Promise<void>((resolve) => {
-        releaseStoreSlot = resolve;
-      });
-      storeOperationTail = previousOperation
-        .catch(() => undefined)
-        .then(() => storeSlot);
       const finishStoreOperation = (): void => {
         scheduledStoreOperations -= 1;
-        releaseStoreSlot();
-        if (scheduledStoreOperations === 0) {
-          storeOperationTail = Promise.resolve();
-        }
       };
-
-      const acquired = await awaitBeforeDeadline(
-        () => previousOperation.catch(() => undefined),
+      const operationPromise = previousOperation
+        .catch(() => undefined)
+        .then(async () => {
+          if (!canStart() || Date.now() >= deadline) {
+            return STORE_OPERATION_NOT_STARTED;
+          }
+          return operation();
+        });
+      const trackedOperation = this.#trackStoreOperation(
+        operationPromise.finally(finishStoreOperation),
+      );
+      storeOperationTail = trackedOperation.then(
+        () => undefined,
+        () => undefined,
+      );
+      const result = await awaitBeforeDeadline(
+        () => trackedOperation,
         deadline,
       );
-      if (
-        acquired === DEADLINE_EXCEEDED ||
-        Date.now() >= deadline ||
-        !canStart()
-      ) {
-        finishStoreOperation();
-        return DEADLINE_EXCEEDED;
-      }
-
-      let operationPromise: Promise<T>;
-      try {
-        operationPromise = operation();
-      } catch (error) {
-        finishStoreOperation();
-        throw error;
-      }
-      void operationPromise.then(finishStoreOperation, finishStoreOperation);
-      return awaitBeforeDeadline(() => operationPromise, deadline);
+      return result === STORE_OPERATION_NOT_STARTED
+        ? DEADLINE_EXCEEDED
+        : result;
     };
     const isCurrentConnection = (): boolean => {
       const active = this.#activeConnections.get(identity.connectorId);
@@ -765,19 +785,14 @@ export class ConnectorGateway {
       try {
         if (!canContinue(generation)) return;
         const dispatched = await runStoreBeforeDeadline(
-          () => this.#store.dispatchNext(identity, this.#now()),
+          () => this.#store.dispatchNext(identity),
           deadline,
           () => canContinue(generation),
         );
         if (dispatched === DEADLINE_EXCEEDED) return;
         if (!canContinue(generation)) return;
         const pending = await runStoreBeforeDeadline(
-          () =>
-            this.#store.pendingServerMessages(
-              identity,
-              scanAfterSequence,
-              this.#now(),
-            ),
+          () => this.#store.pendingServerMessages(identity, scanAfterSequence),
           deadline,
           () => canContinue(generation),
         );
@@ -838,12 +853,10 @@ export class ConnectorGateway {
       try {
         const errorMessage = await runStoreBeforeDeadline(
           () =>
-            this.#store.enqueueServer(
-              identity,
-              "protocol.error",
-              { code, message: "Connector protocol error." },
-              new Date(this.#now().getTime() + 60_000),
-            ),
+            this.#store.enqueueServer(identity, "protocol.error", {
+              code,
+              message: "Connector protocol error.",
+            }),
           deadline,
           canContinueFailure,
         );
@@ -889,7 +902,7 @@ export class ConnectorGateway {
       const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
       try {
         const accepted = await runStoreBeforeDeadline(
-          () => this.#store.acceptClientMessage(identity, message, this.#now()),
+          () => this.#store.acceptClientMessage(identity, message),
           deadline,
           () => canContinue(generation),
         );
@@ -930,7 +943,6 @@ export class ConnectorGateway {
                   this.#store.pendingServerMessages(
                     identity,
                     scanAfterSequence,
-                    this.#now(),
                   ),
                 deadline,
                 () => canContinue(generation),

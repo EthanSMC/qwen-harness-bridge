@@ -28,6 +28,10 @@ export type ConnectorEndpoint = string | ListeningHttpsApp;
 
 export { LOCALHOST_TLS } from "./tls.js";
 
+export const FAKE_CONNECTOR_BOOTSTRAP_TIMEOUT_MS = 2_000;
+export const FAKE_CONNECTOR_SOCKET_TIMEOUT_MS = 2_000;
+export const FAKE_CONNECTOR_HELLO_WELCOME_TIMEOUT_MS = 2_000;
+
 export type SendOverrides = Readonly<{
   message_id?: string;
   sequence?: number;
@@ -78,7 +82,41 @@ const requestJson = async (
 ): Promise<{ statusCode: number; body: string }> => {
   const body = JSON.stringify(payload);
   return new Promise((resolve, reject) => {
-    const httpRequest = request(
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let responseStream: import("node:http").IncomingMessage | undefined;
+    let onResponseData: ((chunk: string) => void) | undefined;
+    let onResponseEnd: (() => void) | undefined;
+    let onResponseError: ((error: Error) => void) | undefined;
+    let httpRequest: ReturnType<typeof request>;
+    const cleanup = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      httpRequest.off("error", onRequestError);
+      if (responseStream !== undefined) {
+        if (onResponseData !== undefined)
+          responseStream.off("data", onResponseData);
+        if (onResponseEnd !== undefined)
+          responseStream.off("end", onResponseEnd);
+        if (onResponseError !== undefined)
+          responseStream.off("error", onResponseError);
+      }
+    };
+    const finish = (
+      error: Error | undefined,
+      result?: { statusCode: number; body: string },
+    ): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error === undefined) {
+        resolve(result as { statusCode: number; body: string });
+      } else {
+        httpRequest.destroy();
+        reject(error);
+      }
+    };
+    const onRequestError = (error: Error): void => finish(error);
+    httpRequest = request(
       url,
       {
         method: "POST",
@@ -91,20 +129,28 @@ const requestJson = async (
         },
       },
       (response) => {
+        responseStream = response;
         let responseBody = "";
-        response.setEncoding("utf8");
-        response.on("data", (chunk: string) => {
+        onResponseData = (chunk: string): void => {
           responseBody += chunk;
-        });
-        response.once("end", () => {
-          resolve({
+        };
+        onResponseEnd = (): void => {
+          finish(undefined, {
             statusCode: response.statusCode ?? 0,
             body: responseBody,
           });
-        });
+        };
+        onResponseError = (error: Error): void => finish(error);
+        response.setEncoding("utf8");
+        response.on("data", onResponseData);
+        response.once("end", onResponseEnd);
+        response.once("error", onResponseError);
       },
     );
-    httpRequest.once("error", reject);
+    httpRequest.once("error", onRequestError);
+    timer = setTimeout(() => {
+      finish(new Error("FakeConnector bootstrap deadline exceeded"));
+    }, FAKE_CONNECTOR_BOOTSTRAP_TIMEOUT_MS);
     httpRequest.end(body);
   });
 };
@@ -167,7 +213,91 @@ class RawWebSocket {
     const url = new URL("/connector/v1", baseUrl);
     return new Promise((resolve, reject) => {
       const key = randomBytes(16).toString("base64");
-      const httpRequest = request(url, {
+      let settled = false;
+      let upgradedSocket: Duplex | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let responseStream: import("node:http").IncomingMessage | undefined;
+      let onResponseData: ((chunk: string) => void) | undefined;
+      let onResponseEnd: (() => void) | undefined;
+      let onResponseError: ((error: Error) => void) | undefined;
+      let httpRequest: ReturnType<typeof request>;
+      const cleanup = (): void => {
+        if (timer !== undefined) clearTimeout(timer);
+        httpRequest.off("upgrade", onUpgrade);
+        httpRequest.off("response", onResponse);
+        httpRequest.off("error", onRequestError);
+        if (responseStream !== undefined) {
+          if (onResponseData !== undefined)
+            responseStream.off("data", onResponseData);
+          if (onResponseEnd !== undefined)
+            responseStream.off("end", onResponseEnd);
+          if (onResponseError !== undefined)
+            responseStream.off("error", onResponseError);
+        }
+      };
+      const fail = (error: Error, socket?: Duplex): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        socket?.destroy();
+        upgradedSocket?.destroy();
+        httpRequest.destroy();
+        reject(error);
+      };
+      const onRequestError = (error: Error): void => fail(error);
+      const onUpgrade = (
+        response: import("node:http").IncomingMessage,
+        socket: Duplex,
+        head: Buffer,
+      ): void => {
+        upgradedSocket = socket;
+        if (response.statusCode !== 101) {
+          fail(
+            new Error(`Connector upgrade returned ${response.statusCode}`),
+            socket,
+          );
+          return;
+        }
+        const expectedAccept = createHash("sha1")
+          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, "ascii")
+          .digest("base64");
+        if (response.headers["sec-websocket-accept"] !== expectedAccept) {
+          fail(
+            new Error("Connector upgrade returned an invalid accept"),
+            socket,
+          );
+          return;
+        }
+        try {
+          const connector = new RawWebSocket(socket, head);
+          settled = true;
+          cleanup();
+          resolve(connector);
+        } catch (error) {
+          fail(
+            error instanceof Error ? error : new Error(String(error)),
+            socket,
+          );
+        }
+      };
+      const onResponse = (
+        response: import("node:http").IncomingMessage,
+      ): void => {
+        responseStream = response;
+        let responseBody = "";
+        onResponseData = (chunk: string): void => {
+          responseBody += chunk;
+        };
+        onResponseEnd = (): void => {
+          fail(new ConnectorHttpError(response.statusCode ?? 0, responseBody));
+        };
+        onResponseError = (error: Error): void => fail(error);
+        response.setEncoding("utf8");
+        response.on("data", onResponseData);
+        response.once("end", onResponseEnd);
+        response.once("error", onResponseError);
+      };
+      httpRequest = request(url, {
         method: "GET",
         ca: LOCALHOST_TLS.cert,
         rejectUnauthorized: true,
@@ -180,55 +310,12 @@ class RawWebSocket {
           "sec-websocket-key": key,
         },
       });
-      let settled = false;
-      httpRequest.once("upgrade", (response, socket, head) => {
-        if (response.statusCode !== 101) {
-          socket.destroy();
-          if (!settled) {
-            settled = true;
-            reject(
-              new Error(`Connector upgrade returned ${response.statusCode}`),
-            );
-          }
-          return;
-        }
-        const expectedAccept = createHash("sha1")
-          .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, "ascii")
-          .digest("base64");
-        if (response.headers["sec-websocket-accept"] !== expectedAccept) {
-          socket.destroy();
-          if (!settled) {
-            settled = true;
-            reject(new Error("Connector upgrade returned an invalid accept"));
-          }
-          return;
-        }
-        if (!settled) {
-          settled = true;
-          resolve(new RawWebSocket(socket, head));
-        }
-      });
-      httpRequest.once("response", (response) => {
-        let responseBody = "";
-        response.setEncoding("utf8");
-        response.on("data", (chunk: string) => {
-          responseBody += chunk;
-        });
-        response.once("end", () => {
-          if (!settled) {
-            settled = true;
-            reject(
-              new ConnectorHttpError(response.statusCode ?? 0, responseBody),
-            );
-          }
-        });
-      });
-      httpRequest.once("error", (error) => {
-        if (!settled) {
-          settled = true;
-          reject(error);
-        }
-      });
+      httpRequest.once("upgrade", onUpgrade);
+      httpRequest.once("response", onResponse);
+      httpRequest.once("error", onRequestError);
+      timer = setTimeout(() => {
+        fail(new Error("FakeConnector socket deadline exceeded"));
+      }, FAKE_CONNECTOR_SOCKET_TIMEOUT_MS);
       httpRequest.end();
     });
   }
@@ -279,6 +366,7 @@ class RawWebSocket {
 
   async destroy(): Promise<void> {
     if (this.#closed) return;
+    this.#socket.end();
     this.#socket.destroy();
     await this.#waitForClose();
   }
@@ -556,15 +644,23 @@ export class FakeConnector {
       sessionToken,
     );
     const connector = new FakeConnector(socket, credentials);
-    await connector.send("connector.hello", {
-      connector_id: credentials.connector_id,
-      connector_version: "fake-connector/1.0",
-      capabilities: ["harness", "integration-test"],
-      last_server_sequence: credentials.last_server_sequence ?? 0,
-      last_client_sequence: credentials.last_client_sequence ?? 0,
-    });
-    await connector.next("connector.welcome");
-    return connector;
+    try {
+      await connector.send("connector.hello", {
+        connector_id: credentials.connector_id,
+        connector_version: "fake-connector/1.0",
+        capabilities: ["harness", "integration-test"],
+        last_server_sequence: credentials.last_server_sequence ?? 0,
+        last_client_sequence: credentials.last_client_sequence ?? 0,
+      });
+      await connector.next(
+        "connector.welcome",
+        FAKE_CONNECTOR_HELLO_WELCOME_TIMEOUT_MS,
+      );
+      return connector;
+    } catch (error) {
+      await socket.destroy();
+      throw error;
+    }
   }
 
   static async exchangeSession(

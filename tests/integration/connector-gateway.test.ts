@@ -1,11 +1,14 @@
 import { createHash } from "node:crypto";
+import type { IncomingMessage } from "node:http";
 import * as https from "node:https";
 import { type AddressInfo, Socket } from "node:net";
 import { type Duplex, PassThrough } from "node:stream";
 import { connect as connectTls } from "node:tls";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hashConnectorCredential } from "../../apps/control-plane/src/connector/auth.js";
+import { createConnectorGateway } from "../../apps/control-plane/src/connector/gateway.js";
 import { PostgresConnectorStore } from "../../apps/control-plane/src/connector/outbox.js";
+import { createConnectorSessionService } from "../../apps/control-plane/src/connector/session.js";
 import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js";
 import { Aes256GcmEncryptor } from "../../apps/control-plane/src/domain/job-coordinator.js";
 import { createApp } from "../../apps/control-plane/src/http/app.js";
@@ -17,7 +20,8 @@ import {
 import { createTestDatabase, type TestDatabase } from "./support/postgres.js";
 
 const db = createTestDatabase();
-const OWNER_ID = "integration-gateway-owner";
+const FIXTURE_NAMESPACE = crypto.randomUUID().replaceAll("-", "").slice(0, 16);
+const OWNER_ID = `integration-gateway-owner-${FIXTURE_NAMESPACE}`;
 const MCP_BEARER = "qhb-mcp-bearer-fixture-only";
 const SESSION_SIGNING_KEY = "qhb-connector-session-signing-key-fixture-only";
 
@@ -398,6 +402,51 @@ const startNonMinimalFrameServer = async (
   };
 };
 
+const startStalledWebSocketServer = async (): Promise<{
+  server: https.Server;
+  socket: Duplex | undefined;
+  socketClosed: Promise<void>;
+}> => {
+  let upgradedSocket: Duplex | undefined;
+  let resolveSocketClosed!: () => void;
+  const socketClosed = new Promise<void>((resolve) => {
+    resolveSocketClosed = resolve;
+  });
+  const server = https.createServer(LOCALHOST_TLS);
+  server.on("upgrade", (request, socket) => {
+    upgradedSocket = socket;
+    socket.on("error", () => undefined);
+    socket.once("close", resolveSocketClosed);
+    socket.once("end", () => socket.destroy());
+    socket.resume();
+    const key = request.headers["sec-websocket-key"];
+    if (typeof key !== "string") {
+      socket.destroy();
+      return;
+    }
+    const accept = createHash("sha1")
+      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, "ascii")
+      .digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen({ host: "127.0.0.1", port: 0 }, () => resolve());
+  });
+  return {
+    server,
+    socketClosed,
+    get socket() {
+      return upgradedSocket;
+    },
+  };
+};
+
 beforeAll(async () => {
   await db.start();
 });
@@ -407,6 +456,93 @@ afterAll(async () => {
 });
 
 describe("Connector gateway authentication and handshake", () => {
+  it("contains synchronous Upgrade construction failures without an unhandled rejection", async () => {
+    const server = https.createServer(LOCALHOST_TLS);
+    const signingKey = "gateway-upgrade-failure-signing-key-fixture";
+    const gateway = createConnectorGateway(server, {
+      database: db.client,
+      sessionSigningKey: signingKey,
+    });
+    const session = createConnectorSessionService({
+      signingKey,
+      now: () => new Date(),
+    });
+    const connectorId = crypto.randomUUID();
+    const token = session.issue({
+      ownerId: "gateway-upgrade-failure-owner",
+      connectorId,
+      protocolVersion: "1.0",
+    });
+    const key = Buffer.alloc(16).toString("base64");
+    const socket = new PassThrough();
+    let destroyCalls = 0;
+    const originalDestroy = socket.destroy.bind(socket);
+    socket.destroy = ((...args: Parameters<typeof socket.destroy>) => {
+      destroyCalls += 1;
+      return originalDestroy(...args);
+    }) as typeof socket.destroy;
+    socket.write = (() => {
+      throw new Error("injected Upgrade write failure");
+    }) as typeof socket.write;
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      server.emit(
+        "upgrade",
+        {
+          url: "/connector/v1",
+          rawHeaders: ["Authorization", `Bearer ${token}`],
+          headers: {
+            authorization: `Bearer ${token}`,
+            connection: "Upgrade",
+            upgrade: "websocket",
+            "sec-websocket-version": "13",
+            "sec-websocket-key": key,
+          },
+        } as IncomingMessage,
+        socket,
+        Buffer.alloc(0),
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+      expect(destroyCalls).toBe(1);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await gateway.close(server);
+    }
+  });
+
+  it("times out a stalled hello and closes the raw socket", async () => {
+    const stalled = await startStalledWebSocketServer();
+    const credentials: ConnectorCredentials = {
+      connector_id: crypto.randomUUID(),
+      credential_id: `stalled-${crypto.randomUUID()}`,
+      credential_secret: `stalled-secret-${crypto.randomUUID()}`,
+    };
+
+    try {
+      await expect(
+        FakeConnector.connectWithSessionToken(
+          { server: stalled.server },
+          credentials,
+          "stalled-session-fixture",
+        ),
+      ).rejects.toThrow(
+        "Timed out waiting for Connector message connector.welcome",
+      );
+      await stalled.socketClosed;
+      expect(stalled.socket?.destroyed).toBe(true);
+    } finally {
+      stalled.socket?.destroy();
+      await new Promise<void>((resolve, reject) =>
+        stalled.server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
   it("rejects a non-101 Upgrade response and removes its data listener", async () => {
     const socket = new PassThrough();
     const result = waitForServerMessage(socket, () => true, {
@@ -1353,10 +1489,12 @@ describe("Connector gateway authentication and handshake", () => {
       );
       await acceptStarted;
 
-      await app.close();
-      appClosed = true;
+      const closing = app.close();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(appClosed).toBe(false);
       releaseAccept?.();
-      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      await closing;
+      appClosed = true;
 
       expect(setIntervalSpy.mock.calls.length).toBe(intervalsBeforeHelloReturn);
     } finally {
@@ -1837,6 +1975,60 @@ describe("Connector gateway authentication and handshake", () => {
       expect(socket.destroyed).toBe(true);
     } finally {
       socket.destroy();
+    }
+  });
+
+  it("waits for in-flight store work before app.close resolves", async () => {
+    const originalAcceptClientMessage =
+      PostgresConnectorStore.prototype.acceptClientMessage;
+    let releaseHeartbeat: (() => void) | undefined;
+    let heartbeatStarted!: () => void;
+    const heartbeatGate = new Promise<void>((resolve) => {
+      releaseHeartbeat = resolve;
+    });
+    const heartbeatWorkStarted = new Promise<void>((resolve) => {
+      heartbeatStarted = resolve;
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "acceptClientMessage",
+    ).mockImplementation(async function (identity, message, now) {
+      if (message.type === "connector.heartbeat") {
+        heartbeatStarted();
+        await heartbeatGate;
+      }
+      return originalAcceptClientMessage.call(this, identity, message, now);
+    });
+
+    const app = await startApp(5_000);
+    const credentials = await seedConnector(db);
+    const connector = await FakeConnector.connect(app, credentials);
+    try {
+      const heartbeat = connector.send("connector.heartbeat", {});
+      await heartbeatWorkStarted;
+      const closing = app.close();
+      await connector.waitForClose();
+      let closeResolved = false;
+      void closing.then(() => {
+        closeResolved = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(closeResolved).toBe(false);
+
+      releaseHeartbeat?.();
+      await heartbeat;
+      await closing;
+      await expect(
+        db.query<{ last_client_sequence: number }>(
+          "SELECT last_client_sequence::integer AS last_client_sequence FROM connectors WHERE id = $1",
+          [credentials.connector_id],
+        ),
+      ).resolves.toMatchObject({ rows: [{ last_client_sequence: 2 }] });
+    } finally {
+      releaseHeartbeat?.();
+      await connector.close();
+      vi.restoreAllMocks();
+      if (app.server.listening) await app.close();
     }
   });
 

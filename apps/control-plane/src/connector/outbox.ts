@@ -285,8 +285,23 @@ const findOriginalResponse = async (
   clientMessage: ConnectorMessageRow,
 ): Promise<OriginalResponse | null> => {
   if (message.type === "ack") return null;
-  const expectedType =
-    message.type === "connector.hello" ? "connector.welcome" : "ack";
+  const storedPayload = asRecord(clientMessage.payload);
+  const storedResponse: StoredResponseMetadata | null =
+    storedPayload === null
+      ? null
+      : (asRecord(
+          storedPayload[STORED_RESPONSE_KEY],
+        ) as StoredResponseMetadata | null);
+  if (
+    storedResponse === null ||
+    typeof storedResponse.type !== "string" ||
+    typeof storedResponse.sequence !== "number" ||
+    !Number.isSafeInteger(storedResponse.sequence) ||
+    storedResponse.sequence < 1
+  ) {
+    throw new ConnectorStoreError("INTERNAL", "Original response is missing");
+  }
+
   const rows = await database
     .select()
     .from(connectorMessages)
@@ -294,32 +309,18 @@ const findOriginalResponse = async (
       and(
         eq(connectorMessages.connectorId, connectorId),
         eq(connectorMessages.direction, "server"),
-        eq(connectorMessages.correlationId, message.correlation_id),
-        expectedType === "ack"
-          ? or(
-              eq(connectorMessages.type, "ack"),
-              eq(connectorMessages.type, "protocol.error"),
-            )
-          : or(
-              eq(connectorMessages.type, expectedType),
-              eq(connectorMessages.type, "protocol.error"),
-            ),
+        eq(connectorMessages.sequence, storedResponse.sequence),
       ),
     )
-    .orderBy(asc(connectorMessages.sequence));
-  const row = rows.find((candidate) => {
-    if (expectedType === "connector.welcome") {
-      return candidate.type === "connector.welcome";
-    }
-    if (candidate.type === "ack") {
-      return candidate.payload.sequence === message.sequence;
-    }
-    return (
-      message.type === "job.claim" &&
-      candidate.type === "protocol.error" &&
-      candidate.payload.code === "CLAIM_REJECTED"
-    );
-  });
+    .limit(2);
+  if (rows.length !== 1) {
+    throw new ConnectorStoreError("INTERNAL", "Original response is missing");
+  }
+  const row = rows[0];
+  if (row === undefined) {
+    throw new ConnectorStoreError("INTERNAL", "Original response is missing");
+  }
+
   const validateResponse = (
     candidate: ConnectorMessageRow,
     type: unknown,
@@ -383,40 +384,28 @@ const findOriginalResponse = async (
       payload: response.payload as Record<string, unknown>,
     };
   };
-  if (row !== undefined) {
-    const response = validateResponse(
-      row,
-      row.type,
-      row.payload,
-      row.sequence,
-      row.correlationId,
-    );
-    if (response === null) {
-      throw new ConnectorStoreError("INTERNAL", "Original response is invalid");
-    }
-    return response;
-  }
-  const storedPayload = asRecord(clientMessage.payload);
-  const storedResponse: StoredResponseMetadata | null =
-    storedPayload === null
-      ? null
-      : (asRecord(
-          storedPayload[STORED_RESPONSE_KEY],
-        ) as StoredResponseMetadata | null);
-  const tombstone = rows.find(
-    (candidate) =>
-      candidate.type === "protocol.error" &&
-      candidate.payload.code === "MESSAGE_EXPIRED" &&
-      storedResponse?.sequence === candidate.sequence,
-  );
-  if (tombstone === undefined || storedResponse === null) {
-    throw new ConnectorStoreError("INTERNAL", "Original response is missing");
-  }
   const storedCorrelationId = Object.hasOwn(storedResponse, "correlation_id")
     ? storedResponse.correlation_id
-    : tombstone.correlationId;
+    : row.correlationId;
+  if (
+    storedCorrelationId !== row.correlationId ||
+    (row.type !== storedResponse.type &&
+      !(
+        row.type === "protocol.error" && row.payload.code === "MESSAGE_EXPIRED"
+      ))
+  ) {
+    throw new ConnectorStoreError("INTERNAL", "Original response is invalid");
+  }
+  if (row.type !== "protocol.error" || row.payload.code !== "MESSAGE_EXPIRED") {
+    if (
+      row.type !== storedResponse.type ||
+      canonicalJson(row.payload) !== canonicalJson(storedResponse.payload)
+    ) {
+      throw new ConnectorStoreError("INTERNAL", "Original response is invalid");
+    }
+  }
   const response = validateResponse(
-    tombstone,
+    row,
     storedResponse.type,
     storedResponse.payload,
     storedResponse.sequence,
@@ -557,78 +546,52 @@ const replaceServerMessage = async (
  * in place by a fresh-ID, same-sequence tombstone. Ordinary replay rows keep
  * their stored identity.
  */
-const tombstoneExpiredServerMessages = async (
+const tombstoneReplayBatch = async (
   database: QueryDatabase,
   connectorId: string,
   afterSequence: number,
   now: Date,
 ): Promise<void> => {
-  while (true) {
-    const expiredMessages = await database
-      .select()
-      .from(connectorMessages)
-      .where(
-        and(
-          eq(connectorMessages.connectorId, connectorId),
-          eq(connectorMessages.direction, "server"),
-          gt(connectorMessages.sequence, afterSequence),
+  const candidates = await database
+    .select({ message: connectorMessages, job: jobs })
+    .from(connectorMessages)
+    .leftJoin(
+      jobs,
+      sql`${jobs.id}::text = ${connectorMessages.payload}->>'job_id'`,
+    )
+    .where(
+      and(
+        eq(connectorMessages.connectorId, connectorId),
+        eq(connectorMessages.direction, "server"),
+        gt(connectorMessages.sequence, afterSequence),
+        or(
           lte(connectorMessages.expiresAt, now),
+          and(
+            eq(connectorMessages.type, "job.offer"),
+            inArray(jobs.status, [
+              "cancelled",
+              "expired",
+              "failed",
+              "succeeded",
+            ]),
+          ),
         ),
-      )
-      .orderBy(asc(connectorMessages.sequence))
-      .limit(SERVER_REPLAY_BATCH_SIZE)
-      .for("update");
-    if (expiredMessages.length === 0) return;
-    for (const message of expiredMessages) {
-      await replaceServerMessage(
-        database,
-        message,
-        now,
-        expiredTombstonePayload(),
-        undefined,
-        true,
-      );
-    }
-  }
-};
-
-const tombstoneInactiveOffers = async (
-  database: QueryDatabase,
-  connectorId: string,
-  afterSequence: number,
-  now: Date,
-): Promise<void> => {
-  while (true) {
-    const inactiveOffers = await database
-      .select({ message: connectorMessages, job: jobs })
-      .from(connectorMessages)
-      .innerJoin(
-        jobs,
-        sql`${jobs.id}::text = ${connectorMessages.payload}->>'job_id'`,
-      )
-      .where(
-        and(
-          eq(connectorMessages.connectorId, connectorId),
-          eq(connectorMessages.direction, "server"),
-          eq(connectorMessages.type, "job.offer"),
-          gt(connectorMessages.sequence, afterSequence),
-          inArray(jobs.status, ["cancelled", "expired", "failed", "succeeded"]),
-        ),
-      )
-      .orderBy(asc(connectorMessages.sequence))
-      .limit(SERVER_REPLAY_BATCH_SIZE);
-    if (inactiveOffers.length === 0) return;
-    for (const { message, job } of inactiveOffers) {
-      await replaceServerMessage(
-        database,
-        message,
-        now,
-        job.status === "cancelled"
-          ? cancelledTombstonePayload()
-          : expiredTombstonePayload(),
-        "job.offer",
-      );
-    }
+      ),
+    )
+    .orderBy(asc(connectorMessages.sequence))
+    .limit(SERVER_REPLAY_BATCH_SIZE);
+  for (const { message, job } of candidates) {
+    const inactiveOffer = message.type === "job.offer" && job !== null;
+    await replaceServerMessage(
+      database,
+      message,
+      now,
+      inactiveOffer && job.status === "cancelled"
+        ? cancelledTombstonePayload()
+        : expiredTombstonePayload(),
+      inactiveOffer ? "job.offer" : undefined,
+      !inactiveOffer || message.expiresAt.getTime() <= now.getTime(),
+    );
   }
 };
 
@@ -692,14 +655,6 @@ const lockClientJob = async (
   return rows[0];
 };
 
-const readCurrentTimeAtLeast = async (
-  database: QueryDatabase,
-  atLeast: Date,
-): Promise<Date> => {
-  const currentTime = await readDatabaseTime(database);
-  return currentTime.getTime() >= atLeast.getTime() ? currentTime : atLeast;
-};
-
 const readDatabaseTime = async (database: QueryDatabase): Promise<Date> => {
   const rows = await database.execute(
     sql`select clock_timestamp() as "currentTime"`,
@@ -727,9 +682,12 @@ const enqueueServerMessage = async (
   connector: ConnectorRow,
   type: ConnectorServerMessage["type"],
   payload: Record<string, unknown>,
-  expiresAt: Date,
+  expiresAt: Date | undefined,
   correlationId: string = crypto.randomUUID(),
 ): Promise<StoredServerMessage> => {
+  const effectiveExpiresAt =
+    expiresAt ??
+    new Date((await readDatabaseTime(database)).getTime() + 60_000);
   const sequence = connector.lastServerSequence + 1;
   if (!Number.isSafeInteger(sequence) || sequence < 1) {
     throw new ConnectorStoreError("INTERNAL", "Server sequence exhausted");
@@ -757,7 +715,7 @@ const enqueueServerMessage = async (
       type,
       payload,
       correlationId,
-      expiresAt,
+      expiresAt: effectiveExpiresAt,
     })
     .returning();
   const row = inserted[0];
@@ -1036,21 +994,15 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
   async acceptClientMessage(
     identity: ConnectorIdentity,
     message: ConnectorClientMessage,
-    now = new Date(),
+    _callerNow?: Date,
   ): Promise<ClientMessageAcceptance> {
-    if (Date.parse(message.expires_at) <= now.getTime()) {
-      throw new ConnectorStoreError(
-        "CLIENT_REPLAY_MISMATCH",
-        "Expired message",
-      );
-    }
     return this.#db.transaction(async (tx) => {
       const lockedJob =
         message.type === "job.claim" || message.type === "job.event"
           ? await lockClientJob(tx, identity, message.payload.job_id)
           : undefined;
       const connector = await lockConnector(tx, identity);
-      const currentTime = await readCurrentTimeAtLeast(tx, now);
+      const currentTime = await readDatabaseTime(tx);
       if (Date.parse(message.expires_at) <= currentTime.getTime()) {
         throw new ConnectorStoreError(
           "CLIENT_REPLAY_MISMATCH",
@@ -1095,13 +1047,12 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
                 )
               : toStoredServerMessage(originalResponse.row);
         if (message.type === "connector.heartbeat") {
-          const heartbeatTime = await readDatabaseTime(tx);
           await tx
             .update(connectors)
             .set({
-              lastHeartbeatAt: heartbeatTime,
+              lastHeartbeatAt: currentTime,
               health: "fresh",
-              updatedAt: heartbeatTime,
+              updatedAt: currentTime,
             })
             .where(eq(connectors.id, connector.id));
         }
@@ -1225,13 +1176,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
               ),
             ),
           );
-        await tombstoneInactiveOffers(
-          tx,
-          connector.id,
-          message.payload.last_server_sequence,
-          currentTime,
-        );
-        await tombstoneExpiredServerMessages(
+        await tombstoneReplayBatch(
           tx,
           connector.id,
           message.payload.last_server_sequence,
@@ -1304,7 +1249,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
 
   async dispatchNext(
     identity: ConnectorIdentity,
-    _now = new Date(),
+    _callerNow?: Date,
   ): Promise<StoredServerMessage | null> {
     return this.#db.transaction(async (tx) => {
       await readConnector(tx, identity);
@@ -1345,6 +1290,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
                 gt(jobs.leaseExpiresAt, admissionTime),
               ),
             ),
+            gt(jobs.expiresAt, admissionTime),
           ),
         )
         .groupBy(jobs.repositoryId);
@@ -1459,18 +1405,13 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
   async pendingServerMessages(
     identity: ConnectorIdentity,
     afterSequence: number,
-    now = new Date(),
+    _callerNow?: Date,
   ): Promise<readonly StoredServerMessage[]> {
     assertSafeSequence(afterSequence);
     return this.#db.transaction(async (tx) => {
       const connector = await lockConnector(tx, identity);
-      await tombstoneInactiveOffers(tx, connector.id, afterSequence, now);
-      await tombstoneExpiredServerMessages(
-        tx,
-        connector.id,
-        afterSequence,
-        now,
-      );
+      const currentTime = await readDatabaseTime(tx);
+      await tombstoneReplayBatch(tx, connector.id, afterSequence, currentTime);
       const rows = await tx
         .select()
         .from(connectorMessages)
@@ -1491,7 +1432,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
     identity: ConnectorIdentity,
     type: ConnectorServerMessage["type"],
     payload: Record<string, unknown>,
-    expiresAt: Date,
+    expiresAt?: Date,
     correlationId?: string,
   ): Promise<StoredServerMessage> {
     return this.#db.transaction(async (tx) => {
@@ -1510,8 +1451,8 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
   async materializeServerMessage(
     stored: StoredServerMessage,
     decryptor?: RequestDecryptor,
-    now = new Date(),
-    currentTime: () => Date = () => new Date(),
+    _callerNow?: Date,
+    _callerCurrentTime?: () => Date,
   ): Promise<ConnectorServerMessage> {
     const jobId = stored.payload.job_id;
     const leaseId = stored.payload.lease_id;
@@ -1579,20 +1520,24 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
       }
       return row.job.requestCiphertext;
     };
-    assertNotExpired(now);
     let payload = stored.payload;
     if (stored.type === "job.offer") {
       if (typeof jobId !== "string" || decryptor === undefined) {
         throw new ConnectorStoreError("INTERNAL", "Offer cannot be hydrated");
       }
-      const ciphertext = await readActionableOffer(now);
+      const beforeDecrypt = await readDatabaseTime(this.#db);
+      assertNotExpired(beforeDecrypt);
+      const ciphertext = await readActionableOffer(beforeDecrypt);
       payload = {
         ...stored.payload,
         request: await decryptor.decrypt(ciphertext),
       };
-      await readActionableOffer(currentTime());
+      const afterDecrypt = await readDatabaseTime(this.#db);
+      await readActionableOffer(afterDecrypt);
+      assertNotExpired(afterDecrypt);
+    } else {
+      assertNotExpired(await readDatabaseTime(this.#db));
     }
-    assertNotExpired(currentTime());
     return ConnectorServerMessageSchema.parse({
       protocol_version: "1.0",
       message_id: stored.messageId,
@@ -1605,16 +1550,21 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
     });
   }
 
-  async refreshHealth(now = new Date()): Promise<void> {
-    const staleBefore = new Date(now.getTime() - CONNECTOR_STALE_AFTER_MS);
-    const offlineBefore = new Date(now.getTime() - CONNECTOR_OFFLINE_AFTER_MS);
+  async refreshHealth(_now?: Date): Promise<void> {
+    const currentTime = await readDatabaseTime(this.#db);
+    const staleBefore = new Date(
+      currentTime.getTime() - CONNECTOR_STALE_AFTER_MS,
+    );
+    const offlineBefore = new Date(
+      currentTime.getTime() - CONNECTOR_OFFLINE_AFTER_MS,
+    );
     await this.#db
       .update(connectors)
-      .set({ health: "offline", updatedAt: now })
+      .set({ health: "offline", updatedAt: currentTime })
       .where(lte(connectors.lastHeartbeatAt, offlineBefore));
     await this.#db
       .update(connectors)
-      .set({ health: "stale", updatedAt: now })
+      .set({ health: "stale", updatedAt: currentTime })
       .where(
         and(
           gt(connectors.lastHeartbeatAt, offlineBefore),

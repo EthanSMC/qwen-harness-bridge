@@ -497,6 +497,168 @@ describe("PostgreSQL Connector outbox", () => {
     );
   });
 
+  it.each([
+    ["future", new Date("2100-01-01T00:00:00.000Z")],
+    ["past", new Date("2000-01-01T00:00:00.000Z")],
+  ] as const)(
+    "uses PostgreSQL time for client envelope expiry under a %s-skewed caller clock",
+    async (_case, callerNow) => {
+      const testIdentity = await insertConnector();
+      const sentAt = new Date();
+      const message = envelope("connector.heartbeat", 1, {}, { sentAt });
+      const store = new PostgresConnectorStore(database.client);
+
+      await expect(
+        store.acceptClientMessage(testIdentity, message, callerNow),
+      ).resolves.toMatchObject({
+        duplicate: false,
+        response: { type: "ack" },
+      });
+    },
+  );
+
+  it.each([
+    ["future", new Date("2100-01-01T00:00:00.000Z")],
+    ["past", new Date("2000-01-01T00:00:00.000Z")],
+  ] as const)(
+    "uses PostgreSQL time for replay expiry under a %s-skewed caller clock",
+    async (_case, callerNow) => {
+      const testIdentity = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      const expired = await store.enqueueServer(
+        testIdentity,
+        "ack",
+        { sequence: 1 },
+        new Date(Date.now() - 1_000),
+      );
+
+      await expect(
+        store.pendingServerMessages(testIdentity, 0, callerNow),
+      ).resolves.toMatchObject([
+        {
+          sequence: expired.sequence,
+          type: "protocol.error",
+          payload: { code: "MESSAGE_EXPIRED" },
+        },
+      ]);
+    },
+  );
+
+  it.each([
+    ["future", new Date("2100-01-01T00:00:00.000Z")],
+    ["past", new Date("2000-01-01T00:00:00.000Z")],
+  ] as const)(
+    "uses PostgreSQL time for offer materialization under a %s-skewed caller clock",
+    async (_case, callerNow) => {
+      const testIdentity = await insertConnector();
+      const repositoryId = `repo-mat-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
+      const job = await createJob(repositoryId, "Materialize clock skew");
+      const store = new PostgresConnectorStore(database.client);
+      const offer = await store.dispatchNext(testIdentity);
+      if (offer === null) throw new Error("expected a job offer");
+
+      await expect(
+        store.materializeServerMessage(offer, cipher, callerNow),
+      ).resolves.toMatchObject({
+        type: "job.offer",
+        payload: { job_id: job.jobId, request: "Materialize clock skew" },
+      });
+    },
+  );
+
+  it("does not decrypt an offer already expired in PostgreSQL under a past caller clock", async () => {
+    const testIdentity = await insertConnector();
+    const repositoryId = `repo-mat-exp-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
+    const job = await createJob(repositoryId, "DB expired offer");
+    const store = new PostgresConnectorStore(database.client);
+    const offer = await store.dispatchNext(testIdentity);
+    if (offer === null) throw new Error("expected a job offer");
+    await database.query(
+      `UPDATE jobs
+          SET expires_at = now() - interval '1 second',
+              lease_expires_at = now() - interval '1 second'
+        WHERE id = $1`,
+      [job.jobId],
+    );
+    await database.query(
+      `UPDATE connector_messages
+          SET expires_at = now() - interval '1 second'
+        WHERE connector_id = $1 AND sequence = $2`,
+      [testIdentity.connectorId, offer.sequence],
+    );
+    let decryptCalls = 0;
+
+    await expect(
+      store.materializeServerMessage(
+        offer,
+        {
+          decrypt: async () => {
+            decryptCalls += 1;
+            return "must not be returned";
+          },
+        },
+        new Date("2000-01-01T00:00:00.000Z"),
+      ),
+    ).rejects.toMatchObject({ code: "MESSAGE_EXPIRED" });
+    expect(decryptCalls).toBe(0);
+  });
+
+  it.each([
+    ["future", new Date("2100-01-01T00:00:00.000Z")],
+    ["past", new Date("2000-01-01T00:00:00.000Z")],
+  ] as const)(
+    "uses PostgreSQL time for health thresholds under a %s-skewed caller clock",
+    async (_case, callerNow) => {
+      const testIdentity = await insertConnector();
+      await database.query(
+        `UPDATE connectors
+            SET health = 'fresh'::connector_health,
+                last_heartbeat_at = now() - interval '1 minute'
+          WHERE id = $1`,
+        [testIdentity.connectorId],
+      );
+
+      await new PostgresConnectorStore(database.client).refreshHealth(
+        callerNow,
+      );
+
+      await expect(
+        database.query<{ health: string }>(
+          "SELECT health FROM connectors WHERE id = $1",
+          [testIdentity.connectorId],
+        ),
+      ).resolves.toMatchObject({ rows: [{ health: "offline" }] });
+    },
+  );
+
+  it("does not let an expired active job consume a live dispatch slot", async () => {
+    const testIdentity = await insertConnector();
+    const repositoryId = `repo-exp-cap-${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`;
+    const active = await createJob(repositoryId, "Expired active job");
+    const queued = await new JobRepository(database.client).createIdempotent({
+      ownerId: OWNER_ID,
+      clientRequestId: crypto.randomUUID(),
+      repositoryId,
+      requestCiphertext: cipher.encrypt("Live queued job"),
+      requestDigest: `sha256:${"d".repeat(64)}`,
+    });
+    await database.query(
+      `UPDATE jobs
+          SET status = 'running'::job_status,
+              connector_id = $1,
+              attempt = 1,
+              expires_at = now() - interval '1 second'
+        WHERE id = $2`,
+      [testIdentity.connectorId, active.jobId],
+    );
+
+    const offer = await new PostgresConnectorStore(
+      database.client,
+    ).dispatchNext(testIdentity);
+
+    expect(offer?.payload.job_id).toBe(queued.jobId);
+  });
+
   it("deduplicates exact client messages and rejects gaps or modified replay", async () => {
     const store = new PostgresConnectorStore(database.client);
     const hello = envelope("connector.hello", 1, {
@@ -560,6 +722,34 @@ describe("PostgreSQL Connector outbox", () => {
       store.acceptClientMessage(identity, gap),
       "CLIENT_SEQUENCE_GAP",
     );
+  });
+
+  it("restores the response identified by durable sequence metadata without correlation scans", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const correlationId = crypto.randomUUID();
+    for (let index = 0; index < 128; index += 1) {
+      await store.enqueueServer(
+        testIdentity,
+        "ack",
+        { sequence: 1 },
+        new Date(Date.now() + 60_000),
+        correlationId,
+      );
+    }
+    const heartbeat = envelope("connector.heartbeat", 1, {}, { correlationId });
+    const accepted = await store.acceptClientMessage(testIdentity, heartbeat);
+    if (accepted.response === null) throw new Error("expected an ACK");
+
+    await expect(
+      store.acceptClientMessage(testIdentity, heartbeat),
+    ).resolves.toMatchObject({
+      duplicate: true,
+      response: {
+        messageId: accepted.response.messageId,
+        sequence: accepted.response.sequence,
+      },
+    });
   });
 
   it("restores a tombstoned connector welcome for an exact duplicate hello", async () => {
@@ -1071,12 +1261,12 @@ describe("PostgreSQL Connector outbox", () => {
   it("tombstones an expired ACKed row when the durable cursor lags", async () => {
     const cursorIdentity = await insertConnector();
     const store = new PostgresConnectorStore(database.client);
-    const now = new Date("2030-01-02T03:04:05.000Z");
+    const now = new Date();
     const expired = await store.enqueueServer(
       cursorIdentity,
       "ack",
       { sequence: 1 },
-      new Date("2030-01-02T03:04:04.000Z"),
+      new Date(now.getTime() - 1_000),
     );
     const ack = envelope(
       "ack",
@@ -1129,7 +1319,7 @@ describe("PostgreSQL Connector outbox", () => {
   it("makes an expired actionable row at N a same-sequence tombstone when hello reports N-1", async () => {
     const cursorIdentity = await insertConnector();
     const store = new PostgresConnectorStore(database.client);
-    const now = new Date("2030-01-02T03:04:05.000Z");
+    const now = new Date();
     const offer = await store.enqueueServer(
       cursorIdentity,
       "job.offer",
@@ -1139,7 +1329,7 @@ describe("PostgreSQL Connector outbox", () => {
         lease_id: crypto.randomUUID(),
         repository_id: REPOSITORY_ID,
       },
-      new Date("2030-01-02T03:04:04.000Z"),
+      new Date(now.getTime() - 1_000),
     );
     const hello = envelope(
       "connector.hello",
@@ -1618,15 +1808,16 @@ describe("PostgreSQL Connector outbox", () => {
     "rejects %s exactly at jobs.expiresAt",
     async (type, status, attempt, code) => {
       const testIdentity = await insertConnector();
-      const now = new Date("2030-01-02T03:04:05.000Z");
+      const now = new Date(Date.now() - 5_000);
+      const expiredAt = new Date(Date.now() - 1_000);
       const leaseId = type === "job.claim" ? crypto.randomUUID() : null;
       const job = await insertConnectedJob(
         testIdentity.connectorId,
         status,
-        now,
+        expiredAt,
         attempt,
         leaseId,
-        leaseId === null ? null : new Date("2030-01-02T03:05:05.000Z"),
+        leaseId === null ? null : new Date(Date.now() + 60_000),
       );
       const message =
         type === "job.claim"
@@ -1882,8 +2073,8 @@ describe("PostgreSQL Connector outbox", () => {
   it("replaces every mixed expired server command in bounded contiguous replay batches", async () => {
     const replayIdentity = await insertConnector();
     const store = new PostgresConnectorStore(database.client);
-    const now = new Date("2030-01-02T03:04:05.000Z");
-    const expiredAt = new Date("2030-01-02T03:04:04.000Z");
+    const now = new Date();
+    const expiredAt = new Date(now.getTime() - 1_000);
     const expiredCount = SERVER_REPLAY_BATCH_SIZE * 2 + 7;
     const expiredJobId = crypto.randomUUID();
     const expiredApprovalId = crypto.randomUUID();
@@ -1941,7 +2132,7 @@ describe("PostgreSQL Connector outbox", () => {
         replayIdentity.connectorId,
         expiredCount + 1,
         JSON.stringify({ sequence: expiredCount + 1 }),
-        new Date("2030-01-02T03:05:05.000Z"),
+        new Date(now.getTime() + 60_000),
       ],
     );
     await database.query(
@@ -2017,11 +2208,49 @@ describe("PostgreSQL Connector outbox", () => {
     ).toBe(true);
   });
 
+  it("updates at most one tombstone batch per request and makes progress on the next cursor", async () => {
+    const batchIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const total = SERVER_REPLAY_BATCH_SIZE + 1;
+    const expiredAt = new Date(Date.now() - 1_000);
+    await database.query(
+      `INSERT INTO connector_messages
+         (connector_id, direction, sequence, type, payload, correlation_id, expires_at)
+       SELECT $1, 'server', sequence, 'ack',
+              jsonb_build_object('sequence', sequence),
+              gen_random_uuid(), $2
+         FROM generate_series(1, $3::integer) AS sequence`,
+      [batchIdentity.connectorId, expiredAt, total],
+    );
+    await database.query(
+      "UPDATE connectors SET last_server_sequence = $2 WHERE id = $1",
+      [batchIdentity.connectorId, total],
+    );
+
+    const first = await store.pendingServerMessages(batchIdentity, 0);
+    expect(first).toHaveLength(SERVER_REPLAY_BATCH_SIZE);
+    const untouched = await database.query<{ type: string }>(
+      "SELECT type FROM connector_messages WHERE connector_id = $1 AND sequence = $2",
+      [batchIdentity.connectorId, SERVER_REPLAY_BATCH_SIZE + 1],
+    );
+    expect(untouched.rows[0]?.type).toBe("ack");
+
+    await expect(
+      store.pendingServerMessages(batchIdentity, SERVER_REPLAY_BATCH_SIZE),
+    ).resolves.toMatchObject([
+      {
+        sequence: SERVER_REPLAY_BATCH_SIZE + 1,
+        type: "protocol.error",
+        payload: { code: "MESSAGE_EXPIRED" },
+      },
+    ]);
+  });
+
   it("rejects a previously fetched offer after expiry without decrypting it", async () => {
     const fetchIdentity = await insertConnector();
     const store = new PostgresConnectorStore(database.client);
-    const fetchedAt = new Date("2030-01-02T03:04:05.000Z");
-    const expiresAt = new Date("2030-01-02T03:04:06.000Z");
+    const fetchedAt = new Date();
+    const expiresAt = new Date(fetchedAt.getTime() + 60_000);
     const offer = await store.enqueueServer(
       fetchIdentity,
       "job.offer",
@@ -2041,6 +2270,10 @@ describe("PostgreSQL Connector outbox", () => {
     expect(fetched[0]).toMatchObject({ type: "job.offer" });
     const fetchedOffer = fetched[0];
     if (fetchedOffer === undefined) throw new Error("expected a fetched offer");
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE connector_id = $1 AND sequence = $2",
+      [fetchIdentity.connectorId, offer.sequence],
+    );
     let decryptCalls = 0;
     await expect(
       store.materializeServerMessage(
@@ -2051,13 +2284,13 @@ describe("PostgreSQL Connector outbox", () => {
             return "must not be sent";
           },
         },
-        expiresAt,
+        new Date("2000-01-01T00:00:00.000Z"),
       ),
     ).rejects.toMatchObject({ code: "MESSAGE_EXPIRED" });
     expect(decryptCalls).toBe(0);
 
     await expect(
-      store.pendingServerMessages(fetchIdentity, 0, expiresAt),
+      store.pendingServerMessages(fetchIdentity, 0),
     ).resolves.toMatchObject([
       { sequence: offer.sequence, type: "protocol.error" },
     ]);
@@ -2066,18 +2299,18 @@ describe("PostgreSQL Connector outbox", () => {
   it("rejects an offer that expires while its request is decrypting", async () => {
     const fetchIdentity = await insertConnector();
     const store = new PostgresConnectorStore(database.client);
-    const fetchedAt = new Date("2100-01-02T03:04:05.000Z");
-    const expiresAt = new Date("2100-01-02T03:04:06.000Z");
+    const fetchedAt = new Date();
+    const expiresAt = new Date(fetchedAt.getTime() + 60_000);
     const leaseId = crypto.randomUUID();
     const job = await insertConnectedJob(
       fetchIdentity.connectorId,
       "dispatched",
-      new Date("2100-01-02T03:05:00.000Z"),
+      expiresAt,
       0,
       leaseId,
       expiresAt,
     );
-    await store.enqueueServer(
+    const offer = await store.enqueueServer(
       fetchIdentity,
       "job.offer",
       {
@@ -2104,22 +2337,27 @@ describe("PostgreSQL Connector outbox", () => {
     const decryptReleased = new Promise<void>((resolve) => {
       releaseDecrypt = resolve;
     });
-    let currentTime = new Date("2100-01-02T03:04:05.999Z");
     const materialized = store.materializeServerMessage(
       fetchedOffer,
       {
         decrypt: async () => {
+          await database.query(
+            "UPDATE jobs SET expires_at = now() - interval '1 second', lease_expires_at = now() - interval '1 second' WHERE id = $1",
+            [job.jobId],
+          );
+          await database.query(
+            "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE connector_id = $1 AND sequence = $2",
+            [fetchIdentity.connectorId, offer.sequence],
+          );
           signalDecryptStarted();
           await decryptReleased;
           return "plaintext must not be returned";
         },
       },
-      currentTime,
-      () => currentTime,
+      new Date("2100-01-01T00:00:00.000Z"),
     );
 
     await decryptStarted;
-    currentTime = new Date("2100-01-02T03:04:06.000Z");
     releaseDecrypt();
 
     await expect(materialized).rejects.toMatchObject({

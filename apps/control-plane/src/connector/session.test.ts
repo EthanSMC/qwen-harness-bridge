@@ -4,7 +4,7 @@ import { createConnectorSessionService } from "./session.js";
 
 const OWNER_ID = "owner-session-fixture";
 const OTHER_OWNER_ID = "owner-attacker-fixture";
-const CONNECTOR_ID = "00000000-0000-4000-8000-000000000006";
+const CONNECTOR_ID = "00000000-0000-4000-8000-0000000000a6";
 const FIXED_NOW_MS = Date.parse("2026-09-01T00:00:00.000Z");
 const SESSION_SIGNING_KEY = "connector-session-signing-key-fixture-only";
 const MCP_BEARER = "mcp-bearer-fixture-only";
@@ -107,6 +107,26 @@ describe("Connector session tokens", () => {
       iat: FIXED_NOW_MS / 1000,
       exp: FIXED_NOW_MS / 1000 + 15 * 60,
     });
+  });
+
+  it("canonicalizes connector UUIDs in issued and verified session claims", () => {
+    const service = createService(() => new Date(FIXED_NOW_MS));
+    const token = service.issue({
+      ...connectorIdentity,
+      connectorId: CONNECTOR_ID.toUpperCase(),
+    });
+
+    expect(service.verify(token).connector_id).toBe(CONNECTOR_ID);
+  });
+
+  it("fails closed for a malformed connector UUID claim", () => {
+    const service = createService(() => new Date(FIXED_NOW_MS));
+    expect(() =>
+      service.issue({
+        ...connectorIdentity,
+        connectorId: "not-a-connector-uuid",
+      }),
+    ).toThrow();
   });
 
   it("keeps MCP bearer credentials and Connector session tokens in separate trust domains", () => {

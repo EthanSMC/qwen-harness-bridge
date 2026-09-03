@@ -2,6 +2,7 @@ import {
   createHmac,
   timingSafeEqual as nodeTimingSafeEqual,
 } from "node:crypto";
+import { ConnectorHelloPayloadSchema } from "@qhb/protocol";
 
 export const CONNECTOR_SESSION_TTL_SECONDS = 900;
 export const CONNECTOR_SESSION_SIGNING_DOMAIN = "qhb.connector.session.v1";
@@ -14,6 +15,12 @@ const CONNECTOR_SESSION_HEADER = Object.freeze({
 const CONNECTOR_PROTOCOL_VERSION = "1.0";
 const MAX_SESSION_TOKEN_BYTES = 4096;
 const bearerPattern = /^Bearer ([^\s]+)$/;
+const connectorIdSchema = ConnectorHelloPayloadSchema.shape.connector_id;
+
+const canonicalConnectorId = (value: unknown): string | null => {
+  const parsed = connectorIdSchema.safeParse(value);
+  return parsed.success ? parsed.data : null;
+};
 
 export type ConnectorSessionClaims = Readonly<{
   owner_id: string;
@@ -102,11 +109,12 @@ const isSessionClaims = (value: unknown): value is ConnectorSessionClaims => {
     typeof value.owner_id !== "string" ||
     value.owner_id.length === 0 ||
     typeof value.connector_id !== "string" ||
-    value.connector_id.length === 0 ||
     value.protocol_version !== CONNECTOR_PROTOCOL_VERSION
   ) {
     return false;
   }
+
+  if (canonicalConnectorId(value.connector_id) === null) return false;
 
   const { iat, exp } = value;
   return (
@@ -180,8 +188,13 @@ export function createConnectorSessionService(options: {
     if (
       identity.protocolVersion !== CONNECTOR_PROTOCOL_VERSION ||
       identity.ownerId.length === 0 ||
-      identity.connectorId.length === 0
+      canonicalConnectorId(identity.connectorId) === null
     ) {
+      throw new Error("Connector session identity is invalid");
+    }
+
+    const connectorId = canonicalConnectorId(identity.connectorId);
+    if (connectorId === null) {
       throw new Error("Connector session identity is invalid");
     }
 
@@ -190,7 +203,7 @@ export function createConnectorSessionService(options: {
     const headerSegment = encodeJson(CONNECTOR_SESSION_HEADER);
     const claimsSegment = encodeJson({
       owner_id: identity.ownerId,
-      connector_id: identity.connectorId,
+      connector_id: connectorId,
       protocol_version: identity.protocolVersion,
       iat,
       exp,
@@ -265,7 +278,9 @@ export function createConnectorSessionService(options: {
       if (nowSeconds < claims.iat || nowSeconds >= claims.exp) {
         throw authenticationFailure();
       }
-      return claims;
+      const connectorId = canonicalConnectorId(claims.connector_id);
+      if (connectorId === null) throw authenticationFailure();
+      return { ...claims, connector_id: connectorId };
     } catch (error) {
       if (error instanceof ConnectorSessionAuthenticationError) {
         throw error;

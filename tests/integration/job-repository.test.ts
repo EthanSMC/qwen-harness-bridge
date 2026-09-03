@@ -1,6 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql as drizzleSql } from "../../apps/control-plane/node_modules/drizzle-orm";
 import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js";
 import {
@@ -14,8 +14,9 @@ const db = createTestDatabase();
 
 const SHA256_A = `sha256:${"a".repeat(64)}`;
 const SHA256_B = `sha256:${"b".repeat(64)}`;
-const DEFAULT_OWNER_ID = "integration-owner";
-const DEFAULT_REPOSITORY_ID = "novelty-studio";
+const FIXTURE_NAMESPACE = crypto.randomUUID().replaceAll("-", "").slice(0, 16);
+const DEFAULT_OWNER_ID = `integration-owner-${FIXTURE_NAMESPACE}`;
+const DEFAULT_REPOSITORY_ID = `novelty-studio-${FIXTURE_NAMESPACE}`;
 
 type CreateInput = {
   ownerId: string;
@@ -782,6 +783,40 @@ describe("JobRepository offer claims", () => {
       "UPDATE jobs SET status = 'expired'::job_status WHERE id = $1",
       [job.jobId],
     );
+  });
+
+  it("uses PostgreSQL time for claim expiry rather than a future-skewed process clock", async () => {
+    const repository = new JobRepository(db.client);
+    const connectorId = crypto.randomUUID();
+    const job = await createJob(repository, {
+      repositoryId: `claim-clock-${crypto.randomUUID()}`,
+    });
+    await seedConnector(db, connectorId, job.ownerId);
+    const leaseId = crypto.randomUUID();
+    const expiresAt = await expiryAfter(60_000);
+    await db.query(
+      `UPDATE jobs
+          SET connector_id = $2,
+              status = 'dispatched'::job_status,
+              lease_id = $3,
+              lease_expires_at = $4,
+              expires_at = $5
+        WHERE id = $1`,
+      [job.jobId, connectorId, leaseId, expiresAt, expiresAt],
+    );
+
+    vi.setSystemTime(new Date("2100-01-01T00:00:00.000Z"));
+    try {
+      await expect(
+        repository.claimOffer(job.jobId, {
+          connectorId,
+          attempt: 1,
+          leaseId,
+        }),
+      ).resolves.toMatchObject({ status: "running", attempt: 1 });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("rejects a claim that waits past the job and lease expiry", async () => {
