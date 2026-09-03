@@ -21,8 +21,8 @@ const bodyFor = ({
   ciEvidence = `https://github.com/${REPOSITORY}/pull/${PR_NUMBER}/checks`,
 } = {}) => [
   "## Review evidence",
-  `- [${mode === "formal" ? "x" : " "}] Formal GitHub review — a distinct eligible GitHub reviewer gave an Approve.`,
-  `- [${mode === "solo" ? "x" : " "}] Solo-maintainer fallback — eligibility evidence shows no distinct eligible GitHub reviewer.`,
+  `- [${mode === "formal" ? "x" : " "}] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.`,
+  `- [${mode === "solo" ? "x" : " "}] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.`,
   `- Formal GitHub review URL (required for formal mode): ${formalUrl}`,
   `- Formal reviewer GitHub identity (required for formal mode): ${formalIdentity}`,
   `- Solo eligibility evidence URL or repository-status reference (required for solo mode): ${soloRef}`,
@@ -61,6 +61,27 @@ const pullRequestFor = (overrides = {}) => ({
   body: bodyFor(),
   ...overrides,
 });
+
+const publicRepositoryState = (value) => ({
+  ...value,
+  repository: { ...value.repository, visibility: "public" },
+  pull_request: {
+    ...value.pull_request,
+    base: { ...value.pull_request.base, repo: { ...value.pull_request.base.repo, private: false } },
+    head: { ...value.pull_request.head, repo: { ...value.pull_request.head.repo, private: false } },
+  },
+});
+
+const publicEventFor = () => publicRepositoryState(eventFor());
+
+const publicPullRequestFor = (overrides = {}) => {
+  const pullRequest = pullRequestFor(overrides);
+  return {
+    ...pullRequest,
+    base: { ...pullRequest.base, repo: { ...pullRequest.base.repo, private: false } },
+    head: { ...pullRequest.head, repo: { ...pullRequest.head.repo, private: false } },
+  };
+};
 
 const runFor = (overrides = {}) => ({
   id: Number(RUN_ID),
@@ -122,6 +143,16 @@ test("accepts solo mode when current PR state and checks URL match", async () =>
   const result = await stateFor(eventFor(), fixturesFor());
 
   assert.equal(result.mode, "solo");
+});
+
+test("accepts solo mode for a public repository with no distinct eligible direct collaborator", async () => {
+  const event = publicEventFor();
+  const result = await stateFor(event, fixturesFor({
+    pullRequest: publicPullRequestFor({ body: event.pull_request.body }),
+  }));
+
+  assert.equal(result.mode, "solo");
+  assert.deepEqual(result.eligibleReviewerLogins, []);
 });
 
 test("accepts formal mode with a current-head approval from the specified eligible reviewer", async () => {
@@ -203,8 +234,13 @@ test("rejects a run associated with another PR or head", async () => {
   await assert.rejects(stateFor(eventFor(), fixtures), /workflow run.*current PR|run.*head|run.*PR/i);
 });
 
-test("rejects solo mode when a second eligible collaborator exists", async () => {
-  await assert.rejects(stateFor(eventFor(), fixturesFor({ secondReviewer: true })), /solo mode.*eligible reviewer|eligible reviewer.*solo/i);
+test("rejects solo mode for a public repository when a distinct eligible collaborator exists", async () => {
+  const event = publicEventFor();
+
+  await assert.rejects(stateFor(event, fixturesFor({
+    secondReviewer: true,
+    pullRequest: publicPullRequestFor({ body: event.pull_request.body }),
+  })), /solo mode.*eligible reviewer|eligible reviewer.*solo/i);
 });
 
 test("rejects formal mode with a stale approval", async () => {

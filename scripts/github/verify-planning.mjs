@@ -64,6 +64,8 @@ for (const [pattern, message] of [
   [/Review mode \(check exactly one\)/, "an explicit mutually-exclusive review mode selector"],
   [/Formal GitHub review/, "the formal GitHub review mode"],
   [/Solo-maintainer fallback/, "the solo-maintainer fallback mode"],
+  [/no distinct eligible direct GitHub collaborator/i, "visibility-independent solo eligibility"],
+  [/regardless of repository visibility/i, "repository-visibility-independent review mode"],
   [/Formal GitHub review URL \(required for formal mode\)/, "the formal GitHub review URL field"],
   [/Formal reviewer GitHub identity \(required for formal mode\)/, "the formal reviewer identity field"],
   [/Solo eligibility evidence URL or repository-status reference \(required for solo mode\)/, "the solo eligibility evidence field"],
@@ -81,7 +83,8 @@ for (const [pattern, message] of [
 
 for (const [pattern, message] of [
   [/formal GitHub Approve/i, "formal GitHub approval priority"],
-  [/private single-maintainer repository with no second eligible GitHub account/i, "the strict solo-fallback eligibility condition"],
+  [/no distinct eligible direct GitHub collaborator/i, "the strict solo-fallback eligibility condition"],
+  [/regardless of repository visibility/i, "the visibility-independent solo-fallback condition"],
   [/fresh independent subagent reviewer plus success of all required GitHub checks/i, "the solo reviewer and CI requirements"],
   [/different from the implementer/i, "reviewer/implementer separation"],
   [/must not self-approve/i, "the no-self-approval rule"],
@@ -157,6 +160,8 @@ for (const [pattern, message] of [
   [/status !== "completed"/, "completed check-run validation"],
   [/conclusion !== "success"/, "successful check-run conclusion validation"],
   [/currentPullRequest\.body/, "current PR body authority"],
+  [/repository visibility is irrelevant to direct-collaborator eligibility/i, "visibility-independent direct-collaborator eligibility"],
+  [/const reviewMode = eligible\.length > 0 \? "formal" : "solo";/, "collaborator-derived review mode"],
 ]) requireSourceField(reviewEvidenceScript, "scripts/github/verify-pr-review-evidence.mjs", pattern, message);
 
 console.log(`Planning baseline verified: ${files.length} files, ${taskCount} implementation tasks.`);

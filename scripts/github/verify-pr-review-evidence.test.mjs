@@ -31,8 +31,8 @@ const bodyFor = ({
 } = {}) => [
   "## Review evidence",
   "",
-  `- [${mode === "formal" ? "x" : " "}] Formal GitHub review — a distinct eligible GitHub reviewer gave an Approve.`,
-  `- [${mode === "solo" ? "x" : " "}] Solo-maintainer fallback — eligibility evidence shows no distinct eligible GitHub reviewer.`,
+  `- [${mode === "formal" ? "x" : " "}] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.`,
+  `- [${mode === "solo" ? "x" : " "}] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.`,
   "",
   `- Formal GitHub review URL (required for formal mode): ${formalUrl}`,
   `- Formal reviewer GitHub identity (required for formal mode): ${formalIdentity}`,

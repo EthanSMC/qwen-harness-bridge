@@ -159,6 +159,7 @@ const requireEqual = (actual, expected, label) => {
 };
 
 const eligibleCollaborators = (collaborators, authorLogin) => {
+  // Repository visibility is irrelevant to direct-collaborator eligibility.
   const eligibleRoles = new Set(["admin", "maintain", "push"]);
   return collaborators.filter((collaborator) => {
     const login = typeof collaborator.login === "string" ? collaborator.login : "";
@@ -276,9 +277,10 @@ export async function validatePullRequestState({ event, token, repository, runId
   verifyStaticCheck(await apiJson(fetchImpl, repository, `/commits/${eventPullRequest.head.sha}/check-runs?per_page=100`, token), eventPullRequest.head.sha);
   const collaborators = requireArray(await apiJson(fetchImpl, repository, "/collaborators?affiliation=direct&per_page=100", token), "direct collaborators");
   const eligible = eligibleCollaborators(collaborators, eventPullRequest.authorLogin);
+  const reviewMode = eligible.length > 0 ? "formal" : "solo";
 
   if (bodyResult.mode === "solo") {
-    if (eligible.length > 0) throw new Error("solo mode is invalid while an eligible reviewer exists");
+    if (reviewMode === "formal") throw new Error("solo mode is invalid while an eligible reviewer exists");
   } else {
     const formalIdentity = bodyResult.fields.formalIdentity;
     if (!eligible.some((collaborator) => normalizedIdentity(collaborator.login) === normalizedIdentity(formalIdentity))) {
