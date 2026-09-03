@@ -10,13 +10,13 @@
 
 ## Review evidence
 
-<!-- Complete exactly one review mode. Do not check both boxes. The solo fallback is valid only for a private single-maintainer repository with no second eligible GitHub reviewer account. -->
-<!-- CI evidence must be this PR's https://github.com/<owner>/<repo>/pull/<number>/checks URL. The PR number is unavailable before creation, so create the PR, immediately edit this body with the current checks URL, and rerun the edited gate. A first opened run may fail; the final merge gate must be green. -->
+<!-- Complete exactly one review mode. Do not check both boxes. The solo fallback is valid when no distinct eligible direct GitHub collaborator exists, regardless of repository visibility. -->
+<!-- CI evidence must be this PR's https://github.com/<owner>/<repo>/pull/<number>/checks URL. The PR number is unavailable before creation, so create the PR, immediately edit this body with the current checks URL, and rerun the edited gate. A first opened run may fail; the final merge gate must be green, and the controller re-verifies the GitHub checks API before merge. -->
 
 ### Review mode (check exactly one)
 
-- [ ] Formal GitHub review — a distinct eligible GitHub reviewer gave an Approve.
-- [ ] Solo-maintainer fallback — eligibility evidence shows no distinct eligible GitHub reviewer.
+- [ ] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.
+- [ ] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.
 
 ### Mode-specific evidence (complete only for the selected mode)
 
@@ -40,7 +40,7 @@
 - Findings:
 - Fix rounds:
 - Final verdict: PASS / FAIL
-- CI run URL(s) / PR checks URL(s) and required-check results (controller re-verifies GitHub checks API before merge):
+- CI run URL(s) / PR checks URL(s) and required-check results:
 
 ## Verification
 
@@ -64,8 +64,8 @@
 - [ ] Relevant checks pass.
 - [ ] Exactly one review mode is selected; the other mode is not used.
 - [ ] Reviewer is different from the implementer and reviewed the complete diff and commit range.
-- [ ] If an eligible different GitHub reviewer is available, that reviewer gave a formal GitHub Approve; the solo fallback was not used.
-- [ ] If no second eligible GitHub reviewer account exists in this private single-maintainer repository, a fresh independent subagent reviewer returned PASS and all required GitHub checks succeeded.
+- [ ] If a distinct eligible direct GitHub collaborator is available, that collaborator gave a formal GitHub Approve; the solo fallback was not used.
+- [ ] If no distinct eligible direct GitHub collaborator exists, a fresh independent subagent reviewer returned PASS and all required GitHub checks succeeded.
 - [ ] Review evidence records reviewer type/identity, commit range, verdict, findings, fix rounds, and CI evidence.
 - [ ] The author did not self-approve or fabricate review evidence.
 - [ ] No credentials, raw prompts/logs, source bodies, or absolute local paths are exposed.

@@ -33,7 +33,7 @@ jobs:
       - name: Verify planning and repository governance
         run: node scripts/github/verify-planning.mjs
       - name: Test pull-request review evidence validator
-        run: node --test scripts/github/verify-pr-review-evidence.test.mjs scripts/github/verify-pr-review-state.test.mjs
+        run: node --test scripts/github/verify-pr-review-evidence.test.mjs scripts/github/verify-pr-review-state.test.mjs scripts/github/sync-management.test.mjs
       - name: Check whitespace errors
         run: git diff --check HEAD^
 

@@ -38,9 +38,9 @@ Qwen Harness Bridge（眼镜任务台）让单一所有者通过千问 AI 眼镜
 
 Implementation is issue-driven. Each numbered task in the five plans maps to one GitHub issue and one milestone. Work starts at Plan 1 Task 1, follows test-first steps in the issue, and merges through a short-lived pull request with a focused Conventional Commit.
 
-Repository governance is defined in [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [.github/](.github/). `node scripts/github/verify-planning.mjs` validates the planning baseline; `node scripts/github/sync-management.mjs` synchronizes labels, milestones, implementation issues, and main-branch protection after the private GitHub repository exists.
+Repository governance is defined in [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [.github/](.github/). `node scripts/github/verify-planning.mjs` validates the planning baseline; `node scripts/github/sync-management.mjs` synchronizes labels, milestones, implementation issues, and main-branch protection for the public GitHub repository.
 
-The current remote-management snapshot and private-repository branch-protection limitation are recorded in [docs/github/repository-status.md](docs/github/repository-status.md).
+The current remote-management snapshot, including that branch protection is enabled on `main`, is recorded in [docs/github/repository-status.md](docs/github/repository-status.md).
 
 ## Current status
 
