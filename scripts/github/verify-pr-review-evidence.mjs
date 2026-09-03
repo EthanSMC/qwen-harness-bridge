@@ -469,20 +469,69 @@ const verifyStaticCheck = (checkRunsPayload, headSha) => {
   }
 };
 
-const latestReviewFor = (reviews, reviewerLogin) =>
-  reviews
-    .filter(
-      (review) =>
-        normalizedIdentity(review.user?.login ?? "") ===
-        normalizedIdentity(reviewerLogin),
-    )
-    .sort((left, right) => {
-      const leftTime =
-        Date.parse(left.submitted_at ?? left.created_at ?? "") || 0;
-      const rightTime =
-        Date.parse(right.submitted_at ?? right.created_at ?? "") || 0;
-      return rightTime - leftTime;
-    })[0];
+const parseReviewTimestamp = (value, label) => {
+  if (typeof value !== "string") {
+    throw new Error(`${label} timestamp must be a GitHub UTC timestamp`);
+  }
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/.exec(value);
+  const timestamp = Date.parse(value);
+  if (!match || !Number.isFinite(timestamp)) {
+    throw new Error(`${label} timestamp must be a valid GitHub UTC timestamp`);
+  }
+  const expectedParts = match.slice(1, 7).map(Number);
+  const parsed = new Date(timestamp);
+  const actualParts = [
+    parsed.getUTCFullYear(),
+    parsed.getUTCMonth() + 1,
+    parsed.getUTCDate(),
+    parsed.getUTCHours(),
+    parsed.getUTCMinutes(),
+    parsed.getUTCSeconds(),
+  ];
+  if (actualParts.some((part, index) => part !== expectedParts[index])) {
+    throw new Error(`${label} timestamp must be a valid GitHub UTC timestamp`);
+  }
+  return timestamp;
+};
+
+const latestReviewFor = (reviews, reviewerLogin) => {
+  const targetReviews = reviews.flatMap((review, index) => {
+    if (
+      normalizedIdentity(review?.user?.login ?? "") !==
+      normalizedIdentity(reviewerLogin)
+    ) {
+      return [];
+    }
+    const label = `specified reviewer review ${index + 1}`;
+    requireObject(review, label);
+    if (!Number.isSafeInteger(review.id) || review.id < 1) {
+      throw new Error(`${label} id must be a positive safe integer`);
+    }
+    const timestampValue = review.submitted_at ?? review.created_at;
+    return [
+      {
+        id: review.id,
+        review,
+        timestamp: parseReviewTimestamp(timestampValue, label),
+      },
+    ];
+  });
+
+  const reviewIds = new Set();
+  for (const targetReview of targetReviews) {
+    if (reviewIds.has(targetReview.id)) {
+      throw new Error(
+        `specified reviewer has duplicate review id ${targetReview.id}; ordering is ambiguous`,
+      );
+    }
+    reviewIds.add(targetReview.id);
+  }
+
+  return targetReviews.sort(
+    (left, right) => right.timestamp - left.timestamp || right.id - left.id,
+  )[0]?.review;
+};
 
 export async function validatePullRequestState({
   event,

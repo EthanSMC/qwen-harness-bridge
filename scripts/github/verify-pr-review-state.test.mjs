@@ -146,11 +146,13 @@ const fullIneligibleCollaboratorPage = () => [
 ];
 
 const reviewsFor = ({
+  id = 1001,
   reviewer = "eligible-reviewer",
   state = "APPROVED",
   commitId = HEAD_SHA,
 } = {}) => [
   {
+    id,
     user: { login: reviewer },
     state,
     commit_id: commitId,
@@ -266,6 +268,26 @@ const stateFor = (event, fixtures, { staticResult = "success" } = {}) =>
     staticResult,
     fetchImpl: fixtureFetch(fixtures),
   });
+
+const formalStateFor = (reviews) => {
+  const event = eventFor({
+    body: bodyFor({
+      mode: "formal",
+      formalIdentity: "eligible-reviewer",
+      formalUrl: `https://github.com/${REPOSITORY}/pull/${PR_NUMBER}#pullrequestreview-123`,
+      soloRef: "",
+      soloDate: "",
+    }),
+  });
+  return stateFor(
+    event,
+    fixturesFor({
+      secondReviewer: true,
+      reviews,
+      pullRequest: pullRequestFor({ body: event.pull_request.body }),
+    }),
+  );
+};
 
 test("accepts solo mode when current PR state and checks URL match", async () => {
   const result = await stateFor(eventFor(), fixturesFor());
@@ -494,6 +516,7 @@ test("rejects formal mode when a later review page supersedes the approval", asy
               fullReviewPage(),
               [
                 {
+                  id: 1002,
                   user: { login: "eligible-reviewer" },
                   state,
                   commit_id: HEAD_SHA,
@@ -508,6 +531,138 @@ test("rejects formal mode when a later review page supersedes the approval", asy
       );
     });
   }
+});
+
+test("fails closed when a target review has missing or invalid ordering metadata", async (t) => {
+  const cases = [
+    [
+      "missing timestamp on newer changes request",
+      {
+        id: 1002,
+        user: { login: "eligible-reviewer" },
+        state: "CHANGES_REQUESTED",
+        commit_id: HEAD_SHA,
+      },
+      /timestamp/i,
+    ],
+    [
+      "invalid timestamp on newer dismissal",
+      {
+        id: 1002,
+        user: { login: "eligible-reviewer" },
+        state: "DISMISSED",
+        commit_id: HEAD_SHA,
+        submitted_at: "not-a-timestamp",
+      },
+      /timestamp/i,
+    ],
+    [
+      "invalid created_at fallback",
+      {
+        id: 1002,
+        user: { login: "eligible-reviewer" },
+        state: "DISMISSED",
+        commit_id: HEAD_SHA,
+        submitted_at: null,
+        created_at: "not-a-timestamp",
+      },
+      /timestamp/i,
+    ],
+    [
+      "impossible calendar timestamp",
+      {
+        id: 1002,
+        user: { login: "eligible-reviewer" },
+        state: "APPROVED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-02-30T02:00:00Z",
+      },
+      /timestamp/i,
+    ],
+    [
+      "missing review id",
+      {
+        user: { login: "eligible-reviewer" },
+        state: "APPROVED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-09-01T02:00:00Z",
+      },
+      /review.*id/i,
+    ],
+    [
+      "invalid review id",
+      {
+        id: "1002",
+        user: { login: "eligible-reviewer" },
+        state: "APPROVED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-09-01T02:00:00Z",
+      },
+      /review.*id/i,
+    ],
+  ];
+
+  for (const [name, targetReview, errorPattern] of cases) {
+    await t.test(name, async () => {
+      await assert.rejects(
+        formalStateFor([...reviewsFor(), targetReview]),
+        errorPattern,
+      );
+    });
+  }
+});
+
+test("uses review id to break equal-timestamp ties", async () => {
+  await assert.rejects(
+    formalStateFor([
+      ...reviewsFor(),
+      {
+        id: 1002,
+        user: { login: "eligible-reviewer" },
+        state: "CHANGES_REQUESTED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-09-01T01:00:00Z",
+      },
+    ]),
+    /APPROVED.*current head|current-head.*approval/i,
+  );
+});
+
+test("fails closed when target-review ordering is ambiguous", async () => {
+  await assert.rejects(
+    formalStateFor([
+      ...reviewsFor(),
+      {
+        id: 1001,
+        user: { login: "eligible-reviewer" },
+        state: "DISMISSED",
+        commit_id: HEAD_SHA,
+        submitted_at: "2026-09-01T01:00:00Z",
+      },
+    ]),
+    /ambiguous|duplicate.*review.*id/i,
+  );
+});
+
+test("denies solo mode when the repository owner can review a non-owner author's PR", async () => {
+  const nonOwnerAuthor = "contributor-author";
+  const event = eventFor({
+    user: { login: nonOwnerAuthor },
+  });
+
+  await assert.rejects(
+    stateFor(
+      event,
+      fixturesFor({
+        collaboratorPages: [collaboratorsFor()],
+        pullRequest: pullRequestFor({
+          user: { login: nonOwnerAuthor },
+          body: event.pull_request.body,
+        }),
+      }),
+    ),
+    /solo mode.*eligible reviewer|eligible reviewer.*solo/i,
+  );
 });
 
 test("fails closed when collaborator pagination reaches its safety cap without a short page", async () => {
