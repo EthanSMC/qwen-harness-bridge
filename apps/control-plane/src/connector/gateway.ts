@@ -24,6 +24,12 @@ import {
 
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_FRAME_BYTES = 64 * 1024;
+const MAX_FRAGMENT_COUNT = 1_024;
+const MAX_FRAGMENT_OVERHEAD_BYTES = 64 * 1024;
+const MAX_PENDING_MESSAGES = 128;
+const MAX_PENDING_MESSAGE_BYTES = 512 * 1024;
+const MAX_OUTBOUND_QUEUE_FRAMES = 128;
+const MAX_OUTBOUND_QUEUE_BYTES = 256 * 1024;
 const SOCKET_WRITE_TIMEOUT_MS = 1_000;
 const DEFAULT_DISPATCH_INTERVAL_MS = 250;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
@@ -69,6 +75,13 @@ type FrameHandlers = Readonly<{
   close(): void;
 }>;
 
+type OutboundWrite = {
+  frame: Buffer;
+  deadline: number;
+  resolve(): void;
+  reject(error: Error): void;
+};
+
 class ServerWebSocket {
   readonly #socket: Duplex;
   readonly #handlers: FrameHandlers;
@@ -78,6 +91,13 @@ class ServerWebSocket {
   #closePromise: Promise<void> | undefined;
   #fragmentedText: Buffer[] | undefined;
   #fragmentedTextBytes = 0;
+  #fragmentedTextFrameCount = 0;
+  #fragmentedTextOverheadBytes = 0;
+  #outboundQueue: OutboundWrite[] = [];
+  #outboundQueueBytes = 0;
+  #writeInProgress = false;
+  #pendingPong: Buffer | undefined;
+  #pongDraining = false;
 
   constructor(socket: Duplex, head: Buffer, handlers: FrameHandlers) {
     this.#socket = socket;
@@ -87,6 +107,10 @@ class ServerWebSocket {
     socket.once("close", () => this.#finish());
     socket.once("error", () => this.#finish());
     if (head.length > 0) this.#read(Buffer.alloc(0));
+  }
+
+  get isClosing(): boolean {
+    return this.#closing;
   }
 
   async sendJson(
@@ -116,6 +140,8 @@ class ServerWebSocket {
     if (this.#closed) return Promise.resolve();
     if (this.#closePromise !== undefined) return this.#closePromise;
     this.#closing = true;
+    this.#pendingPong = undefined;
+    this.#dropQueuedWrites(new Error("Connector WebSocket is closing"));
     this.#closePromise = this.#performClose(statusCode, deadline);
     return this.#closePromise;
   }
@@ -148,14 +174,14 @@ class ServerWebSocket {
     }
   }
 
-  async #sendFrame(
+  #sendFrame(
     opcode: number,
     payload: Buffer,
     allowClosing = false,
     deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS,
   ): Promise<void> {
     if (this.#closed || (this.#closing && !allowClosing)) {
-      throw new Error("Connector WebSocket is closed");
+      return Promise.reject(new Error("Connector WebSocket is closed"));
     }
     const length = payload.length;
     const headerLength = length < 126 ? 2 : length <= 0xffff ? 4 : 10;
@@ -171,28 +197,148 @@ class ServerWebSocket {
       frame.writeBigUInt64BE(BigInt(length), 2);
     }
     payload.copy(frame, headerLength);
-    await new Promise<void>((resolve, reject) => {
+    if (
+      this.#outboundQueue.length >= MAX_OUTBOUND_QUEUE_FRAMES ||
+      this.#outboundQueueBytes + frame.length > MAX_OUTBOUND_QUEUE_BYTES
+    ) {
+      const error = new Error("Connector WebSocket outbound queue exceeded");
+      this.#finish();
+      return Promise.reject(error);
+    }
+    const write = new Promise<void>((resolve, reject) => {
+      this.#outboundQueue.push({ frame, deadline, resolve, reject });
+      this.#outboundQueueBytes += frame.length;
+    });
+    this.#drainWrites();
+    return write;
+  }
+
+  #drainWrites(): void {
+    if (this.#closed || this.#writeInProgress) return;
+    const write = this.#outboundQueue.shift();
+    if (write === undefined) return;
+    this.#outboundQueueBytes -= write.frame.length;
+    this.#writeInProgress = true;
+    void this.#writeOne(write.frame, write.deadline)
+      .then(
+        () => write.resolve(),
+        (error: unknown) =>
+          write.reject(
+            error instanceof Error
+              ? error
+              : new Error("Connector WebSocket write failed"),
+          ),
+      )
+      .then(
+        () => {
+          this.#writeInProgress = false;
+          this.#drainWrites();
+        },
+        () => {
+          this.#writeInProgress = false;
+          this.#drainWrites();
+        },
+      );
+  }
+
+  #writeOne(frame: Buffer, deadline: number): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
         this.#finish();
         reject(new Error("Connector WebSocket write deadline exceeded"));
         return;
       }
+      let settled = false;
+      let callbackDone = false;
+      let writeReturned = false;
+      let needsDrain = false;
+      let drainSeen = false;
       const timer = setTimeout(() => {
-        this.#finish();
-        reject(new Error("Connector WebSocket write timed out"));
+        finish(new Error("Connector WebSocket write timed out"));
       }, remaining);
       timer.unref();
-      this.#socket.write(frame, (error?: Error | null) => {
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
-        if (error !== undefined && error !== null) {
+        this.#socket.off("drain", onDrain);
+        this.#socket.off("error", onError);
+        this.#socket.off("close", onClose);
+        if (error === undefined) {
+          resolve();
+        } else {
           this.#finish();
           reject(error);
-          return;
         }
-        resolve();
-      });
+      };
+      const maybeFinish = (): void => {
+        if (writeReturned && callbackDone && (!needsDrain || drainSeen)) {
+          finish();
+        }
+      };
+      const onDrain = (): void => {
+        drainSeen = true;
+        maybeFinish();
+      };
+      const onError = (error: Error): void => finish(error);
+      const onClose = (): void =>
+        finish(new Error("Connector WebSocket closed during write"));
+      this.#socket.once("error", onError);
+      this.#socket.once("close", onClose);
+      try {
+        const returned = this.#socket.write(frame, (error?: Error | null) => {
+          if (error !== undefined && error !== null) {
+            finish(error);
+            return;
+          }
+          callbackDone = true;
+          maybeFinish();
+        });
+        needsDrain = !returned;
+        if (!needsDrain) drainSeen = true;
+        if (needsDrain && !settled) this.#socket.once("drain", onDrain);
+        writeReturned = true;
+        maybeFinish();
+      } catch (error) {
+        finish(
+          error instanceof Error
+            ? error
+            : new Error("Connector WebSocket write failed"),
+        );
+      }
     });
+  }
+
+  #dropQueuedWrites(error: Error): void {
+    const queued = this.#outboundQueue.splice(0);
+    this.#outboundQueueBytes = 0;
+    for (const write of queued) write.reject(error);
+  }
+
+  #queuePong(payload: Buffer): void {
+    if (this.#closed || this.#closing) return;
+    this.#pendingPong = Buffer.from(payload);
+    if (this.#pongDraining) return;
+    this.#pongDraining = true;
+    void this.#drainPongs().then(
+      () => {
+        this.#pongDraining = false;
+      },
+      () => {
+        this.#pongDraining = false;
+        this.#finish();
+      },
+    );
+  }
+
+  async #drainPongs(): Promise<void> {
+    while (!this.#closed && !this.#closing) {
+      const payload = this.#pendingPong;
+      if (payload === undefined) return;
+      this.#pendingPong = undefined;
+      await this.#sendFrame(0xa, payload);
+    }
   }
 
   #read(chunk: Buffer): void {
@@ -229,10 +375,18 @@ class ServerWebSocket {
       } else if (lengthCode === 126) {
         if (this.#buffer.length < 4) return;
         length = this.#buffer.readUInt16BE(2);
+        if (length < 126) {
+          this.#closeForProtocolError();
+          return;
+        }
         offset = 4;
       } else {
         if (this.#buffer.length < 10) return;
         const extended = this.#buffer.readBigUInt64BE(2);
+        if ((extended & 0x8000000000000000n) !== 0n || extended < 65_536n) {
+          this.#closeForProtocolError();
+          return;
+        }
         if (extended > BigInt(MAX_FRAME_BYTES)) {
           this.#closeForProtocolError(1009);
           return;
@@ -244,6 +398,7 @@ class ServerWebSocket {
         this.#closeForProtocolError(1009);
         return;
       }
+      const frameOverheadBytes = offset + 4;
       const frameLength = offset + 4 + length;
       if (this.#buffer.length < frameLength) return;
       const mask = this.#buffer.subarray(offset, offset + 4);
@@ -276,23 +431,34 @@ class ServerWebSocket {
         return;
       }
       if (opcode === 0x9) {
-        void this.#sendFrame(0xa, payload).catch(() => this.#finish());
+        this.#queuePong(payload);
         continue;
       }
       if (opcode === 0xa) continue;
 
       if (opcode === 0x1 || opcode === 0x0) {
-        if (this.#fragmentedTextBytes + payload.length > MAX_FRAME_BYTES) {
+        const fragmentCount = this.#fragmentedTextFrameCount + 1;
+        const fragmentOverheadBytes =
+          this.#fragmentedTextOverheadBytes + frameOverheadBytes;
+        if (
+          this.#fragmentedTextBytes + payload.length > MAX_FRAME_BYTES ||
+          fragmentCount > MAX_FRAGMENT_COUNT ||
+          fragmentOverheadBytes > MAX_FRAGMENT_OVERHEAD_BYTES
+        ) {
           this.#closeForProtocolError(1009);
           return;
         }
         this.#fragmentedText ??= [];
         this.#fragmentedText.push(payload);
         this.#fragmentedTextBytes += payload.length;
+        this.#fragmentedTextFrameCount = fragmentCount;
+        this.#fragmentedTextOverheadBytes = fragmentOverheadBytes;
         if (!fin) continue;
         const text = Buffer.concat(this.#fragmentedText);
         this.#fragmentedText = undefined;
         this.#fragmentedTextBytes = 0;
+        this.#fragmentedTextFrameCount = 0;
+        this.#fragmentedTextOverheadBytes = 0;
         try {
           this.#handlers.message(utf8Decoder.decode(text));
         } catch {
@@ -307,6 +473,8 @@ class ServerWebSocket {
     if (this.#closed) return;
     this.#closed = true;
     this.#closing = true;
+    this.#pendingPong = undefined;
+    this.#dropQueuedWrites(new Error("Connector WebSocket is closed"));
     if (!this.#socket.destroyed) this.#socket.destroy();
     this.#handlers.close();
   }
@@ -459,11 +627,34 @@ export class ConnectorGateway {
     let accepting = true;
     let scanAfterSequence = 0;
     let processing = Promise.resolve();
+    let pendingMessageCount = 0;
+    let pendingMessageBytes = 0;
     let dispatching = false;
+    let activeStoreOperation: Promise<unknown> | undefined;
     let failureGeneration = 0;
     let timer: ReturnType<typeof setInterval> | undefined;
+    const runStoreBeforeDeadline = <T>(
+      operation: () => Promise<T>,
+      deadline: number,
+    ): Promise<T | typeof DEADLINE_EXCEEDED> => {
+      if (activeStoreOperation !== undefined) {
+        return Promise.resolve(DEADLINE_EXCEEDED);
+      }
+      const operationPromise = operation();
+      activeStoreOperation = operationPromise;
+      const clearOperation = (): void => {
+        if (activeStoreOperation === operationPromise) {
+          activeStoreOperation = undefined;
+        }
+      };
+      void operationPromise.then(clearOperation, clearOperation);
+      return awaitBeforeDeadline(() => operationPromise, deadline);
+    };
     const canContinue = (generation: number): boolean =>
-      accepting && generation === failureGeneration && !this.#closed;
+      accepting &&
+      generation === failureGeneration &&
+      !this.#closed &&
+      !connection.isClosing;
     const sendStored = async (
       connection: ServerWebSocket,
       stored: StoredServerMessage,
@@ -476,11 +667,25 @@ export class ConnectorGateway {
       if (!retransmit && stored.sequence !== scanAfterSequence + 1) {
         return false;
       }
-      const message = await awaitBeforeDeadline(
-        () =>
-          this.#store.materializeServerMessage(stored, this.#requestDecryptor),
-        deadline,
-      );
+      let message: ConnectorServerMessage | typeof DEADLINE_EXCEEDED;
+      try {
+        message = await runStoreBeforeDeadline(
+          () =>
+            this.#store.materializeServerMessage(
+              stored,
+              this.#requestDecryptor,
+            ),
+          deadline,
+        );
+      } catch (error) {
+        if (
+          error instanceof ConnectorStoreError &&
+          String(error.code) === "MESSAGE_EXPIRED"
+        ) {
+          return false;
+        }
+        throw error;
+      }
       if (message === DEADLINE_EXCEEDED) return false;
       if (!canContinue(generation)) return false;
       const sent = await awaitBeforeDeadline(
@@ -495,20 +700,25 @@ export class ConnectorGateway {
     };
     const pump = async (connection: ServerWebSocket): Promise<void> => {
       const generation = failureGeneration;
-      if (!canContinue(generation) || !initialized || dispatching) {
+      if (
+        !canContinue(generation) ||
+        !initialized ||
+        dispatching ||
+        activeStoreOperation !== undefined
+      ) {
         return;
       }
       dispatching = true;
       const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
       try {
         if (!canContinue(generation)) return;
-        const dispatched = await awaitBeforeDeadline(
+        const dispatched = await runStoreBeforeDeadline(
           () => this.#store.dispatchNext(identity, this.#now()),
           deadline,
         );
         if (dispatched === DEADLINE_EXCEEDED) return;
         if (!canContinue(generation)) return;
-        const pending = await awaitBeforeDeadline(
+        const pending = await runStoreBeforeDeadline(
           () =>
             this.#store.pendingServerMessages(
               identity,
@@ -536,8 +746,16 @@ export class ConnectorGateway {
       }
     };
     let connection: ServerWebSocket;
+    const rejectPendingOverflow = (): void => {
+      if (!accepting) return;
+      accepting = false;
+      failureGeneration += 1;
+      if (timer !== undefined) clearInterval(timer);
+      void connection.closeGracefully(1013).catch(() => undefined);
+    };
     const closeConnection = (): void => {
       accepting = false;
+      failureGeneration += 1;
       if (timer !== undefined) clearInterval(timer);
       this.#connections.delete(connection);
     };
@@ -548,7 +766,7 @@ export class ConnectorGateway {
       if (timer !== undefined) clearInterval(timer);
       const deadline = Date.now() + SOCKET_WRITE_TIMEOUT_MS;
       try {
-        const errorMessage = await awaitBeforeDeadline(
+        const errorMessage = await runStoreBeforeDeadline(
           () =>
             this.#store.enqueueServer(
               identity,
@@ -562,7 +780,7 @@ export class ConnectorGateway {
           errorMessage !== DEADLINE_EXCEEDED &&
           errorMessage.sequence === scanAfterSequence + 1
         ) {
-          const error = await awaitBeforeDeadline(
+          const error = await runStoreBeforeDeadline(
             () =>
               this.#store.materializeServerMessage(
                 errorMessage,
@@ -583,6 +801,7 @@ export class ConnectorGateway {
     };
     const handle = async (serialized: string): Promise<void> => {
       if (!accepting) return;
+      const generation = failureGeneration;
       let message: ConnectorClientMessage;
       try {
         message = ConnectorClientMessageSchema.parse(JSON.parse(serialized));
@@ -592,12 +811,16 @@ export class ConnectorGateway {
       if (!initialized && message.type !== "connector.hello") {
         return failProtocol("HELLO_REQUIRED");
       }
+      if (initialized && message.type === "connector.hello") {
+        return failProtocol("HELLO_ALREADY_INITIALIZED");
+      }
       try {
         const accepted = await this.#store.acceptClientMessage(
           identity,
           message,
           this.#now(),
         );
+        if (!canContinue(generation)) return;
         const isInitialHello =
           message.type === "connector.hello" && !initialized;
         if (isInitialHello) {
@@ -620,7 +843,7 @@ export class ConnectorGateway {
                 connection,
                 replay,
                 false,
-                failureGeneration,
+                generation,
                 deadline,
               ))
             ) {
@@ -629,7 +852,7 @@ export class ConnectorGateway {
           }
           if (isInitialHello) {
             while (true) {
-              const pending = await awaitBeforeDeadline(
+              const pending = await runStoreBeforeDeadline(
                 () =>
                   this.#store.pendingServerMessages(
                     identity,
@@ -646,7 +869,7 @@ export class ConnectorGateway {
                     connection,
                     replay,
                     false,
-                    failureGeneration,
+                    generation,
                     deadline,
                   ))
                 ) {
@@ -661,7 +884,7 @@ export class ConnectorGateway {
                 connection,
                 accepted.response,
                 accepted.duplicate,
-                failureGeneration,
+                generation,
                 deadline,
               ))
             ) {
@@ -681,13 +904,29 @@ export class ConnectorGateway {
       }
     };
     connection = new ServerWebSocket(socket, head, {
-      message(value) {
-        if (!accepting) return;
+      message: (value) => {
+        if (!accepting || connection.isClosing || this.#closed) return;
+        const messageBytes = Buffer.byteLength(value, "utf8");
+        if (
+          pendingMessageCount >= MAX_PENDING_MESSAGES ||
+          pendingMessageBytes + messageBytes > MAX_PENDING_MESSAGE_BYTES
+        ) {
+          rejectPendingOverflow();
+          return;
+        }
+        pendingMessageCount += 1;
+        pendingMessageBytes += messageBytes;
         processing = processing
           .then(() => handle(value))
           .catch(() => {
             accepting = false;
+            failureGeneration += 1;
+            if (timer !== undefined) clearInterval(timer);
             void connection.close().catch(() => undefined);
+          })
+          .finally(() => {
+            pendingMessageCount -= 1;
+            pendingMessageBytes -= messageBytes;
           });
       },
       close: closeConnection,

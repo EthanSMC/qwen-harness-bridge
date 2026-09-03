@@ -1,8 +1,13 @@
+import { createHash } from "node:crypto";
 import * as https from "node:https";
-import type { AddressInfo } from "node:net";
+import { type AddressInfo, Socket } from "node:net";
 import type { Duplex } from "node:stream";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hashConnectorCredential } from "../../apps/control-plane/src/connector/auth.js";
+import {
+  ConnectorStoreError,
+  PostgresConnectorStore,
+} from "../../apps/control-plane/src/connector/outbox.js";
 import { createApp } from "../../apps/control-plane/src/http/app.js";
 import {
   type ConnectorCredentials,
@@ -37,6 +42,7 @@ const sendRawFrame = (
     fin?: boolean;
     masked?: boolean;
     rsv?: number;
+    lengthCode?: 126 | 127;
   } = {},
 ): void => {
   const fin = options.fin ?? true;
@@ -46,12 +52,14 @@ const sendRawFrame = (
     ? Buffer.from(crypto.randomUUID().replaceAll("-", "")).subarray(0, 4)
     : undefined;
   const length = payload.length;
-  const headerLength = length < 126 ? 2 : length <= 0xffff ? 4 : 10;
+  const lengthCode =
+    options.lengthCode ?? (length < 126 ? 0 : length <= 0xffff ? 126 : 127);
+  const headerLength = lengthCode === 0 ? 2 : lengthCode === 126 ? 4 : 10;
   const frame = Buffer.alloc(headerLength + (masked ? 4 : 0) + length);
   frame[0] = (fin ? 0x80 : 0) | (rsv & 0x70) | opcode;
-  if (length < 126) {
+  if (lengthCode === 0) {
     frame[1] = (masked ? 0x80 : 0) | length;
-  } else if (length <= 0xffff) {
+  } else if (lengthCode === 126) {
     frame[1] = (masked ? 0x80 : 0) | 126;
     frame.writeUInt16BE(length, 2);
   } else {
@@ -250,6 +258,47 @@ const rawConnectorSocket = async (
     request.once("error", reject);
     request.end();
   });
+};
+
+const startNonMinimalFrameServer = async (
+  lengthCode: 126 | 127,
+): Promise<{ server: https.Server; socket: Duplex | undefined }> => {
+  let upgradedSocket: Duplex | undefined;
+  const server = https.createServer(LOCALHOST_TLS);
+  server.on("upgrade", (request, socket) => {
+    upgradedSocket = socket;
+    socket.on("error", () => undefined);
+    const key = request.headers["sec-websocket-key"];
+    if (typeof key !== "string") {
+      socket.destroy();
+      return;
+    }
+    const accept = createHash("sha1")
+      .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, "ascii")
+      .digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+    socket.once("data", () => {
+      sendRawFrame(socket, 0x1, Buffer.from("{}"), {
+        masked: false,
+        lengthCode,
+      });
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen({ host: "127.0.0.1", port: 0 }, () => resolve());
+  });
+  return {
+    server,
+    get socket() {
+      return upgradedSocket;
+    },
+  };
 };
 
 beforeAll(async () => {
@@ -457,6 +506,361 @@ describe("Connector gateway authentication and handshake", () => {
     }
   });
 
+  it("does not overlap dispatch database work after its deadline", async () => {
+    const originalDispatchNext = PostgresConnectorStore.prototype.dispatchNext;
+    let activeDispatches = 0;
+    let maximumActiveDispatches = 0;
+    let releaseDispatch: (() => void) | undefined;
+    const dispatchBlocked = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    const firstDispatchStarted = new Promise<void>((resolve) => {
+      vi.spyOn(
+        PostgresConnectorStore.prototype,
+        "dispatchNext",
+      ).mockImplementation(async function (identity, now) {
+        activeDispatches += 1;
+        maximumActiveDispatches = Math.max(
+          maximumActiveDispatches,
+          activeDispatches,
+        );
+        resolve();
+        try {
+          await dispatchBlocked;
+          return await originalDispatchNext.call(this, identity, now);
+        } finally {
+          activeDispatches -= 1;
+        }
+      });
+    });
+    const app = await startApp(10);
+    const credentials = await seedConnector(db);
+    const connector = await FakeConnector.connect(app, credentials);
+    try {
+      await firstDispatchStarted;
+      await new Promise<void>((resolve) => setTimeout(resolve, 1_150));
+      expect(maximumActiveDispatches).toBe(1);
+    } finally {
+      releaseDispatch?.();
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      await connector.close();
+      await app.close();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("does not start new store work while a timed-out pending scan is running", async () => {
+    const originalDispatchNext = PostgresConnectorStore.prototype.dispatchNext;
+    const originalPendingServerMessages =
+      PostgresConnectorStore.prototype.pendingServerMessages;
+    let dispatchStarts = 0;
+    let storeStartsWhilePending = 0;
+    let pendingBlocked = false;
+    let blockedPending = false;
+    let releasePending: (() => void) | undefined;
+    let pendingStartedResolve!: () => void;
+    const pendingStarted = new Promise<void>((resolve) => {
+      pendingStartedResolve = resolve;
+    });
+    const pendingGate = new Promise<void>((resolve) => {
+      releasePending = resolve;
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "dispatchNext",
+    ).mockImplementation(async function (identity, now) {
+      dispatchStarts += 1;
+      if (pendingBlocked) storeStartsWhilePending += 1;
+      return originalDispatchNext.call(this, identity, now);
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "pendingServerMessages",
+    ).mockImplementation(async function (identity, afterSequence, now) {
+      if (pendingBlocked) storeStartsWhilePending += 1;
+      if (!blockedPending && dispatchStarts > 0) {
+        blockedPending = true;
+        pendingBlocked = true;
+        pendingStartedResolve();
+        try {
+          await pendingGate;
+        } finally {
+          pendingBlocked = false;
+        }
+      }
+      return originalPendingServerMessages.call(
+        this,
+        identity,
+        afterSequence,
+        now,
+      );
+    });
+
+    const app = await startApp(10);
+    const credentials = await seedConnector(db);
+    const connector = await FakeConnector.connect(app, credentials);
+    try {
+      await pendingStarted;
+      await new Promise<void>((resolve) => setTimeout(resolve, 1_150));
+
+      expect(storeStartsWhilePending).toBe(0);
+      expect(dispatchStarts).toBe(1);
+
+      releasePending?.();
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      expect(dispatchStarts).toBeGreaterThan(1);
+    } finally {
+      releasePending?.();
+      await connector.close();
+      await app.close();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("refetches an offer that expires during materialization as a same-sequence tombstone", async () => {
+    const credentials = await seedConnector(db);
+    const store = new PostgresConnectorStore(db.client);
+    const offer = await store.enqueueServer(
+      {
+        ownerId: OWNER_ID,
+        connectorId: credentials.connector_id,
+        protocolVersion: "1.0",
+      },
+      "job.offer",
+      {
+        job_id: crypto.randomUUID(),
+        attempt: 1,
+        lease_id: crypto.randomUUID(),
+        repository_id: crypto.randomUUID(),
+      },
+      new Date(Date.now() + 60_000),
+    );
+    const tombstone = {
+      ...offer,
+      messageId: crypto.randomUUID(),
+      type: "protocol.error" as const,
+      payload: {
+        code: "MESSAGE_EXPIRED",
+        message: "A Connector message expired before delivery.",
+      },
+      expiresAt: new Date(Date.now() + 60_000),
+    };
+    const originalMaterializeServerMessage =
+      PostgresConnectorStore.prototype.materializeServerMessage;
+    const originalPendingServerMessages =
+      PostgresConnectorStore.prototype.pendingServerMessages;
+    let threwExpired = false;
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "materializeServerMessage",
+    ).mockImplementation(async function (stored, decryptor) {
+      if (!threwExpired && stored.sequence === offer.sequence) {
+        threwExpired = true;
+        throw new ConnectorStoreError("MESSAGE_EXPIRED" as never);
+      }
+      return originalMaterializeServerMessage.call(this, stored, decryptor);
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "pendingServerMessages",
+    ).mockImplementation(async function (identity, afterSequence, now) {
+      const pending = await originalPendingServerMessages.call(
+        this,
+        identity,
+        afterSequence,
+        now,
+      );
+      if (!threwExpired || afterSequence >= offer.sequence) return pending;
+      return pending.map((message) =>
+        message.sequence === offer.sequence ? tombstone : message,
+      );
+    });
+
+    const app = await startApp(50);
+    let connector: FakeConnector | undefined;
+    try {
+      connector = await FakeConnector.connect(app, credentials);
+      expect(
+        connector.wireReceived.filter(
+          (message) => message.type === "protocol.error",
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          message_id: tombstone.messageId,
+          sequence: offer.sequence,
+          type: "protocol.error",
+          payload: expect.objectContaining({ code: "MESSAGE_EXPIRED" }),
+        }),
+      ]);
+
+      const heartbeat = await connector.send("connector.heartbeat", {});
+      await expect(connector.next("ack")).resolves.toMatchObject({
+        payload: { sequence: heartbeat.sequence },
+      });
+    } finally {
+      if (connector !== undefined) await connector.close();
+      await app.close();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("does not initialize a connector after its hello is accepted too late", async () => {
+    const originalAcceptClientMessage =
+      PostgresConnectorStore.prototype.acceptClientMessage;
+    let releaseAccept: (() => void) | undefined;
+    let acceptStartedResolve!: () => void;
+    const acceptStarted = new Promise<void>((resolve) => {
+      acceptStartedResolve = resolve;
+    });
+    const acceptBlocked = new Promise<void>((resolve) => {
+      releaseAccept = resolve;
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "acceptClientMessage",
+    ).mockImplementation(async function (identity, message, now) {
+      acceptStartedResolve();
+      await acceptBlocked;
+      return originalAcceptClientMessage.call(this, identity, message, now);
+    });
+
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+    let app: Awaited<ReturnType<typeof startApp>> | undefined;
+    let socket: Duplex | undefined;
+    let appClosed = false;
+    try {
+      app = await startApp(10);
+      const credentials = await seedConnector(db);
+      socket = await rawConnectorSocket(app, credentials);
+      const intervalsBeforeHelloReturn = setIntervalSpy.mock.calls.length;
+      sendRawFrame(
+        socket,
+        0x1,
+        Buffer.from(
+          JSON.stringify({
+            protocol_version: "1.0",
+            message_id: crypto.randomUUID(),
+            sequence: 1,
+            sent_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 60_000).toISOString(),
+            correlation_id: crypto.randomUUID(),
+            type: "connector.hello",
+            payload: {
+              connector_id: credentials.connector_id,
+              connector_version: "raw-close-race-test/1.0",
+              capabilities: ["harness", "integration-test"],
+              last_server_sequence: 0,
+              last_client_sequence: 0,
+            },
+          }),
+        ),
+      );
+      await acceptStarted;
+
+      await app.close();
+      appClosed = true;
+      releaseAccept?.();
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      expect(setIntervalSpy.mock.calls.length).toBe(intervalsBeforeHelloReturn);
+    } finally {
+      releaseAccept?.();
+      socket?.destroy();
+      if (app !== undefined && !appClosed) await app.close();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("rejects a second connector hello after initialization", async () => {
+    const app = await startApp(5_000);
+    const credentials = await seedConnector(db);
+    const connector = await FakeConnector.connect(app, credentials);
+    try {
+      const welcomeCount = connector.wireReceived.filter(
+        (message) => message.type === "connector.welcome",
+      ).length;
+      const lastClientSequence = connector.lastClientSequence;
+      const lastServerSequence = connector.lastServerSequence;
+      await connector.send("connector.hello", {
+        connector_id: credentials.connector_id,
+        connector_version: "fake-connector/1.0",
+        capabilities: ["harness", "integration-test"],
+        last_server_sequence: lastServerSequence,
+        last_client_sequence: lastClientSequence,
+      });
+
+      await expect(connector.next("protocol.error")).resolves.toMatchObject({
+        payload: { code: "HELLO_ALREADY_INITIALIZED" },
+      });
+      expect(
+        connector.wireReceived.filter(
+          (message) => message.type === "connector.welcome",
+        ),
+      ).toHaveLength(welcomeCount);
+    } finally {
+      await connector.close();
+      await app.close();
+    }
+  });
+
+  it("caps authenticated messages queued behind a blocked consumer", async () => {
+    const originalAcceptClientMessage =
+      PostgresConnectorStore.prototype.acceptClientMessage;
+    let activeAccepts = 0;
+    let maximumActiveAccepts = 0;
+    let releaseAccept: (() => void) | undefined;
+    let firstHeartbeatStarted!: () => void;
+    const heartbeatStarted = new Promise<void>((resolve) => {
+      firstHeartbeatStarted = resolve;
+    });
+    const acceptBlocked = new Promise<void>((resolve) => {
+      releaseAccept = resolve;
+    });
+    vi.spyOn(
+      PostgresConnectorStore.prototype,
+      "acceptClientMessage",
+    ).mockImplementation(async function (identity, message, now) {
+      if (message.type === "connector.heartbeat") {
+        activeAccepts += 1;
+        maximumActiveAccepts = Math.max(maximumActiveAccepts, activeAccepts);
+        firstHeartbeatStarted();
+        try {
+          await acceptBlocked;
+        } finally {
+          activeAccepts -= 1;
+        }
+      }
+      return originalAcceptClientMessage.call(this, identity, message, now);
+    });
+
+    const app = await startApp(5_000);
+    const credentials = await seedConnector(db);
+    const connector = await FakeConnector.connect(app, credentials);
+    const timeout = new Promise<never>((_, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error("Timed out waiting for bounded queue shutdown"));
+      }, 2_000);
+      timer.unref();
+    });
+    try {
+      await connector.send("connector.heartbeat", {});
+      await heartbeatStarted;
+      for (let index = 0; index < 512; index += 1) {
+        await connector.send("connector.heartbeat", {});
+      }
+
+      await expect(
+        Promise.race([connector.waitForClose(), timeout]),
+      ).resolves.toBeUndefined();
+      expect(maximumActiveAccepts).toBe(1);
+    } finally {
+      releaseAccept?.();
+      await connector.close();
+      await app.close();
+      vi.restoreAllMocks();
+    }
+  });
+
   it.each([
     ["reserved close status code", Buffer.from([0x03, 0xed])],
     ["invalid UTF-8 close reason", Buffer.from([0x03, 0xe8, 0xff])],
@@ -580,6 +984,144 @@ describe("Connector gateway authentication and handshake", () => {
     }
   });
 
+  it("closes a zero-byte continuation flood with the application limit", async () => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    const socket = await rawConnectorSocket(app, credentials);
+    const chunks: Buffer[] = [];
+    socket.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+    const closed = new Promise<void>((resolve) => {
+      socket.once("close", () => resolve());
+    });
+    const timeout = new Promise<never>((_, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error("Timed out waiting for fragmented message limit"));
+      }, 2_000);
+      timer.unref();
+    });
+    try {
+      sendRawFrame(socket, 0x1, Buffer.alloc(0), { fin: false });
+      for (let index = 0; index < 2_048; index += 1) {
+        sendRawFrame(socket, 0x0, Buffer.alloc(0), { fin: false });
+      }
+
+      await expect(Promise.race([closed, timeout])).resolves.toBeUndefined();
+      expect(readCloseCode(chunks)).toBe(1009);
+    } finally {
+      socket.destroy();
+      await app.close();
+    }
+  });
+
+  it.each([126, 127] as const)(
+    "closes a non-minimal %s-byte length encoding with protocol status 1002",
+    async (lengthCode) => {
+      const app = await startApp();
+      const credentials = await seedConnector(db);
+      const socket = await rawConnectorSocket(app, credentials);
+      const chunks: Buffer[] = [];
+      socket.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+      const closed = new Promise<void>((resolve) => {
+        socket.once("close", () => resolve());
+      });
+      try {
+        sendRawFrame(socket, 0x1, Buffer.from("{}"), {
+          lengthCode,
+        });
+
+        const closedOrTimedOut = Promise.race([
+          closed.then(() => true as const),
+          new Promise<false>((resolve) => {
+            const timer = setTimeout(() => resolve(false), 2_000);
+            timer.unref();
+          }),
+        ]);
+        await expect(closedOrTimedOut).resolves.toBe(true);
+        expect(readCloseCode(chunks)).toBe(1002);
+        expect(Buffer.concat(chunks).toString("utf8")).not.toContain(
+          '"type":"protocol.error"',
+        );
+      } finally {
+        socket.destroy();
+        await app.close();
+      }
+    },
+  );
+
+  it.each([126, 127] as const)(
+    "FakeConnector rejects a non-minimal %s-byte server length encoding",
+    async (lengthCode) => {
+      const peer = await startNonMinimalFrameServer(lengthCode);
+      const credentials = {
+        connector_id: crypto.randomUUID(),
+        credential_id: `credential-${crypto.randomUUID()}`,
+        credential_secret: `connector-secret-${crypto.randomUUID()}`,
+      };
+      try {
+        await expect(
+          FakeConnector.connectWithSessionToken(
+            peer,
+            credentials,
+            "standalone-test-token",
+          ),
+        ).rejects.toThrow("non-minimal");
+      } finally {
+        peer.socket?.destroy();
+        await new Promise<void>((resolve) =>
+          peer.server.close(() => resolve()),
+        );
+      }
+    },
+  );
+
+  it("serializes pong output under backpressure", async () => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    const socket = await rawConnectorSocket(app, credentials);
+    const originalWrite = Socket.prototype.write;
+    let writesInFlight = 0;
+    let maximumWritesInFlight = 0;
+    let heldWrites = 0;
+    const writeSpy = vi
+      .spyOn(Socket.prototype, "write")
+      .mockImplementation(function (this: Socket, ...args) {
+        const [chunk, encoding, callback] = args;
+        const callbackFn = typeof encoding === "function" ? encoding : callback;
+        if (
+          this !== socket &&
+          Buffer.isBuffer(chunk) &&
+          ((chunk[0] ?? 0) & 0x80) !== 0
+        ) {
+          writesInFlight += 1;
+          maximumWritesInFlight = Math.max(
+            maximumWritesInFlight,
+            writesInFlight,
+          );
+          heldWrites += 1;
+          const timer = setTimeout(() => {
+            writesInFlight -= 1;
+            callbackFn?.();
+          }, 25);
+          timer.unref();
+          return false;
+        }
+        return originalWrite.apply(this, args);
+      });
+    try {
+      for (let index = 0; index < 64; index += 1) {
+        sendRawFrame(socket, 0x9, Buffer.from([index]));
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+
+      expect(heldWrites).toBeGreaterThan(0);
+      expect(maximumWritesInFlight).toBe(1);
+    } finally {
+      writeSpy.mockRestore();
+      socket.destroy();
+      await app.close();
+    }
+  });
+
   it.each([
     {
       name: "RSV1",
@@ -637,6 +1179,20 @@ describe("Connector gateway authentication and handshake", () => {
       }
     },
   );
+
+  it("completes the FakeConnector close handshake during app shutdown", async () => {
+    const app = await startApp();
+    const credentials = await seedConnector(db);
+    const connector = await FakeConnector.connect(app, credentials);
+    try {
+      await expect(app.close()).resolves.toBeUndefined();
+      await expect(connector.waitForClose()).resolves.toBeUndefined();
+      expect(connector.closeResponseSent).toBe(true);
+      expect(connector.closeResponseMasked).toBe(true);
+    } finally {
+      await connector.close();
+    }
+  });
 
   it("waits for every upgraded connector socket before app.close resolves", async () => {
     const app = await startApp();

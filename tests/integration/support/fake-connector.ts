@@ -239,6 +239,8 @@ class RawWebSocket {
   readonly #errorHandlers: ErrorHandler[] = [];
   #buffer: Buffer;
   #closed = false;
+  #closeResponseSent = false;
+  #closeResponseMasked = false;
   #fragmentedText: Buffer[] | undefined;
   #fragmentedTextBytes = 0;
 
@@ -293,6 +295,14 @@ class RawWebSocket {
 
   waitForClose(): Promise<void> {
     return this.#waitForClose();
+  }
+
+  get closeResponseSent(): boolean {
+    return this.#closeResponseSent;
+  }
+
+  get closeResponseMasked(): boolean {
+    return this.#closeResponseMasked;
   }
 
   #waitForClose(): Promise<void> {
@@ -375,10 +385,26 @@ class RawWebSocket {
       } else if (lengthCode === 126) {
         if (this.#buffer.byteLength < 4) return;
         length = this.#buffer.readUInt16BE(2);
+        if (length < 126) {
+          this.#failReceive(
+            new Error(
+              "FakeConnector received a non-minimal server frame length",
+            ),
+          );
+          return;
+        }
         offset = 4;
       } else {
         if (this.#buffer.byteLength < 10) return;
         const extended = this.#buffer.readBigUInt64BE(2);
+        if ((extended & 0x8000000000000000n) !== 0n || extended < 65_536n) {
+          this.#failReceive(
+            new Error(
+              "FakeConnector received a non-minimal server frame length",
+            ),
+          );
+          return;
+        }
         if (extended > BigInt(MAX_FRAME_BYTES)) {
           this.#failReceive(
             new Error("FakeConnector received an oversized server frame"),
@@ -425,7 +451,14 @@ class RawWebSocket {
             return;
           }
         }
-        this.#finishClose();
+        try {
+          this.#sendFrame(0x8, payload, 0, true, true);
+          this.#closeResponseSent = true;
+          this.#closeResponseMasked = true;
+          this.#socket.end();
+        } catch {
+          this.#finishClose();
+        }
         return;
       }
       if (opcode === 0x9) {
@@ -574,6 +607,14 @@ export class FakeConnector {
 
   get lastServerSequence(): number {
     return this.#serverSequence;
+  }
+
+  get closeResponseSent(): boolean {
+    return this.#socket.closeResponseSent;
+  }
+
+  get closeResponseMasked(): boolean {
+    return this.#socket.closeResponseMasked;
   }
 
   async send(
