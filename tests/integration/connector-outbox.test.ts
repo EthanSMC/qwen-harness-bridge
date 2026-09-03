@@ -349,8 +349,8 @@ describe("PostgreSQL Connector outbox", () => {
   it("caps an offer lease at the job expiry", async () => {
     const repositoryId = `offer-expiry-cap-${crypto.randomUUID()}`;
     const job = await createJob(repositoryId, "Offer expiry cap");
-    const now = new Date("2030-01-02T03:04:05.000Z");
-    const jobExpiresAt = new Date("2030-01-02T03:04:10.000Z");
+    const now = new Date();
+    const jobExpiresAt = new Date(String(await expiryAfter(5_000)));
     await database.query("UPDATE jobs SET expires_at = $1 WHERE id = $2", [
       jobExpiresAt,
       job.jobId,
@@ -449,6 +449,54 @@ describe("PostgreSQL Connector outbox", () => {
     );
   });
 
+  it("uses PostgreSQL time for concurrency admission under a future-skewed caller clock", async () => {
+    const testIdentity = await insertConnector();
+    const repositoryId = `dispatch-clock-skew-${crypto.randomUUID()}`;
+    const repository = new JobRepository(database.client);
+    const queued = await createJob(repositoryId, "Queued behind a live lease");
+    const active = await repository.createIdempotent({
+      ownerId: OWNER_ID,
+      clientRequestId: crypto.randomUUID(),
+      repositoryId,
+      requestCiphertext: cipher.encrypt("Already dispatched"),
+      requestDigest: `sha256:${crypto.randomUUID().replaceAll("-", "")}`,
+    });
+    const liveLease = await expiryAfter(60_000);
+    const jobExpiry = await expiryAfter(10 * 60_000);
+    await database.query(
+      `UPDATE jobs
+          SET connector_id = $1,
+              status = 'dispatched'::job_status,
+              lease_id = $2,
+              lease_expires_at = $3,
+              expires_at = $4
+        WHERE id = $5`,
+      [
+        testIdentity.connectorId,
+        crypto.randomUUID(),
+        liveLease,
+        jobExpiry,
+        active.jobId,
+      ],
+    );
+
+    const futureSkewedNow = new Date(Date.now() + 5 * 60_000);
+    const store = new PostgresConnectorStore(database.client);
+    await expect(
+      store.dispatchNext(testIdentity, futureSkewedNow),
+    ).resolves.toBeNull();
+    await expect(repository.get(queued.jobId)).resolves.toMatchObject({
+      status: "queued",
+      attempt: 0,
+      revision: 0,
+    });
+
+    await database.query(
+      "UPDATE jobs SET status = 'expired'::job_status WHERE id IN ($1, $2)",
+      [active.jobId, queued.jobId],
+    );
+  });
+
   it("deduplicates exact client messages and rejects gaps or modified replay", async () => {
     const store = new PostgresConnectorStore(database.client);
     const hello = envelope("connector.hello", 1, {
@@ -512,6 +560,68 @@ describe("PostgreSQL Connector outbox", () => {
       store.acceptClientMessage(identity, gap),
       "CLIENT_SEQUENCE_GAP",
     );
+  });
+
+  it("restores a tombstoned connector welcome for an exact duplicate hello", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const hello = envelope("connector.hello", 1, {
+      connector_id: testIdentity.connectorId,
+      connector_version: "integration-1.0",
+      capabilities: ["tests"],
+      last_server_sequence: 0,
+      last_client_sequence: 0,
+    });
+    const accepted = await store.acceptClientMessage(testIdentity, hello);
+    if (accepted.response === null) throw new Error("expected a welcome");
+    expect(accepted.response.type).toBe("connector.welcome");
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE message_id = $1",
+      [accepted.response.messageId],
+    );
+
+    const maintained = await store.pendingServerMessages(
+      testIdentity,
+      0,
+      new Date(),
+    );
+    expect(maintained).toMatchObject([
+      {
+        sequence: accepted.response.sequence,
+        type: "protocol.error",
+        payload: { code: "MESSAGE_EXPIRED" },
+      },
+    ]);
+
+    const retryNow = new Date();
+    const retried = await store.acceptClientMessage(
+      testIdentity,
+      hello,
+      retryNow,
+    );
+    if (retried.response === null)
+      throw new Error("expected a retried welcome");
+    expect(retried).toMatchObject({ duplicate: true });
+    expect(retried.response).toMatchObject({
+      type: "connector.welcome",
+      sequence: accepted.response.sequence,
+      payload: accepted.response.payload,
+    });
+    expect(retried.response.messageId).not.toBe(accepted.response.messageId);
+    expect(retried.response.messageId).not.toBe(maintained[0]?.messageId);
+    expect(retried.response.expiresAt.getTime()).toBeGreaterThan(
+      retryNow.getTime(),
+    );
+
+    await expectClientCursor(testIdentity.connectorId, 1);
+    await expect(
+      database.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM connector_messages
+          WHERE connector_id = $1 AND direction = 'server'`,
+        [testIdentity.connectorId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: "1" }] });
   });
 
   it("validates ACK ownership and keeps a valid duplicate idempotent", async () => {
@@ -607,6 +717,80 @@ describe("PostgreSQL Connector outbox", () => {
       previousHeartbeat,
     );
     expect(durable.rows[0]?.health).toBe("stale");
+  });
+
+  it("refreshes stale liveness for an exact duplicate heartbeat without replaying it", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const sentAt = new Date();
+    const heartbeat = envelope("connector.heartbeat", 1, {}, { sentAt });
+    const accepted = await store.acceptClientMessage(
+      testIdentity,
+      heartbeat,
+      sentAt,
+    );
+    expect(accepted).toMatchObject({
+      duplicate: false,
+      response: { type: "ack", payload: { sequence: 1 } },
+    });
+
+    const staleAt = new Date(Date.now() - 60_000);
+    await database.query(
+      `UPDATE connectors
+          SET health = 'stale'::connector_health,
+              last_heartbeat_at = $2,
+              updated_at = $2
+        WHERE id = $1`,
+      [testIdentity.connectorId, staleAt],
+    );
+
+    const duplicate = await store.acceptClientMessage(
+      testIdentity,
+      heartbeat,
+      new Date(),
+    );
+    expect(duplicate).toMatchObject({
+      duplicate: true,
+      response: {
+        messageId: accepted.response?.messageId,
+        sequence: accepted.response?.sequence,
+        type: "ack",
+      },
+    });
+
+    const durable = await database.query<{
+      last_client_sequence: number;
+      last_heartbeat_at: string;
+      health: string;
+      updated_at: string;
+      client_messages: string;
+      server_messages: string;
+    }>(
+      `SELECT last_client_sequence,
+              last_heartbeat_at::text,
+              health,
+              updated_at::text,
+              (SELECT count(*)::text
+                 FROM connector_messages
+                WHERE connector_id = $1 AND direction = 'client') AS client_messages,
+              (SELECT count(*)::text
+                 FROM connector_messages
+                WHERE connector_id = $1 AND direction = 'server') AS server_messages
+         FROM connectors
+        WHERE id = $1`,
+      [testIdentity.connectorId],
+    );
+    const row = durable.rows[0];
+    expect(Number(row?.last_client_sequence)).toBe(1);
+    expect(new Date(row?.last_heartbeat_at ?? 0).getTime()).toBeGreaterThan(
+      staleAt.getTime(),
+    );
+    expect(row?.health).toBe("fresh");
+    expect(new Date(row?.updated_at ?? 0).getTime()).toBeGreaterThan(
+      staleAt.getTime(),
+    );
+    expect(row?.client_messages).toBe("1");
+    expect(row?.server_messages).toBe("1");
   });
 
   it("does not replay a durably received sequence when its ACK was lost", async () => {
@@ -870,6 +1054,255 @@ describe("PostgreSQL Connector outbox", () => {
         expression,
       );
     }
+  });
+
+  it("refreshes an expired successful claim ACK without repeating the claim", async () => {
+    const testIdentity = await insertConnector();
+    const repository = new JobRepository(database.client);
+    const job = await createJob(
+      `retry-ack-expired-${crypto.randomUUID()}`,
+      "Retry an expired claim ACK",
+    );
+    await database.query("UPDATE jobs SET accepted_at = $1 WHERE id = $2", [
+      new Date("2000-01-01T00:00:00.000Z"),
+      job.jobId,
+    ]);
+    const store = new PostgresConnectorStore(database.client);
+    const offer = await store.dispatchNext(testIdentity);
+    if (offer === null) throw new Error("expected a job offer");
+    const claim = envelope("job.claim", 1, {
+      job_id: job.jobId,
+      attempt: offer.payload.attempt as number,
+      lease_id: offer.payload.lease_id as string,
+    });
+    const accepted = await store.acceptClientMessage(testIdentity, claim);
+    if (accepted.response === null) throw new Error("expected a claim ACK");
+    expect(accepted.response).toMatchObject({
+      type: "ack",
+      payload: { sequence: claim.sequence },
+    });
+
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE message_id = $1",
+      [accepted.response.messageId],
+    );
+    const retryNow = new Date();
+    const retried = await store.acceptClientMessage(
+      testIdentity,
+      claim,
+      retryNow,
+    );
+    if (retried.response === null) throw new Error("expected a retried ACK");
+    expect(retried).toMatchObject({ duplicate: true });
+    expect(retried.response).toMatchObject({
+      type: "ack",
+      sequence: accepted.response.sequence,
+      payload: accepted.response.payload,
+    });
+    expect(retried.response.messageId).not.toBe(accepted.response.messageId);
+    expect(retried.response.expiresAt.getTime()).toBeGreaterThan(
+      retryNow.getTime(),
+    );
+    expect(retried.response.expiresAt.getTime()).toBeLessThanOrEqual(
+      retryNow.getTime() + 61_000,
+    );
+
+    await expect(repository.get(job.jobId)).resolves.toMatchObject({
+      status: "running",
+      attempt: 1,
+      revision: 2,
+    });
+    await expect(
+      database.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM job_events
+          WHERE job_id = $1 AND event_type = 'job.claimed'`,
+        [job.jobId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: "1" }] });
+    await expect(
+      database.query<{ message_id: string; sequence: number; type: string }>(
+        `SELECT message_id, sequence::integer AS sequence, type
+           FROM connector_messages
+          WHERE connector_id = $1 AND direction = 'server'
+            AND sequence = $2`,
+        [testIdentity.connectorId, accepted.response.sequence],
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        {
+          message_id: retried.response.messageId,
+          sequence: accepted.response.sequence,
+          type: "ack",
+        },
+      ],
+    });
+    await database.query(
+      "UPDATE jobs SET status = 'succeeded'::job_status WHERE id = $1",
+      [job.jobId],
+    );
+  });
+
+  it("restores a tombstoned successful claim ACK without repeating the claim", async () => {
+    const testIdentity = await insertConnector();
+    const repository = new JobRepository(database.client);
+    const job = await createJob(
+      `retry-ack-tombstone-${crypto.randomUUID()}`,
+      "Retry a tombstoned claim ACK",
+    );
+    await database.query("UPDATE jobs SET accepted_at = $1 WHERE id = $2", [
+      new Date("2000-01-01T00:00:00.000Z"),
+      job.jobId,
+    ]);
+    const store = new PostgresConnectorStore(database.client);
+    const offer = await store.dispatchNext(testIdentity);
+    if (offer === null) throw new Error("expected a job offer");
+    const claim = envelope("job.claim", 1, {
+      job_id: job.jobId,
+      attempt: offer.payload.attempt as number,
+      lease_id: offer.payload.lease_id as string,
+    });
+    const accepted = await store.acceptClientMessage(testIdentity, claim);
+    if (accepted.response === null) throw new Error("expected a claim ACK");
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE message_id = $1",
+      [accepted.response.messageId],
+    );
+
+    const maintained = await store.pendingServerMessages(
+      testIdentity,
+      accepted.response.sequence - 1,
+      new Date(),
+    );
+    expect(maintained).toMatchObject([
+      {
+        sequence: accepted.response.sequence,
+        type: "protocol.error",
+        payload: { code: "MESSAGE_EXPIRED" },
+      },
+    ]);
+
+    const retryNow = new Date();
+    const retried = await store.acceptClientMessage(
+      testIdentity,
+      claim,
+      retryNow,
+    );
+    if (retried.response === null) throw new Error("expected a retried ACK");
+    expect(retried).toMatchObject({ duplicate: true });
+    expect(retried.response).toMatchObject({
+      type: "ack",
+      sequence: accepted.response.sequence,
+      payload: accepted.response.payload,
+    });
+    expect(retried.response.messageId).not.toBe(accepted.response.messageId);
+    expect(retried.response.messageId).not.toBe(maintained[0]?.messageId);
+    expect(retried.response.expiresAt.getTime()).toBeGreaterThan(
+      retryNow.getTime(),
+    );
+
+    await expect(repository.get(job.jobId)).resolves.toMatchObject({
+      status: "running",
+      attempt: 1,
+      revision: 2,
+    });
+    await expect(
+      database.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM job_events
+          WHERE job_id = $1 AND event_type = 'job.claimed'`,
+        [job.jobId],
+      ),
+    ).resolves.toMatchObject({ rows: [{ count: "1" }] });
+    await database.query(
+      "UPDATE jobs SET status = 'succeeded'::job_status WHERE id = $1",
+      [job.jobId],
+    );
+  });
+
+  it("refreshes an expired CLAIM_REJECTED response without repeating cancellation handling", async () => {
+    const testIdentity = await insertConnector();
+    const repository = new JobRepository(database.client);
+    const job = await createJob(
+      `retry-claim-rejected-${crypto.randomUUID()}`,
+      "Retry a rejected claim response",
+    );
+    await database.query("UPDATE jobs SET accepted_at = $1 WHERE id = $2", [
+      new Date("2000-01-01T00:00:00.000Z"),
+      job.jobId,
+    ]);
+    const store = new PostgresConnectorStore(database.client);
+    const offer = await store.dispatchNext(testIdentity);
+    if (offer === null) throw new Error("expected a job offer");
+    const claim = envelope("job.claim", 1, {
+      job_id: job.jobId,
+      attempt: offer.payload.attempt as number,
+      lease_id: offer.payload.lease_id as string,
+    });
+    const dispatched = await repository.get(job.jobId);
+    if (dispatched === null) throw new Error("expected a dispatched job");
+    await expect(
+      repository.cancelAtomically({
+        ownerId: OWNER_ID,
+        jobId: job.jobId,
+        expectedRevision: dispatched.revision,
+      }),
+    ).resolves.toMatchObject({ status: "cancelled" });
+
+    const accepted = await store.acceptClientMessage(testIdentity, claim);
+    if (accepted.response === null) {
+      throw new Error("expected a CLAIM_REJECTED response");
+    }
+    expect(accepted.response).toMatchObject({
+      type: "protocol.error",
+      payload: {
+        code: "CLAIM_REJECTED",
+        message: "The offered job was cancelled before it was claimed.",
+      },
+    });
+    const eventsAfterInitialClaim = await database.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM job_events WHERE job_id = $1",
+      [job.jobId],
+    );
+    const stateAfterInitialClaim = await repository.get(job.jobId);
+
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE message_id = $1",
+      [accepted.response.messageId],
+    );
+    const retryNow = new Date();
+    const retried = await store.acceptClientMessage(
+      testIdentity,
+      claim,
+      retryNow,
+    );
+    if (retried.response === null) {
+      throw new Error("expected a retried CLAIM_REJECTED response");
+    }
+    expect(retried).toMatchObject({ duplicate: true });
+    expect(retried.response).toMatchObject({
+      type: "protocol.error",
+      sequence: accepted.response.sequence,
+      payload: accepted.response.payload,
+    });
+    expect(retried.response.messageId).not.toBe(accepted.response.messageId);
+    expect(retried.response.expiresAt.getTime()).toBeGreaterThan(
+      retryNow.getTime(),
+    );
+    expect(retried.response.expiresAt.getTime()).toBeLessThanOrEqual(
+      retryNow.getTime() + 61_000,
+    );
+
+    await expect(repository.get(job.jobId)).resolves.toEqual(
+      stateAfterInitialClaim,
+    );
+    const eventsAfterRetry = await database.query<{ count: string }>(
+      "SELECT count(*)::text AS count FROM job_events WHERE job_id = $1",
+      [job.jobId],
+    );
+    expect(eventsAfterRetry.rows[0]?.count).toBe(
+      eventsAfterInitialClaim.rows[0]?.count,
+    );
   });
 
   it("releases an expired offer lease without incrementing the product attempt", async () => {
