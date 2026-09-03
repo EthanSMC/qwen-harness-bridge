@@ -206,4 +206,89 @@ describe("Foundation fake Connector end to end", () => {
       await app.close();
     }
   });
+
+  it("rejects a case-variant reconnect when a tombstone reuses a recorded server sequence", async () => {
+    const ownerId = `owner-${crypto.randomUUID()}`;
+    const connectorId = `a${crypto.randomUUID().slice(1)}`;
+    const credentialId = `credential-${crypto.randomUUID()}`;
+    const credentialSecret = `connector-secret-${crypto.randomUUID()}`;
+    await database.query(
+      "INSERT INTO owners (id, display_name) VALUES ($1, 'Sequence owner')",
+      [ownerId],
+    );
+    await database.query(
+      `INSERT INTO connectors (id, owner_id, credential_id, credential_hash)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        connectorId,
+        ownerId,
+        credentialId,
+        await hashConnectorCredential(credentialSecret),
+      ],
+    );
+
+    const repository = new JobRepository(database.client);
+    const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(91));
+    const coordinator = new JobCoordinator({
+      repository,
+      encryptor: cipher,
+      now: () => new Date(),
+    });
+    const app = await createApp({
+      coordinator,
+      ownerId,
+      mcpBearerToken: "sequence-mismatch-mcp-bearer-fixture-only",
+      https: LOCALHOST_TLS,
+      connectorGateway: {
+        database: database.client,
+        sessionSigningKey:
+          "sequence-mismatch-connector-session-signing-key-with-32-bytes",
+        requestDecryptor: cipher,
+        dispatchIntervalMs: 10,
+      },
+    });
+    await app.listen({ host: "127.0.0.1", port: 0 });
+    const credentials = {
+      connector_id: connectorId,
+      credential_id: credentialId,
+      credential_secret: credentialSecret,
+    };
+    let connector: FakeConnector | undefined;
+    try {
+      connector = await FakeConnector.connect(app, credentials);
+      const welcome = connector.received.find(
+        (message) => message.type === "connector.welcome",
+      );
+      if (welcome === undefined) {
+        throw new Error("FakeConnector did not receive its welcome message");
+      }
+
+      const expired = await database.query<{ message_id: string }>(
+        `UPDATE connector_messages
+            SET expires_at = now() - interval '1 second'
+          WHERE connector_id = $1
+            AND direction = 'server'
+            AND sequence = $2
+            AND message_id = $3
+          RETURNING message_id`,
+        [connectorId, welcome.sequence, welcome.message_id],
+      );
+      expect(expired.rows).toHaveLength(1);
+
+      await connector.disconnectWithoutAck();
+      await expect(
+        FakeConnector.connect(app, {
+          ...credentials,
+          connector_id: credentials.connector_id.toUpperCase(),
+          last_client_sequence: connector.lastClientSequence,
+          last_server_sequence: 0,
+        }),
+      ).rejects.toThrow(
+        "FakeConnector received a different message for a sequence",
+      );
+    } finally {
+      if (connector !== undefined) await connector.close();
+      await app.close();
+    }
+  });
 });
