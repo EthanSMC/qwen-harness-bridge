@@ -840,7 +840,9 @@ describe("release runtime build contract", () => {
     }
     expect(evidence).toContain("printf 'live_status=%s\\n' \"$live_status\"");
     expect(evidence).toContain("printf 'ready_status=%s\\n' \"$ready_status\"");
-    expect(evidence).toContain("printf 'metrics_status=%s\\n' \"$metrics_status\"");
+    expect(evidence).toContain(
+      "printf 'metrics_status=%s\\n' \"$metrics_status\"",
+    );
     expect(evidence).toMatch(/(?:cat|source)[^\n]*RUNTIME_[A-Z_]*OBSERV/i);
     expect(evidence).toMatch(/live_body/);
     expect(evidence).toMatch(/ready_body/);
