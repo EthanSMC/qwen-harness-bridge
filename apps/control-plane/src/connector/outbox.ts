@@ -47,8 +47,16 @@ type OriginalResponse = Readonly<{
   type: ConnectorServerMessage["type"];
   payload: Record<string, unknown>;
 }>;
+type StoredResponseMetadata = Readonly<{
+  type: unknown;
+  payload: unknown;
+  sequence: unknown;
+  correlation_id: unknown;
+}>;
 
 const STORED_RESPONSE_KEY = "__qhb_original_response";
+const CLAIM_REJECTED_MESSAGE =
+  "The offered job was cancelled before it was claimed.";
 
 export type ConnectorIdentity = Readonly<{
   ownerId: string;
@@ -312,37 +320,103 @@ const findOriginalResponse = async (
       candidate.payload.code === "CLAIM_REJECTED"
     );
   });
-  if (row !== undefined) {
+  const validateResponse = (
+    candidate: ConnectorMessageRow,
+    type: unknown = candidate.type,
+    payload: unknown = candidate.payload,
+    sequence: unknown = candidate.sequence,
+    correlationId: unknown = candidate.correlationId,
+  ): OriginalResponse | null => {
+    if (
+      candidate.connectorId !== connectorId ||
+      candidate.direction !== "server" ||
+      candidate.correlationId !== message.correlation_id ||
+      correlationId !== message.correlation_id ||
+      sequence !== candidate.sequence ||
+      typeof sequence !== "number" ||
+      !Number.isSafeInteger(sequence) ||
+      sequence < 1
+    ) {
+      return null;
+    }
+    const createdAtMs = candidate.createdAt.getTime();
+    const expiresAtMs = candidate.expiresAt.getTime();
+    if (!Number.isFinite(createdAtMs) || !Number.isFinite(expiresAtMs)) {
+      return null;
+    }
+    const schemaExpiresAt = new Date(Math.max(expiresAtMs, createdAtMs + 1));
+    const parsed = ConnectorServerMessageSchema.safeParse({
+      protocol_version: "1.0",
+      message_id: candidate.messageId,
+      sequence,
+      sent_at: candidate.createdAt.toISOString(),
+      expires_at: schemaExpiresAt.toISOString(),
+      correlation_id: candidate.correlationId,
+      type,
+      payload,
+    });
+    if (!parsed.success) return null;
+    const response = parsed.data;
+    if (message.type === "connector.hello") {
+      if (
+        response.type !== "connector.welcome" ||
+        response.payload.connector_id !== connectorId ||
+        response.payload.server_sequence !== candidate.sequence ||
+        response.payload.replay_from !==
+          message.payload.last_server_sequence + 1
+      ) {
+        return null;
+      }
+    } else if (response.type === "ack") {
+      if (response.payload.sequence !== message.sequence) return null;
+    } else if (
+      message.type !== "job.claim" ||
+      response.type !== "protocol.error" ||
+      response.payload.code !== "CLAIM_REJECTED" ||
+      response.payload.message !== CLAIM_REJECTED_MESSAGE
+    ) {
+      return null;
+    }
     return {
-      row,
-      type: row.type as ConnectorServerMessage["type"],
-      payload: row.payload,
+      row: candidate,
+      type: response.type,
+      payload: response.payload as Record<string, unknown>,
     };
+  };
+  if (row !== undefined) {
+    const response = validateResponse(row);
+    if (response === null) {
+      throw new ConnectorStoreError("INTERNAL", "Original response is invalid");
+    }
+    return response;
   }
   const storedPayload = asRecord(clientMessage.payload);
-  const storedResponse =
+  const storedResponse: StoredResponseMetadata | null =
     storedPayload === null
       ? null
-      : asRecord(storedPayload[STORED_RESPONSE_KEY]);
+      : (asRecord(
+          storedPayload[STORED_RESPONSE_KEY],
+        ) as StoredResponseMetadata | null);
   const tombstone = rows.find(
     (candidate) =>
       candidate.type === "protocol.error" &&
       candidate.payload.code === "MESSAGE_EXPIRED" &&
       storedResponse?.sequence === candidate.sequence,
   );
-  if (
-    tombstone === undefined ||
-    storedResponse === null ||
-    typeof storedResponse.type !== "string" ||
-    asRecord(storedResponse.payload) === null
-  ) {
+  if (tombstone === undefined || storedResponse === null) {
     throw new ConnectorStoreError("INTERNAL", "Original response is missing");
   }
-  return {
-    row: tombstone,
-    type: storedResponse.type as ConnectorServerMessage["type"],
-    payload: asRecord(storedResponse.payload) as Record<string, unknown>,
-  };
+  const response = validateResponse(
+    tombstone,
+    storedResponse.type,
+    storedResponse.payload,
+    storedResponse.sequence,
+    storedResponse.correlation_id,
+  );
+  if (response === null) {
+    throw new ConnectorStoreError("INTERNAL", "Original response is invalid");
+  }
+  return response;
 };
 
 const refreshServerMessage = async (
@@ -389,6 +463,7 @@ const rememberOriginalResponse = async (
           type: response.type,
           payload: response.payload,
           sequence: response.sequence,
+          correlation_id: response.correlationId,
         },
       },
     })
@@ -1198,8 +1273,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
                 "protocol.error",
                 {
                   code: "CLAIM_REJECTED",
-                  message:
-                    "The offered job was cancelled before it was claimed.",
+                  message: CLAIM_REJECTED_MESSAGE,
                 },
                 new Date(currentTime.getTime() + 60_000),
                 message.correlation_id,

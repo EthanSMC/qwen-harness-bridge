@@ -624,6 +624,78 @@ describe("PostgreSQL Connector outbox", () => {
     ).resolves.toMatchObject({ rows: [{ count: "1" }] });
   });
 
+  it("rejects incompatible tombstone response metadata without mutating the tombstone", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const hello = envelope("connector.hello", 1, {
+      connector_id: testIdentity.connectorId,
+      connector_version: "integration-1.0",
+      capabilities: ["tests"],
+      last_server_sequence: 0,
+      last_client_sequence: 0,
+    });
+    const accepted = await store.acceptClientMessage(testIdentity, hello);
+    if (accepted.response === null) throw new Error("expected a welcome");
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE message_id = $1",
+      [accepted.response.messageId],
+    );
+    const maintained = await store.pendingServerMessages(
+      testIdentity,
+      0,
+      new Date(),
+    );
+    const tombstone = maintained[0];
+    if (tombstone === undefined) throw new Error("expected a tombstone");
+    expect(tombstone).toMatchObject({
+      type: "protocol.error",
+      sequence: accepted.response.sequence,
+      payload: { code: "MESSAGE_EXPIRED" },
+    });
+
+    await database.query(
+      `UPDATE connector_messages
+          SET payload = jsonb_set(
+            payload,
+            '{__qhb_original_response,type}',
+            '"protocol.error"'::jsonb
+          )
+        WHERE connector_id = $1 AND direction = 'client' AND message_id = $2`,
+      [testIdentity.connectorId, hello.message_id],
+    );
+
+    await expectStoreError(
+      store.acceptClientMessage(testIdentity, hello, new Date()),
+      "INTERNAL",
+    );
+    await expect(
+      database.query<{
+        message_id: string;
+        sequence: number;
+        type: string;
+        payload: Record<string, unknown>;
+      }>(
+        `SELECT message_id, sequence::integer AS sequence, type, payload
+           FROM connector_messages
+          WHERE connector_id = $1 AND direction = 'server'
+            AND sequence = $2`,
+        [testIdentity.connectorId, tombstone.sequence],
+      ),
+    ).resolves.toMatchObject({
+      rows: [
+        {
+          message_id: tombstone.messageId,
+          sequence: tombstone.sequence,
+          type: "protocol.error",
+          payload: {
+            code: "MESSAGE_EXPIRED",
+            message: "A Connector message expired before delivery.",
+          },
+        },
+      ],
+    });
+  });
+
   it("validates ACK ownership and keeps a valid duplicate idempotent", async () => {
     const ackIdentity = await insertConnector();
     const otherIdentity = await insertConnector();
