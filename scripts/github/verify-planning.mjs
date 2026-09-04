@@ -109,7 +109,7 @@ const lifecycleMigrations = JSON.parse(
   contents.get("docs/github/ai-lifecycle-migrations.json"),
 );
 if (
-  lifecycleMigrations.schema_version !== 2 ||
+  lifecycleMigrations.schema_version !== 3 ||
   !Array.isArray(lifecycleMigrations.entries) ||
   !(
     lifecycleMigrations.mutation_acceptance === null ||
@@ -121,6 +121,12 @@ if (
   )
 ) {
   throw new Error("AI lifecycle migration registry has an invalid schema");
+}
+if (
+  lifecycleMigrations.mutation_acceptance !== null &&
+  typeof lifecycleMigrations.mutation_acceptance.approved_at !== "string"
+) {
+  throw new Error("AI lifecycle mutation acceptance needs an approval time");
 }
 
 for (const template of [
@@ -136,6 +142,14 @@ for (const template of [
     [/label: Definition of done/, "the Definition of done field"],
   ]) {
     requireGovernanceField(template, pattern, message);
+  }
+  const ids = [
+    ...contents
+      .get(template)
+      .matchAll(/^\s+id:\s*([A-Za-z][A-Za-z0-9_-]*)\s*$/gmu),
+  ].map((match) => match[1]);
+  if (ids.length === 0 || new Set(ids).size !== ids.length) {
+    throw new Error(`${template} must define unique Issue Form input IDs`);
   }
 }
 
@@ -403,7 +417,10 @@ for (const [pattern, message] of [
   [/issues:[\s\S]*?opened[\s\S]*?edited/, "new and edited Issue triggers"],
   [/issues:\s*write/, "Issue write permission"],
   [/pull-requests:\s*read/, "pull-request read permission"],
-  [/github\.event\.issue\.number/, "per-Issue lifecycle queue"],
+  [
+    /^\s*group:\s*ai-issue-lifecycle-\$\{\{\s*github\.repository\s*\}\}\s*$/m,
+    "repository-wide lifecycle mutation queue",
+  ],
   [/cancel-in-progress:\s*false/, "non-cancelling lifecycle queue"],
   [
     /ref:\s*\$\{\{\s*github\.event\.repository\.default_branch\s*\}\}/,
@@ -431,6 +448,13 @@ for (const [pattern, message] of [
   [/Number\(left\.id\) - Number\(right\.id\)/, "immutable comment-ID ordering"],
   [/reconcileRepositoryState/, "scheduled repository state reconciliation"],
   [/MAX_COMMANDS_PER_DRAIN = 1_000/, "bounded command draining"],
+  [/COMMAND_SCAN_MAX_PAGES = 10/, "bounded repository comment scanning"],
+  [/\.slice\(0, maxCommands\)/, "oldest bounded command batch selection"],
+  [
+    /!parentByNumber\.get\(number\)\?\.pull_request/,
+    "pre-accounting pull-request comment filtering",
+  ],
+  [/runReconciliationPhases/, "non-starving event reconciliation phases"],
   [/stableSystemEventId/, "deterministic system event identities"],
 ]) {
   requireSourceField(

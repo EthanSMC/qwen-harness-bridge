@@ -165,7 +165,7 @@ agent: codex
 
 ### 7.2 Durable serialized decision
 
-The lifecycle workflow uses per-Issue concurrency with `cancel-in-progress: false`. GitHub may replace an older pending run even when cancellation is disabled, so concurrency alone is not a queue. Every Issue-triggered run lists the Issue comments, finds commands without a workflow receipt or bounded rejection marker, and drains them in immutable comment-ID order. The hourly run performs the same bounded repository-wide recovery scan. Pull-request and Issue reconciliation use deterministic system event IDs and converge from current live state, including reconstruction of a missed PR-open transition when the final merge is already verifiable.
+The lifecycle workflow uses one repository-wide concurrency group with `cancel-in-progress: false`, so Issue comments, Issue changes, pull-request events, and scheduled repair cannot mutate the same Issue concurrently. GitHub may replace an older pending run even when cancellation is disabled, so concurrency alone is not a queue. Every surviving event run and the hourly recovery run inspect at most the 1,000 most recent repository comments, exclude pull-request comments before backlog accounting, and process the oldest bounded batch of pending Issue commands. Processing re-reads the command's bounded Issue history, so a replay observes the durable workflow receipt or rejection marker. Pull-request and Issue reconciliation use deterministic system event IDs and converge from current live state, including reconstruction of a missed PR-open transition when the final merge is already verifiable.
 
 The controller checks the live Issue, all readiness rules, current assignees, labels, open closing pull requests, and the comment author's current repository permission. The workflow never checks out contributor-controlled code and uses only the default branch implementation.
 
@@ -181,7 +181,7 @@ If the postconditions do not hold, it creates a bounded failure receipt and fail
 
 ### 7.3 Claim lease and heartbeat
 
-An active claim has a 24-hour renewable lease. Meaningful public activity on the linked branch or pull request does not silently renew it because branch activity may not explain the state of the Issue. The owner or their AI renews explicitly:
+An active implementation claim has a 24-hour renewable lease. Meaningful public activity on the linked branch or pull request does not silently renew it because branch activity may not explain the state of the Issue. While the Issue is `status:in-progress`, the owner or their AI renews explicitly:
 
 ```text
 /ai-heartbeat
@@ -190,7 +190,7 @@ summary: protocol schema implemented; integration tests remain
 
 The summary is required, is limited to 240 UTF-8 bytes, and must contain no private execution material. The workflow verifies ownership and extends the lease from the immutable command-comment timestamp. Scheduled expiry and migration decisions use the GitHub response `Date` header, never the runner's local clock.
 
-A scheduled hourly reconciliation releases an expired `status:in-progress` claim by removing the assignee, restoring `status:ready` when readiness still passes or `status:waiting` otherwise, and writing a stale-release receipt. It does not automatically release `status:review` or `status:blocked`; those states require an explicit resolution because a pull request or external dependency may still exist. The owner may heartbeat `status:review` without changing its state; an expired review lease blocks merge until renewed.
+A scheduled hourly reconciliation releases an expired `status:in-progress` claim by removing the assignee, restoring `status:ready` when readiness still passes or `status:waiting` otherwise, and writing a stale-release receipt. A qualifying pull request must have been created after the claim and strictly before this implementation deadline. Its verified `pr-open` transition replaces the deadline with a durable review lock, so required checks do not become stale merely because wall-clock time advances and `/ai-heartbeat` is rejected in `status:review`. Closing the pull request unmerged returns to `status:in-progress` with a fresh 24-hour lease. `status:blocked` still requires explicit resolution because an external dependency exists.
 
 ## 8. Local execution contract
 
@@ -253,7 +253,7 @@ A pull request for governed work must:
 - include the exact base and head commits, observed verification results, risk, compatibility, migration, privacy/security effect, and rollback path; and
 - complete the existing review-mode evidence.
 
-When a qualifying pull request opens, the lifecycle workflow moves the Issue from `status:in-progress` to `status:review`. Draft pull requests are allowed, but they do not weaken evidence requirements.
+When a qualifying pull request created strictly within the implementation lease opens, the lifecycle workflow moves the Issue from `status:in-progress` to `status:review` and records a durable review-admission receipt with no expiry. Draft pull requests are allowed, but they do not weaken evidence requirements.
 
 The implementer and final reviewer must be distinct. Review follows the existing two-path gate:
 
@@ -264,7 +264,7 @@ A review finding returns work to the implementation/fix loop without creating a 
 
 ## 11. Merge, closure, and cleanup
 
-The controller merges only through the protected `main` branch after independently querying required checks and review state. It then verifies:
+The required read-only merge gate permits merge only through the protected `main` branch after independently querying required checks and review state. The lifecycle controller then verifies:
 
 1. the pull request names the current claim receipt and is authored by that claim's owner;
 2. the pull request is merged into `main` after the current claim began;
@@ -301,7 +301,7 @@ Implementation adds or updates these bounded components:
 - `.github/ISSUE_TEMPLATE/implementation.yml` and `bug.yml`: outcome, dependencies, verification, readiness, and AI-safe evidence fields.
 - `.github/pull_request_template.md`: claim receipt, accountable owner, agent class, lifecycle, review, and closure evidence.
 - `.github/labels.yml`: the six mutually exclusive lifecycle labels.
-- `.github/workflows/ai-issue-lifecycle.yml`: per-Issue serialization, durable command draining, scheduled expiry, pull-request transitions, close/reopen reconciliation, and receipts.
+- `.github/workflows/ai-issue-lifecycle.yml`: repository-wide mutation serialization, bounded command draining, scheduled expiry, pull-request transitions, close/reopen reconciliation, and receipts.
 - `.github/workflows/governance.yml`: read-only lifecycle validation as a required pull-request gate.
 - `scripts/github/ai-issue-policy.mjs` and `ai-issue-controller.mjs`: strict command parsing, transition policy, trusted GitHub adapter boundary, and reconciliation logic.
 - `scripts/github/verify-ai-lifecycle.mjs`: fail-closed live Issue/claim/PR validation.
@@ -323,7 +323,7 @@ The lifecycle policy lives in testable JavaScript modules. Workflow YAML supplie
 - Workflow receipts include stable machine markers but no reusable credential or private agent identifier.
 - Duplicate deliveries are idempotent by event/comment ID and claim generation.
 - Non-idempotent POST requests are never replayed after an uncertain response; the controller performs bounded live reads and accepts identical duplicate intent markers while rejecting conflicting ones.
-- Pagination is complete and bounded; malformed or truncated external state fails closed.
+- Complete state reads use bounded pagination and fail closed if truncated; repository command recovery deliberately inspects a documented 1,000-comment window and replays each selected command against its complete bounded Issue history.
 - Every REST request has a hard deadline.
 - Manual state edits, deleted receipts, ambiguous closing keywords, multiple assignees, multiple lifecycle labels, or stale evidence block merge.
 - Maintainer repair actions create explicit audit receipts.
@@ -362,8 +362,8 @@ GitHub API timeouts, permission ambiguity, pagination exhaustion, and post-write
 ### 16.2 Adapter and workflow tests
 
 - Fake GitHub API fixtures for pagination, timeout, malformed records, partial writes, retries, and post-write mismatch.
-- Static checks for event triggers, per-Issue concurrency, default-branch trust, and least-privilege workflow permissions.
-- Governance fixtures for valid formal review, valid solo review, missing claim, wrong assignee, stale lease, multiple labels, open dependency, mismatched commit range, and failed current-head checks.
+- Static checks for event triggers, repository-wide concurrency, default-branch trust, and least-privilege workflow permissions.
+- Governance fixtures for valid formal review, valid solo review, missing claim, wrong assignee, missing review admission, multiple labels, open dependency, mismatched commit range, and failed current-head checks.
 
 ### 16.3 Live acceptance
 

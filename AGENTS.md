@@ -19,7 +19,7 @@ agent: codex
 - Use one Issue, one supported branch, one isolated worktree, and one primary pull request.
 - Branch from current `origin/main` using `feat/<issue>-<slug>`, `fix/<issue>-<slug>`, `security/<issue>-<slug>`, or `docs/<issue>-<slug>`.
 - Use test-first development for behavior changes. Preserve unrelated user changes and avoid parallel writes to shared files.
-- Keep the 24-hour claim lease active with a bounded public checkpoint:
+- Keep the 24-hour implementation lease active with a bounded public checkpoint until a qualifying pull request enters review:
 
 ```text
 /ai-heartbeat
@@ -27,6 +27,7 @@ summary: protocol schema implemented; integration tests remain
 ```
 
 - Use `/ai-block` only for a concrete external condition, `/ai-resume` after verifying that condition changed, and `/ai-release` when abandoning the claim. Handoff is release followed by a fresh claim from the recipient.
+- Create the qualifying pull request strictly before the implementation lease expires. Its verified `pr-open` receipt grants a durable review lock; `/ai-heartbeat` is not accepted in `status:review`. Closing it unmerged restores `status:in-progress` with a fresh 24-hour lease.
 - Never publish a private agent thread or share link, prompt, model reasoning, credential, raw/full log, source body, private repository path, or local absolute path.
 
 ## Pull request and completion

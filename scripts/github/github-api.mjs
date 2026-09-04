@@ -212,14 +212,30 @@ export const createGitHubClient = ({
           method: normalizedMethod,
           path: normalizedPath,
           status: response.status,
+          uncertain: normalizedMethod !== "GET",
+        },
+      );
+    }
+    let validated;
+    try {
+      validated = validateResponseShape(
+        value,
+        `GitHub API ${normalizedMethod} ${normalizedPath} response`,
+      );
+    } catch (error) {
+      clearTimeout(timeout);
+      if (normalizedMethod === "GET") throw error;
+      throw requestError(
+        `GitHub API ${normalizedMethod} ${normalizedPath} returned an invalid response shape`,
+        {
+          method: normalizedMethod,
+          path: normalizedPath,
+          status: response.status,
+          uncertain: true,
         },
       );
     }
     clearTimeout(timeout);
-    const validated = validateResponseShape(
-      value,
-      `GitHub API ${normalizedMethod} ${normalizedPath} response`,
-    );
     return includeServerDate
       ? {
           value: validated,

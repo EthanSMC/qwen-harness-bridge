@@ -10,7 +10,7 @@ Every contributor may use an AI agent, but the named human Issue assignee remain
 2. Read [AGENTS.md](AGENTS.md), [the AI collaboration guide](docs/github/ai-collaboration.md), the Issue's linked plan task, and every interface it consumes.
 3. Post `/ai-claim` with a safe agent class and wait for the repository workflow's success receipt. A command comment alone does not grant ownership.
 4. From current `origin/main`, create `feat/<issue>-<slug>`, `fix/<issue>-<slug>`, `security/<issue>-<slug>`, or `docs/<issue>-<slug>` in an isolated worktree.
-5. Follow the task's red-green-refactor sequence and exact verification commands. Renew the 24-hour lease with a bounded `/ai-heartbeat`.
+5. Follow the task's red-green-refactor sequence and exact verification commands. Renew the 24-hour implementation lease with a bounded `/ai-heartbeat` until the pull request enters review.
 6. Commit the smallest coherent green change using Conventional Commits.
 7. Open one primary pull request with `Closes #<issue>`, the claim receipt, matching accountable owner, safe agent class, Spec/plan link, test evidence, risk, migration/protocol/privacy impact, and rollback notes.
 8. Complete an independent review/fix loop and current-head CI. After merge, verify Issue closure, terminal reconciliation, and safe branch/worktree cleanup.
@@ -35,7 +35,7 @@ A pull request is ready only when:
 
 - Its author, primary Issue assignee, accountable-owner field, and verified claim actor match.
 - Its branch contains the primary Issue number and the body contains exactly one `Closes #<issue>`.
-- The primary Issue is in `status:review` with a live, unexpired, unreleased claim receipt.
+- The primary Issue is in `status:review` with a live, unreleased claim generation and a durable `pr-open` review-admission receipt created before its implementation lease expired.
 - The linked issue's checkboxes and definition of done are satisfied.
 - Relevant unit, contract, integration, security, build, and document checks pass.
 - A Changeset is present for user-visible package behavior, unless the change is docs/tests only.

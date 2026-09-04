@@ -16,7 +16,7 @@ The normative design is [AI-Assisted Issue Collaboration Design](../superpowers/
 | `status:done` | Completed closed Issue | none |
 
 An Issue may carry only one managed `status:*` label. Manual label or assignee edits that violate this table stop the workflow until a maintainer repairs the state.
-Every governed Issue also carries exactly one managed work type: `type:feature`, `type:bug`, `type:test`, `type:docs`, or `type:security`. Untyped Issues are ignored; multiple managed types fail closed.
+Every governed Issue also carries exactly one managed work type: `type:feature`, `type:bug`, `type:test`, `type:docs`, or `type:security`. Untyped Issues remain outside the lifecycle, and any `/ai-*` command on them receives a durable `NOT_ELIGIBLE` rejection; multiple managed types fail closed.
 
 ## Readiness
 
@@ -44,7 +44,7 @@ agent: codex
 
 `agent` is a safe lowercase class such as `codex`, `claude-code`, `copilot`, `gemini-cli`, `other`, or `none`. Do not include a thread URL, prompt, local path, or log.
 
-Repository automation serializes commands per Issue, verifies live GitHub state and permissions, assigns the human commenter, changes the label to `status:in-progress`, and writes a versioned claim receipt. Each run drains every unprocessed `/ai-*` comment in immutable comment-ID order; the hourly run performs a repository-wide recovery drain. A superseded pending workflow run therefore cannot silently discard a command. Work starts only after the success receipt appears. A competing claim receives `ALREADY_CLAIMED` and must not start.
+Repository automation uses one repository-wide mutation queue, verifies live GitHub state and permissions, assigns the human commenter, changes the label to `status:in-progress`, and writes a versioned claim receipt. Every surviving event run and the hourly recovery run scan at most the 1,000 most recent repository comments, remove pull-request comments before backlog accounting, and process the oldest 1,000 pending Issue commands in that window. The command's own Issue history is then read in full bounded pages, so replay observes an existing receipt or rejection marker. Work starts only after the success receipt appears. A competing claim receives `ALREADY_CLAIMED` and must not start.
 
 Claims expire after 24 hours without an explicit heartbeat. Lease deadlines are calculated from the verified GitHub comment timestamp; scheduled expiry and migration checks use the GitHub API `Date` header, not runner-local time.
 
@@ -66,7 +66,7 @@ Keep public progress bounded and useful:
 summary: claim parser and state tests pass; controller integration remains
 ```
 
-The summary is a single line of at most 240 UTF-8 bytes. It renews the lease for 24 hours in either `status:in-progress` or `status:review` without changing the lifecycle state. Branch pushes do not renew the lease implicitly. Review work is not automatically released when a lease expires, but the expired lease blocks merge until the owner renews it.
+The summary is a single line of at most 240 UTF-8 bytes. It renews an implementation lease for 24 hours only while the Issue is `status:in-progress`; branch pushes do not renew it implicitly. A qualifying pull request must be created after the claim and strictly before the implementation lease expires. Admission to `status:review` replaces that deadline with a durable review lock, so review does not depend on a time-sensitive required check and `/ai-heartbeat` is no longer accepted. Closing the pull request without merging returns the Issue to `status:in-progress` with a fresh 24-hour lease.
 
 ## Block, resume, release, and handoff
 
@@ -107,11 +107,11 @@ Behavior changes follow red-green-refactor. Commits are small, coherent, verifie
 - security, privacy, protocol, migration, compatibility, and rollback effects; and
 - the existing formal or solo independent-review evidence.
 
-Opening a qualifying pull request moves the Issue to `status:review`. The reviewer must differ from the implementer and review the complete final range. Findings return to a fix loop. Every push invalidates stale review evidence; a fresh PASS and successful current-head checks are required.
+Opening a qualifying pull request before the implementation deadline moves the Issue to `status:review` and records the durable review-admission receipt. The reviewer must differ from the implementer and review the complete final range. Findings return to a fix loop. Every push invalidates stale review evidence; a fresh PASS and successful current-head checks are required.
 
 ## Merge and close
 
-Protected `main` is the only merge target. Before merge, the controller independently verifies the current checks, review state, Issue owner, claim receipt, branch, and lifecycle state.
+Protected `main` is the only merge target. Before merge, the required read-only gate independently verifies the current checks, review state, Issue owner, claim and review-admission receipts, branch, and lifecycle state.
 
 Rollout uses two independent repository variables. `AI_LIFECYCLE_MUTATION_MODE` controls Issue/receipt writes; `AI_LIFECYCLE_VALIDATION_MODE` controls the read-only PR merge gate. Both default to `report`.
 
@@ -148,6 +148,6 @@ The workflow fails closed with one safe next action. Common codes are:
 - `DEPENDENCY_OPEN`: finish the named dependency.
 - `CLOSING_PR_EXISTS`: continue or close the existing pull request.
 - `NOT_OWNER`: ask the current owner or a maintainer.
-- `LEASE_EXPIRED`: claim again if the Issue returned to ready.
+- `LEASE_EXPIRED`: renew before review admission, or claim again after the Issue returns to ready.
 - `STATE_MISMATCH`: stop and ask a maintainer to repair labels/assignees.
 - `GITHUB_STATE_UNAVAILABLE`: retry after GitHub state can be verified.

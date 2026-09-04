@@ -10,11 +10,12 @@ const NOW = "2026-09-04T12:00:00.000Z";
 const ACTIVATION = "a".repeat(40);
 
 const registry = (overrides = {}) => ({
-  schema_version: 2,
+  schema_version: 3,
   activation_commit: null,
   mutation_acceptance: {
     reason: "Bounded live acceptance",
     approved_by: "maintainer",
+    approved_at: "2026-09-04T00:00:00.000Z",
     expires_at: "2026-09-11T00:00:00.000Z",
   },
   entries: [],
@@ -88,6 +89,36 @@ test("never honors migrations after activation, including in report mode", () =>
         },
       ),
     /activated.*forbids/i,
+  );
+});
+
+test("acceptance approval cannot be future-dated or exceed seven days", () => {
+  assert.throws(
+    () =>
+      validateLifecycleMutationMode(
+        registry({
+          mutation_acceptance: {
+            ...registry().mutation_acceptance,
+            approved_at: "2030-01-01T00:00:00.000Z",
+            expires_at: "2030-01-07T00:00:00.000Z",
+          },
+        }),
+        { mode: "report", now: NOW },
+      ),
+    /approval.*future/i,
+  );
+  assert.throws(
+    () =>
+      validateLifecycleMutationMode(
+        registry({
+          mutation_acceptance: {
+            ...registry().mutation_acceptance,
+            expires_at: "2026-09-12T00:00:00.000Z",
+          },
+        }),
+        { mode: "report", now: NOW },
+      ),
+    /seven days|acceptance window/i,
   );
 });
 

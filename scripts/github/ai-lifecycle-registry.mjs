@@ -73,16 +73,32 @@ const validateMigrationEntry = (entry, index) => {
   requireRegistryTimestamp(entry.expires_at, `${label} expiry`);
 };
 
-const validateAcceptance = (acceptance) => {
+const validateAcceptance = (acceptance, nowTimestamp) => {
   if (acceptance === null) return;
   requireExactKeys(
     acceptance,
-    ["approved_by", "expires_at", "reason"],
+    ["approved_at", "approved_by", "expires_at", "reason"],
     "Mutation acceptance",
   );
   requirePublicReason(acceptance.reason, "Mutation acceptance reason");
   validateApproval(acceptance.approved_by, "Mutation acceptance");
-  requireRegistryTimestamp(acceptance.expires_at, "Mutation acceptance expiry");
+  const approvedAt = requireRegistryTimestamp(
+    acceptance.approved_at,
+    "Mutation acceptance approval",
+  );
+  const expiresAt = requireRegistryTimestamp(
+    acceptance.expires_at,
+    "Mutation acceptance expiry",
+  );
+  if (approvedAt > nowTimestamp) {
+    fail("Mutation acceptance approval cannot be in the future");
+  }
+  if (expiresAt <= approvedAt) {
+    fail("Mutation acceptance expiry must follow its approval");
+  }
+  if (expiresAt - approvedAt > MAX_ACCEPTANCE_WINDOW_MS) {
+    fail("Mutation acceptance window cannot exceed seven days");
+  }
 };
 
 export const validateLifecycleRegistry = (registry, { now }) => {
@@ -91,18 +107,18 @@ export const validateLifecycleRegistry = (registry, { now }) => {
     ["activation_commit", "entries", "mutation_acceptance", "schema_version"],
     "Lifecycle migration registry",
   );
-  if (registry.schema_version !== 2) {
-    fail("Lifecycle migration registry schema_version must be 2");
+  if (registry.schema_version !== 3) {
+    fail("Lifecycle migration registry schema_version must be 3");
   }
   if (!Array.isArray(registry.entries) || registry.entries.length > 100) {
     fail("Lifecycle migration entries must be a bounded array");
   }
   registry.entries.forEach(validateMigrationEntry);
-  validateAcceptance(registry.mutation_acceptance);
   const nowTimestamp = requireRegistryTimestamp(
     now,
     "Lifecycle validation time",
   );
+  validateAcceptance(registry.mutation_acceptance, nowTimestamp);
   if (
     registry.activation_commit !== null &&
     !FULL_SHA.test(registry.activation_commit ?? "")
@@ -172,11 +188,7 @@ export const validateLifecycleMutationMode = (registry, { mode, now }) => {
   }
   if (
     validated.mutationAcceptance &&
-    Date.parse(validated.mutationAcceptance.expires_at) >
-      validated.nowTimestamp &&
-    Date.parse(validated.mutationAcceptance.expires_at) -
-      validated.nowTimestamp <=
-      MAX_ACCEPTANCE_WINDOW_MS
+    Date.parse(validated.mutationAcceptance.expires_at) > validated.nowTimestamp
   ) {
     return { phase: "acceptance", ...validated };
   }

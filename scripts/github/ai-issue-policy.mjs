@@ -236,7 +236,9 @@ export const currentClaimFromReceipts = (receipts) => {
     if (!active || receipt.claimId !== active.claimId) continue;
     if (RECEIPT_END_ACTIONS.has(receipt.action)) {
       active = null;
-    } else if (["heartbeat", "resume", "pr-close"].includes(receipt.action)) {
+    } else if (
+      ["heartbeat", "resume", "pr-open", "pr-close"].includes(receipt.action)
+    ) {
       active.leaseExpiresAt = receipt.leaseExpiresAt;
     }
   }
@@ -614,10 +616,10 @@ export const planLifecycleCommand = ({
 
   if (action === "heartbeat") {
     if (!isOwner) fail("NOT_OWNER", "Only the owner can renew a claim.");
-    if (!["in-progress", "review"].includes(state)) {
+    if (state !== "in-progress") {
       fail(
         "INVALID_TRANSITION",
-        "Only in-progress or review work accepts a heartbeat.",
+        "Only in-progress work accepts a heartbeat before review admission.",
       );
     }
     if (isExpired(currentClaim.leaseExpiresAt, now)) {
@@ -886,12 +888,19 @@ const parseReceiptBody = (body) => {
     ) {
       fail("STATE_MISMATCH", "A refresh receipt has an invalid transition.");
     }
+  } else if (receipt.action === "pr-open") {
+    if (
+      receipt.from !== "in-progress" ||
+      receipt.to !== "review" ||
+      receipt.leaseExpiresAt !== null
+    ) {
+      fail("STATE_MISMATCH", "A review admission receipt is invalid.");
+    }
   } else {
     const transition = SUCCESS_TRANSITIONS[receipt.action];
     if (
       (receipt.action === "heartbeat"
-        ? !["in-progress", "review"].includes(receipt.from) ||
-          receipt.to !== receipt.from
+        ? receipt.from !== "in-progress" || receipt.to !== receipt.from
         : !transition ||
           receipt.from !== transition[0] ||
           receipt.to !== transition[1]) ||

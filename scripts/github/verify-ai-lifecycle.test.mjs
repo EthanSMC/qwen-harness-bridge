@@ -81,6 +81,7 @@ const reviewReceipt = () => ({
   action: "pr-open",
   from: "in-progress",
   to: "review",
+  leaseExpiresAt: null,
 });
 
 const commentsFor = ({ user = "github-actions[bot]", receipts } = {}) =>
@@ -121,7 +122,7 @@ const issue = (overrides = {}) => ({
 });
 
 const strictMigrations = (overrides = {}) => ({
-  schema_version: 2,
+  schema_version: 3,
   activation_commit: ACTIVATION,
   mutation_acceptance: null,
   entries: [],
@@ -243,15 +244,25 @@ test("rejects missing, deleted, or non-workflow claim receipts", () => {
   );
 });
 
-test("rejects expired or subsequently released claim generations", () => {
+test("a review admission remains valid after its implementation lease", () => {
+  assert.equal(
+    validatePullRequestLifecycleState(
+      validInput({ now: "2026-10-05T12:00:00.000Z" }),
+    ).valid,
+    true,
+  );
+});
+
+test("rejects missing review admission or subsequently released claims", () => {
   assert.throws(
     () =>
       validatePullRequestLifecycleState(
-        validInput({ now: "2026-09-05T12:00:00.000Z" }),
+        validInput({
+          comments: commentsFor({ receipts: [claimReceipt()] }),
+        }),
       ),
-    /expired/i,
+    /review admission/i,
   );
-
   const released = {
     ...claimReceipt(),
     eventId: 903,
@@ -401,11 +412,12 @@ test("report mode still fails on unavailable external GitHub state", () => {
 
 test("allows only an exact unexpired migration before activation", () => {
   const migrations = {
-    schema_version: 2,
+    schema_version: 3,
     activation_commit: null,
     mutation_acceptance: {
       reason: "Bounded live acceptance",
       approved_by: "maintainer",
+      approved_at: NOW,
       expires_at: "2026-09-11T00:00:00.000Z",
     },
     entries: [
@@ -472,11 +484,12 @@ test("CLI resolves an exact legacy migration before claim-field lookup", async (
   await writeFile(
     migrationsPath,
     JSON.stringify({
-      schema_version: 2,
+      schema_version: 3,
       activation_commit: null,
       mutation_acceptance: {
         reason: "Bounded live acceptance",
         approved_by: "maintainer",
+        approved_at: NOW,
         expires_at: "2026-09-11T00:00:00Z",
       },
       entries: [

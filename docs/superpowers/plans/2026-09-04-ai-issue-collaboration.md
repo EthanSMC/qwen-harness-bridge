@@ -16,7 +16,7 @@
 - Eligible claimants are direct collaborators with `write`, `maintain`, or `admin` permission.
 - GitHub Issue state, exactly one managed lifecycle label, one human assignee where required, workflow receipts, the linked pull request, and current-head checks are authoritative.
 - Managed states are exactly `status:waiting`, `status:ready`, `status:in-progress`, `status:review`, `status:blocked`, and `status:done`.
-- Active claim leases last 24 hours and renew only through an explicit bounded heartbeat.
+- Active implementation leases last 24 hours and renew only through an explicit bounded heartbeat; timely review admission replaces the deadline with a durable review lock.
 - Each claim produces exactly one implementation branch and one primary closing pull request.
 - The implementation agent and final reviewer are different identities; the existing formal-collaborator and solo-maintainer gates remain mandatory.
 - Public evidence never contains private agent threads, prompts, model reasoning, full logs, credentials, source bodies, private repository paths, or absolute local paths.
@@ -115,7 +115,7 @@ Use test-first development for behavior changes. A different agent or eligible c
 Document the exact state table, readiness conditions, command syntax, success receipts, safe evidence, branch/worktree convention, review/fix loop, handoff, closure, and Release gate in `docs/github/ai-collaboration.md`. Update `README.md` to link it and summarize:
 
 ```markdown
-Every eligible contributor may use an AI agent. The human Issue assignee remains accountable, and repository automation serializes claims, records bounded receipts, enforces independent review and current-head CI, and verifies closure. See [AI-assisted Issue collaboration](docs/github/ai-collaboration.md).
+Every eligible contributor may use an AI agent. The human Issue assignee remains accountable, and one repository-wide automation queue drains bounded claims, records implementation leases and durable review admission, enforces independent current-head review/CI, and verifies closure. See [AI-assisted Issue collaboration](docs/github/ai-collaboration.md).
 ```
 
 Replace the generic start-work steps in `CONTRIBUTING.md` with the normative claim-first lifecycle without weakening the existing review gate.
@@ -436,13 +436,13 @@ Expected: FAIL because the controller does not exist.
 
 - [x] **Step 4: Implement claim context loading and verified mutation**
 
-For Issue comments, verify the event repository, Issue number, comment ID/body/author, and live comment identity. Ignore comments on pull requests and non-command comments. Query live permission, Issue, all Issue comments, parsed dependencies, and open pull requests whose body has a primary closing reference.
+For Issue comments, verify the event repository, Issue number, comment ID/body/author, and live comment identity. Ignore comments on pull requests and non-command comments. Commands on untyped or malformed Issues receive a durable bounded rejection marker. Query live permission, Issue, all Issue comments, parsed dependencies, and open pull requests whose body has a primary closing reference.
 
 Apply the pure plan in this order: create an intent record keyed by event ID, mutate label/assignee idempotently, create the success receipt, and re-read all state. If any final invariant fails, create one failure receipt with `STATE_MISMATCH` and return a failing status.
 
 - [x] **Step 5: Implement heartbeat, block, resume, and release**
 
-Require the current assignee for heartbeat/block/resume. Permit release by the owner or an admin/maintain collaborator. Refuse release while a closing pull request is open. Each action uses the current claim ID and produces one idempotent receipt.
+Require the current assignee for heartbeat/block/resume, and accept heartbeat only during `status:in-progress`. Permit release by the owner or an admin/maintain collaborator. Refuse release while a closing pull request is open. Each action uses the current claim ID and produces one idempotent receipt.
 
 - [x] **Step 6: Write lease and recovery tests**
 
@@ -454,11 +454,11 @@ Test exact expiry boundaries, scheduled release to ready, scheduled release to w
 
 - [x] **Step 8: Write PR transition and closure tests**
 
-Cover open/draft/synchronize moving the primary Issue to review, closed-unmerged returning review to in-progress, merged requiring the Issue to close as completed, branch Issue-number matching, PR-author/assignee matching, and ambiguous/multiple primary closing references.
+Cover open/draft/synchronize moving the primary Issue to review only when the PR was created before lease expiry, a durable non-expiring review receipt, closed-unmerged returning review to in-progress, merged requiring the Issue to close as completed, branch Issue-number matching, PR-author/assignee matching, and ambiguous/multiple primary closing references.
 
 - [x] **Step 9: Implement pull-request reconciliation**
 
-Read the pull request live. A qualifying open PR moves `in-progress` to `review`. A closed unmerged PR returns to `in-progress` with a renewed lease. A merged PR verifies GitHub closure, main reachability through the merge response, and terminal reconciliation before applying `status:done` and removing the assignee.
+Read the pull request live. A qualifying open PR created after the claim and strictly before lease expiry moves `in-progress` to `review` with a durable review lock. A closed unmerged PR returns to `in-progress` with a renewed lease. A terminal PR event rejects any alternate open closing PR. A merged PR verifies GitHub closure, main reachability through the merge response, and terminal reconciliation before applying `status:done` and removing the assignee.
 
 - [x] **Step 10: Run controller tests and commit**
 
@@ -488,7 +488,7 @@ git commit -m "feat(governance): add AI issue lifecycle controller"
 
 **Interfaces:**
 - Consumes: Issue comments, Issue close/reopen events, pull-request-target lifecycle events, and hourly schedule.
-- Produces: per-Issue serialized runs, immutable-ID command backlog draining, deterministic live-state reconciliation, and a read-only governance test surface.
+- Produces: one repository-wide mutation queue, bounded immutable-ID command backlog draining, deterministic live-state reconciliation, and a read-only governance test surface.
 
 - [x] **Step 1: Add failing static workflow assertions**
 
@@ -530,8 +530,8 @@ permissions:
   pull-requests: read
 
 concurrency:
-  # Per-Issue serialization plus durable comment draining prevents lost commands.
-  group: ai-issue-lifecycle-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || 'scheduled' }}
+  # One repository queue prevents Issue, PR, and scheduled mutations from racing.
+  group: ai-issue-lifecycle-${{ github.repository }}
   cancel-in-progress: false
 ```
 
@@ -619,23 +619,24 @@ Parse exactly one `Closes #N` line outside fenced code, exactly one value for ev
 
 - [x] **Step 4: Write live-state gate tests**
 
-Cover a valid review-state Issue; missing/deleted receipt; receipt by the wrong workflow actor; stale/expired claim; wrong assignee; waiting/ready/blocked/done label; multiple status labels; open dependency; PR head after last review; ambiguous closing PR; GitHub timeout; pagination exhaustion; and report/enforce modes.
+Cover a valid review-state Issue with a durable timely review-admission receipt; missing/deleted receipt; receipt by the wrong workflow actor; a missing or released review admission; wrong assignee; waiting/ready/blocked/done label; multiple status labels; open dependency; PR head after last review; ambiguous closing PR; GitHub timeout; pagination exhaustion; and report/enforce modes.
 
 - [x] **Step 5: Implement fail-closed live validation**
 
-Use the shared API client to fetch the current PR, Issue, comments, dependencies, closing PRs, and repository Actions bot identity. In enforce mode require `status:review`, one assignee matching the PR author, a current successful claim receipt URL from the PR body, and no contradictory release/stale receipt after it. Return structured evidence to the caller without mutating GitHub.
 
+Use the shared API client to fetch the current PR, Issue, comments, dependencies, closing PRs, and repository Actions bot identity. In enforce mode require `status:review`, one assignee matching the PR author, a current successful claim receipt URL from the PR body, a durable `pr-open` receipt for that generation, and no contradictory release after it. Return structured evidence to the caller without mutating GitHub.
 - [x] **Step 6: Add an explicit migration registry**
 
 Use this schema with bounded entries:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "activation_commit": null,
   "mutation_acceptance": {
     "reason": "Bounded live acceptance after bootstrap",
     "approved_by": "EthanSMC",
+    "approved_at": "2026-09-04T06:56:56Z",
     "expires_at": "2026-09-11T00:00:00Z"
   },
   "entries": [

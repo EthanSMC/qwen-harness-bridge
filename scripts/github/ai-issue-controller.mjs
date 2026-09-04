@@ -25,6 +25,8 @@ const WORKFLOW_LOGIN = "github-actions[bot]";
 const LEASE_MILLISECONDS = 24 * 60 * 60 * 1000;
 const COMMAND_PREFIX = "/ai-";
 const MAX_COMMANDS_PER_DRAIN = 1_000;
+const COMMAND_SCAN_PAGE_SIZE = 100;
+const COMMAND_SCAN_MAX_PAGES = 10;
 const MAX_RECONCILIATION_OBJECTS = 1_000;
 const SYSTEM_EVENT_BASE = 8_000_000_000_000_000;
 const MIGRATION_PATH = resolve(
@@ -191,6 +193,37 @@ const requireChronology = ({ claim, pullRequest, issueClosedAt }) => {
     );
   }
 };
+
+const requireReviewAdmissionChronology = ({ claim, pullRequest }) => {
+  const claimedAt = Date.parse(claim?.claimedAt ?? "");
+  const expiresAt = Date.parse(claim?.leaseExpiresAt ?? "");
+  const pullCreatedAt = Date.parse(pullRequest?.created_at ?? "");
+  if (
+    Number.isNaN(claimedAt) ||
+    Number.isNaN(expiresAt) ||
+    Number.isNaN(pullCreatedAt) ||
+    pullCreatedAt < claimedAt
+  ) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "The claim and pull request review-admission chronology is invalid.",
+    );
+  }
+  if (pullCreatedAt >= expiresAt) {
+    throw new LifecycleError(
+      "LEASE_EXPIRED",
+      "The claim lease expired before pull request review admission.",
+    );
+  }
+};
+
+const durableReviewAdmissionFor = (receipts, claim) =>
+  receipts.findLast(
+    (receipt) =>
+      receipt.result === "success" &&
+      receipt.action === "pr-open" &&
+      receipt.claimId === claim?.claimId,
+  ) ?? null;
 
 const assertMergeReachable = async ({
   github,
@@ -584,6 +617,14 @@ const rejectCommand = async ({
 }) => {
   const code = error instanceof LifecycleError ? error.code : "STATE_MISMATCH";
   if (mode === "enforce") {
+    let state;
+    try {
+      state = statusOf(issue);
+    } catch (stateError) {
+      if (!(stateError instanceof LifecycleError)) throw stateError;
+      await postCommandRejectionNotice(github, issueNumber, eventId, code);
+      return { status: "rejected", code };
+    }
     await postReceipt(
       github,
       issueNumber,
@@ -592,7 +633,7 @@ const rejectCommand = async ({
         action,
         actor,
         agent,
-        state: statusOf(issue),
+        state,
         code,
       }),
     );
@@ -600,15 +641,22 @@ const rejectCommand = async ({
   return { status: "rejected", code };
 };
 
-const postInvalidCommandNotice = async (github, issueNumber, eventId) => {
+const postCommandRejectionNotice = async (
+  github,
+  issueNumber,
+  eventId,
+  code,
+) => {
   const body = [
-    "AI lifecycle command rejected (`INVALID_COMMAND`).",
+    `AI lifecycle command rejected (\`${code}\`).`,
     "",
-    "Use one documented `/ai-*` command with its exact required fields.",
+    code === "INVALID_COMMAND"
+      ? "Use one documented `/ai-*` command with its exact required fields."
+      : "This Issue is not currently eligible for an AI lifecycle command.",
     "",
     "<!-- qhb-ai-command-rejection:v1",
     `event-id=${eventId}`,
-    "code=INVALID_COMMAND",
+    `code=${code}`,
     "-->",
   ].join("\n");
   const existing = await commentsFor(github, issueNumber);
@@ -682,7 +730,13 @@ export const handleIssueComment = async ({
   }
   const issue = await github.get(`/issues/${issueNumber}`);
   const typeCount = managedTypeCount(issue);
-  if (typeCount === 0) return { status: "ignored" };
+  if (typeCount !== 1) {
+    const code = typeCount === 0 ? "NOT_ELIGIBLE" : "STATE_MISMATCH";
+    if (mode === "enforce") {
+      await postCommandRejectionNotice(github, issueNumber, commentId, code);
+    }
+    return { status: "rejected", code };
+  }
   assertManagedIssue(issue);
 
   let command;
@@ -694,7 +748,12 @@ export const handleIssueComment = async ({
       /^\/ai-(claim|heartbeat|block|resume|release)\b/u.exec(body)?.[1];
     if (!inferredAction) {
       if (mode === "enforce") {
-        await postInvalidCommandNotice(github, issueNumber, commentId);
+        await postCommandRejectionNotice(
+          github,
+          issueNumber,
+          commentId,
+          "INVALID_COMMAND",
+        );
       }
       return { status: "rejected", code: error.code };
     }
@@ -888,6 +947,22 @@ export const handlePullRequest = async ({
     issue,
     openPullRequests,
   );
+  if (pullRequest.state === "open") {
+    if (
+      loaded.closingPullRequests.length !== 1 ||
+      loaded.closingPullRequests[0].number !== pullRequest.number
+    ) {
+      throw new LifecycleError(
+        "STATE_MISMATCH",
+        "An open pull request must be the Issue's only open closing pull request.",
+      );
+    }
+  } else if (loaded.closingPullRequests.length > 0) {
+    throw new LifecycleError(
+      "CLOSING_PR_EXISTS",
+      "A terminal pull request event cannot leave another open closing pull request.",
+    );
+  }
   const prior = loaded.receipts.find(
     ({ eventId: id }) => id === Number(eventId),
   );
@@ -923,12 +998,6 @@ export const handlePullRequest = async ({
       "The pull request author must be the accountable Issue owner.",
     );
   }
-  if (loaded.closingPullRequests.length > 1) {
-    throw new LifecycleError(
-      "STATE_MISMATCH",
-      "An Issue cannot have multiple open closing pull requests.",
-    );
-  }
   const claim = currentClaimFromReceipts(loaded.receipts);
   if (!claim || claim.owner !== assignee) {
     throw new LifecycleError(
@@ -948,10 +1017,27 @@ export const handlePullRequest = async ({
       "The pull request claim receipt is not the current claim generation.",
     );
   }
+  if (
+    state === "in-progress" &&
+    (pullRequest.state === "open" || pullRequest.merged === true)
+  ) {
+    requireReviewAdmissionChronology({ claim, pullRequest });
+  }
 
   let plan;
   if (pullRequest.state === "open") {
-    if (state === "review") return { status: "unchanged" };
+    if (state === "review") {
+      if (
+        claim.leaseExpiresAt !== null ||
+        !durableReviewAdmissionFor(loaded.receipts, claim)
+      ) {
+        throw new LifecycleError(
+          "STATE_MISMATCH",
+          "Review state requires a durable review admission for the current claim.",
+        );
+      }
+      return { status: "unchanged" };
+    }
     if (state !== "in-progress") {
       throw new LifecycleError(
         "INVALID_TRANSITION",
@@ -964,7 +1050,7 @@ export const handlePullRequest = async ({
       action: "pr-open",
       from: state,
       to: "review",
-      leaseExpiresAt: claim.leaseExpiresAt,
+      leaseExpiresAt: null,
     });
   } else if (pullRequest.merged === true) {
     if (!["in-progress", "review"].includes(state)) {
@@ -1010,7 +1096,7 @@ export const handlePullRequest = async ({
         action: "pr-open",
         from: "in-progress",
         to: "review",
-        leaseExpiresAt: claim.leaseExpiresAt,
+        leaseExpiresAt: null,
       });
       if (mode === "report") {
         return {
@@ -1216,7 +1302,26 @@ export const handleIssueChange = async ({
       });
     } else {
       try {
-        assertIssueInvariant(loaded.issue);
+        const invariant = assertIssueInvariant(loaded.issue);
+        if (["in-progress", "review", "blocked"].includes(invariant.state)) {
+          if (!claim || claim.owner !== invariant.assignee) {
+            throw new LifecycleError(
+              "STATE_MISMATCH",
+              "Active Issue state requires a current claim matching its assignee.",
+            );
+          }
+          if (
+            invariant.state === "review" &&
+            (claim.leaseExpiresAt !== null ||
+              !durableReviewAdmissionFor(loaded.receipts, claim) ||
+              loaded.closingPullRequests.length !== 1)
+          ) {
+            throw new LifecycleError(
+              "STATE_MISMATCH",
+              "Review state requires one open closing pull request and a durable review admission.",
+            );
+          }
+        }
         return { status: "unchanged" };
       } catch (error) {
         if (!(error instanceof LifecycleError)) throw error;
@@ -1387,6 +1492,28 @@ const issueNumberFromComment = (comment, repository) => {
   return Number(match[1]);
 };
 
+const recentRepositoryComments = async (github) => {
+  const comments = [];
+  for (let page = 1; page <= COMMAND_SCAN_MAX_PAGES; page += 1) {
+    const pageComments = await github.get(
+      `/issues/comments?sort=created&direction=desc&per_page=${COMMAND_SCAN_PAGE_SIZE}&page=${page}`,
+    );
+    if (!Array.isArray(pageComments)) {
+      throw new Error(
+        `Repository Issue comments page ${page} must be an array`,
+      );
+    }
+    if (pageComments.length > COMMAND_SCAN_PAGE_SIZE) {
+      throw new Error(
+        `Repository Issue comments page ${page} exceeded the requested page size`,
+      );
+    }
+    comments.push(...pageComments);
+    if (pageComments.length < COMMAND_SCAN_PAGE_SIZE) break;
+  }
+  return comments;
+};
+
 export const reconcileLifecycleCommands = async ({
   github,
   repository,
@@ -1397,32 +1524,47 @@ export const reconcileLifecycleCommands = async ({
   maxCommands = MAX_COMMANDS_PER_DRAIN,
 }) => {
   assertMode(mode);
+  requirePositiveInteger(maxCommands, "AI lifecycle command drain cap");
   const comments = issueNumber
     ? await commentsFor(github, issueNumber)
-    : await github.getAll(
-        "/issues/comments?sort=created&direction=asc",
-        "repository Issue comments",
-      );
+    : await recentRepositoryComments(github);
   const completed = completedCommandEventIds(comments);
-  const pending = comments
-    .filter(
-      (comment) =>
-        comment.user?.login !== WORKFLOW_LOGIN &&
-        typeof comment.body === "string" &&
-        comment.body.trimStart().startsWith(COMMAND_PREFIX) &&
-        !completed.has(Number(comment.id)),
-    )
-    .sort((left, right) => Number(left.id) - Number(right.id));
-  if (pending.length > maxCommands) {
-    throw new Error(
-      `AI lifecycle command backlog exceeds the ${maxCommands}-command drain cap`,
+  let candidates = comments.filter(
+    (comment) =>
+      comment.user?.login !== WORKFLOW_LOGIN &&
+      typeof comment.body === "string" &&
+      comment.body.trimStart().startsWith(COMMAND_PREFIX) &&
+      !completed.has(Number(comment.id)),
+  );
+  if (!issueNumber) {
+    const numberedCandidates = candidates.map((comment) => ({
+      comment,
+      issueNumber: issueNumberFromComment(comment, repository),
+    }));
+    const issueNumbers = [
+      ...new Set(numberedCandidates.map(({ issueNumber: number }) => number)),
+    ];
+    const parents = await fetchDependencies(github, issueNumbers);
+    const parentByNumber = new Map(
+      parents.map((parent, index) => [issueNumbers[index], parent]),
     );
+    candidates = numberedCandidates
+      .filter(
+        ({ issueNumber: number }) => !parentByNumber.get(number)?.pull_request,
+      )
+      .map(({ comment, issueNumber: number }) => ({
+        ...comment,
+        governedIssueNumber: number,
+      }));
   }
+  const pending = candidates
+    .sort((left, right) => Number(left.id) - Number(right.id))
+    .slice(0, maxCommands);
   const results = [];
   const failures = [];
   for (const comment of pending) {
     try {
-      const number = issueNumber ?? issueNumberFromComment(comment, repository);
+      const number = issueNumber ?? comment.governedIssueNumber;
       results.push(
         await handleIssueComment({
           github,
@@ -1565,7 +1707,7 @@ export const reconcileRepositoryState = async ({
   return { status: mode, processed: results.length, results };
 };
 
-export const runScheduledReconciliationPhases = async (phases) => {
+export const runReconciliationPhases = async (phases) => {
   const results = {};
   const failures = [];
   for (const { name, run } of phases) {
@@ -1582,7 +1724,7 @@ export const runScheduledReconciliationPhases = async (phases) => {
   if (failures.length > 0) {
     throw new AggregateError(
       failures,
-      `${failures.length} scheduled lifecycle phase(s) failed after reconciliation continued`,
+      `${failures.length} lifecycle reconciliation phase(s) failed after reconciliation continued`,
     );
   }
   return results;
@@ -1652,71 +1794,15 @@ export const main = async ({
   }
   let result;
   if (eventName === "issue_comment") {
-    if (event.issue?.pull_request) {
-      result = { status: "ignored" };
-      process.stdout.write(`${JSON.stringify(result)}\n`);
-      return result;
-    }
     const issueNumber = requirePositiveInteger(
       event.issue?.number,
       "Issue number",
     );
-    const lifecycle = await handleIssueChange({
-      github,
-      event,
-      repository,
-      mode,
-      eventId: stableSystemEventId(
-        "issue-reconcile",
-        issueNumber,
-        event.issue?.updated_at,
-        event.issue?.state,
-        event.issue?.state_reason,
-      ),
-    });
-    const commandDrain = await reconcileLifecycleCommands({
-      github,
-      repository,
-      defaultBranch,
-      mode,
-      now: authoritativeNow,
-      issueNumber,
-    });
-    result = { lifecycle, commandDrain };
-  } else if (eventName === "issues") {
-    const issueNumber = requirePositiveInteger(
-      event.issue?.number,
-      "Issue number",
-    );
-    const lifecycle = await runLifecycleController({
-      github,
-      event,
-      eventName,
-      repository,
-      mode,
-      now: authoritativeNow,
-      eventId: stableSystemEventId(
-        eventName,
-        issueNumber,
-        event.issue?.updated_at,
-        event.action,
-      ),
-    });
-    const commandDrain = await reconcileLifecycleCommands({
-      github,
-      repository,
-      defaultBranch,
-      mode,
-      now: authoritativeNow,
-      issueNumber,
-    });
-    result = { lifecycle, commandDrain };
-  } else if (["schedule", "workflow_dispatch"].includes(eventName)) {
-    result = await runScheduledReconciliationPhases([
+    result = await runReconciliationPhases([
       {
-        name: "repositoryState",
+        name: "commandDrain",
         run: () =>
-          reconcileRepositoryState({
+          reconcileLifecycleCommands({
             github,
             repository,
             defaultBranch,
@@ -1725,9 +1811,76 @@ export const main = async ({
           }),
       },
       {
+        name: "lifecycle",
+        run: () =>
+          handleIssueChange({
+            github,
+            event,
+            repository,
+            mode,
+            eventId: stableSystemEventId(
+              "issue-reconcile",
+              issueNumber,
+              event.issue?.updated_at,
+              event.issue?.state,
+              event.issue?.state_reason,
+            ),
+          }),
+      },
+    ]);
+  } else if (eventName === "issues") {
+    const issueNumber = requirePositiveInteger(
+      event.issue?.number,
+      "Issue number",
+    );
+    result = await runReconciliationPhases([
+      {
         name: "commandDrain",
         run: () =>
           reconcileLifecycleCommands({
+            github,
+            repository,
+            defaultBranch,
+            mode,
+            now: authoritativeNow,
+          }),
+      },
+      {
+        name: "lifecycle",
+        run: () =>
+          runLifecycleController({
+            github,
+            event,
+            eventName,
+            repository,
+            mode,
+            now: authoritativeNow,
+            eventId: stableSystemEventId(
+              eventName,
+              issueNumber,
+              event.issue?.updated_at,
+              event.action,
+            ),
+          }),
+      },
+    ]);
+  } else if (["schedule", "workflow_dispatch"].includes(eventName)) {
+    result = await runReconciliationPhases([
+      {
+        name: "commandDrain",
+        run: () =>
+          reconcileLifecycleCommands({
+            github,
+            repository,
+            defaultBranch,
+            mode,
+            now: authoritativeNow,
+          }),
+      },
+      {
+        name: "repositoryState",
+        run: () =>
+          reconcileRepositoryState({
             github,
             repository,
             defaultBranch,
@@ -1747,22 +1900,39 @@ export const main = async ({
       },
     ]);
   } else {
-    result = await runLifecycleController({
-      github,
-      event,
-      eventName,
-      repository,
-      mode,
-      now: authoritativeNow,
-      eventId: stableSystemEventId(
-        eventName,
-        event.pull_request?.number,
-        event.pull_request?.updated_at,
-        event.action,
-        event.pull_request?.head?.sha,
-        event.pull_request?.merged_at,
-      ),
-    });
+    result = await runReconciliationPhases([
+      {
+        name: "commandDrain",
+        run: () =>
+          reconcileLifecycleCommands({
+            github,
+            repository,
+            defaultBranch,
+            mode,
+            now: authoritativeNow,
+          }),
+      },
+      {
+        name: "lifecycle",
+        run: () =>
+          runLifecycleController({
+            github,
+            event,
+            eventName,
+            repository,
+            mode,
+            now: authoritativeNow,
+            eventId: stableSystemEventId(
+              eventName,
+              event.pull_request?.number,
+              event.pull_request?.updated_at,
+              event.action,
+              event.pull_request?.head?.sha,
+              event.pull_request?.merged_at,
+            ),
+          }),
+      },
+    ]);
   }
   process.stdout.write(`${JSON.stringify(result)}\n`);
   return result;

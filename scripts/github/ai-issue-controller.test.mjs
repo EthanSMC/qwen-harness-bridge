@@ -10,7 +10,7 @@ import {
   reconcileLifecycleCommands,
   reconcileRepositoryState,
   runLifecycleController,
-  runScheduledReconciliationPhases,
+  runReconciliationPhases,
   stableSystemEventId,
 } from "./ai-issue-controller.mjs";
 import { parseReceipts } from "./ai-issue-policy.mjs";
@@ -95,6 +95,7 @@ class FakeGitHub {
       id,
       body,
       created_at: NOW,
+      issue_url: `https://api.github.com/repos/${REPOSITORY}/issues/${number}`,
       user: { login: actor },
     };
     this.comments.get(number).push(comment);
@@ -112,6 +113,7 @@ class FakeGitHub {
     merged = false,
     user = "alice",
     head = `docs/${issueNumber}-lifecycle`,
+    createdAt = NOW,
   } = {}) {
     const claimReceipt = this.workflowReceipts(issueNumber)
       .filter(
@@ -124,6 +126,7 @@ class FakeGitHub {
       state,
       draft: false,
       merged,
+      created_at: createdAt,
       merged_at: merged ? NOW : null,
       merge_commit_sha: merged ? "abc1234" : null,
       body: [
@@ -164,6 +167,15 @@ class FakeGitHub {
   }
 
   async get(path) {
+    if (path.startsWith("/issues/comments?")) {
+      const page = Number(
+        new URL(`https://api.github.test${path}`).searchParams.get("page"),
+      );
+      if (page !== 1) return [];
+      return [...this.comments.values()].flatMap((comments) =>
+        comments.map((comment) => this.clone(comment)),
+      );
+    }
     let match = /^\/issues\/(\d+)$/u.exec(path);
     if (match) return this.issue(Number(match[1]));
     match = /^\/issues\/comments\/(\d+)$/u.exec(path);
@@ -202,6 +214,11 @@ class FakeGitHub {
     }
     if (path === "/pulls?state=all&sort=updated&direction=asc") {
       return [...this.pulls.values()].map((pull) => this.clone(pull));
+    }
+    if (path.startsWith("/issues/comments?")) {
+      return [...this.comments.values()].flatMap((comments) =>
+        comments.map((comment) => this.clone(comment)),
+      );
     }
     match = /^\/issues\/(\d+)\/timeline$/u.exec(path);
     if (match) {
@@ -356,6 +373,75 @@ test("a later run drains earlier commands in immutable comment order", async () 
   assert.deepEqual(fake.issue().assignees, [{ login: "alice" }]);
 });
 
+test("a bounded command drain processes the oldest batch instead of wedging", async () => {
+  const fake = new FakeGitHub();
+  fake.command(901, "alice", "/ai-claim\nagent: codex");
+  fake.command(
+    902,
+    "alice",
+    "/ai-heartbeat\nsummary: implementation continues",
+  );
+  const first = await reconcileLifecycleCommands({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+    issueNumber: 46,
+    maxCommands: 1,
+  });
+  assert.equal(first.processed, 1);
+  assert.deepEqual(
+    fake.workflowReceipts().map(({ eventId }) => eventId),
+    [901],
+  );
+  const second = await reconcileLifecycleCommands({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+    issueNumber: 46,
+    maxCommands: 1,
+  });
+  assert.equal(second.processed, 1);
+  assert.deepEqual(
+    fake.workflowReceipts().map(({ eventId }) => eventId),
+    [901, 902],
+  );
+});
+
+test("repository drain excludes pull-request comments before backlog accounting", async () => {
+  const fake = new FakeGitHub();
+  fake.issues.set(51, {
+    id: 51,
+    number: 51,
+    state: "open",
+    body: "pull request",
+    labels: [],
+    assignees: [],
+    pull_request: {
+      url: `https://api.github.com/repos/${REPOSITORY}/pulls/51`,
+    },
+  });
+  fake.comments.set(51, []);
+  fake.command(900, "bob", "/ai-claim\nagent: codex", 51);
+  fake.command(901, "alice", "/ai-claim\nagent: codex");
+  const result = await reconcileLifecycleCommands({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+    maxCommands: 1,
+  });
+  assert.equal(result.processed, 1);
+  assert.deepEqual(
+    fake.workflowReceipts().map(({ eventId }) => eventId),
+    [901],
+  );
+});
+
 test("system event IDs are deterministic, namespaced, and distinct", () => {
   const first = stableSystemEventId("issues", 46, "updated-1", "edited");
   assert.equal(first, stableSystemEventId("issues", 46, "updated-1", "edited"));
@@ -383,10 +469,10 @@ test("scheduled live-state reconciliation recovers a dropped PR event", async ()
   assert.equal(fake.workflowReceipts().at(-1).action, "pr-open");
 });
 
-test("scheduled phases continue after an earlier phase fails", async () => {
+test("reconciliation phases continue after an earlier phase fails", async () => {
   const calls = [];
   await assert.rejects(
-    runScheduledReconciliationPhases([
+    runReconciliationPhases([
       {
         name: "repositoryState",
         run: async () => {
@@ -449,14 +535,18 @@ test("claim leases use the verified comment timestamp, not runner time", async (
   assert.equal(result.plan.leaseExpiresAt, "2026-09-05T12:00:00.000Z");
 });
 
-test("untyped Issues are ignored before lifecycle context hydration", async () => {
+test("untyped Issue commands receive a durable rejection marker", async () => {
   const fake = new FakeGitHub();
   fake.issues.get(46).labels = [];
   const result = await handleIssueComment(
     context(fake, fake.command(901, "alice", "/ai-claim\nagent: codex")),
   );
-  assert.deepEqual(result, { status: "ignored" });
-  assert.deepEqual(fake.mutations, []);
+  assert.equal(result.status, "rejected");
+  assert.equal(result.code, "NOT_ELIGIBLE");
+  assert.match(
+    fake.issueComments().at(-1).body,
+    /qhb-ai-command-rejection:v1[\s\S]*event-id=901[\s\S]*code=NOT_ELIGIBLE/u,
+  );
 });
 
 test("report mode computes a claim without any GitHub mutation", async () => {
@@ -703,6 +793,7 @@ test("pull request open and closed-unmerged move review back to active work", as
     context(fake, fake.pullEvent(pull), { eventId: 910 }),
   );
   assert.ok(fake.issue().labels.some(({ name }) => name === "status:review"));
+  assert.equal(fake.workflowReceipts().at(-1).leaseExpiresAt, null);
 
   const closed = fake.pulls.get(51);
   closed.state = "closed";
@@ -716,6 +807,75 @@ test("pull request open and closed-unmerged move review back to active work", as
     fake.issue().labels.some(({ name }) => name === "status:in-progress"),
   );
   assert.equal(fake.workflowReceipts().at(-1).action, "pr-close");
+});
+
+test("review admission rejects an implementation claim at its expiry boundary", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const pull = fake.pull({ createdAt: "2026-09-05T12:00:00.000Z" });
+  await assert.rejects(
+    () =>
+      handlePullRequest(
+        context(fake, fake.pullEvent(pull), {
+          eventId: 910,
+          now: "2026-09-05T12:00:00.000Z",
+        }),
+      ),
+    /lease.*expired|expired.*lease/i,
+  );
+});
+
+test("manual review state without a review-admission receipt fails closed", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  fake.issues.get(46).labels = [
+    { name: "type:docs" },
+    { name: "status:review" },
+  ];
+  const pull = fake.pull();
+  await assert.rejects(
+    () =>
+      handlePullRequest(context(fake, fake.pullEvent(pull), { eventId: 910 })),
+    /review admission/i,
+  );
+
+  const repair = await handleIssueChange(
+    context(fake, fake.issueEvent(), { eventId: 911 }),
+  );
+  assert.deepEqual(repair, {
+    status: "repair-required",
+    code: "STATE_MISMATCH",
+  });
+});
+
+test("terminal pull events reject every alternate open closing pull request", async () => {
+  for (const merged of [false, true]) {
+    const fake = new FakeGitHub();
+    await claim(fake);
+    const pull = fake.pull();
+    await handlePullRequest(
+      context(fake, fake.pullEvent(pull), { eventId: 910 }),
+    );
+    fake.pull({ number: 52 });
+    const terminal = fake.pulls.get(51);
+    terminal.state = "closed";
+    terminal.merged = merged;
+    terminal.merged_at = merged ? "2026-09-06T12:00:00.000Z" : null;
+    terminal.merge_commit_sha = merged ? "abc1234" : null;
+    if (merged) {
+      const governedIssue = fake.issues.get(46);
+      governedIssue.state = "closed";
+      governedIssue.state_reason = "completed";
+      governedIssue.closed_at = "2026-09-06T12:00:00.000Z";
+    }
+    await assert.rejects(
+      () =>
+        handlePullRequest(
+          context(fake, fake.pullEvent(terminal), { eventId: 911 }),
+        ),
+      /open closing pull request/i,
+    );
+  }
 });
 
 test("merged pull request verifies completed closure and reaches done", async () => {

@@ -82,14 +82,3 @@ body:
           required: true
         - label: Documentation and acceptance evidence are current.
           required: true
-  - type: checkboxes
-    id: done
-    attributes:
-      label: Definition of done
-      options:
-        - label: A failing reproduction exists before the behavior change.
-          required: true
-        - label: Relevant automated checks pass.
-          required: true
-        - label: Documentation and acceptance evidence are current.
-          required: true

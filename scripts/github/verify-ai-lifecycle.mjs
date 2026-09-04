@@ -48,22 +48,6 @@ const requirePositiveInteger = (value, label) => {
   return number;
 };
 
-const requireTimestamp = (value, label) => {
-  if (
-    typeof value !== "string" ||
-    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u.test(value)
-  ) {
-    fail(`${label} must be a GitHub UTC timestamp`);
-  }
-  const timestamp = Date.parse(value);
-  if (Number.isNaN(timestamp)) fail(`${label} must be a valid timestamp`);
-  const normalized = new Date(timestamp).toISOString();
-  if (normalized !== value && normalized.replace(".000Z", "Z") !== value) {
-    fail(`${label} must be a real canonical timestamp`);
-  }
-  return timestamp;
-};
-
 const stripFencedCode = (body) => {
   let fenced = false;
   return String(body ?? "")
@@ -202,7 +186,6 @@ const strictLifecycleEvidence = ({
   dependencies,
   closingPullRequests,
   reviewedHeadSha,
-  now,
   fields,
 }) => {
   if (pullRequest.state !== "open") fail("Pull request must still be open");
@@ -277,11 +260,14 @@ const strictLifecycleEvidence = ({
   if (!activeClaim || activeClaim.claimId !== claimReceipt.claimId) {
     fail("Claim receipt generation is no longer active or was released");
   }
-  if (
-    Date.parse(activeClaim.leaseExpiresAt) <=
-    requireTimestamp(now, "Validation time")
-  ) {
-    fail("Active claim lease has expired; renew it before merge");
+  const reviewAdmission = receipts.findLast(
+    (receipt) =>
+      receipt.result === "success" &&
+      receipt.action === "pr-open" &&
+      receipt.claimId === activeClaim.claimId,
+  );
+  if (!reviewAdmission || activeClaim.leaseExpiresAt !== null) {
+    fail("Current claim generation has no durable review admission");
   }
   requireIdentityMatch(activeClaim.owner, fields.owner, "Active claim owner");
 

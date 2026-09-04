@@ -569,6 +569,7 @@ test("parses system transitions and retains the active claim generation", () => 
     action: "pr-open",
     from: "in-progress",
     to: "review",
+    leaseExpiresAt: null,
   };
   const prClose = {
     ...claim,
@@ -703,7 +704,7 @@ test("renews only the current owner's active claim", () => {
   );
 });
 
-test("renews a review-state claim so an expired lease cannot merge", () => {
+test("rejects heartbeats after a claim receives its durable review lock", () => {
   const claim = plan().receipt;
   const review = {
     ...claim,
@@ -711,22 +712,24 @@ test("renews a review-state claim so an expired lease cannot merge", () => {
     action: "pr-open",
     from: "in-progress",
     to: "review",
+    leaseExpiresAt: null,
   };
-  const heartbeat = plan({
-    command: parseLifecycleCommand(
-      "/ai-heartbeat\nsummary: final review is still in progress",
-    ),
-    issue: issue({
-      labels: ["type:docs", "status:review"],
-      assignees: ["alice"],
-    }),
-    receipts: [claim, review],
-    eventId: 903,
-    now: "2026-09-05T00:00:00.000Z",
-  });
-  assert.equal(heartbeat.from, "review");
-  assert.equal(heartbeat.to, "review");
-  assert.equal(heartbeat.leaseExpiresAt, "2026-09-06T00:00:00.000Z");
+  expectCode(
+    () =>
+      plan({
+        command: parseLifecycleCommand(
+          "/ai-heartbeat\nsummary: final review is still in progress",
+        ),
+        issue: issue({
+          labels: ["type:docs", "status:review"],
+          assignees: ["alice"],
+        }),
+        receipts: [claim, review],
+        eventId: 903,
+        now: "2026-09-05T00:00:00.000Z",
+      }),
+    "INVALID_TRANSITION",
+  );
 });
 
 test("plans owner block and resume with the same claim generation", () => {

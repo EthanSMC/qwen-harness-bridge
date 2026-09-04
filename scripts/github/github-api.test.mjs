@@ -256,6 +256,61 @@ test("retries an idempotent uncertain mutation only after failed verification", 
   assert.equal(patches, 2);
 });
 
+for (const method of ["POST", "PATCH"]) {
+  for (const failure of ["body timeout", "invalid JSON", "invalid shape"]) {
+    test(`${method} reconciles a committed mutation after ${failure}`, async () => {
+      let applied = false;
+      let mutationCalls = 0;
+      let reads = 0;
+      const client = createGitHubClient({
+        fetchImpl: async (_url, options) => {
+          if (options.method === method) {
+            applied = true;
+            mutationCalls += 1;
+            return {
+              ok: true,
+              status: 200,
+              headers: { get: () => null },
+              json: async () => {
+                if (failure === "invalid JSON") {
+                  throw new SyntaxError("truncated response");
+                }
+                if (failure === "invalid shape") return "not-an-object";
+                return new Promise((_resolve, reject) => {
+                  options.signal.addEventListener(
+                    "abort",
+                    () => reject(new Error("body aborted")),
+                    { once: true },
+                  );
+                });
+              },
+            };
+          }
+          reads += 1;
+          return response({ id: 46, applied });
+        },
+        repository: REPOSITORY,
+        token: TOKEN,
+        timeoutMs: 10,
+      });
+
+      const result = await client.mutateAndVerify({
+        mutation: {
+          method,
+          path: method === "POST" ? "/issues/46/comments" : "/issues/46",
+          body: { applied: true },
+        },
+        read: () => client.get("/issues/46"),
+        verify: (current) => current.applied === true,
+      });
+      assert.equal(result.reconciled, true);
+      assert.equal(result.retried, false);
+      assert.equal(mutationCalls, 1);
+      assert.equal(reads, 1);
+    });
+  }
+}
+
 test("never replays an uncertain POST, even when given a stable intent key", async () => {
   let posts = 0;
   let reads = 0;
