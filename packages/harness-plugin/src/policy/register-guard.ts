@@ -9,6 +9,7 @@ import {
   type ActionPolicyOptions,
   classifyAction,
   type TrustedActionContext,
+  type TrustedExecutableResolver,
 } from "./action-classifier.js";
 import type { CanonicalAction, PolicyDecision } from "./types.js";
 
@@ -17,6 +18,7 @@ type PolicyExecution = Pick<Readonly<ToolExecution>, "arguments" | "name">;
 export type TrustedPolicyAction = Readonly<{
   action: CanonicalAction;
   provenance: TrustedActionContext["provenance"];
+  resolveExecutable?: TrustedExecutableResolver;
 }>;
 
 export type PolicyGuardRegistrationOptions = ActionPolicyOptions &
@@ -56,7 +58,9 @@ const resolveTrustedAction = (
     !isRecord(resolved) ||
     !isRecord(resolved.action) ||
     (resolved.provenance !== "local_tool" &&
-      resolved.provenance !== "cloud_command")
+      resolved.provenance !== "cloud_command") ||
+    (resolved.resolveExecutable !== undefined &&
+      typeof resolved.resolveExecutable !== "function")
   ) {
     return { kind: "denied", reason: "POLICY_DENIED:UNTRUSTED_ACTION" };
   }
@@ -75,6 +79,9 @@ const classifyResolvedAction = (
 ): PolicyDecision =>
   classifyAction(resolved.action, options, {
     provenance: resolved.provenance,
+    ...(resolved.resolveExecutable === undefined
+      ? {}
+      : { resolveExecutable: resolved.resolveExecutable }),
   });
 
 type ExecutionSnapshots = WeakMap<object, string>;

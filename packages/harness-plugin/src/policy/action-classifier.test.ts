@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -23,9 +24,34 @@ const makeFixture = () => {
   const directory = mkdtempSync(join(tmpdir(), "qhb-policy-classifier-"));
   const repositoryPath = join(directory, "repository");
   const outsidePath = join(directory, "outside");
+  const executableDirectory = join(directory, "bin");
   mkdirSync(repositoryPath);
   mkdirSync(join(repositoryPath, "src"));
   mkdirSync(outsidePath);
+  mkdirSync(executableDirectory);
+  for (const executable of [
+    "bash",
+    "curl",
+    "defaults",
+    "find",
+    "git",
+    "grep",
+    "npm",
+    "npm-cli.js",
+    "npx",
+    "npx-cli.js",
+    "pnpm",
+    "pnpm.mjs",
+    "python3",
+    "rg",
+    "rm",
+    "security",
+    "tsc",
+    "vercel",
+    "vitest",
+  ]) {
+    writeFileSync(join(executableDirectory, executable), "test executable\n");
+  }
   writeFileSync(join(repositoryPath, "src", "index.ts"), "export {};\n");
   writeFileSync(join(outsidePath, "secret.txt"), "not for the repository\n");
   writeFileSync(join(outsidePath, "ordinary.txt"), "outside data\n");
@@ -37,12 +63,21 @@ const makeFixture = () => {
   };
   return {
     directory,
+    executableDirectory,
     repository,
     outsidePath: realpathSync(outsidePath),
     outsideDataPath: join(realpathSync(outsidePath), "ordinary.txt"),
     sourcePath: join(repository.canonicalPath, "src", "index.ts"),
   };
 };
+
+const trustedContext = (fixture: ReturnType<typeof makeFixture>) => ({
+  provenance: "local_tool" as const,
+  resolveExecutable(executable: string): string | undefined {
+    const candidate = join(fixture.executableDirectory, executable);
+    return existsSync(candidate) ? candidate : undefined;
+  },
+});
 
 const makeAction = (
   fixture: ReturnType<typeof makeFixture>,
@@ -73,6 +108,18 @@ const makeExecutableAlias = (
   return { aliasPath, targetPath };
 };
 
+const makeBareExecutableAlias = (
+  fixture: ReturnType<typeof makeFixture>,
+  aliasName: string,
+  targetName: string,
+): void => {
+  rmSync(join(fixture.executableDirectory, aliasName), { force: true });
+  symlinkSync(
+    join(fixture.executableDirectory, targetName),
+    join(fixture.executableDirectory, aliasName),
+  );
+};
+
 afterEach(() => {
   while (temporaryDirectories.length > 0) {
     rmSync(temporaryDirectories.pop() as string, {
@@ -95,12 +142,132 @@ describe("classifyAction", () => {
   ])("classifies %s as automatic", (_label, overrides) => {
     const fixture = makeFixture();
 
-    const decision = classifyAction(makeAction(fixture, overrides), [
-      fixture.repository,
-    ]);
+    const decision = classifyAction(
+      makeAction(fixture, overrides),
+      [fixture.repository],
+      trustedContext(fixture),
+    );
 
     expect(decision.classification).toBe("automatic");
   });
+
+  it.each([
+    ["matched ripgrep search", "search", "rg", ["needle", "src"]],
+    ["matched grep search", "grep", "grep", ["needle", "src"]],
+    ["pnpm test", "test", "pnpm", ["test", "--runInBand"]],
+    ["npm test", "test", "npm", ["test", "--", "unit"]],
+    ["pnpm build", "build", "pnpm", ["build"]],
+    ["npm run build", "build", "npm", ["run", "build"]],
+    ["direct Vitest", "test", "vitest", ["run"]],
+    ["direct TypeScript build", "build", "tsc", ["--noEmit"]],
+  ])(
+    "classifies coherent %s identity and argv as automatic",
+    (_label, toolName, executable, argv) => {
+      const fixture = makeFixture();
+
+      const decision = classifyAction(
+        makeAction(fixture, { toolName, executable, argv }),
+        [fixture.repository],
+        trustedContext(fixture),
+      );
+
+      expect(decision.classification).toBe("automatic");
+    },
+  );
+
+  it.each([
+    ["read_file with /bin/rm", "read_file", "/bin/rm", []],
+    ["read_file with /usr/bin/curl", "read_file", "/usr/bin/curl", []],
+    ["read_file with bare npx", "read_file", "npx", ["vitest"]],
+    ["read_file with npm exec", "read_file", "npm", ["exec", "vitest"]],
+    ["search with a package manager", "search", "pnpm", ["build"]],
+    ["test with a search executable", "test", "rg", ["needle"]],
+    ["test with an arbitrary script", "test", "pnpm", ["run", "postinstall"]],
+    ["test runner shell escape", "test", "pnpm", ["test", "&&", "rm"]],
+    ["build with npm exec", "build", "npm", ["exec", "tsc"]],
+    ["ripgrep preprocessor", "search", "rg", ["--pre=cat", "needle"]],
+    ["find exec form", "find", "find", [".", "-exec", "rm", "{}", "+"]],
+    ["unresolved bare executable", "read_file", "not-on-path", []],
+  ])(
+    "denies incoherent or unresolved executable: %s",
+    (_label, toolName, executable, argv) => {
+      const fixture = makeFixture();
+
+      const decision = classifyAction(
+        makeAction(fixture, { toolName, executable, argv }),
+        [fixture.repository],
+        trustedContext(fixture),
+      );
+
+      expect(decision.classification).toBe("denied");
+    },
+  );
+
+  it("resolves a bare allowlisted spelling before matching its identity", () => {
+    const fixture = makeFixture();
+    makeBareExecutableAlias(fixture, "rg", "rm");
+
+    const decision = classifyAction(
+      makeAction(fixture, {
+        toolName: "search",
+        executable: "rg",
+        argv: ["needle", "src"],
+      }),
+      [fixture.repository],
+      trustedContext(fixture),
+    );
+
+    expect(decision.classification).toBe("denied");
+  });
+
+  it.each([
+    ["test", ["test"]],
+    ["build", ["build"]],
+  ])("denies %s without a resolved runner identity", (toolName, argv) => {
+    const fixture = makeFixture();
+
+    const decision = classifyAction(
+      makeAction(fixture, { toolName, executable: undefined, argv }),
+      [fixture.repository],
+      trustedContext(fixture),
+    );
+
+    expect(decision.classification).toBe("denied");
+  });
+
+  it.each([
+    ["pnpm wrapper", "pnpm", "pnpm.mjs", "test", ["test"], "automatic"],
+    [
+      "npm wrapper",
+      "npm",
+      "npm-cli.js",
+      "read_file",
+      ["ci"],
+      "approval_required",
+    ],
+    [
+      "npx wrapper",
+      "npx",
+      "npx-cli.js",
+      "read_file",
+      ["vercel", "deploy"],
+      "approval_required",
+    ],
+  ])(
+    "classifies canonical package-manager implementation identity: %s",
+    (_label, alias, target, toolName, argv, expected) => {
+      const fixture = makeFixture();
+      makeBareExecutableAlias(fixture, alias, target);
+
+      const decision = classifyAction(
+        makeAction(fixture, { toolName, executable: alias, argv }),
+        [fixture.repository],
+        trustedContext(fixture),
+      );
+
+      expect(decision.classification).toBe(expected);
+    },
+  );
 
   it.each([
     ["package install", { executable: "pnpm", argv: ["install"] }],
@@ -118,9 +285,11 @@ describe("classifyAction", () => {
   ])("classifies %s as approval_required", (_label, overrides) => {
     const fixture = makeFixture();
 
-    const decision = classifyAction(makeAction(fixture, overrides), [
-      fixture.repository,
-    ]);
+    const decision = classifyAction(
+      makeAction(fixture, overrides),
+      [fixture.repository],
+      trustedContext(fixture),
+    );
 
     expect(decision.classification).toBe("approval_required");
   });
@@ -166,9 +335,11 @@ describe("classifyAction", () => {
           }
         : overrides;
 
-    const decision = classifyAction(makeAction(fixture, resolvedOverrides), [
-      fixture.repository,
-    ]);
+    const decision = classifyAction(
+      makeAction(fixture, resolvedOverrides),
+      [fixture.repository],
+      trustedContext(fixture),
+    );
 
     expect(decision.classification).toBe("denied");
   });
@@ -218,6 +389,96 @@ describe("classifyAction", () => {
     );
 
     expect(decision.classification).toBe("denied");
+  });
+
+  it.each([
+    [
+      "absolute outside path",
+      (fixture: ReturnType<typeof makeFixture>) => `-C${fixture.outsidePath}`,
+      "PATH_OUTSIDE_REPOSITORY",
+    ],
+    ["relative traversal", () => "-C../outside", "PATH_TRAVERSAL"],
+    ["missing attached value", () => "-C", "PATH_UNAVAILABLE"],
+    ["equals-prefixed value", () => "-C=../outside", "PATH_UNAVAILABLE"],
+    ["network URL", () => "-Chttps://example.com/archive", "PATH_UNAVAILABLE"],
+    [
+      "other short option with outside path",
+      (fixture: ReturnType<typeof makeFixture>) => `-I${fixture.outsidePath}`,
+      "PATH_OUTSIDE_REPOSITORY",
+    ],
+    [
+      "other short option with traversal",
+      () => "-o../outside",
+      "PATH_TRAVERSAL",
+    ],
+    [
+      "outside file URL",
+      (fixture: ReturnType<typeof makeFixture>) =>
+        `-Cfile://${fixture.outsidePath}`,
+      "PATH_OUTSIDE_REPOSITORY",
+    ],
+  ])(
+    "denies malformed or outside BSD tar attached -C form: %s",
+    (_label, argumentFor, reasonCode) => {
+      const fixture = makeFixture();
+
+      const decision = classifyAction(
+        makeAction(fixture, { argv: [argumentFor(fixture)] }),
+        [fixture.repository],
+        trustedContext(fixture),
+      );
+
+      expect(decision).toMatchObject({ classification: "denied", reasonCode });
+    },
+  );
+
+  it("canonicalizes a safe attached -C path without changing its option spelling", () => {
+    const fixture = makeFixture();
+
+    const canonical = canonicalizeAction(
+      makeAction(fixture, {
+        argv: [`-C${fixture.repository.canonicalPath}/src/./`],
+      }),
+      [fixture.repository],
+      trustedContext(fixture),
+    );
+
+    expect(canonical).toMatchObject({
+      action: { argv: [`-C${join(fixture.repository.canonicalPath, "src")}`] },
+      violations: [],
+    });
+  });
+
+  it("canonicalizes a visibly path-bearing attached short option", () => {
+    const fixture = makeFixture();
+
+    const canonical = canonicalizeAction(
+      makeAction(fixture, {
+        argv: [`-I${fixture.repository.canonicalPath}/src/./`],
+      }),
+      [fixture.repository],
+      trustedContext(fixture),
+    );
+
+    expect(canonical).toMatchObject({
+      action: { argv: [`-I${join(fixture.repository.canonicalPath, "src")}`] },
+      violations: [],
+    });
+  });
+
+  it("denies an outside path in the split -C form", () => {
+    const fixture = makeFixture();
+
+    const decision = classifyAction(
+      makeAction(fixture, { argv: ["-C", fixture.outsidePath] }),
+      [fixture.repository],
+      trustedContext(fixture),
+    );
+
+    expect(decision).toMatchObject({
+      classification: "denied",
+      reasonCode: "PATH_OUTSIDE_REPOSITORY",
+    });
   });
 
   it.each([

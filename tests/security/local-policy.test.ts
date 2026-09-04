@@ -1,4 +1,5 @@
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -35,11 +36,17 @@ const makeFixture = () => {
   const directory = mkdtempSync(join(tmpdir(), "qhb-local-policy-"));
   const repositoryPath = join(directory, "repository");
   const outsidePath = join(directory, "outside");
+  const executableDirectory = join(directory, "bin");
   mkdirSync(repositoryPath);
   mkdirSync(outsidePath);
+  mkdirSync(executableDirectory);
+  for (const executable of ["pnpm", "rg", "rm"]) {
+    writeFileSync(join(executableDirectory, executable), "test executable\n");
+  }
   temporaryDirectories.push(directory);
   return {
     directory,
+    executableDirectory,
     repositoryPath,
     outsidePath,
     repository: {
@@ -111,9 +118,17 @@ const trustExecution = (
   trustedActions: WeakMap<object, TrustedPolicyAction>,
   execution: TestExecution,
   action: CanonicalAction,
+  fixture: ReturnType<typeof makeFixture>,
   provenance: TrustedPolicyAction["provenance"] = "local_tool",
 ): void => {
-  trustedActions.set(execution, { action, provenance });
+  trustedActions.set(execution, {
+    action,
+    provenance,
+    resolveExecutable(executable: string): string | undefined {
+      const candidate = join(fixture.executableDirectory, executable);
+      return existsSync(candidate) ? candidate : undefined;
+    },
+  });
 };
 
 afterEach(() => {
@@ -223,7 +238,7 @@ describe("local repository policy boundary", () => {
 
     const deniedAction = makeAction(fixture, { environmentRead: "arbitrary" });
     const deniedExecution = makeExecution(deniedAction);
-    trustExecution(trustedActions, deniedExecution, deniedAction);
+    trustExecution(trustedActions, deniedExecution, deniedAction, fixture);
     expect(guards[0]?.(deniedExecution)).toMatch(/POLICY_DENIED|ENVIRONMENT/);
 
     const approvalAction = makeAction(fixture, {
@@ -231,7 +246,7 @@ describe("local repository policy boundary", () => {
       argv: ["install"],
     });
     const approvalExecution = makeExecution(approvalAction);
-    trustExecution(trustedActions, approvalExecution, approvalAction);
+    trustExecution(trustedActions, approvalExecution, approvalAction, fixture);
     await expect(
       agentContext.waterfall(
         "tools/pre-execute",
@@ -261,7 +276,7 @@ describe("local repository policy boundary", () => {
       argv: ["install"],
     });
     const execution = makeExecution(action);
-    trustExecution(trustedActions, execution, action);
+    trustExecution(trustedActions, execution, action, fixture);
 
     const result = await agentContext.waterfall(
       "tools/pre-execute",
@@ -333,10 +348,36 @@ describe("local repository policy boundary", () => {
     );
     const action = makeAction(fixture);
     const execution = makeExecution(action, "shell");
-    trustExecution(trustedActions, execution, action);
+    trustExecution(trustedActions, execution, action, fixture);
 
     expect(guards[0]?.(execution)).toBe(
       "POLICY_DENIED:UNTRUSTED_TOOL_IDENTITY",
+    );
+  });
+
+  it("resolves a trusted bare executable before automatic authorization", () => {
+    const fixture = makeFixture();
+    rmSync(join(fixture.executableDirectory, "rg"));
+    symlinkSync(
+      join(fixture.executableDirectory, "rm"),
+      join(fixture.executableDirectory, "rg"),
+    );
+    const { agentContext, guards } = makeAgentScope();
+    const trustedActions = new WeakMap<object, TrustedPolicyAction>();
+    registerPolicyGuard(
+      agentContext,
+      trustedPolicyOptions(fixture, trustedActions),
+    );
+    const action = makeAction(fixture, {
+      toolName: "search",
+      executable: "rg",
+      argv: ["needle"],
+    });
+    const execution = makeExecution(action);
+    trustExecution(trustedActions, execution, action, fixture);
+
+    expect(guards[0]?.(execution)).toBe(
+      "POLICY_DENIED:EXECUTABLE_TOOL_MISMATCH",
     );
   });
 
@@ -358,7 +399,7 @@ describe("local repository policy boundary", () => {
       fileChange: "destructive",
     });
     const execution = makeExecution(action);
-    trustExecution(trustedActions, execution, action);
+    trustExecution(trustedActions, execution, action, fixture);
     await expect(
       agentContext.waterfall("tools/pre-execute", execution, async () => ({
         kind: "allow" as const,
@@ -391,7 +432,7 @@ describe("local repository policy boundary", () => {
       fileChange: "destructive",
     });
     const execution = makeExecution(action);
-    trustExecution(trustedActions, execution, action);
+    trustExecution(trustedActions, execution, action, fixture);
     await agentContext.waterfall("tools/pre-execute", execution, async () => ({
       kind: "allow" as const,
     }));
