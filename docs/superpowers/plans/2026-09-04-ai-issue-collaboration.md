@@ -827,11 +827,11 @@ Keep `AI_LIFECYCLE_VALIDATION_MODE=report` and set only `AI_LIFECYCLE_MUTATION_M
 
 On a disposable documentation-only Issue, exercise in order: first claim success, competing claim rejection, heartbeat, block, resume, release, fresh claim, and qualifying pull request transition to review. Capture only public GitHub URLs and bounded receipts.
 
-- [ ] **Step 4: Complete independent review, CI, merge, close, and reopen**
+- [x] **Step 4: Complete independent review, CI, merge, close, and reopen**
 
 Make a harmless documentation change in the disposable PR. Obtain the applicable independent review gate and current-head checks, merge it, verify automatic Issue closure and `status:done`, then reopen it and verify unassigned waiting/ready reconciliation. Preserve that valid ready state for the post-activation fresh claim and strict smoke PR in Step 6; its second verified merge closes the fixture, after which add an explicit acceptance note.
 
-- [ ] **Step 5: Remove bootstrap migrations and set activation commit**
+- [x] **Step 5: Remove bootstrap migrations and set activation commit**
 
 Set `activation_commit` to the exact 40-character protected-main commit containing the trusted workflow, set `mutation_acceptance` to `null`, and set `entries` to `[]`. Update repository status with acceptance Issue/PR/workflow URLs and GitHub-derived timestamps. Merge this registry change while validation is still report-only, verify reachability, and then set both repository variables to `enforce`.
 
