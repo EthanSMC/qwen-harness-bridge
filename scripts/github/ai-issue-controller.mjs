@@ -217,12 +217,13 @@ const requireReviewAdmissionChronology = ({ claim, pullRequest }) => {
   }
 };
 
-const durableReviewAdmissionFor = (receipts, claim) =>
+const durableReviewAdmissionFor = (receipts, claim, pullRequestNumber) =>
   receipts.findLast(
     (receipt) =>
       receipt.result === "success" &&
       receipt.action === "pr-open" &&
-      receipt.claimId === claim?.claimId,
+      receipt.claimId === claim?.claimId &&
+      receipt.pullRequestNumber === pullRequestNumber,
   ) ?? null;
 
 const assertMergeReachable = async ({
@@ -304,6 +305,7 @@ const mergedPullRequestForIssue = async ({
           repository,
           issueNumber,
         }) === claim.claimCommentId &&
+        pullRequest.number === claim.pullRequestNumber &&
         pullRequest.user?.login === claim.owner &&
         pullRequest.base?.ref === defaultBranch &&
         pullRequest.base?.repo?.full_name?.toLowerCase() ===
@@ -389,7 +391,7 @@ const intentBody = (plan) =>
       `AI lifecycle ${plan.receipt.action}:`,
       `Pending AI lifecycle ${plan.receipt.action}:`,
     )
-    .replace("<!-- qhb-ai-lifecycle:v1", "<!-- qhb-ai-intent:v1");
+    .replace("<!-- qhb-ai-lifecycle:v2", "<!-- qhb-ai-intent:v2");
 
 const hasIntent = (comments, receipt) => {
   const expectedBody = intentBody({ receipt });
@@ -418,7 +420,7 @@ const pendingIntentFor = (comments, receipts, eventId) => {
   const intents = comments.filter(
     (comment) =>
       comment.user?.login === WORKFLOW_LOGIN &&
-      comment.body?.includes("<!-- qhb-ai-intent:v1") &&
+      comment.body?.includes("<!-- qhb-ai-intent:v2") &&
       comment.body.includes(`event-id=${eventId}`),
   );
   if (new Set(intents.map(({ body }) => body)).size > 1) {
@@ -431,13 +433,13 @@ const pendingIntentFor = (comments, receipts, eventId) => {
   const synthetic = {
     ...intents[0],
     body: intents[0].body.replace(
-      "<!-- qhb-ai-intent:v1",
-      "<!-- qhb-ai-lifecycle:v1",
+      "<!-- qhb-ai-intent:v2",
+      "<!-- qhb-ai-lifecycle:v2",
     ),
   };
   const parsed = parseReceipts([
     ...comments.filter(
-      (comment) => !comment.body?.includes("<!-- qhb-ai-intent:v1"),
+      (comment) => !comment.body?.includes("<!-- qhb-ai-intent:v2"),
     ),
     synthetic,
   ]).find((receipt) => receipt.eventId === Number(eventId));
@@ -591,7 +593,7 @@ const recoverPendingIntent = async ({
 };
 
 const failureReceipt = ({ eventId, action, actor, agent, state, code }) => ({
-  version: 1,
+  version: 2,
   eventId,
   claimId: null,
   action,
@@ -601,6 +603,7 @@ const failureReceipt = ({ eventId, action, actor, agent, state, code }) => ({
   from: state,
   to: state,
   leaseExpiresAt: null,
+  pullRequestNumber: null,
   code,
 });
 
@@ -848,8 +851,9 @@ const systemReceipt = ({
   from,
   to,
   leaseExpiresAt = null,
+  pullRequestNumber = null,
 }) => ({
-  version: 1,
+  version: 2,
   eventId: Number(eventId),
   claimId: claim?.claimId ?? null,
   action,
@@ -859,10 +863,19 @@ const systemReceipt = ({
   from,
   to,
   leaseExpiresAt,
+  pullRequestNumber,
   code: null,
 });
 
-const systemPlan = ({ eventId, claim, action, from, to, leaseExpiresAt }) => ({
+const systemPlan = ({
+  eventId,
+  claim,
+  action,
+  from,
+  to,
+  leaseExpiresAt,
+  pullRequestNumber = null,
+}) => ({
   command: action,
   from,
   to,
@@ -878,6 +891,7 @@ const systemPlan = ({ eventId, claim, action, from, to, leaseExpiresAt }) => ({
     from,
     to,
     leaseExpiresAt: leaseExpiresAt ?? null,
+    pullRequestNumber,
   }),
 });
 
@@ -1018,6 +1032,15 @@ export const handlePullRequest = async ({
     );
   }
   if (
+    claim.pullRequestNumber !== null &&
+    claim.pullRequestNumber !== pullRequest.number
+  ) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "The claim generation is already bound to another pull request.",
+    );
+  }
+  if (
     state === "in-progress" &&
     (pullRequest.state === "open" || pullRequest.merged === true)
   ) {
@@ -1029,7 +1052,7 @@ export const handlePullRequest = async ({
     if (state === "review") {
       if (
         claim.leaseExpiresAt !== null ||
-        !durableReviewAdmissionFor(loaded.receipts, claim)
+        !durableReviewAdmissionFor(loaded.receipts, claim, pullRequest.number)
       ) {
         throw new LifecycleError(
           "STATE_MISMATCH",
@@ -1051,6 +1074,7 @@ export const handlePullRequest = async ({
       from: state,
       to: "review",
       leaseExpiresAt: null,
+      pullRequestNumber: pullRequest.number,
     });
   } else if (pullRequest.merged === true) {
     if (!["in-progress", "review"].includes(state)) {
@@ -1097,6 +1121,7 @@ export const handlePullRequest = async ({
         from: "in-progress",
         to: "review",
         leaseExpiresAt: null,
+        pullRequestNumber: pullRequest.number,
       });
       if (mode === "report") {
         return {
@@ -1109,6 +1134,7 @@ export const handlePullRequest = async ({
               action: "merge",
               from: "review",
               to: "done",
+              pullRequestNumber: pullRequest.number,
             }),
           ],
         };
@@ -1132,6 +1158,7 @@ export const handlePullRequest = async ({
       action: "merge",
       from: "review",
       to: "done",
+      pullRequestNumber: pullRequest.number,
     });
   } else {
     if (state === "in-progress") return { status: "unchanged" };
@@ -1148,6 +1175,7 @@ export const handlePullRequest = async ({
       from: state,
       to: "in-progress",
       leaseExpiresAt: plusOneLease(now),
+      pullRequestNumber: pullRequest.number,
     });
   }
   if (mode === "report") return { status: "report", plan };
@@ -1164,11 +1192,13 @@ export const handleIssueChange = async ({
 }) => {
   assertMode(mode);
   requireRepository(event, repository);
+  if (event.issue?.pull_request) return { status: "ignored" };
   const issueNumber = requirePositiveInteger(
     event.issue?.number,
     "Issue number",
   );
   const issue = await github.get(`/issues/${issueNumber}`);
+  if (issue.pull_request) return { status: "ignored" };
   const typeCount = managedTypeCount(issue);
   if (typeCount === 0) return { status: "ignored" };
   assertManagedIssue(issue);
@@ -1240,7 +1270,7 @@ export const handleIssueChange = async ({
           "Only claimed review work can reconcile to done.",
         );
       }
-      await mergedPullRequestForIssue({
+      const mergedPullRequest = await mergedPullRequestForIssue({
         github,
         issueNumber,
         repository,
@@ -1255,6 +1285,7 @@ export const handleIssueChange = async ({
         action: "close",
         from: "review",
         to: "done",
+        pullRequestNumber: mergedPullRequest.number,
       });
     } else if (loaded.issue.state === "open" && state === "done") {
       const readiness = evaluateReadiness({
@@ -1313,7 +1344,11 @@ export const handleIssueChange = async ({
           if (
             invariant.state === "review" &&
             (claim.leaseExpiresAt !== null ||
-              !durableReviewAdmissionFor(loaded.receipts, claim) ||
+              !durableReviewAdmissionFor(
+                loaded.receipts,
+                claim,
+                loaded.closingPullRequests[0]?.number,
+              ) ||
               loaded.closingPullRequests.length !== 1)
           ) {
             throw new LifecycleError(
@@ -1461,7 +1496,7 @@ const completedCommandEventIds = (comments) =>
         return [];
       }
       const match =
-        /<!-- qhb-ai-(?:lifecycle|command-rejection):v1[\s\S]*?^event-id=([1-9]\d*)$/mu.exec(
+        /<!-- qhb-ai-(?:lifecycle:v2|command-rejection:v1)[\s\S]*?^event-id=([1-9]\d*)$/mu.exec(
           comment.body,
         );
       return match ? [Number(match[1])] : [];

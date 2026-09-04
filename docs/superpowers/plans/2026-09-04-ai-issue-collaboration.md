@@ -279,7 +279,7 @@ export const ALLOWED_TRANSITIONS = Object.freeze({
   assignee: "alice",
   removeAssignee: null,
   leaseExpiresAt: "2026-09-05T12:00:00.000Z",
-  receipt: { version: 1, eventId: 901, claimId: "<uuid>", actor: "alice", agent: "codex" },
+  receipt: { version: 2, eventId: 901, claimId: "<uuid>", actor: "alice", agent: "codex", pullRequestNumber: null },
 }
 ```
 
@@ -294,7 +294,7 @@ Cover first claim success, second claim rejection, non-owner heartbeat rejection
 Generate a human-readable comment followed by this bounded marker:
 
 ```html
-<!-- qhb-ai-lifecycle:v1
+<!-- qhb-ai-lifecycle:v2
 event-id=901
 claim-id=550e8400-e29b-41d4-a716-446655440000
 action=claim
@@ -304,11 +304,12 @@ agent=codex
 from=ready
 to=in-progress
 lease-expires-at=2026-09-05T12:00:00.000Z
+pull-request=-
 code=-
 -->
 ```
 
-Reject unknown keys, duplicate keys, unsupported versions, invalid timestamps/UUIDs, and actor/claim mismatches. `parseReceipts` sorts by GitHub comment ID, rejects duplicate event IDs with different content, and selects only workflow-authored verified receipts supplied by the adapter.
+Reject unknown keys, duplicate keys, unsupported versions, invalid timestamps/UUIDs, actor/claim mismatches, and a claim generation that binds more than one pull-request number. `parseReceipts` sorts by GitHub comment ID, rejects duplicate event IDs with different content, and selects only workflow-authored verified receipts supplied by the adapter.
 
 - [x] **Step 8: Run policy tests and commit**
 
@@ -458,7 +459,7 @@ Cover open/draft/synchronize moving the primary Issue to review only when the PR
 
 - [x] **Step 9: Implement pull-request reconciliation**
 
-Read the pull request live. A qualifying open PR created after the claim and strictly before lease expiry moves `in-progress` to `review` with a durable review lock. A closed unmerged PR returns to `in-progress` with a renewed lease. A terminal PR event rejects any alternate open closing PR. A merged PR verifies GitHub closure, main reachability through the merge response, and terminal reconciliation before applying `status:done` and removing the assignee.
+Read the pull request live. A qualifying open PR created after the claim and strictly before lease expiry moves `in-progress` to `review` with a durable review lock bound to that PR number. A closed unmerged PR returns to `in-progress` with a renewed lease while retaining the same PR binding. A terminal PR event rejects any alternate open closing PR, and a different PR cannot inherit the prior lock. A merged PR verifies GitHub closure, main reachability through the merge response, and terminal reconciliation before applying `status:done` and removing the assignee.
 
 - [x] **Step 10: Run controller tests and commit**
 

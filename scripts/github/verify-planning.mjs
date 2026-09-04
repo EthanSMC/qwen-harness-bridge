@@ -455,6 +455,11 @@ for (const [pattern, message] of [
     "pre-accounting pull-request comment filtering",
   ],
   [/runReconciliationPhases/, "non-starving event reconciliation phases"],
+  [
+    /if \(event\.issue\?\.pull_request\) return \{ status: "ignored" \}/,
+    "pull-request comment lifecycle isolation",
+  ],
+  [/pullRequestNumber:\s*pullRequest\.number/, "receipt pull-request binding"],
   [/stableSystemEventId/, "deterministic system event identities"],
 ]) {
   requireSourceField(

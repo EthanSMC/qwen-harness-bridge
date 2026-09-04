@@ -53,7 +53,7 @@ const STATUS_PREFIX = "status:";
 const ELIGIBLE_PERMISSIONS = new Set(["admin", "maintain", "write"]);
 const MAINTAINER_PERMISSIONS = new Set(["admin", "maintain"]);
 const LEASE_MILLISECONDS = 24 * 60 * 60 * 1000;
-const RECEIPT_START = "<!-- qhb-ai-lifecycle:v1";
+const RECEIPT_START = "<!-- qhb-ai-lifecycle:v2";
 const RECEIPT_END = "-->";
 const RECEIPT_PREFIX = "<!-- qhb-ai-lifecycle:v";
 const RECEIPT_KEYS = [
@@ -66,6 +66,7 @@ const RECEIPT_KEYS = [
   "from",
   "to",
   "lease-expires-at",
+  "pull-request",
   "code",
 ];
 
@@ -110,6 +111,7 @@ const OWNER_BOUND_ACTIONS = new Set([
   "merge",
   "close",
 ]);
+const PULL_REQUEST_ACTIONS = new Set(["pr-open", "pr-close", "merge", "close"]);
 
 export class LifecycleError extends Error {
   constructor(code, message) {
@@ -215,6 +217,7 @@ const receiptIdentity = (receipt) =>
     from: receipt.from,
     to: receipt.to,
     leaseExpiresAt: receipt.leaseExpiresAt,
+    pullRequestNumber: receipt.pullRequestNumber,
     code: receipt.code,
   });
 
@@ -228,6 +231,7 @@ export const currentClaimFromReceipts = (receipts) => {
         owner: receipt.actor,
         agent: receipt.agent,
         leaseExpiresAt: receipt.leaseExpiresAt,
+        pullRequestNumber: null,
         claimCommentId: receipt.commentId ?? null,
         claimedAt: receipt.createdAt ?? null,
       };
@@ -240,6 +244,9 @@ export const currentClaimFromReceipts = (receipts) => {
       ["heartbeat", "resume", "pr-open", "pr-close"].includes(receipt.action)
     ) {
       active.leaseExpiresAt = receipt.leaseExpiresAt;
+      if (receipt.action === "pr-open") {
+        active.pullRequestNumber = receipt.pullRequestNumber;
+      }
     }
   }
   return active;
@@ -254,8 +261,9 @@ const makeReceipt = ({
   from,
   to,
   leaseExpiresAt = null,
+  pullRequestNumber = null,
 }) => ({
-  version: 1,
+  version: 2,
   eventId: Number(eventId),
   claimId,
   action,
@@ -265,6 +273,7 @@ const makeReceipt = ({
   from,
   to,
   leaseExpiresAt,
+  pullRequestNumber,
   code: null,
 });
 
@@ -722,6 +731,7 @@ export const receiptBody = (receipt) => {
     from: receipt.from,
     to: receipt.to,
     "lease-expires-at": receipt.leaseExpiresAt,
+    "pull-request": receipt.pullRequestNumber,
     code: receipt.code,
   };
   const marker = RECEIPT_KEYS.map(
@@ -767,7 +777,7 @@ const parseReceiptBody = (body) => {
     fail("STATE_MISMATCH", "A lifecycle receipt has an invalid event ID.");
   }
   const receipt = {
-    version: 1,
+    version: 2,
     eventId,
     claimId: values["claim-id"],
     action: values.action,
@@ -777,6 +787,8 @@ const parseReceiptBody = (body) => {
     from: values.from,
     to: values.to,
     leaseExpiresAt: values["lease-expires-at"],
+    pullRequestNumber:
+      values["pull-request"] === null ? null : Number(values["pull-request"]),
     code: values.code,
   };
   if (
@@ -790,6 +802,18 @@ const parseReceiptBody = (body) => {
   }
   if (!RECEIPT_ACTIONS.includes(receipt.action)) {
     fail("STATE_MISMATCH", "A lifecycle receipt has an invalid action.");
+  }
+  if (
+    (PULL_REQUEST_ACTIONS.has(receipt.action) &&
+      (!Number.isSafeInteger(receipt.pullRequestNumber) ||
+        receipt.pullRequestNumber < 1)) ||
+    (!PULL_REQUEST_ACTIONS.has(receipt.action) &&
+      receipt.pullRequestNumber !== null)
+  ) {
+    fail(
+      "STATE_MISMATCH",
+      "A lifecycle receipt has an invalid pull request binding.",
+    );
   }
   if (!new Set(["success", "failure"]).has(receipt.result)) {
     fail("STATE_MISMATCH", "A lifecycle receipt has an invalid result.");
@@ -969,6 +993,7 @@ export const parseReceipts = (
       claims.set(parsed.claimId, {
         owner: parsed.actor,
         agent: parsed.agent,
+        pullRequestNumber: null,
         released: false,
       });
     } else {
@@ -985,6 +1010,26 @@ export const parseReceipts = (
         fail(
           "STATE_MISMATCH",
           "A receipt actor does not match the claim owner.",
+        );
+      }
+      if (parsed.action === "pr-open") {
+        if (
+          claim.pullRequestNumber !== null &&
+          claim.pullRequestNumber !== parsed.pullRequestNumber
+        ) {
+          fail(
+            "STATE_MISMATCH",
+            "A claim generation cannot bind more than one pull request.",
+          );
+        }
+        claim.pullRequestNumber = parsed.pullRequestNumber;
+      } else if (
+        PULL_REQUEST_ACTIONS.has(parsed.action) &&
+        claim.pullRequestNumber !== parsed.pullRequestNumber
+      ) {
+        fail(
+          "STATE_MISMATCH",
+          "A pull request receipt does not match its claim generation binding.",
         );
       }
       if (RECEIPT_END_ACTIONS.has(parsed.action)) claim.released = true;

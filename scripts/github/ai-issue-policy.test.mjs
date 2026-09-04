@@ -409,7 +409,7 @@ test("plans an exact 24-hour exclusive claim", () => {
   assert.equal(result.assignee, "alice");
   assert.equal(result.leaseExpiresAt, "2026-09-05T12:00:00.000Z");
   assert.deepEqual(result.receipt, {
-    version: 1,
+    version: 2,
     eventId: 901,
     claimId: UUID,
     action: "claim",
@@ -419,6 +419,7 @@ test("plans an exact 24-hour exclusive claim", () => {
     from: "ready",
     to: "in-progress",
     leaseExpiresAt: "2026-09-05T12:00:00.000Z",
+    pullRequestNumber: null,
     code: null,
   });
 });
@@ -441,7 +442,7 @@ test("rejects an ineligible or competing claimant", () => {
 test("round-trips a workflow-authored receipt and ignores other comments", () => {
   const claim = plan().receipt;
   const body = receiptBody(claim);
-  assert.match(body, /qhb-ai-lifecycle:v1/);
+  assert.match(body, /qhb-ai-lifecycle:v2/);
   assert.deepEqual(
     parseReceipts([
       { id: 10, body: "ordinary", user: { login: "alice" } },
@@ -507,7 +508,7 @@ test("rejects malformed, unsupported, or inconsistent receipts", () => {
     () =>
       parseReceipts([
         validComment(
-          receiptBody(claim).replace("lifecycle:v1", "lifecycle:v2"),
+          receiptBody(claim).replace("lifecycle:v2", "lifecycle:v3"),
         ),
       ]),
     "STATE_MISMATCH",
@@ -536,7 +537,7 @@ test("rejects malformed, unsupported, or inconsistent receipts", () => {
 
 test("round-trips a bounded failure receipt without creating a claim", () => {
   const failure = {
-    version: 1,
+    version: 2,
     eventId: 902,
     claimId: null,
     action: "claim",
@@ -546,6 +547,7 @@ test("round-trips a bounded failure receipt without creating a claim", () => {
     from: "in-progress",
     to: "in-progress",
     leaseExpiresAt: null,
+    pullRequestNumber: null,
     code: "ALREADY_CLAIMED",
   };
   assert.deepEqual(
@@ -570,6 +572,7 @@ test("parses system transitions and retains the active claim generation", () => 
     from: "in-progress",
     to: "review",
     leaseExpiresAt: null,
+    pullRequestNumber: 51,
   };
   const prClose = {
     ...claim,
@@ -578,6 +581,7 @@ test("parses system transitions and retains the active claim generation", () => 
     from: "review",
     to: "in-progress",
     leaseExpiresAt: "2026-09-06T12:00:00.000Z",
+    pullRequestNumber: 51,
   };
   const parsed = parseReceipts(
     [claim, prOpen, prClose].map((receipt, index) => ({
@@ -601,7 +605,7 @@ test("parses system transitions and retains the active claim generation", () => 
   assert.equal(heartbeat.receipt.claimId, UUID);
 
   const reopened = {
-    version: 1,
+    version: 2,
     eventId: 905,
     claimId: null,
     action: "reopen",
@@ -647,6 +651,43 @@ test("parses system transitions and retains the active claim generation", () => 
       })),
     ).map(({ action }) => action),
     ["initialize", "refresh"],
+  );
+});
+
+test("one claim generation cannot bind receipts from two pull requests", () => {
+  const claim = plan().receipt;
+  const review = {
+    ...claim,
+    eventId: 902,
+    action: "pr-open",
+    from: "in-progress",
+    to: "review",
+    leaseExpiresAt: null,
+    pullRequestNumber: 51,
+  };
+  const returned = {
+    ...review,
+    eventId: 903,
+    action: "pr-close",
+    from: "review",
+    to: "in-progress",
+    leaseExpiresAt: "2026-09-06T12:00:00.000Z",
+  };
+  const replacement = {
+    ...review,
+    eventId: 904,
+    pullRequestNumber: 52,
+  };
+  expectCode(
+    () =>
+      parseReceipts(
+        [claim, review, returned, replacement].map((receipt, index) => ({
+          id: 40 + index,
+          body: receiptBody(receipt),
+          user: { login: "github-actions[bot]" },
+        })),
+      ),
+    "STATE_MISMATCH",
   );
 });
 

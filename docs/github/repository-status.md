@@ -17,11 +17,11 @@ Verified on 2026-09-04 against [EthanSMC/qwen-harness-bridge](https://github.com
 
 Observed locally on 2026-09-04 after rebasing the bootstrap candidate onto current `main`:
 
-- `node --test scripts/github/*.test.mjs`: PASS, 167 tests, including bounded ordered backlog recovery, durable untyped-command rejection, non-starving event reconciliation, timely durable review admission, current-claim terminal binding, uncertain-response convergence, bounded rollout, GraphQL historical proof, and the legacy-migration CLI path.
+- `node --test scripts/github/*.test.mjs`: PASS, 170 tests, including bounded ordered backlog recovery, durable untyped-command rejection, PR-comment isolation through the real controller entry point, non-starving event reconciliation, timely PR-bound durable review admission, current-claim terminal binding, uncertain-response convergence, bounded rollout, GraphQL historical proof, and the legacy-migration CLI path.
 - `node scripts/github/verify-planning.mjs`: PASS, 25 governance/planning files and 34 implementation tasks.
 - `pnpm build && pnpm check`: PASS; both workspace packages built, Biome checked 83 files, both workspace TypeScript projects passed, and Vitest passed 21 files / 381 tests.
 - `git diff --check origin/main..HEAD`: PASS for the exact rebased candidate range.
-- Security inspection: the write-capable workflow uses `pull_request_target`, serializes every mutation in one repository-wide queue, scans at most 1,000 recent repository comments and drains the oldest pending Issue commands by immutable comment ID, filters pull-request comments before backlog accounting, checks out only `github.event.repository.default_branch`, disables persisted checkout credentials, grants `contents: read` plus `issues: write` and `pull-requests: read`, never grants `contents: write`, and reads untrusted comment data only inside Node.
+- Security inspection: the write-capable workflow uses `pull_request_target`, serializes every mutation in one repository-wide queue, scans at most 1,000 recent repository comments and drains the oldest pending Issue commands by immutable comment ID, filters pull-request comments before backlog accounting and again at the Issue handler boundary, binds every v2 review/terminal receipt to one exact PR number, checks out only `github.event.repository.default_branch`, disables persisted checkout credentials, grants `contents: read` plus `issues: write` and `pull-requests: read`, never grants `contents: write`, and reads untrusted comment data only inside Node.
 
 These local results do not substitute for current-head GitHub checks or independent final review.
 

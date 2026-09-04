@@ -264,10 +264,17 @@ const strictLifecycleEvidence = ({
     (receipt) =>
       receipt.result === "success" &&
       receipt.action === "pr-open" &&
-      receipt.claimId === activeClaim.claimId,
+      receipt.claimId === activeClaim.claimId &&
+      receipt.pullRequestNumber === pullRequest.number,
   );
-  if (!reviewAdmission || activeClaim.leaseExpiresAt !== null) {
-    fail("Current claim generation has no durable review admission");
+  if (
+    !reviewAdmission ||
+    activeClaim.leaseExpiresAt !== null ||
+    activeClaim.pullRequestNumber !== pullRequest.number
+  ) {
+    fail(
+      "Current claim generation has no durable review admission for this pull request",
+    );
   }
   requireIdentityMatch(activeClaim.owner, fields.owner, "Active claim owner");
 

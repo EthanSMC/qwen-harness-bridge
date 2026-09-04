@@ -62,7 +62,7 @@ const claimReceipt = ({
   actor = "alice",
   leaseExpiresAt = "2026-09-05T12:00:00.000Z",
 } = {}) => ({
-  version: 1,
+  version: 2,
   eventId,
   claimId: CLAIM_ID,
   action: "claim",
@@ -72,6 +72,7 @@ const claimReceipt = ({
   from: "ready",
   to: "in-progress",
   leaseExpiresAt,
+  pullRequestNumber: null,
   code: null,
 });
 
@@ -82,6 +83,7 @@ const reviewReceipt = () => ({
   from: "in-progress",
   to: "review",
   leaseExpiresAt: null,
+  pullRequestNumber: 51,
 });
 
 const commentsFor = ({ user = "github-actions[bot]", receipts } = {}) =>
@@ -262,6 +264,20 @@ test("rejects missing review admission or subsequently released claims", () => {
         }),
       ),
     /review admission/i,
+  );
+  assert.throws(
+    () =>
+      validatePullRequestLifecycleState(
+        validInput({
+          comments: commentsFor({
+            receipts: [
+              claimReceipt(),
+              { ...reviewReceipt(), pullRequestNumber: 52 },
+            ],
+          }),
+        }),
+      ),
+    /review admission.*this pull request/i,
   );
   const released = {
     ...claimReceipt(),

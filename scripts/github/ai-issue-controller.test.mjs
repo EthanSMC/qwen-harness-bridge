@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
@@ -6,6 +9,7 @@ import {
   handleIssueChange,
   handleIssueComment,
   handlePullRequest,
+  main,
   reconcileExpiredClaims,
   reconcileLifecycleCommands,
   reconcileRepositoryState,
@@ -270,7 +274,7 @@ class FakeGitHub {
     if (!match) throw new Error(`unexpected POST ${path}`);
     if (
       this.failNextReceiptPost &&
-      body.body.includes("<!-- qhb-ai-lifecycle:v1")
+      body.body.includes("<!-- qhb-ai-lifecycle:v2")
     ) {
       this.failNextReceiptPost = false;
       throw new Error("simulated receipt write interruption");
@@ -605,7 +609,7 @@ test("recovery tolerates identical duplicate intent comments", async () => {
   await assert.rejects(() => handleIssueComment(context(fake, event)));
   const intent = fake
     .issueComments()
-    .find(({ body }) => body.includes("<!-- qhb-ai-intent:v1"));
+    .find(({ body }) => body.includes("<!-- qhb-ai-intent:v2"));
   fake.comments.get(46).push({
     ...intent,
     id: fake.nextCommentId,
@@ -846,6 +850,27 @@ test("manual review state without a review-admission receipt fails closed", asyn
     status: "repair-required",
     code: "STATE_MISMATCH",
   });
+});
+
+test("a review lock cannot transfer to a second pull request", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const firstPull = fake.pull();
+  await handlePullRequest(
+    context(fake, fake.pullEvent(firstPull), { eventId: 910 }),
+  );
+  fake.pulls.get(51).state = "closed";
+  const secondPull = fake.pull({
+    number: 52,
+    createdAt: "2026-09-06T12:00:00.000Z",
+  });
+  await assert.rejects(
+    () =>
+      handlePullRequest(
+        context(fake, fake.pullEvent(secondPull), { eventId: 911 }),
+      ),
+    /bound.*pull request|pull request.*bound/i,
+  );
 });
 
 test("terminal pull events reject every alternate open closing pull request", async () => {
@@ -1128,5 +1153,65 @@ test("runLifecycleController dispatches supported event names", async () => {
         eventName: "push",
       }),
     /unsupported.*event/i,
+  );
+});
+
+test("main drains commands but never treats a pull-request comment target as an Issue", async (t) => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "qhb-pr-comment-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const eventPath = join(temporaryDirectory, "event.json");
+  await writeFile(
+    eventPath,
+    JSON.stringify({
+      repository: { full_name: REPOSITORY, default_branch: "main" },
+      issue: {
+        number: 51,
+        pull_request: {
+          url: `https://api.github.com/repos/${REPOSITORY}/pulls/51`,
+        },
+      },
+      comment: {
+        id: 901,
+        body: "/ai-claim\nagent: codex",
+        issue_url: `https://api.github.com/repos/${REPOSITORY}/issues/51`,
+        user: { login: "alice" },
+      },
+    }),
+  );
+  const requests = [];
+  const fetchImpl = async (url, options = {}) => {
+    const requestUrl = new URL(url);
+    requests.push({
+      method: options.method,
+      path: `${requestUrl.pathname}${requestUrl.search}`,
+    });
+    if (requestUrl.pathname.endsWith("/issues/comments")) {
+      return new Response("[]", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    throw new Error(`unexpected request ${requestUrl.pathname}`);
+  };
+  const result = await main({
+    eventPath,
+    eventName: "issue_comment",
+    repository: REPOSITORY,
+    token: "test-token",
+    mode: "enforce",
+    now: NOW,
+    fetchImpl,
+  });
+  assert.deepEqual(result, {
+    commandDrain: { status: "enforce", processed: 0, results: [] },
+    lifecycle: { status: "ignored" },
+  });
+  assert.equal(
+    requests.some(({ path }) => path.endsWith("/issues/51")),
+    false,
+  );
+  assert.deepEqual(
+    new Set(requests.map(({ method }) => method)),
+    new Set(["GET"]),
   );
 });

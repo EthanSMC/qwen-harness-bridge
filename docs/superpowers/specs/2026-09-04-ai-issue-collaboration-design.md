@@ -70,7 +70,7 @@ Authority is ordered as follows:
 1. GitHub Issue open/closed state is authoritative for terminal completion.
 2. The repository-managed lifecycle label is authoritative for the active phase.
 3. The single Issue assignee is authoritative for human ownership.
-4. Workflow-generated receipt comments are authoritative for claim generation, lease, release, and transition history.
+4. Workflow-generated v2 receipt comments are authoritative for claim generation, lease, exact pull-request binding, release, and transition history.
 5. The pull request and current-head GitHub checks are authoritative for review and merge readiness.
 6. Local branches, worktrees, agent threads, and private ledgers are implementation aids and cannot override GitHub state.
 
@@ -253,7 +253,7 @@ A pull request for governed work must:
 - include the exact base and head commits, observed verification results, risk, compatibility, migration, privacy/security effect, and rollback path; and
 - complete the existing review-mode evidence.
 
-When a qualifying pull request created strictly within the implementation lease opens, the lifecycle workflow moves the Issue from `status:in-progress` to `status:review` and records a durable review-admission receipt with no expiry. Draft pull requests are allowed, but they do not weaken evidence requirements.
+When a qualifying pull request created strictly within the implementation lease opens, the lifecycle workflow moves the Issue from `status:in-progress` to `status:review` and records a durable review-admission receipt with no expiry and the exact pull-request number. That claim generation remains bound to the same primary pull request across close/reopen recovery; a different PR requires release and a fresh claim. Draft pull requests are allowed, but they do not weaken evidence requirements.
 
 The implementer and final reviewer must be distinct. Review follows the existing two-path gate:
 
