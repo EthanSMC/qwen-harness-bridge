@@ -7,7 +7,10 @@ import {
   SequenceCursor,
 } from "@qhb/protocol";
 import WebSocket, { type ClientOptions } from "ws";
-import type { PluginStore } from "../store/plugin-store.js";
+import type {
+  PluginStore,
+  StoredInboundMessage,
+} from "../store/plugin-store.js";
 import {
   type StoredOutboundEvent,
   StoreSequenceError,
@@ -50,6 +53,7 @@ const MESSAGE_TTL_MS = 60_000;
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 const SOCKET_CLOSE_TIMEOUT_MS = 1_000;
 const MAX_SEQUENCE_ALLOCATION_PROBES = 100_000;
+const ABORTED = Symbol("CONNECTOR_ABORTED");
 
 const assertWssUrl = (value: string): void => {
   let url: URL;
@@ -147,7 +151,7 @@ export class DurableConnectorClient implements ConnectorClient {
   readonly #outboundBySequence = new Map<number, StoredOutboundEvent>();
   readonly #sentOnConnection = new Set<number>();
   #clientSequence = 0;
-  #serverCursor = new SequenceCursor();
+  #serverCursor: SequenceCursor;
   #socket: WebSocket | undefined;
   #startPromise: Promise<void> | undefined;
   #refreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -156,9 +160,10 @@ export class DurableConnectorClient implements ConnectorClient {
   #receivePump: Promise<void> = Promise.resolve();
   #welcomeWaiter: Promise<void> | undefined;
   #resolveWelcome: (() => void) | undefined;
-  #helloServerSequence = 0;
   #helloMessage: PendingMessage | undefined;
   #welcomeReceived = false;
+  #retireSessionOnStop = false;
+  #started = false;
   #stopping = false;
   #nextSession: { token: string; expiresAt: string } | undefined;
 
@@ -171,6 +176,7 @@ export class DurableConnectorClient implements ConnectorClient {
     this.#socketFactory =
       options.webSocketFactory ??
       ((url, socketOptions) => new WebSocket(url, socketOptions));
+    this.#serverCursor = new SequenceCursor(options.store.maxInboundSequence());
     const pending = options.store.pendingEvents(0);
     for (const event of pending) {
       this.#rememberPending(event);
@@ -180,7 +186,9 @@ export class DurableConnectorClient implements ConnectorClient {
 
   start(signal: AbortSignal): Promise<void> {
     if (this.#startPromise !== undefined) return this.#startPromise;
+    this.#started = true;
     this.#stopping = signal.aborted;
+    if (!signal.aborted) this.#prepareHello();
     this.#startPromise = this.#run(signal);
     return this.#startPromise;
   }
@@ -190,6 +198,8 @@ export class DurableConnectorClient implements ConnectorClient {
     payload: unknown,
     correlationId: string,
   ): Promise<void> {
+    if (!this.#started) throw new Error("CONNECTOR_NOT_STARTED");
+    if (this.#stopping) throw new Error("CONNECTOR_STOPPED");
     if (
       type === "connector.hello" ||
       type === "connector.heartbeat" ||
@@ -212,6 +222,8 @@ export class DurableConnectorClient implements ConnectorClient {
 
   async #run(signal: AbortSignal): Promise<void> {
     const onAbort = (): void => {
+      this.#retireSessionOnStop =
+        this.#welcomeReceived && this.#socket?.readyState === WebSocket.OPEN;
       this.#stopping = true;
       this.#clearTimers();
       this.#closeSocket();
@@ -220,9 +232,10 @@ export class DurableConnectorClient implements ConnectorClient {
     let attempt = 0;
     try {
       while (!signal.aborted) {
+        this.#prepareHello();
         try {
-          await this.#connectOnce(signal);
-          attempt = 0;
+          const welcomed = await this.#connectOnce(signal);
+          if (welcomed) attempt = 0;
         } catch {
           if (signal.aborted) break;
         }
@@ -239,23 +252,35 @@ export class DurableConnectorClient implements ConnectorClient {
       this.#clearTimers();
       this.#closeSocket();
       this.#nextSession = undefined;
+      this.#retireSessionIfSafe();
       this.#stopping = true;
     }
   }
 
-  async #connectOnce(signal: AbortSignal): Promise<void> {
-    if (signal.aborted) return;
+  async #connectOnce(signal: AbortSignal): Promise<boolean> {
+    if (signal.aborted) return false;
     let session = this.#nextSession;
     if (session === undefined) {
-      const bootstrapCredential =
-        await this.#options.bootstrapCredentialProvider();
-      if (signal.aborted) return;
-      session = await this.#options.sessionTokenClient.exchange({
-        connectorId: this.#options.connectorId,
-        bootstrapCredential,
-      });
+      const bootstrapCredential = await this.#abortable(
+        Promise.resolve().then(() =>
+          this.#options.bootstrapCredentialProvider(),
+        ),
+        signal,
+      );
+      if (bootstrapCredential === ABORTED) return false;
+      const exchanged = await this.#abortable(
+        Promise.resolve().then(() =>
+          this.#options.sessionTokenClient.exchange({
+            connectorId: this.#options.connectorId,
+            bootstrapCredential,
+          }),
+        ),
+        signal,
+      );
+      if (exchanged === ABORTED) return false;
+      session = exchanged;
     }
-    if (signal.aborted) return;
+    if (signal.aborted) return false;
     this.#nextSession = undefined;
     this.#scheduleTokenRefresh(session.expiresAt, signal);
 
@@ -270,7 +295,6 @@ export class DurableConnectorClient implements ConnectorClient {
     });
     this.#receivePump = Promise.resolve();
     this.#sendPump = Promise.resolve();
-    this.#helloServerSequence = this.#serverCursor.lastSequence;
     const closePromise = new Promise<void>((resolve, reject) => {
       let settled = false;
       const finish = (error?: Error): void => {
@@ -288,14 +312,15 @@ export class DurableConnectorClient implements ConnectorClient {
       socket.on("message", (data) => {
         const serialized = typeof data === "string" ? data : data.toString();
         this.#receivePump = this.#receivePump
-          .then(() => this.#handleIncoming(socket, serialized))
+          .then(() => this.#handleIncoming(socket, serialized, signal))
           .catch(() => {
             this.#closeSocket(socket);
           });
       });
-      socket.once("error", (error) =>
-        finish(asError(error, "CONNECTOR_SOCKET_ERROR")),
-      );
+      socket.once("error", (error) => {
+        this.#closeSocket(socket);
+        finish(asError(error, "CONNECTOR_SOCKET_ERROR"));
+      });
       socket.once("close", () => {
         this.#resolveWelcome?.();
         finish();
@@ -303,6 +328,7 @@ export class DurableConnectorClient implements ConnectorClient {
     });
     try {
       await closePromise;
+      return this.#welcomeReceived;
     } finally {
       if (this.#socket === socket) this.#socket = undefined;
       this.#welcomeWaiter = undefined;
@@ -312,47 +338,43 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   async #afterOpen(socket: WebSocket, signal: AbortSignal): Promise<void> {
-    const pendingHello = this.#pendingMessages().find(
-      ({ message }) => message.type === "connector.hello",
-    );
-    const hello =
-      pendingHello ??
-      this.#persistMessage((sequence) =>
-        buildConnectorHello({
-          connectorId: this.#options.connectorId,
-          sequence,
-          lastServerSequence: this.#serverCursor.lastSequence,
-          lastClientSequence:
-            this.#clientSequence === 0 ? undefined : this.#clientSequence,
-          correlationId: this.#randomUUID(),
-          messageId: this.#randomUUID(),
-          now: this.#now(),
-          connectorVersion:
-            this.#options.connectorVersion ?? "qhb-harness-plugin/1.0",
-          capabilities: this.#options.capabilities ?? ["harness", "replay"],
-        }),
-      );
+    const hello = this.#helloMessage;
+    if (hello === undefined) throw new Error("CONNECTOR_HELLO_MISSING");
     if (hello.message.type !== "connector.hello") {
       throw new Error("CONNECTOR_HELLO_MISSING");
     }
     this.#helloMessage = hello;
-    this.#helloServerSequence = hello.message.payload.last_server_sequence;
     this.#sendJson(socket, hello.message);
-    this.#heartbeatTimer = setInterval(() => {
-      if (
-        signal.aborted ||
-        this.#socket !== socket ||
-        socket.readyState !== WebSocket.OPEN
-      )
-        return;
-      void this.#sendHeartbeat(socket).catch(() => this.#closeSocket(socket));
-    }, HEARTBEAT_INTERVAL_MS);
     await this.#welcomeWaiter;
     if (signal.aborted || this.#socket !== socket) return;
     await this.#sendPending(socket);
   }
 
-  async #handleIncoming(socket: WebSocket, serialized: string): Promise<void> {
+  #prepareHello(): void {
+    if (this.#helloMessage !== undefined) return;
+    const lastClientSequence = this.#clientSequence;
+    this.#helloMessage = this.#persistMessage((sequence) =>
+      buildConnectorHello({
+        connectorId: this.#options.connectorId,
+        sequence,
+        lastServerSequence: this.#serverCursor.lastSequence,
+        lastClientSequence:
+          lastClientSequence === 0 ? undefined : lastClientSequence,
+        correlationId: this.#randomUUID(),
+        messageId: this.#randomUUID(),
+        now: this.#now(),
+        connectorVersion:
+          this.#options.connectorVersion ?? "qhb-harness-plugin/1.0",
+        capabilities: this.#options.capabilities ?? ["harness", "replay"],
+      }),
+    );
+  }
+
+  async #handleIncoming(
+    socket: WebSocket,
+    serialized: string,
+    signal: AbortSignal,
+  ): Promise<void> {
     if (this.#socket !== socket || this.#stopping) return;
     let message: ConnectorServerMessage;
     try {
@@ -364,44 +386,41 @@ export class DurableConnectorClient implements ConnectorClient {
       this.#closeSocket(socket);
       return;
     }
-    let receipt: "new" | "duplicate";
-    try {
-      receipt = this.#options.store.recordInbound(
-        message.message_id,
-        message.sequence,
-        serialized,
-      );
-    } catch {
+    if (message.type === "connector.welcome" && !this.#validWelcome(message)) {
       this.#closeSocket(socket);
       return;
     }
-    if (receipt === "new") {
+
+    const existing = this.#options.store.inboundMessage(message.message_id);
+    if (
+      existing !== undefined &&
+      (existing.sequence !== message.sequence || existing.body !== serialized)
+    ) {
+      this.#closeSocket(socket);
+      return;
+    }
+    if (
+      existing === undefined &&
+      message.sequence !== this.#serverCursor.lastSequence + 1
+    ) {
+      this.#closeSocket(socket);
+      return;
+    }
+    if (
+      message.type === "connector.welcome" &&
+      this.#welcomeReceived &&
+      existing === undefined
+    ) {
+      this.#closeSocket(socket);
+      return;
+    }
+    if (existing === undefined) {
       try {
-        if (
-          this.#serverCursor.lastSequence > 0 &&
-          message.sequence > this.#serverCursor.lastSequence + 1
-        ) {
-          this.#closeSocket(socket);
-          return;
-        }
-        if (message.sequence <= this.#serverCursor.lastSequence) {
-          this.#closeSocket(socket);
-          return;
-        }
-        this.#serverCursor.accept(message.sequence);
-      } catch {
-        this.#closeSocket(socket);
-        return;
-      }
-    } else if (message.sequence > this.#serverCursor.lastSequence) {
-      try {
-        if (
-          this.#serverCursor.lastSequence > 0 &&
-          message.sequence > this.#serverCursor.lastSequence + 1
-        ) {
-          this.#closeSocket(socket);
-          return;
-        }
+        this.#options.store.recordInbound(
+          message.message_id,
+          message.sequence,
+          serialized,
+        );
         this.#serverCursor.accept(message.sequence);
       } catch {
         this.#closeSocket(socket);
@@ -410,36 +429,90 @@ export class DurableConnectorClient implements ConnectorClient {
     }
 
     if (message.type === "connector.welcome") {
-      if (
-        message.payload.connector_id !== this.#options.connectorId ||
-        message.payload.server_sequence !== message.sequence ||
-        message.payload.replay_from !== this.#helloServerSequence + 1
-      ) {
-        this.#closeSocket(socket);
+      this.#welcomeReceived = true;
+      this.#startHeartbeat(socket, signal);
+      // Keep the accepted hello pending as the durable replay anchor. A later
+      // connection can resend that exact hello before replaying any uncertain
+      // post-welcome client sequences.
+      await this.#recoverPendingInbound(socket);
+      if (existing?.delivered === true) {
+        await this.#completeInbound(message, true);
+      }
+      this.#resolveWelcome?.();
+      return;
+    }
+    if (!this.#welcomeReceived) return;
+    await this.#completeInbound(message, existing?.delivered ?? false);
+  }
+
+  #validWelcome(
+    message: Extract<ConnectorServerMessage, { type: "connector.welcome" }>,
+  ): boolean {
+    const hello = this.#helloMessage?.message;
+    return (
+      hello?.type === "connector.hello" &&
+      message.correlation_id === hello.correlation_id &&
+      message.payload.connector_id === this.#options.connectorId &&
+      message.payload.server_sequence === message.sequence &&
+      message.payload.replay_from === hello.payload.last_server_sequence + 1
+    );
+  }
+
+  async #recoverPendingInbound(socket: WebSocket): Promise<void> {
+    for (const stored of this.#options.store.pendingInboundMessages()) {
+      if (this.#socket !== socket || socket.readyState !== WebSocket.OPEN) {
         return;
       }
-      this.#welcomeReceived = true;
-      if (this.#helloMessage !== undefined) {
-        this.#options.store.acknowledgeEvent(
-          this.#helloMessage.stored.messageId,
+      const message = this.#parseStoredInbound(stored);
+      if (message === undefined) {
+        throw new Error("CONNECTOR_STORED_INBOUND_INVALID");
+      }
+      await this.#completeInbound(message, false);
+    }
+  }
+
+  #parseStoredInbound(
+    stored: StoredInboundMessage,
+  ): ConnectorServerMessage | undefined {
+    try {
+      const message = ConnectorServerMessageSchema.parse(
+        JSON.parse(stored.body),
+      );
+      if (
+        message.message_id !== stored.messageId ||
+        message.sequence !== stored.sequence
+      ) {
+        return undefined;
+      }
+      return message;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async #completeInbound(
+    message: ConnectorServerMessage,
+    delivered: boolean,
+  ): Promise<void> {
+    if (!delivered) {
+      if (message.type === "ack") {
+        this.#acknowledgeOutbound(
+          message.payload.sequence,
+          message.correlation_id,
         );
-        this.#outboundBySequence.delete(this.#helloMessage.stored.sequence);
-        this.#helloMessage = undefined;
+      }
+      if (isCommand(message)) {
+        for (const handler of [...this.#handlers]) await handler(message);
       }
     }
-    if (message.type === "ack") {
-      this.#acknowledgeOutbound(
-        message.payload.sequence,
-        message.correlation_id,
-      );
+    this.#enqueueAck(message.sequence);
+    if (!delivered) {
+      // ACK persistence precedes this marker. A crash after handler success but
+      // before the marker can redeliver, giving commands at-least-once rather
+      // than risking silent loss. Handlers must therefore make external effects
+      // idempotent using the command's product identifiers.
+      this.#options.store.markInboundDelivered(message.message_id);
     }
-    if (receipt === "new" && isCommand(message)) {
-      for (const handler of [...this.#handlers]) await handler(message);
-    }
-    if (this.#socket === socket && socket.readyState === WebSocket.OPEN) {
-      await this.#sendAck(socket, message.sequence);
-    }
-    if (message.type === "connector.welcome") this.#resolveWelcome?.();
   }
 
   #acknowledgeOutbound(sequence: number, correlationId: string): void {
@@ -457,8 +530,8 @@ export class DurableConnectorClient implements ConnectorClient {
     this.#outboundBySequence.delete(sequence);
   }
 
-  #sendAck(socket: WebSocket, sequence: number): void {
-    const { message, stored } = this.#persistMessage((nextSequence) =>
+  #enqueueAck(sequence: number): void {
+    this.#persistMessage((nextSequence) =>
       messageEnvelope(
         "ack",
         nextSequence,
@@ -468,13 +541,11 @@ export class DurableConnectorClient implements ConnectorClient {
         this.#randomUUID(),
       ),
     );
-    this.#sendJson(socket, message);
-    this.#options.store.acknowledgeEvent(stored.messageId);
-    this.#outboundBySequence.delete(stored.sequence);
+    this.#scheduleSendPump();
   }
 
-  async #sendHeartbeat(socket: WebSocket): Promise<void> {
-    const { message, stored } = this.#persistMessage((nextSequence) =>
+  #enqueueHeartbeat(): void {
+    this.#persistMessage((nextSequence) =>
       messageEnvelope(
         "connector.heartbeat",
         nextSequence,
@@ -484,9 +555,7 @@ export class DurableConnectorClient implements ConnectorClient {
         this.#randomUUID(),
       ),
     );
-    this.#sendJson(socket, message);
-    this.#options.store.acknowledgeEvent(stored.messageId);
-    this.#outboundBySequence.delete(stored.sequence);
+    this.#scheduleSendPump();
   }
 
   #persistMessage(
@@ -538,6 +607,12 @@ export class DurableConnectorClient implements ConnectorClient {
         return;
       }
       this.#outboundBySequence.set(event.sequence, event);
+      if (
+        message.type === "connector.hello" &&
+        this.#helloMessage === undefined
+      ) {
+        this.#helloMessage = { stored: event, message };
+      }
     } catch {
       // The store only contains locally-created payloads. Ignore an invalid
       // legacy row here; it cannot be safely sent to the control plane.
@@ -566,19 +641,13 @@ export class DurableConnectorClient implements ConnectorClient {
   #sendPending(socket: WebSocket): Promise<void> {
     const operation = this.#sendPump.then(async () => {
       for (const pending of this.#pendingMessages()) {
+        if (pending.message.type === "connector.hello") continue;
         if (this.#sentOnConnection.has(pending.stored.sequence)) continue;
         if (this.#socket !== socket || socket.readyState !== WebSocket.OPEN)
           return;
         this.#outboundBySequence.set(pending.stored.sequence, pending.stored);
         this.#sendJson(socket, pending.message);
         this.#sentOnConnection.add(pending.stored.sequence);
-        if (
-          pending.message.type === "ack" ||
-          pending.message.type === "connector.heartbeat"
-        ) {
-          this.#options.store.acknowledgeEvent(pending.stored.messageId);
-          this.#outboundBySequence.delete(pending.stored.sequence);
-        }
       }
     });
     this.#sendPump = operation.catch(() => undefined);
@@ -591,7 +660,48 @@ export class DurableConnectorClient implements ConnectorClient {
     void this.#sendPending(socket).catch(() => this.#closeSocket(socket));
   }
 
+  #startHeartbeat(socket: WebSocket, signal: AbortSignal): void {
+    this.#clearHeartbeat();
+    this.#heartbeatTimer = setInterval(() => {
+      if (
+        signal.aborted ||
+        this.#socket !== socket ||
+        socket.readyState !== WebSocket.OPEN ||
+        !this.#welcomeReceived
+      ) {
+        return;
+      }
+      this.#enqueueHeartbeat();
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  #retireSessionIfSafe(): void {
+    if (!this.#retireSessionOnStop) return;
+    if (this.#options.store.pendingInboundMessages().length > 0) return;
+    const stored = this.#options.store.pendingEvents(0);
+    const pending = this.#pendingMessages();
+    if (stored.length !== pending.length) return;
+    for (const item of pending) {
+      if (item.message.type === "connector.hello") continue;
+      if (
+        (item.message.type !== "ack" &&
+          item.message.type !== "connector.heartbeat") ||
+        !this.#sentOnConnection.has(item.stored.sequence)
+      ) {
+        return;
+      }
+    }
+    for (const item of pending) {
+      this.#options.store.acknowledgeEvent(item.stored.messageId);
+      this.#outboundBySequence.delete(item.stored.sequence);
+    }
+    // A graceful close after every one-way control frame was put on this
+    // connection permits the next process to advance to a fresh hello/cursor.
+    this.#helloMessage = undefined;
+  }
+
   #scheduleTokenRefresh(expiresAt: string, signal: AbortSignal): void {
+    if (signal.aborted || this.#stopping) return;
     if (this.#refreshTimer !== undefined) clearTimeout(this.#refreshTimer);
     const expiry = Date.parse(expiresAt);
     const delay = Number.isFinite(expiry)
@@ -605,13 +715,23 @@ export class DurableConnectorClient implements ConnectorClient {
   async #refreshToken(signal: AbortSignal): Promise<void> {
     if (signal.aborted || this.#stopping) return;
     try {
-      const bootstrapCredential =
-        await this.#options.bootstrapCredentialProvider();
-      if (signal.aborted) return;
-      const session = await this.#options.sessionTokenClient.exchange({
-        connectorId: this.#options.connectorId,
-        bootstrapCredential,
-      });
+      const bootstrapCredential = await this.#abortable(
+        Promise.resolve().then(() =>
+          this.#options.bootstrapCredentialProvider(),
+        ),
+        signal,
+      );
+      if (bootstrapCredential === ABORTED) return;
+      const session = await this.#abortable(
+        Promise.resolve().then(() =>
+          this.#options.sessionTokenClient.exchange({
+            connectorId: this.#options.connectorId,
+            bootstrapCredential,
+          }),
+        ),
+        signal,
+      );
+      if (session === ABORTED) return;
       this.#nextSession = session;
       this.#scheduleTokenRefresh(session.expiresAt, signal);
       const socket = this.#socket;
@@ -622,17 +742,50 @@ export class DurableConnectorClient implements ConnectorClient {
       )
         socket.close();
     } catch {
-      this.#refreshTimer = setTimeout(
-        () => void this.#refreshToken(signal),
-        1_000,
-      );
+      if (!signal.aborted && !this.#stopping) {
+        this.#refreshTimer = setTimeout(
+          () => void this.#refreshToken(signal),
+          1_000,
+        );
+      }
     }
+  }
+
+  #abortable<T>(
+    operation: Promise<T>,
+    signal: AbortSignal,
+  ): Promise<T | typeof ABORTED> {
+    if (signal.aborted) {
+      void operation.catch(() => undefined);
+      return Promise.resolve(ABORTED);
+    }
+    return new Promise<T | typeof ABORTED>((resolve, reject) => {
+      let settled = false;
+      const finish = (result: T | typeof ABORTED): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+      };
+      const fail = (error: unknown): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      };
+      const onAbort = (): void => finish(ABORTED);
+      signal.addEventListener("abort", onAbort, { once: true });
+      void operation.then(finish, fail);
+    });
   }
 
   #sleep(milliseconds: number, signal: AbortSignal): Promise<void> {
     if (signal.aborted || milliseconds <= 0) return Promise.resolve();
     return new Promise((resolve) => {
-      const timer = setTimeout(resolve, milliseconds);
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, milliseconds);
       const onAbort = (): void => {
         clearTimeout(timer);
         signal.removeEventListener("abort", onAbort);

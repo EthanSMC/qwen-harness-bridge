@@ -228,6 +228,49 @@ describe("SQLite Harness plugin store", () => {
     reopened.close();
   });
 
+  it("restores the maximum durable inbound sequence after reopen", () => {
+    const databasePath = makeDatabasePath();
+    const first = new SqlitePluginStore(databasePath);
+
+    expect(first.maxInboundSequence()).toBe(0);
+    first.recordInbound("message-1", 1, "body-1");
+    first.recordInbound("message-2", 2, "body-2");
+    expect(first.maxInboundSequence()).toBe(2);
+    first.close();
+
+    const reopened = new SqlitePluginStore(databasePath);
+    expect(reopened.maxInboundSequence()).toBe(2);
+    reopened.close();
+  });
+
+  it("persists completed inbound delivery while leaving unfinished receipts retryable", () => {
+    const databasePath = makeDatabasePath();
+    const first = new SqlitePluginStore(databasePath);
+    first.recordInbound("message-1", 1, "body-1");
+    first.recordInbound("message-2", 2, "body-2");
+
+    expect(first.inboundMessage("message-1")).toEqual({
+      messageId: "message-1",
+      sequence: 1,
+      body: "body-1",
+      delivered: false,
+    });
+    expect(
+      first.pendingInboundMessages().map(({ messageId }) => messageId),
+    ).toEqual(["message-1", "message-2"]);
+    first.markInboundDelivered("message-1");
+    first.markInboundDelivered("message-1");
+    expect(first.inboundMessage("message-1")?.delivered).toBe(true);
+    first.close();
+
+    const reopened = new SqlitePluginStore(databasePath);
+    expect(
+      reopened.pendingInboundMessages().map(({ messageId }) => messageId),
+    ).toEqual(["message-2"]);
+    expect(reopened.inboundMessage("message-1")?.delivered).toBe(true);
+    reopened.close();
+  });
+
   it("rejects reused inbound IDs unless sequence and body match exactly", () => {
     const databasePath = makeDatabasePath();
     const store = new SqlitePluginStore(databasePath);

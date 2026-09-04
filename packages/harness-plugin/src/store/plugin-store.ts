@@ -28,12 +28,23 @@ export type StoredOutboundEvent = Readonly<{
   acknowledgedAt: string | null;
 }>;
 
+export type StoredInboundMessage = Readonly<{
+  messageId: string;
+  sequence: number;
+  body: string;
+  delivered: boolean;
+}>;
+
 export interface PluginStore {
   recordInbound(
     messageId: string,
     sequence: number,
     body: string,
   ): "new" | "duplicate";
+  maxInboundSequence(): number;
+  inboundMessage(messageId: string): StoredInboundMessage | undefined;
+  pendingInboundMessages(): StoredInboundMessage[];
+  markInboundDelivered(messageId: string): void;
   mapJob(input: {
     jobId: string;
     attempt: number;
@@ -77,6 +88,7 @@ class StoreError extends Error {
 }
 
 const now = (): string => new Date().toISOString();
+const INBOUND_DELIVERED_METADATA_PREFIX = "inbound-delivered:";
 
 const assertNonEmpty = (value: string, code: string): void => {
   if (typeof value !== "string" || value.length === 0) {
@@ -247,6 +259,80 @@ export class SqlitePluginStore implements PluginStore {
       if (error instanceof StoreInboundConflictError) throw error;
       throw new StoreError("STORE_INBOUND_WRITE_FAILED");
     }
+  }
+
+  maxInboundSequence(): number {
+    this.assertOpen();
+    const row = this.database
+      .prepare("SELECT MAX(sequence) AS sequence FROM inbound_messages")
+      .get() as { sequence: number | null };
+    return row.sequence ?? 0;
+  }
+
+  inboundMessage(messageId: string): StoredInboundMessage | undefined {
+    this.assertOpen();
+    assertNonEmpty(messageId, "STORE_MESSAGE_ID_REQUIRED");
+    const row = this.database
+      .prepare(
+        `SELECT message_id, sequence, body
+         FROM inbound_messages WHERE message_id = ?`,
+      )
+      .get(messageId) as InboundRow | undefined;
+    if (row === undefined) return undefined;
+    const delivery = this.database
+      .prepare("SELECT value FROM metadata WHERE key = ?")
+      .get(`${INBOUND_DELIVERED_METADATA_PREFIX}${messageId}`) as
+      | { value: string }
+      | undefined;
+    return {
+      messageId: row.message_id,
+      sequence: row.sequence,
+      body: row.body,
+      delivered: delivery?.value === String(row.sequence),
+    };
+  }
+
+  pendingInboundMessages(): StoredInboundMessage[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        `SELECT inbound.message_id, inbound.sequence, inbound.body
+         FROM inbound_messages AS inbound
+         WHERE NOT EXISTS (
+           SELECT 1 FROM metadata
+           WHERE key = ? || inbound.message_id
+             AND value = CAST(inbound.sequence AS TEXT)
+         )
+         ORDER BY inbound.sequence ASC`,
+      )
+      .all(INBOUND_DELIVERED_METADATA_PREFIX) as InboundRow[];
+    return rows.map((row) => ({
+      messageId: row.message_id,
+      sequence: row.sequence,
+      body: row.body,
+      delivered: false,
+    }));
+  }
+
+  markInboundDelivered(messageId: string): void {
+    this.assertOpen();
+    assertNonEmpty(messageId, "STORE_MESSAGE_ID_REQUIRED");
+    const write = this.database.transaction(() => {
+      const row = this.database
+        .prepare("SELECT sequence FROM inbound_messages WHERE message_id = ?")
+        .get(messageId) as { sequence: number } | undefined;
+      if (row === undefined) throw new StoreError("STORE_INBOUND_MISSING");
+      this.database
+        .prepare(
+          `INSERT INTO metadata (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        )
+        .run(
+          `${INBOUND_DELIVERED_METADATA_PREFIX}${messageId}`,
+          String(row.sequence),
+        );
+    });
+    write.immediate();
   }
 
   mapJob(input: {
