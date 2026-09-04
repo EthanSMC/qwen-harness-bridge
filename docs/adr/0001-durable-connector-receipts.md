@@ -22,6 +22,14 @@ For this negotiated capability only:
 
 ## Compatibility and persistence
 
+### Expired offer provenance and shutdown boundary
+
+An original valid claim can arrive after its dispatch lease is replaced, including reassignment to another connector. For negotiated receipts, consume only a rejection plus receipt when server-authored durable evidence proves the original owner, connector, repository, job, attempt, lease ID and expired deadline. Preserve that evidence across offer tombstoning and redispatch; do not infer it from a client assertion, a lease mismatch alone, or the current replacement lease. Prefer bounded metadata on existing authoritative records rather than a schema migration. Unknown or incomplete historical evidence remains fail-closed. This exception must never claim or mutate the current job/lease, authorize another connector, extend a deadline or rewrite the queued client message. Ordinary live claims retain their full current-owner/connector/lease/attempt checks and CAS.
+
+Expired exact-duplicate recovery is determined solely by the stored receipt's immutable negotiated profile. Legacy expired envelopes remain rejected and cannot refresh connector liveness. The connector's current capabilities cannot reinterpret historical receipts.
+
+Abort ends permission for new transport-owned callback invocation and durable writes. Check shutdown before each callback and after each asynchronous boundary, including before ACK/delivery persistence. A callback already executing may finish its own work, but its continuation must not invoke another handler or access SQLite after shutdown settles. Preserve unfinished receipt state for idempotent recovery; do not wait indefinitely for an uncooperative callback or pretend it was forcibly cancelled.
+
 The optional welcome field is sent only to clients that explicitly request the capability, preserving unchanged legacy peer payloads. New Connector/old server pairs fail compatibility verification before command dispatch. An old pending hello without the capability cannot be silently rewritten to opt in; surface an explicit incompatible-state result, preserving its database for recovery. No prior released plugin includes this unpublished transport, so no deployed v0.1.0 transport state migration is claimed.
 
 Use existing PostgreSQL JSON metadata and SQLite metadata/payload storage where possible. Any required schema change must have its own tested migration. Receipt profile and recorded disposition must be recoverable from durable data, not only a mutable in-memory connection flag. A later capability change cannot reinterpret an older receipt or weaken its identity check.
@@ -29,6 +37,8 @@ Use existing PostgreSQL JSON metadata and SQLite metadata/payload storage where 
 ## Required evidence
 
 Tests must exercise both endpoints together for delayed first delivery beyond 60 seconds, unreceived queued product/control frames, expired business operations followed by valid traffic, lost ACK followed by tombstone/restoration, abort after socket send but before receipt commit, and at least 130 accumulated ACKs against the real bounded gateway. Include malformed/modified renewals, omitted negotiation, legacy compatibility, business rollback, expiry crossing during receipt/handler delivery, durable restart, and the existing 100,000-row allocation case. Use real PostgreSQL for transaction/receipt guarantees and real loopback TLS/WebSocket for queue/admission behavior; socket doubles alone do not prove these interactions.
+
+Also prove normal gateway redispatch before an unseen original claim, retained original-offer evidence through tombstones, reassignment to another eligible connector, and following valid traffic without altering the replacement lease/job. Negative cases include unknown/forged/cross-owner/cross-connector original identities and incomplete historical evidence. Verify that an expired legacy heartbeat neither restores a response nor refreshes health, while negotiated recovery still works after capability changes. Abort during a held first handler, await shutdown, close SQLite, then release the callback and prove no second handler, late store access or unhandled rejection.
 
 ## Consequences
 
