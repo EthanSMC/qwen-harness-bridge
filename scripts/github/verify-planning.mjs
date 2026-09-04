@@ -19,6 +19,7 @@ const governance = [
   ".github/ISSUE_TEMPLATE/implementation.yml",
   ".github/ISSUE_TEMPLATE/bug.yml",
   ".github/workflows/governance.yml",
+  ".github/workflows/ai-issue-lifecycle.yml",
   ".github/pull_request_template.md",
   ".github/labels.yml",
   ".github/milestones.yml",
@@ -344,10 +345,13 @@ for (const [pattern, message] of [
     /node scripts\/github\/verify-pr-review-evidence\.mjs/,
     "the actual pull-request body validator command",
   ],
-  [
-    /node --test scripts\/github\/verify-pr-review-evidence\.test\.mjs scripts\/github\/verify-pr-review-state\.test\.mjs scripts\/github\/sync-management\.test\.mjs/,
-    "the review evidence and management-sync node:test commands",
-  ],
+  [/node --test/, "the repository governance node:test command"],
+  [/ai-issue-policy\.test\.mjs/, "the AI lifecycle policy tests"],
+  [/github-api\.test\.mjs/, "the strict GitHub API tests"],
+  [/ai-issue-controller\.test\.mjs/, "the lifecycle controller tests"],
+  [/verify-pr-review-evidence\.test\.mjs/, "the review evidence tests"],
+  [/verify-pr-review-state\.test\.mjs/, "the live review-state tests"],
+  [/sync-management\.test\.mjs/, "the management synchronization tests"],
   [/needs: static/, "the final gate dependency on static"],
   [/name: governance/, "the final governance job name"],
   [/if: always\(\)/, "the always-running final gate"],
@@ -361,6 +365,28 @@ for (const [pattern, message] of [
   ],
 ])
   requireGovernanceField(workflow, pattern, message);
+
+const lifecycleWorkflow = ".github/workflows/ai-issue-lifecycle.yml";
+for (const [pattern, message] of [
+  [/issue_comment:/, "the Issue comment trigger"],
+  [/pull_request_target:/, "the trusted pull-request target trigger"],
+  [/issues:[\s\S]*?opened[\s\S]*?edited/, "new and edited Issue triggers"],
+  [/issues:\s*write/, "Issue write permission"],
+  [/pull-requests:\s*read/, "pull-request read permission"],
+  [/cancel-in-progress:\s*false/, "serialized lifecycle queue"],
+  [
+    /ref:\s*\$\{\{\s*github\.event\.repository\.default_branch\s*\}\}/,
+    "explicit default-branch checkout",
+  ],
+  [/persist-credentials:\s*false/, "disabled checkout credentials"],
+  [/vars\.AI_LIFECYCLE_MODE\s*\|\|\s*'report'/, "report-only default rollout"],
+  [
+    /node scripts\/github\/ai-issue-controller\.mjs/,
+    "the trusted lifecycle controller command",
+  ],
+]) {
+  requireGovernanceField(lifecycleWorkflow, pattern, message);
+}
 
 for (const [pattern, message] of [
   [

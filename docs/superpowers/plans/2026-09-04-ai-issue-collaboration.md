@@ -490,7 +490,7 @@ git commit -m "feat(governance): add AI issue lifecycle controller"
 - Consumes: Issue comments, Issue close/reopen events, pull-request-target lifecycle events, and hourly schedule.
 - Produces: serialized write-capable controller runs and a read-only governance test surface.
 
-- [ ] **Step 1: Add failing static workflow assertions**
+- [x] **Step 1: Add failing static workflow assertions**
 
 Require the lifecycle workflow to contain:
 
@@ -502,12 +502,12 @@ requireGovernanceField(".github/workflows/ai-issue-lifecycle.yml", /cancel-in-pr
 requireGovernanceField(".github/workflows/ai-issue-lifecycle.yml", /ref:\s*\$\{\{\s*github\.event\.repository\.default_branch\s*\}\}/, "default branch checkout");
 ```
 
-- [ ] **Step 2: Run the planning verifier and observe the missing-workflow failure**
+- [x] **Step 2: Run the planning verifier and observe the missing-workflow failure**
 
 Run: `node scripts/github/verify-planning.mjs`  
 Expected: FAIL naming `.github/workflows/ai-issue-lifecycle.yml`.
 
-- [ ] **Step 3: Create the trusted workflow**
+- [x] **Step 3: Create the trusted workflow**
 
 Use this event and permission shape:
 
@@ -530,17 +530,18 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: ai-issue-${{ github.event.issue.number || github.event.pull_request.number || 'reconcile' }}
+  # Repository scope serializes Issue, PR, and scheduled events that use different IDs.
+  group: ai-issue-lifecycle-${{ github.repository }}
   cancel-in-progress: false
 ```
 
 Checkout `github.event.repository.default_branch` explicitly, set `persist-credentials: false`, and run only `node scripts/github/ai-issue-controller.mjs`. Do not interpolate comment bodies into shell or environment variables; the controller reads the immutable event file.
 
-- [ ] **Step 4: Add a report-only rollout switch**
+- [x] **Step 4: Add a report-only rollout switch**
 
 Set `AI_LIFECYCLE_MODE` from repository variable `AI_LIFECYCLE_MODE`, defaulting to `report`. In `report`, command handling may create a rejection/report comment but cannot change assignees or labels. In `enforce`, all verified mutations are enabled. Unit tests must prove report mode emits no mutation requests.
 
-- [ ] **Step 5: Add lifecycle tests to static governance**
+- [x] **Step 5: Add lifecycle tests to static governance**
 
 Extend the `static` job command:
 
@@ -556,7 +557,7 @@ Extend the `static` job command:
     scripts/github/sync-management.test.mjs
 ```
 
-- [ ] **Step 6: Run workflow and controller checks, then commit**
+- [x] **Step 6: Run workflow and controller checks, then commit**
 
 Run:
 

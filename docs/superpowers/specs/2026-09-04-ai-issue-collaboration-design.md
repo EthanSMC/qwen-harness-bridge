@@ -136,6 +136,8 @@ An Issue is claimable only when all of the following are true:
 
 An Issue that lacks sufficient requirements or has open dependencies receives `status:waiting`; an AI agent must not invent missing product scope merely to make it claimable. `status:blocked` is reserved for claimed work whose accountable owner encountered a specific external blocking condition.
 
+On Issue creation, the lifecycle workflow evaluates the same readiness rules and initializes the Issue to `status:ready` or `status:waiting` without an assignee. A later Issue-body edit refreshes only unclaimed `waiting`/`ready` work. It never silently rewrites an active claim; active dependency or scope changes require the accountable owner and reviewer to reconcile the public evidence.
+
 Dependencies use one canonical, machine-readable line per Issue:
 
 ```text
@@ -159,7 +161,7 @@ agent: codex
 
 ### 7.2 Serialized decision
 
-The `issue_comment` workflow handles claim commands with per-Issue concurrency and `cancel-in-progress: false`. It checks the live Issue, all readiness rules, current assignees, labels, open closing pull requests, and the comment author's current repository permission. The workflow never checks out contributor-controlled code and uses only the default branch implementation.
+The lifecycle workflow uses repository-scoped concurrency with `cancel-in-progress: false`. This deliberately serializes Issue, pull-request, and scheduled events even though their event numbers differ, closing the cross-event race that a PR-number or Issue-number key would leave open. It checks the live Issue, all readiness rules, current assignees, labels, open closing pull requests, and the comment author's current repository permission. The workflow never checks out contributor-controlled code and uses only the default branch implementation.
 
 If eligible, the workflow performs and verifies this transition:
 

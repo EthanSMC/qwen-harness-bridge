@@ -100,6 +100,8 @@ test("exports exactly the six managed lifecycle labels", () => {
     "merge",
     "close",
     "reopen",
+    "initialize",
+    "refresh",
   ]);
 });
 
@@ -536,6 +538,31 @@ test("parses system transitions and retains the active claim generation", () => 
       },
     ])[0].action,
     "reopen",
+  );
+
+  const initialize = {
+    ...reopened,
+    eventId: 906,
+    action: "initialize",
+    from: "unmanaged",
+    to: "waiting",
+  };
+  const refresh = {
+    ...reopened,
+    eventId: 907,
+    action: "refresh",
+    from: "waiting",
+    to: "ready",
+  };
+  assert.deepEqual(
+    parseReceipts(
+      [initialize, refresh].map((receipt, index) => ({
+        id: 31 + index,
+        body: receiptBody(receipt),
+        user: { login: "github-actions[bot]" },
+      })),
+    ).map(({ action }) => action),
+    ["initialize", "refresh"],
   );
 });
 

@@ -592,6 +592,22 @@ test("reopened completed Issue returns to ready with a fresh generation required
   assert.equal(fake.workflowReceipts().at(-1).action, "reopen");
 });
 
+test("new and edited Issues initialize waiting then refresh to ready", async () => {
+  const fake = new FakeGitHub();
+  const governedIssue = fake.issues.get(46);
+  governedIssue.labels = [{ name: "type:docs" }];
+  governedIssue.body = "## Outcome\nNeeds the remaining readiness fields.";
+
+  await handleIssueChange(context(fake, fake.issueEvent(), { eventId: 930 }));
+  assert.ok(fake.issue().labels.some(({ name }) => name === "status:waiting"));
+  assert.equal(fake.workflowReceipts().at(-1).action, "initialize");
+
+  governedIssue.body = issueBody();
+  await handleIssueChange(context(fake, fake.issueEvent(), { eventId: 931 }));
+  assert.ok(fake.issue().labels.some(({ name }) => name === "status:ready"));
+  assert.equal(fake.workflowReceipts().at(-1).action, "refresh");
+});
+
 test("manual completed closure cannot bypass a merged pull request", async () => {
   const fake = new FakeGitHub();
   await claim(fake);

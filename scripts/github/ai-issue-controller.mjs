@@ -63,6 +63,13 @@ const statusOf = (issue) => {
   return statuses[0].slice("status:".length);
 };
 
+const observedStatusOf = (issue) => {
+  const statuses = labelsOf(issue).filter((label) =>
+    STATUS_LABELS.includes(label),
+  );
+  return statuses.length === 0 ? "unmanaged" : statusOf(issue);
+};
+
 const replaceStatus = (issue, state) => [
   ...labelsOf(issue).filter((label) => !STATUS_LABELS.includes(label)),
   `status:${state}`,
@@ -188,7 +195,14 @@ const commentsFor = (github, issueNumber) =>
   github.getAll(`/issues/${issueNumber}/comments`, "Issue comments");
 
 const dependenciesFor = async (github, issue) => {
-  const numbers = parseDependencies(issue.body);
+  let numbers;
+  try {
+    numbers = parseDependencies(issue.body);
+  } catch (error) {
+    if (error instanceof LifecycleError && error.code === "NOT_READY")
+      return [];
+    throw error;
+  }
   return Promise.all(numbers.map((number) => github.get(`/issues/${number}`)));
 };
 
@@ -347,7 +361,7 @@ const mutateIssueToPlan = async (github, issueNumber, currentIssue, plan) => {
       : assigneesOf(currentIssue);
   const desiredLabels = replaceStatus(currentIssue, plan.to);
   const currentAssignees = assigneesOf(currentIssue);
-  const statusChanged = statusOf(currentIssue) !== plan.to;
+  const statusChanged = observedStatusOf(currentIssue) !== plan.to;
   const assigneesChanged = !sameAssignees(currentAssignees, desiredAssignees);
   if (!statusChanged && !assigneesChanged) return currentIssue;
 
@@ -394,7 +408,7 @@ const recoverPendingIntent = async ({
       "The pending lifecycle intent does not match the current event.",
     );
   }
-  if (![plan.from, plan.to].includes(statusOf(loaded.issue))) {
+  if (![plan.from, plan.to].includes(observedStatusOf(loaded.issue))) {
     throw new LifecycleError(
       "STATE_MISMATCH",
       "The Issue no longer matches the pending lifecycle intent.",
@@ -861,45 +875,21 @@ export const handleIssueChange = async ({
       issueNumber,
       loaded,
       eventId,
-      expectedActions: ["close", "reopen"],
+      expectedActions: ["close", "reopen", "initialize", "refresh"],
     });
     if (recovered) return recovered;
   }
-  const state = statusOf(loaded.issue);
+  const managedStatuses = labelsOf(loaded.issue).filter((label) =>
+    STATUS_LABELS.includes(label),
+  );
   const claim = currentClaimFromReceipts(loaded.receipts);
 
   let plan;
   if (
-    loaded.issue.state === "closed" &&
-    loaded.issue.state_reason === "completed"
+    loaded.issue.state === "open" &&
+    managedStatuses.length === 0 &&
+    assigneesOf(loaded.issue).length === 0
   ) {
-    if (state === "done" && assigneesOf(loaded.issue).length === 0) {
-      return { status: "unchanged" };
-    }
-    if (
-      state !== "review" ||
-      !claim ||
-      assigneesOf(loaded.issue)[0] !== claim.owner
-    ) {
-      throw new LifecycleError(
-        "STATE_MISMATCH",
-        "Only claimed review work can reconcile to done.",
-      );
-    }
-    await mergedPullRequestForIssue({
-      github,
-      issueNumber,
-      repository,
-      defaultBranch: event.repository.default_branch,
-    });
-    plan = systemPlan({
-      eventId,
-      claim,
-      action: "close",
-      from: "review",
-      to: "done",
-    });
-  } else if (loaded.issue.state === "open" && state === "done") {
     const readiness = evaluateReadiness({
       issue: loaded.issue,
       dependencies: loaded.dependencies,
@@ -908,42 +898,119 @@ export const handleIssueChange = async ({
     if (readiness.code === "GITHUB_STATE_UNAVAILABLE") {
       throw new LifecycleError(
         readiness.code,
-        "Cannot reconcile reopened Issue state.",
+        "Cannot initialize Issue state.",
       );
     }
     plan = systemPlan({
       eventId,
       claim: null,
-      action: "reopen",
-      from: "done",
+      action: "initialize",
+      from: "unmanaged",
       to: readiness.ready ? "ready" : "waiting",
     });
   } else {
-    try {
-      assertIssueInvariant(loaded.issue);
-      return { status: "unchanged" };
-    } catch (error) {
-      if (!(error instanceof LifecycleError)) throw error;
-      if (mode === "report")
-        return { status: "repair-required", code: error.code };
-      const notice = [
-        "AI lifecycle repair required (`STATE_MISMATCH`).",
-        "",
-        "A maintainer must restore exactly one valid lifecycle label and assignee invariant.",
-        "",
-        "<!-- qhb-ai-repair-required:v1 -->",
-      ].join("\n");
-      await github.mutateAndVerify({
-        mutation: {
-          method: "POST",
-          path: `/issues/${issueNumber}/comments`,
-          body: { body: notice },
-          idempotencyKey: `ai-repair:${issueNumber}:${eventId}`,
-        },
-        read: () => commentsFor(github, issueNumber),
-        verify: (comments) => comments.some(({ body }) => body === notice),
+    const state = statusOf(loaded.issue);
+    if (
+      loaded.issue.state === "closed" &&
+      loaded.issue.state_reason === "completed"
+    ) {
+      if (state === "done" && assigneesOf(loaded.issue).length === 0) {
+        return { status: "unchanged" };
+      }
+      if (
+        state !== "review" ||
+        !claim ||
+        assigneesOf(loaded.issue)[0] !== claim.owner
+      ) {
+        throw new LifecycleError(
+          "STATE_MISMATCH",
+          "Only claimed review work can reconcile to done.",
+        );
+      }
+      await mergedPullRequestForIssue({
+        github,
+        issueNumber,
+        repository,
+        defaultBranch: event.repository.default_branch,
       });
-      return { status: "repair-required", code: error.code };
+      plan = systemPlan({
+        eventId,
+        claim,
+        action: "close",
+        from: "review",
+        to: "done",
+      });
+    } else if (loaded.issue.state === "open" && state === "done") {
+      const readiness = evaluateReadiness({
+        issue: loaded.issue,
+        dependencies: loaded.dependencies,
+        closingPullRequests: loaded.closingPullRequests,
+      });
+      if (readiness.code === "GITHUB_STATE_UNAVAILABLE") {
+        throw new LifecycleError(
+          readiness.code,
+          "Cannot reconcile reopened Issue state.",
+        );
+      }
+      plan = systemPlan({
+        eventId,
+        claim: null,
+        action: "reopen",
+        from: "done",
+        to: readiness.ready ? "ready" : "waiting",
+      });
+    } else if (
+      loaded.issue.state === "open" &&
+      ["waiting", "ready"].includes(state) &&
+      assigneesOf(loaded.issue).length === 0
+    ) {
+      const readiness = evaluateReadiness({
+        issue: loaded.issue,
+        dependencies: loaded.dependencies,
+        closingPullRequests: loaded.closingPullRequests,
+      });
+      if (readiness.code === "GITHUB_STATE_UNAVAILABLE") {
+        throw new LifecycleError(
+          readiness.code,
+          "Cannot refresh Issue readiness.",
+        );
+      }
+      const to = readiness.ready ? "ready" : "waiting";
+      if (to === state) return { status: "unchanged" };
+      plan = systemPlan({
+        eventId,
+        claim: null,
+        action: "refresh",
+        from: state,
+        to,
+      });
+    } else {
+      try {
+        assertIssueInvariant(loaded.issue);
+        return { status: "unchanged" };
+      } catch (error) {
+        if (!(error instanceof LifecycleError)) throw error;
+        if (mode === "report")
+          return { status: "repair-required", code: error.code };
+        const notice = [
+          "AI lifecycle repair required (`STATE_MISMATCH`).",
+          "",
+          "A maintainer must restore exactly one valid lifecycle label and assignee invariant.",
+          "",
+          "<!-- qhb-ai-repair-required:v1 -->",
+        ].join("\n");
+        await github.mutateAndVerify({
+          mutation: {
+            method: "POST",
+            path: `/issues/${issueNumber}/comments`,
+            body: { body: notice },
+            idempotencyKey: `ai-repair:${issueNumber}:${eventId}`,
+          },
+          read: () => commentsFor(github, issueNumber),
+          verify: (comments) => comments.some(({ body }) => body === notice),
+        });
+        return { status: "repair-required", code: error.code };
+      }
     }
   }
   if (mode === "report") return { status: "report", plan };

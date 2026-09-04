@@ -25,6 +25,8 @@ export const RECEIPT_ACTIONS = Object.freeze([
   "merge",
   "close",
   "reopen",
+  "initialize",
+  "refresh",
 ]);
 
 export const ALLOWED_TRANSITIONS = Object.freeze({
@@ -88,6 +90,7 @@ const SUCCESS_TRANSITIONS = Object.freeze({
 });
 
 const RECEIPT_END_ACTIONS = new Set(["release", "expire", "merge", "close"]);
+const UNCLAIMED_ACTIONS = new Set(["reopen", "initialize", "refresh"]);
 const OWNER_BOUND_ACTIONS = new Set([
   "heartbeat",
   "block",
@@ -708,7 +711,7 @@ const parseReceiptBody = (body) => {
   };
   if (
     receipt.result === "success" &&
-    receipt.action !== "reopen" &&
+    !UNCLAIMED_ACTIONS.has(receipt.action) &&
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
       receipt.claimId ?? "",
     )
@@ -743,7 +746,11 @@ const parseReceiptBody = (body) => {
   const states = new Set(
     STATUS_LABELS.map((label) => label.slice(STATUS_PREFIX.length)),
   );
-  if (!states.has(receipt.from) || !states.has(receipt.to)) {
+  if (
+    (!states.has(receipt.from) &&
+      !(receipt.action === "initialize" && receipt.from === "unmanaged")) ||
+    !states.has(receipt.to)
+  ) {
     fail("STATE_MISMATCH", "A lifecycle receipt has an invalid state.");
   }
   if (
@@ -788,6 +795,28 @@ const parseReceiptBody = (body) => {
       receipt.leaseExpiresAt !== null
     ) {
       fail("STATE_MISMATCH", "A reopen receipt has an invalid transition.");
+    }
+  } else if (receipt.action === "initialize") {
+    if (
+      receipt.claimId !== null ||
+      receipt.from !== "unmanaged" ||
+      !["ready", "waiting"].includes(receipt.to) ||
+      receipt.leaseExpiresAt !== null
+    ) {
+      fail(
+        "STATE_MISMATCH",
+        "An initialize receipt has an invalid transition.",
+      );
+    }
+  } else if (receipt.action === "refresh") {
+    if (
+      receipt.claimId !== null ||
+      !["ready", "waiting"].includes(receipt.from) ||
+      !["ready", "waiting"].includes(receipt.to) ||
+      receipt.from === receipt.to ||
+      receipt.leaseExpiresAt !== null
+    ) {
+      fail("STATE_MISMATCH", "A refresh receipt has an invalid transition.");
     }
   } else {
     const transition = SUCCESS_TRANSITIONS[receipt.action];
@@ -840,7 +869,7 @@ export const parseReceipts = (
       });
       continue;
     }
-    if (parsed.action === "reopen") {
+    if (UNCLAIMED_ACTIONS.has(parsed.action)) {
       events.set(parsed.eventId, identity);
       receipts.push({
         ...parsed,
