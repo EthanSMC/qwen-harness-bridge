@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
+import { realpathSync } from "node:fs";
 import { isAbsolute, normalize, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { CanonicalPathError, canonicalizePath } from "./canonical-path.js";
 import type {
   CanonicalAction,
@@ -25,8 +27,13 @@ export type ActionInput = Readonly<{
   networkIntent: "none" | "read" | "write";
   fileChange: "none" | "bounded" | "destructive";
   externalSideEffect: "none" | "message" | "deploy" | "purchase";
-  commandSource?: "local" | "cloud";
 }>;
+
+export type TrustedActionContext = Readonly<{
+  provenance: "local_tool" | "cloud_command";
+}>;
+
+const localToolContext: TrustedActionContext = { provenance: "local_tool" };
 
 const asRepositoryArray = (
   source: RepositoryPolicySource | ActionPolicyOptions,
@@ -99,14 +106,61 @@ const actionWithFallback = (action: ActionInput): CanonicalAction => ({
     action.externalSideEffect === "purchase"
       ? action.externalSideEffect
       : "none",
-  ...(action.commandSource === "cloud" || action.commandSource === "local"
-    ? { commandSource: action.commandSource }
-    : {}),
 });
 
 const lexicalFallback = (path: string, basePath?: string): string => {
   if (isAbsolute(path)) return normalize(path);
   return basePath === undefined ? path : resolve(basePath, path);
+};
+
+const hasPathSeparator = (value: string): boolean => /[\\/]/u.test(value);
+
+const canonicalizeExecutable = (
+  executable: string | undefined,
+  cwd: string,
+  violations: PolicyPathViolation[],
+): string | undefined => {
+  if (executable === undefined || !hasPathSeparator(executable)) {
+    return executable;
+  }
+  const candidate = isAbsolute(executable)
+    ? executable
+    : resolve(cwd, executable);
+  try {
+    return realpathSync.native(candidate);
+  } catch {
+    if (!violations.includes("PATH_UNAVAILABLE")) {
+      violations.push("PATH_UNAVAILABLE");
+    }
+    return normalize(candidate);
+  }
+};
+
+const splitPathArgument = (
+  value: string,
+): { prefix: string; candidate: string } | undefined => {
+  const separator = value.startsWith("-") ? value.indexOf("=") : -1;
+  const prefix = separator >= 0 ? value.slice(0, separator + 1) : "";
+  const candidate = separator >= 0 ? value.slice(separator + 1) : value;
+  if (candidate.startsWith("file://")) {
+    return { prefix: `${prefix}file://`, candidate: fileURLToPath(candidate) };
+  }
+  if (
+    candidate.length === 0 ||
+    /^[a-z][a-z0-9+.-]*:\/\//iu.test(candidate) ||
+    /^git@[^:]+:/u.test(candidate) ||
+    /^@[^/\\]+[/\\][^/\\]+$/u.test(candidate)
+  ) {
+    return undefined;
+  }
+  if (
+    !isAbsolute(candidate) &&
+    !/^\.{1,2}[/\\]/u.test(candidate) &&
+    !hasPathSeparator(candidate)
+  ) {
+    return undefined;
+  }
+  return { prefix, candidate };
 };
 
 const addViolation = (
@@ -119,6 +173,36 @@ const addViolation = (
   }
   if (!violations.includes("PATH_UNAVAILABLE")) {
     violations.push("PATH_UNAVAILABLE");
+  }
+};
+
+const canonicalizeArgument = (
+  root: string,
+  value: string,
+  cwd: string,
+  violations: PolicyPathViolation[],
+): string => {
+  let pathArgument: ReturnType<typeof splitPathArgument>;
+  try {
+    pathArgument = splitPathArgument(value);
+  } catch {
+    if (!violations.includes("PATH_UNAVAILABLE")) {
+      violations.push("PATH_UNAVAILABLE");
+    }
+    return value;
+  }
+  if (pathArgument === undefined) return value;
+  try {
+    return `${pathArgument.prefix}${canonicalizePath(
+      root,
+      pathArgument.candidate,
+      {
+        basePath: cwd,
+      },
+    )}`;
+  } catch (error) {
+    addViolation(violations, error);
+    return `${pathArgument.prefix}${lexicalFallback(pathArgument.candidate, cwd)}`;
   }
 };
 
@@ -158,13 +242,10 @@ export function canonicalizeAction(
     (input.externalSideEffect === "none" ||
       input.externalSideEffect === "message" ||
       input.externalSideEffect === "deploy" ||
-      input.externalSideEffect === "purchase") &&
-    (input.commandSource === undefined ||
-      input.commandSource === "local" ||
-      input.commandSource === "cloud");
+      input.externalSideEffect === "purchase");
   if (!validAction) violations.push("UNSTRUCTURED_ACTION");
 
-  if (repository === undefined && source !== undefined) {
+  if (repository === undefined) {
     violations.push("UNKNOWN_REPOSITORY");
   }
 
@@ -189,15 +270,39 @@ export function canonicalizeAction(
     }
   });
 
+  const canonicalArgv =
+    repository === undefined
+      ? [...canonical.argv]
+      : canonical.argv.map((value) =>
+          canonicalizeArgument(
+            repository.canonicalPath,
+            value,
+            canonicalCwd,
+            violations,
+          ),
+        );
+  const canonicalExecutable = canonicalizeExecutable(
+    canonical.executable,
+    canonicalCwd,
+    violations,
+  );
+
   const normalized: CanonicalAction = {
     ...canonical,
+    ...(canonicalExecutable === undefined
+      ? {}
+      : { executable: canonicalExecutable }),
+    argv: canonicalArgv,
     cwd: canonicalCwd,
     touchedPaths: canonicalTouchedPaths,
   };
   return { action: normalized, violations };
 }
 
-const canonicalFingerprintRecord = (action: CanonicalAction) => ({
+const canonicalFingerprintRecord = (
+  action: CanonicalAction,
+  context: TrustedActionContext,
+) => ({
   argv: [...action.argv],
   cwd: action.cwd,
   environmentRead: action.environmentRead,
@@ -205,7 +310,7 @@ const canonicalFingerprintRecord = (action: CanonicalAction) => ({
   externalSideEffect: action.externalSideEffect,
   fileChange: action.fileChange,
   networkIntent: action.networkIntent,
-  commandSource: action.commandSource ?? null,
+  provenance: context.provenance,
   repositoryId: action.repositoryId,
   toolName: action.toolName,
   touchedPaths: [...action.touchedPaths].sort(),
@@ -226,13 +331,21 @@ const stableJson = (value: unknown): string => {
 };
 
 /** Canonical JSON used by the SHA-256 action fingerprint. */
-export function canonicalActionJson(action: CanonicalAction): string {
-  return stableJson(canonicalFingerprintRecord(action));
+export function canonicalActionJson(
+  action: CanonicalAction,
+  context: TrustedActionContext = localToolContext,
+): string {
+  return stableJson(canonicalFingerprintRecord(action, context));
 }
 
 /** SHA-256 of the canonical, machine-readable action record. */
-export function fingerprintAction(action: CanonicalAction): string {
-  return createHash("sha256").update(canonicalActionJson(action)).digest("hex");
+export function fingerprintAction(
+  action: CanonicalAction,
+  context: TrustedActionContext = localToolContext,
+): string {
+  return createHash("sha256")
+    .update(canonicalActionJson(action, context))
+    .digest("hex");
 }
 
 const lowerTokens = (action: CanonicalAction): string[] =>
@@ -250,7 +363,6 @@ const denialForCommand = (action: CanonicalAction): string | undefined => {
   const executableName = executable.split(/[\\/]/u).pop() ?? executable;
 
   if (
-    action.commandSource === "cloud" ||
     /^(arbitrary[-_ ]?command|cloud[-_ ]?command|shell|exec|execute[-_ ]?command)$/u.test(
       tool,
     ) ||
@@ -271,6 +383,11 @@ const denialForCommand = (action: CanonicalAction): string | undefined => {
   if (
     action.environmentRead === "arbitrary" ||
     hasToken(tokens, /(^|[/_ -])(printenv|env|set|export)([/_ -]|$)/u) ||
+    (/^python(?:\d+(?:\.\d+)*)?$/u.test(executableName) &&
+      hasToken(
+        tokens,
+        /(?:os\.(?:environ|getenv)|process\.env|dotenv|\benviron\b)/u,
+      )) ||
     hasToken(
       tokens,
       /(secret|token|password|credential|api[-_ ]?key|private[-_ ]?key)/u,
@@ -305,7 +422,7 @@ const approvalForCommand = (action: CanonicalAction): string | undefined => {
     tool === "package_install" ||
     (packageCommand &&
       args.some((argument) =>
-        /^(install|i|add|remove|rm|update|upgrade|link)$/u.test(argument),
+        /^(install|ci|i|add|remove|rm|update|upgrade|link)$/u.test(argument),
       ))
   ) {
     return "PACKAGE_INSTALL";
@@ -318,7 +435,11 @@ const approvalForCommand = (action: CanonicalAction): string | undefined => {
   }
   if (
     action.externalSideEffect === "deploy" ||
-    /(^|[-_ ])deploy($|[-_ ])/u.test(tool)
+    /(^|[-_ ])deploy($|[-_ ])/u.test(tool) ||
+    (executable === "vercel" && args.includes("deploy")) ||
+    (/^(npx|npm|pnpm)$/u.test(executable) &&
+      args.includes("vercel") &&
+      args.includes("deploy"))
   ) {
     return "DEPLOY";
   }
@@ -329,24 +450,42 @@ const approvalForCommand = (action: CanonicalAction): string | undefined => {
   return undefined;
 };
 
-const automaticReason = (action: CanonicalAction): string => {
+const automaticReason = (action: CanonicalAction): string | undefined => {
   const tool = action.toolName.toLowerCase();
-  if (/search|find|grep|ripgrep/u.test(tool)) return "SEARCH";
+  if (/^(search|find|grep|ripgrep)$/u.test(tool)) return "SEARCH";
   if (
-    /test/u.test(tool) ||
-    action.argv.some((value) => /(^|[/ -])test(s)?$/u.test(value))
+    /^(test|tests|run[-_ ]?tests?)$/u.test(tool) ||
+    (/^(read_file|read|file_read)$/u.test(tool) &&
+      action.argv.some((value) => /(^|[/ -])test(s)?$/u.test(value)))
   ) {
     return "TEST";
   }
   if (
-    /build|compile/u.test(tool) ||
-    action.argv.some((value) => value === "build")
+    /^(build|compile)$/u.test(tool) ||
+    (/^(read_file|read|file_read)$/u.test(tool) &&
+      action.argv.some((value) => value === "build"))
   ) {
     return "BUILD";
   }
-  if (action.fileChange === "bounded") return "BOUNDED_EDIT";
-  return "READ_ONLY";
+  if (
+    /^(edit_file|write_file|apply_patch)$/u.test(tool) &&
+    action.fileChange === "bounded"
+  ) {
+    return "BOUNDED_EDIT";
+  }
+  if (/^(read_file|read|file_read)$/u.test(tool)) return "READ_ONLY";
+  return undefined;
 };
+
+const isKnownApprovalTool = (toolName: string): boolean =>
+  /^(package_install|git_push|deploy|network_write|external_message|send_message|delete_file|remove_file)$/u.test(
+    toolName.toLowerCase(),
+  );
+
+const isKnownTool = (toolName: string): boolean =>
+  /^(read_file|read|file_read|search|find|grep|ripgrep|test|tests|run[-_ ]?tests?|build|compile|edit_file|write_file|apply_patch)$/u.test(
+    toolName.toLowerCase(),
+  ) || isKnownApprovalTool(toolName);
 
 const decision = (
   classification: PolicyDecision["classification"],
@@ -384,9 +523,26 @@ const decision = (
 export function classifyAction(
   action: unknown,
   source?: RepositoryPolicySource | ActionPolicyOptions,
+  context: TrustedActionContext = localToolContext,
 ): PolicyDecision {
   const canonical = canonicalizeAction(action, source);
-  const fingerprint = fingerprintAction(canonical.action);
+  const validContext =
+    isRecord(context) &&
+    (context.provenance === "local_tool" ||
+      context.provenance === "cloud_command");
+  const trustedContext =
+    validContext &&
+    (context.provenance === "local_tool" ||
+      context.provenance === "cloud_command")
+      ? (context as TrustedActionContext)
+      : localToolContext;
+  const fingerprint = fingerprintAction(canonical.action, trustedContext);
+  if (!validContext) {
+    return decision("denied", "UNTRUSTED_ACTION", fingerprint);
+  }
+  if (trustedContext.provenance === "cloud_command") {
+    return decision("denied", "ARBITRARY_COMMAND", fingerprint);
+  }
   const commandDenial = denialForCommand(canonical.action);
   if (commandDenial !== undefined) {
     return decision("denied", commandDenial, fingerprint);
@@ -405,11 +561,18 @@ export function classifyAction(
   if (environmentDenial !== undefined) {
     return decision("denied", environmentDenial, fingerprint);
   }
+  if (!isKnownTool(canonical.action.toolName)) {
+    return decision("denied", "UNKNOWN_TOOL", fingerprint);
+  }
   const approval = approvalForCommand(canonical.action);
   if (approval !== undefined) {
     return decision("approval_required", approval, fingerprint);
   }
-  return decision("automatic", automaticReason(canonical.action), fingerprint);
+  const automatic = automaticReason(canonical.action);
+  if (automatic === undefined) {
+    return decision("denied", "UNCLASSIFIED_ACTION", fingerprint);
+  }
+  return decision("automatic", automatic, fingerprint);
 }
 
 export { stableJson };

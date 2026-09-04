@@ -1,241 +1,100 @@
+import { Context } from "@deepseek-ai/cordis";
+import type { AgentSetup } from "@deepseek-ai/dsh-agent";
+import type {
+  PreToolDecision,
+  ToolExecution,
+  ToolGuard,
+} from "@deepseek-ai/dsh-tools";
 import {
   type ActionPolicyOptions,
   classifyAction,
+  type TrustedActionContext,
 } from "./action-classifier.js";
-import type {
-  CanonicalAction,
-  PolicyDecision,
-  PolicyGuard,
-  PolicyPreExecuteListener,
-  PolicyScopeContext,
-  PolicyToolExecution,
-} from "./types.js";
+import type { CanonicalAction, PolicyDecision } from "./types.js";
+
+type PolicyExecution = Pick<Readonly<ToolExecution>, "arguments" | "name">;
+
+export type TrustedPolicyAction = Readonly<{
+  action: CanonicalAction;
+  provenance: TrustedActionContext["provenance"];
+}>;
 
 export type PolicyGuardRegistrationOptions = ActionPolicyOptions &
   Readonly<{
-    repositoryId?: string;
-    cwd?: string;
-    resolveAction?: (
-      execution: Readonly<PolicyToolExecution>,
-    ) => CanonicalAction | undefined;
+    resolveAction: (
+      execution: PolicyExecution,
+    ) => TrustedPolicyAction | undefined;
   }>;
+
+type PolicyPreExecuteListener = (
+  execution: Readonly<ToolExecution>,
+  next: () => Promise<PreToolDecision>,
+) => Promise<PreToolDecision>;
+
+type Resolution =
+  | Readonly<{ kind: "resolved"; value: TrustedPolicyAction }>
+  | Readonly<{ kind: "denied"; reason: string }>;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
-const isOneOf = <T extends string>(
-  value: unknown,
-  allowed: readonly T[],
-): value is T => value === undefined || allowed.includes(value as T);
-
-const actionFromArguments = (
-  execution: Readonly<PolicyToolExecution>,
+const resolveTrustedAction = (
+  execution: PolicyExecution,
   options: PolicyGuardRegistrationOptions,
-): CanonicalAction | undefined => {
-  const args = execution.arguments;
-  const embedded = isRecord(args) && isRecord(args.action) ? args.action : args;
-  if (!isRecord(embedded)) return undefined;
+): Resolution => {
+  if (typeof options.resolveAction !== "function") {
+    return { kind: "denied", reason: "POLICY_DENIED:UNTRUSTED_ACTION" };
+  }
 
-  const repositoryId =
-    typeof embedded.repositoryId === "string"
-      ? embedded.repositoryId
-      : options.repositoryId;
-  const cwd = typeof embedded.cwd === "string" ? embedded.cwd : options.cwd;
-  const argv = embedded.argv;
-  const touchedPaths = embedded.touchedPaths;
-  const commandValues = [
-    isRecord(args) ? args.command : undefined,
-    embedded.command,
-  ];
+  let resolved: TrustedPolicyAction | undefined;
+  try {
+    resolved = options.resolveAction(execution);
+  } catch {
+    return { kind: "denied", reason: "POLICY_DENIED:UNTRUSTED_ACTION" };
+  }
   if (
-    repositoryId === undefined ||
-    cwd === undefined ||
-    !Array.isArray(argv) ||
-    !argv.every((value) => typeof value === "string") ||
-    !Array.isArray(touchedPaths) ||
-    !touchedPaths.every((value) => typeof value === "string") ||
-    (embedded.executable !== undefined &&
-      typeof embedded.executable !== "string") ||
-    !isOneOf(embedded.environmentRead, [
-      "none",
-      "declared",
-      "arbitrary",
-    ] as const) ||
-    !isOneOf(embedded.networkIntent, ["none", "read", "write"] as const) ||
-    !isOneOf(embedded.fileChange, [
-      "none",
-      "bounded",
-      "destructive",
-    ] as const) ||
-    !isOneOf(embedded.externalSideEffect, [
-      "none",
-      "message",
-      "deploy",
-      "purchase",
-    ] as const) ||
-    !isOneOf(embedded.commandSource, ["local", "cloud"] as const) ||
-    commandValues.some(
-      (value) => value !== undefined && typeof value !== "string",
-    )
+    !isRecord(resolved) ||
+    !isRecord(resolved.action) ||
+    (resolved.provenance !== "local_tool" &&
+      resolved.provenance !== "cloud_command")
   ) {
-    return undefined;
+    return { kind: "denied", reason: "POLICY_DENIED:UNTRUSTED_ACTION" };
   }
-
-  const hasCloudCommand = commandValues.some(
-    (value) => typeof value === "string",
-  );
-
-  return {
-    toolName: execution.name,
-    ...(typeof embedded.executable === "string"
-      ? { executable: embedded.executable }
-      : {}),
-    argv,
-    cwd,
-    repositoryId,
-    touchedPaths,
-    environmentRead:
-      embedded.environmentRead === "declared" ||
-      embedded.environmentRead === "arbitrary"
-        ? embedded.environmentRead
-        : "none",
-    networkIntent:
-      embedded.networkIntent === "read" || embedded.networkIntent === "write"
-        ? embedded.networkIntent
-        : "none",
-    fileChange:
-      embedded.fileChange === "bounded" || embedded.fileChange === "destructive"
-        ? embedded.fileChange
-        : "none",
-    externalSideEffect:
-      embedded.externalSideEffect === "message" ||
-      embedded.externalSideEffect === "deploy" ||
-      embedded.externalSideEffect === "purchase"
-        ? embedded.externalSideEffect
-        : "none",
-    ...(hasCloudCommand
-      ? { commandSource: "cloud" as const }
-      : embedded.commandSource === "cloud" || embedded.commandSource === "local"
-        ? { commandSource: embedded.commandSource }
-        : {}),
-  };
-};
-
-const fallbackAction = (
-  execution: Readonly<PolicyToolExecution>,
-  options: PolicyGuardRegistrationOptions,
-): CanonicalAction | undefined => {
-  const firstRepository = Array.isArray(options.repositories)
-    ? options.repositories[0]
-    : [...options.repositories.entries()].map(([id, repository]) =>
-        typeof repository === "string"
-          ? { id, canonicalPath: repository }
-          : repository,
-      )[0];
-  const repositoryId = options.repositoryId ?? firstRepository?.id;
-  const cwd = options.cwd ?? firstRepository?.canonicalPath;
-  if (repositoryId === undefined || cwd === undefined) return undefined;
-  const args = isRecord(execution.arguments) ? execution.arguments : {};
-  const command = typeof args.command === "string" ? args.command : undefined;
-  return {
-    toolName: execution.name,
-    ...(typeof args.executable === "string"
-      ? { executable: args.executable }
-      : {}),
-    argv:
-      Array.isArray(args.argv) &&
-      args.argv.every((value) => typeof value === "string")
-        ? args.argv
-        : command === undefined
-          ? []
-          : [command],
-    cwd,
-    repositoryId,
-    touchedPaths:
-      Array.isArray(args.touchedPaths) &&
-      args.touchedPaths.every((value) => typeof value === "string")
-        ? args.touchedPaths
-        : [],
-    environmentRead:
-      args.environmentRead === "declared" ||
-      args.environmentRead === "arbitrary"
-        ? args.environmentRead
-        : "none",
-    networkIntent:
-      args.networkIntent === "read" || args.networkIntent === "write"
-        ? args.networkIntent
-        : "none",
-    fileChange:
-      args.fileChange === "bounded" || args.fileChange === "destructive"
-        ? args.fileChange
-        : "none",
-    externalSideEffect:
-      args.externalSideEffect === "message" ||
-      args.externalSideEffect === "deploy" ||
-      args.externalSideEffect === "purchase"
-        ? args.externalSideEffect
-        : "none",
-    ...(command === undefined ? {} : { commandSource: "cloud" as const }),
-  };
-};
-
-const actionFor = (
-  execution: Readonly<PolicyToolExecution>,
-  options: PolicyGuardRegistrationOptions,
-): CanonicalAction | undefined => {
-  const resolved = options.resolveAction?.(execution);
-  if (resolved !== undefined) return resolved;
-
-  const structured = actionFromArguments(execution, options);
-  if (structured !== undefined) return structured;
-
-  const args = execution.arguments;
-  if (isRecord(args) && typeof args.command === "string") {
-    return fallbackAction(execution, options);
+  if (resolved.action.toolName !== execution.name) {
+    return {
+      kind: "denied",
+      reason: "POLICY_DENIED:UNTRUSTED_TOOL_IDENTITY",
+    };
   }
-  return undefined;
+  return { kind: "resolved", value: resolved };
 };
+
+const classifyResolvedAction = (
+  resolved: TrustedPolicyAction,
+  options: PolicyGuardRegistrationOptions,
+): PolicyDecision =>
+  classifyAction(resolved.action, options, {
+    provenance: resolved.provenance,
+  });
 
 type ExecutionSnapshots = WeakMap<object, string>;
 
-const rememberSnapshot = (
-  snapshots: ExecutionSnapshots,
-  execution: Readonly<PolicyToolExecution>,
-  fingerprint: string,
-): void => {
-  if (typeof execution === "object" && execution !== null) {
-    snapshots.set(execution, fingerprint);
-  }
-};
-
-const rememberedSnapshot = (
-  snapshots: ExecutionSnapshots,
-  execution: Readonly<PolicyToolExecution>,
-): string | undefined =>
-  typeof execution === "object" && execution !== null
-    ? snapshots.get(execution)
-    : undefined;
-
-/** Build the scoped, synchronous monotonic denied guard. */
+/** Build the synchronous monotonic denied guard for one Agent scope. */
 export function createPolicyGuard(
   options: PolicyGuardRegistrationOptions,
   snapshots: ExecutionSnapshots = new WeakMap<object, string>(),
-): PolicyGuard {
+): ToolGuard {
   return (execution) => {
-    let action: CanonicalAction | undefined;
-    try {
-      action = actionFor(execution, options);
-    } catch {
-      return "POLICY_DENIED:UNSTRUCTURED_ACTION";
-    }
-    if (action === undefined) return "POLICY_DENIED:UNSTRUCTURED_ACTION";
+    const resolution = resolveTrustedAction(execution, options);
+    if (resolution.kind === "denied") return resolution.reason;
+
     let result: PolicyDecision;
     try {
-      result = classifyAction(action, options);
+      result = classifyResolvedAction(resolution.value, options);
     } catch {
-      return "POLICY_DENIED:UNSTRUCTURED_ACTION";
+      return "POLICY_DENIED:UNTRUSTED_ACTION";
     }
-    const initialFingerprint = rememberedSnapshot(snapshots, execution);
+    const initialFingerprint = snapshots.get(execution);
     if (
       initialFingerprint !== undefined &&
       initialFingerprint !== result.fingerprint
@@ -254,21 +113,18 @@ export function createPolicyPreExecuteListener(
   snapshots: ExecutionSnapshots = new WeakMap<object, string>(),
 ): PolicyPreExecuteListener {
   return async (execution, next) => {
-    let action: CanonicalAction | undefined;
-    try {
-      action = actionFor(execution, options);
-    } catch {
-      return { kind: "deny", reason: "POLICY_DENIED:UNSTRUCTURED_ACTION" };
+    const resolution = resolveTrustedAction(execution, options);
+    if (resolution.kind === "denied") {
+      return { kind: "deny", reason: resolution.reason };
     }
-    if (action === undefined)
-      return { kind: "deny", reason: "POLICY_DENIED:UNSTRUCTURED_ACTION" };
+
     let result: PolicyDecision;
     try {
-      result = classifyAction(action, options);
+      result = classifyResolvedAction(resolution.value, options);
     } catch {
-      return { kind: "deny", reason: "POLICY_DENIED:UNSTRUCTURED_ACTION" };
+      return { kind: "deny", reason: "POLICY_DENIED:UNTRUSTED_ACTION" };
     }
-    rememberSnapshot(snapshots, execution, result.fingerprint);
+    snapshots.set(execution, result.fingerprint);
     if (result.classification === "approval_required") {
       return {
         kind: "ask",
@@ -279,23 +135,32 @@ export function createPolicyPreExecuteListener(
   };
 }
 
-/**
- * Register policy only in the supplied Agent setup context. The caller must
- * pass the scoped context received by `Agent.setup`; this function never reads
- * or mutates a process-global context.
- */
+const assertAgentSetupContext = (agentContext: Context): void => {
+  const agent = agentContext.agent;
+  if (
+    !Context.is(agentContext) ||
+    agentContext === agentContext.root ||
+    agent === undefined ||
+    agent.ctx !== agentContext
+  ) {
+    throw new Error("POLICY_AGENT_SCOPE_REQUIRED");
+  }
+};
+
+/** Register policy through the exact Context supplied to an Agent setup callback. */
 export function registerPolicyGuard(
-  scopedContext: PolicyScopeContext,
+  agentContext: Context,
   options: PolicyGuardRegistrationOptions,
 ): () => void {
+  assertAgentSetupContext(agentContext);
   const snapshots: ExecutionSnapshots = new WeakMap<object, string>();
-  const guardDisposer = scopedContext.tools.guard(
+  const guardDisposer = agentContext.tools.guard(
     createPolicyGuard(options, snapshots),
   );
-  const preExecuteDisposer = scopedContext.on(
+  const preExecuteDisposer = agentContext.on(
     "tools/pre-execute",
     createPolicyPreExecuteListener(options, snapshots),
-    { before: true },
+    { prepend: true },
   );
   let disposed = false;
   return () => {
@@ -303,5 +168,14 @@ export function registerPolicyGuard(
     disposed = true;
     guardDisposer();
     preExecuteDisposer();
+  };
+}
+
+/** Produce the official Agent setup callback used by bridge-owned Agents. */
+export function createPolicyAgentSetup(
+  options: PolicyGuardRegistrationOptions,
+): AgentSetup {
+  return (agentContext) => {
+    registerPolicyGuard(agentContext, options);
   };
 }

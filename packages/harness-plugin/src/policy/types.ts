@@ -11,8 +11,6 @@ export type CanonicalAction = {
   networkIntent: "none" | "read" | "write";
   fileChange: "none" | "bounded" | "destructive";
   externalSideEffect: "none" | "message" | "deploy" | "purchase";
-  /** Set only for commands whose text came directly from the cloud. */
-  commandSource?: "local" | "cloud";
 };
 
 export type PolicyDecision = {
@@ -46,29 +44,4 @@ export type PolicyPathViolation =
 export type CanonicalActionResult = Readonly<{
   action: CanonicalAction;
   violations: readonly PolicyPathViolation[];
-}>;
-
-export type PolicyToolExecution = Readonly<{
-  name: string;
-  arguments: unknown;
-}>;
-
-export type PolicyGuard = (
-  execution: Readonly<PolicyToolExecution>,
-) => string | undefined;
-
-export type PolicyPreExecuteListener = (
-  execution: Readonly<PolicyToolExecution>,
-  next: () => Promise<unknown>,
-) => Promise<unknown>;
-
-export type PolicyScopeContext = Readonly<{
-  tools: Readonly<{
-    guard(guard: PolicyGuard): () => void;
-  }>;
-  on(
-    name: "tools/pre-execute",
-    listener: PolicyPreExecuteListener,
-    options?: Readonly<{ before?: boolean }> | boolean,
-  ): () => boolean | undefined;
 }>;

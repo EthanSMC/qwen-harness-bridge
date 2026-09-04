@@ -5,10 +5,12 @@ import {
   renameSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { Context } from "../../packages/harness-plugin/node_modules/@deepseek-ai/cordis/lib/index.js";
 import {
   type ActionPolicyOptions,
   classifyAction,
@@ -17,7 +19,11 @@ import {
   canonicalizePath,
   recheckCanonicalPath,
 } from "../../packages/harness-plugin/src/policy/canonical-path.js";
-import { registerPolicyGuard } from "../../packages/harness-plugin/src/policy/register-guard.js";
+import {
+  type PolicyGuardRegistrationOptions,
+  registerPolicyGuard,
+  type TrustedPolicyAction,
+} from "../../packages/harness-plugin/src/policy/register-guard.js";
 import type {
   CanonicalAction,
   RepositoryPolicy,
@@ -62,6 +68,53 @@ const makeAction = (
 const policyOptions = (
   fixture: ReturnType<typeof makeFixture>,
 ): ActionPolicyOptions => ({ repositories: [fixture.repository] });
+
+type TestExecution = Readonly<{ name: string; arguments: unknown }>;
+type TestGuard = (execution: TestExecution) => string | undefined;
+
+const makeAgentScope = () => {
+  const root = new Context();
+  const guards: TestGuard[] = [];
+  const agent = {} as { ctx: Context };
+  const agentContext = root.extend({
+    agent,
+    tools: {
+      guard(guard: TestGuard) {
+        guards.push(guard);
+        return () => {
+          const index = guards.indexOf(guard);
+          if (index >= 0) guards.splice(index, 1);
+        };
+      },
+    },
+  });
+  agent.ctx = agentContext;
+  return { agentContext, guards, root };
+};
+
+const makeExecution = (
+  action: CanonicalAction,
+  name = action.toolName,
+): TestExecution => ({ name, arguments: { action } });
+
+const trustedPolicyOptions = (
+  fixture: ReturnType<typeof makeFixture>,
+  trustedActions: WeakMap<object, TrustedPolicyAction>,
+): PolicyGuardRegistrationOptions => ({
+  repositories: [fixture.repository],
+  resolveAction(execution) {
+    return trustedActions.get(execution);
+  },
+});
+
+const trustExecution = (
+  trustedActions: WeakMap<object, TrustedPolicyAction>,
+  execution: TestExecution,
+  action: CanonicalAction,
+  provenance: TrustedPolicyAction["provenance"] = "local_tool",
+): void => {
+  trustedActions.set(execution, { action, provenance });
+};
 
 afterEach(() => {
   while (temporaryDirectories.length > 0) {
@@ -159,195 +212,194 @@ describe("local repository policy boundary", () => {
     expect(denied.reasonCode).not.toBe(laterAllow);
   });
 
-  it("registers the denied guard and approval waterfall only on the supplied scope", async () => {
+  it("registers denied and approval policy through a trusted local resolver", async () => {
     const fixture = makeFixture();
-    const guards: Array<(execution: unknown) => string | undefined> = [];
-    const listeners: Array<{
-      name: string;
-      listener: (
-        execution: unknown,
-        next: () => Promise<unknown>,
-      ) => Promise<unknown>;
-    }> = [];
-    const scopedContext = {
-      tools: {
-        guard(guard: (execution: unknown) => string | undefined) {
-          guards.push(guard);
-          return () => undefined;
-        },
-      },
-      on(
-        name: string,
-        listener: (
-          execution: unknown,
-          next: () => Promise<unknown>,
-        ) => Promise<unknown>,
-      ) {
-        listeners.push({ name, listener });
-        return () => undefined;
-      },
-    };
-
-    const dispose = registerPolicyGuard(scopedContext, policyOptions(fixture));
-    expect(guards).toHaveLength(1);
-    expect(listeners.map(({ name }) => name)).toContain("tools/pre-execute");
+    const { agentContext, guards } = makeAgentScope();
+    const trustedActions = new WeakMap<object, TrustedPolicyAction>();
+    const dispose = registerPolicyGuard(
+      agentContext,
+      trustedPolicyOptions(fixture, trustedActions),
+    );
 
     const deniedAction = makeAction(fixture, { environmentRead: "arbitrary" });
-    expect(
-      guards[0]?.({
-        name: deniedAction.toolName,
-        arguments: { action: deniedAction },
-      }),
-    ).toMatch(/POLICY_DENIED|ENVIRONMENT/);
+    const deniedExecution = makeExecution(deniedAction);
+    trustExecution(trustedActions, deniedExecution, deniedAction);
+    expect(guards[0]?.(deniedExecution)).toMatch(/POLICY_DENIED|ENVIRONMENT/);
 
-    const approvalListener = listeners.find(
-      ({ name }) => name === "tools/pre-execute",
-    )?.listener;
     const approvalAction = makeAction(fixture, {
       executable: "pnpm",
       argv: ["install"],
     });
+    const approvalExecution = makeExecution(approvalAction);
+    trustExecution(trustedActions, approvalExecution, approvalAction);
     await expect(
-      approvalListener?.(
-        {
-          name: approvalAction.toolName,
-          arguments: { action: approvalAction },
-        },
-        async () => ({ kind: "allow" }),
+      agentContext.waterfall(
+        "tools/pre-execute",
+        approvalExecution,
+        async () => ({ kind: "allow" as const }),
       ),
     ).resolves.toMatchObject({ kind: "ask" });
 
     dispose();
   });
 
-  it("rejects a canonical target changed by an inside-repository symlink swap", async () => {
+  it("prepends approval policy ahead of an earlier fail-open listener", async () => {
+    const fixture = makeFixture();
+    const { agentContext } = makeAgentScope();
+    let earlierAllowCalls = 0;
+    const disposeEarlier = agentContext.on("tools/pre-execute", async () => {
+      earlierAllowCalls += 1;
+      return { kind: "allow" as const };
+    });
+    const trustedActions = new WeakMap<object, TrustedPolicyAction>();
+    const disposePolicy = registerPolicyGuard(
+      agentContext,
+      trustedPolicyOptions(fixture, trustedActions),
+    );
+    const action = makeAction(fixture, {
+      executable: "pnpm",
+      argv: ["install"],
+    });
+    const execution = makeExecution(action);
+    trustExecution(trustedActions, execution, action);
+
+    const result = await agentContext.waterfall(
+      "tools/pre-execute",
+      execution,
+      async () => ({ kind: "allow" as const }),
+    );
+
+    expect(result).toMatchObject({ kind: "ask" });
+    expect(earlierAllowCalls).toBe(0);
+    disposePolicy();
+    disposeEarlier();
+  });
+
+  it("rejects policy registration through a root Cordis context", () => {
+    const fixture = makeFixture();
+    const root = new Context();
+    const trustedActions = new WeakMap<object, TrustedPolicyAction>();
+
+    expect(() =>
+      registerPolicyGuard(root, trustedPolicyOptions(fixture, trustedActions)),
+    ).toThrowError("POLICY_AGENT_SCOPE_REQUIRED");
+  });
+
+  it("provides an official Agent setup callback for scoped registration", async () => {
+    const fixture = makeFixture();
+    const { agentContext, guards } = makeAgentScope();
+    const trustedActions = new WeakMap<object, TrustedPolicyAction>();
+    const policyModule = await import(
+      "../../packages/harness-plugin/src/policy/register-guard.js"
+    );
+
+    expect(policyModule).toHaveProperty("createPolicyAgentSetup");
+    const createPolicyAgentSetup = (
+      policyModule as typeof policyModule & {
+        createPolicyAgentSetup: (
+          options: PolicyGuardRegistrationOptions,
+        ) => (agentContext: Context) => void;
+      }
+    ).createPolicyAgentSetup;
+    const setup = createPolicyAgentSetup(
+      trustedPolicyOptions(fixture, trustedActions),
+    );
+    setup(agentContext);
+
+    expect(guards).toHaveLength(1);
+  });
+
+  it.each([
+    ["complete embedded metadata", {}],
+    ["missing side-effect metadata", { externalSideEffect: undefined }],
+    ["unknown side-effect metadata", { environmentRead: "unexpected" }],
+  ])("denies %s without a trusted local resolver", (_label, overrides) => {
+    const fixture = makeFixture();
+    const { agentContext, guards } = makeAgentScope();
+    registerPolicyGuard(agentContext, policyOptions(fixture) as never);
+    const action = { ...makeAction(fixture), ...overrides };
+    const execution = { name: action.toolName, arguments: { action } };
+
+    expect(guards[0]?.(execution)).toBe("POLICY_DENIED:UNTRUSTED_ACTION");
+  });
+
+  it("rejects a trusted tool identity that disagrees with execution", () => {
+    const fixture = makeFixture();
+    const { agentContext, guards } = makeAgentScope();
+    const trustedActions = new WeakMap<object, TrustedPolicyAction>();
+    registerPolicyGuard(
+      agentContext,
+      trustedPolicyOptions(fixture, trustedActions),
+    );
+    const action = makeAction(fixture);
+    const execution = makeExecution(action, "shell");
+    trustExecution(trustedActions, execution, action);
+
+    expect(guards[0]?.(execution)).toBe(
+      "POLICY_DENIED:UNTRUSTED_TOOL_IDENTITY",
+    );
+  });
+
+  it("rejects an inside-repository directory symlink swap through the guard", async () => {
     const fixture = makeFixture();
     const firstDirectory = join(fixture.repository.canonicalPath, "first");
     const secondDirectory = join(fixture.repository.canonicalPath, "second");
     const target = join(firstDirectory, "new-file.txt");
     mkdirSync(firstDirectory);
     mkdirSync(secondDirectory);
-
-    const guards: Array<(execution: unknown) => string | undefined> = [];
-    const listeners: Array<{
-      name: string;
-      listener: (
-        execution: unknown,
-        next: () => Promise<unknown>,
-      ) => Promise<unknown>;
-    }> = [];
-    const scopedContext = {
-      tools: {
-        guard(guard: (execution: unknown) => string | undefined) {
-          guards.push(guard);
-          return () => undefined;
-        },
-      },
-      on(
-        name: string,
-        listener: (
-          execution: unknown,
-          next: () => Promise<unknown>,
-        ) => Promise<unknown>,
-      ) {
-        listeners.push({ name, listener });
-        return () => undefined;
-      },
-    };
-    const dispose = registerPolicyGuard(scopedContext, policyOptions(fixture));
+    const { agentContext, guards } = makeAgentScope();
+    const trustedActions = new WeakMap<object, TrustedPolicyAction>();
+    const dispose = registerPolicyGuard(
+      agentContext,
+      trustedPolicyOptions(fixture, trustedActions),
+    );
     const action = makeAction(fixture, {
       touchedPaths: [target],
       fileChange: "destructive",
     });
-    const execution = {
-      name: action.toolName,
-      arguments: { action },
-    };
-    const listener = listeners.find(
-      ({ name }) => name === "tools/pre-execute",
-    )?.listener;
+    const execution = makeExecution(action);
+    trustExecution(trustedActions, execution, action);
     await expect(
-      listener?.(execution, async () => ({ kind: "allow" })),
-    ).resolves.toMatchObject({
-      kind: "ask",
-    });
+      agentContext.waterfall("tools/pre-execute", execution, async () => ({
+        kind: "allow" as const,
+      })),
+    ).resolves.toMatchObject({ kind: "ask" });
 
     renameSync(firstDirectory, join(fixture.directory, "first-original"));
     symlinkSync(secondDirectory, firstDirectory, "dir");
 
-    expect(guards[0]?.(execution)).toMatch(/PATH_CHANGED|POLICY_DENIED/);
+    expect(guards[0]?.(execution)).toBe("POLICY_DENIED:PATH_CHANGED");
     dispose();
   });
-  it("does not let action arguments relabel the executing shell tool", () => {
+
+  it("rejects an inside-repository leaf symlink swap through the guard", async () => {
     const fixture = makeFixture();
-    const action = makeAction(fixture, { toolName: "read_file" });
-    const guards: Array<(execution: unknown) => string | undefined> = [];
-
-    const scopedContext = {
-      tools: {
-        guard(guard: (execution: unknown) => string | undefined) {
-          guards.push(guard);
-          return () => undefined;
-        },
-      },
-      on() {
-        return () => undefined;
-      },
-    };
-    registerPolicyGuard(scopedContext, policyOptions(fixture));
-
-    expect(guards[0]?.({ name: "shell", arguments: { action } })).toMatch(
-      /POLICY_DENIED|ARBITRARY_COMMAND/,
+    const firstTarget = join(fixture.repository.canonicalPath, "first.txt");
+    const secondTarget = join(fixture.repository.canonicalPath, "second.txt");
+    const leaf = join(fixture.repository.canonicalPath, "leaf.txt");
+    writeFileSync(firstTarget, "first\n");
+    writeFileSync(secondTarget, "second\n");
+    symlinkSync(firstTarget, leaf);
+    const { agentContext, guards } = makeAgentScope();
+    const trustedActions = new WeakMap<object, TrustedPolicyAction>();
+    const dispose = registerPolicyGuard(
+      agentContext,
+      trustedPolicyOptions(fixture, trustedActions),
     );
-  });
-
-  it("fails closed when a structured action has malformed path arguments", () => {
-    const fixture = makeFixture();
-    const guards: Array<(execution: unknown) => string | undefined> = [];
-    const scopedContext = {
-      tools: {
-        guard(guard: (execution: unknown) => string | undefined) {
-          guards.push(guard);
-          return () => undefined;
-        },
-      },
-      on() {
-        return () => undefined;
-      },
-    };
-    registerPolicyGuard(scopedContext, policyOptions(fixture));
-
-    expect(
-      guards[0]?.({
-        name: "read_file",
-        arguments: {
-          action: { repositoryId: fixture.repository.id, argv: "not-an-array" },
-        },
-      }),
-    ).toMatch(/POLICY_DENIED/);
-  });
-
-  it("fails closed when untrusted action flags contain an unknown value", () => {
-    const fixture = makeFixture();
-    const guards: Array<(execution: unknown) => string | undefined> = [];
-    const scopedContext = {
-      tools: {
-        guard(guard: (execution: unknown) => string | undefined) {
-          guards.push(guard);
-          return () => undefined;
-        },
-      },
-      on() {
-        return () => undefined;
-      },
-    };
-    registerPolicyGuard(scopedContext, policyOptions(fixture));
-
     const action = makeAction(fixture, {
-      environmentRead: "unexpected" as never,
+      touchedPaths: [leaf],
+      fileChange: "destructive",
     });
-    expect(
-      guards[0]?.({ name: action.toolName, arguments: { action } }),
-    ).toMatch(/POLICY_DENIED/);
+    const execution = makeExecution(action);
+    trustExecution(trustedActions, execution, action);
+    await agentContext.waterfall("tools/pre-execute", execution, async () => ({
+      kind: "allow" as const,
+    }));
+
+    rmSync(leaf);
+    symlinkSync(secondTarget, leaf);
+
+    expect(guards[0]?.(execution)).toBe("POLICY_DENIED:PATH_CHANGED");
+    dispose();
   });
 });
