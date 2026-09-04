@@ -15,3 +15,10 @@ ACKs, and durably record expired business rejections after rolling back effects.
 Legacy hellos retain legacy behavior; the new plugin requires an explicit welcome
 echo and preserves incompatible state for recovery. Deploy both endpoints together;
 rollback must retain receipt/outbox data and treat unsupported peers as unavailable.
+
+Retain bounded, server-authored original-offer evidence across tombstones and
+redispatch, so verified expired claims can receive a rejection and receipt even
+after connector reassignment without touching the replacement lease. Historical
+records with incomplete proof remain fail-closed. Apply expired replay exceptions
+only to the stored negotiated receipt profile, and stop transport-owned callbacks
+and persistence after abort while retaining unfinished inbound receipts.

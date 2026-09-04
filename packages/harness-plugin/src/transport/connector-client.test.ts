@@ -301,6 +301,133 @@ describe("authenticated connector transport", () => {
     vi.useRealTimers();
   });
 
+  it.each([
+    [false, "resolve"],
+    [false, "reject"],
+    [true, "resolve"],
+    [true, "reject"],
+  ] as const)(
+    "stops held handler continuation after abort and SQLite close (recovery=%s, %s)",
+    async (recovery, outcome) => {
+      const fixture = await startFixture();
+      fixture.autoWelcome = !recovery;
+      fixtures.push(fixture);
+      const item = makeStore();
+      stores.push(item);
+      let closed = false;
+      const lateAccess: string[] = [];
+      const observedStore = new Proxy(item.store, {
+        get(target, property) {
+          const value = Reflect.get(target, property);
+          if (typeof value !== "function") return value;
+          return (...args: unknown[]) => {
+            if (closed) lateAccess.push(String(property));
+            return Reflect.apply(value, target, args);
+          };
+        },
+      });
+      const controller = new AbortController();
+      const client = makeClient(fixture, observedStore);
+      const held = deferred<void>();
+      let entered = false;
+      let secondCalls = 0;
+      const unhandled: unknown[] = [];
+      const onUnhandled = (error: unknown) => unhandled.push(error);
+      process.on("unhandledRejection", onUnhandled);
+      client.onCommand(async () => {
+        entered = true;
+        await held.promise;
+      });
+      client.onCommand(async () => {
+        secondCalls++;
+      });
+      const running = client.start(controller.signal);
+      let command: ConnectorServerMessage | undefined;
+      try {
+        await waitFor(() => fixture.clientMessages.length > 0);
+        const socket = required([...fixture.sockets][0]);
+        command = envelope("job.cancel", fixture.nextServerSequence++, {
+          job_id: JOB_ID,
+          attempt: 1,
+          job_revision: 2,
+          nonce: randomUUID(),
+          reason: "owner_request",
+        });
+        fixture.send(socket, command);
+        if (recovery) {
+          await waitFor(
+            () =>
+              item.store.inboundMessage(command?.message_id ?? "") !==
+              undefined,
+          );
+          fixture.sendWelcome(socket, required(fixture.clientMessages[0]));
+        }
+        await waitFor(() => entered);
+        controller.abort();
+        expect(
+          await Promise.race([
+            running.then(() => true),
+            new Promise<boolean>((resolve) =>
+              setTimeout(() => resolve(false), 1_500),
+            ),
+          ]),
+        ).toBe(true);
+        expect(item.store.inboundMessage(command.message_id)?.delivered).toBe(
+          false,
+        );
+        const allocated = item.store.maxOutboundSequence();
+        item.store.close();
+        closed = true;
+        if (outcome === "resolve") held.resolve();
+        else held.reject(new Error("late handler failure"));
+        // Drain the callback continuation and queued receive/send work.
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+        expect(secondCalls).toBe(0);
+        expect(lateAccess).toEqual([]);
+        expect(unhandled).toEqual([]);
+        const reopened = new SqlitePluginStore(
+          join(item.directory, "state.sqlite"),
+        );
+        try {
+          expect(reopened.inboundMessage(command.message_id)?.delivered).toBe(
+            false,
+          );
+          expect(reopened.maxOutboundSequence()).toBe(allocated);
+        } finally {
+          reopened.close();
+        }
+      } finally {
+        controller.abort();
+        held.resolve();
+        await running;
+        process.off("unhandledRejection", onUnhandled);
+      }
+    },
+  );
+
+  it("does not invoke a queued bootstrap callback after immediate abort", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const item = makeStore();
+    stores.push(item);
+    let calls = 0;
+    const controller = new AbortController();
+    const client = makeClient(fixture, item.store, {
+      bootstrapCredentialProvider: async () => {
+        calls++;
+        return BOOTSTRAP_CREDENTIAL;
+      },
+    });
+    const running = client.start(controller.signal);
+    controller.abort();
+    await running;
+    item.store.close();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(calls).toBe(0);
+    expect(fixture.tokenRequests).toEqual([]);
+    expect(fixture.socketTokens).toEqual([]);
+  });
+
   it("fails a missing welcome echo before commands or post-hello traffic", async () => {
     const fixture = await startFixture();
     fixture.autoWelcome = false;

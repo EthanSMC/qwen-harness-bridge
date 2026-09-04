@@ -268,14 +268,13 @@ export class DurableConnectorClient implements ConnectorClient {
     let session = this.#nextSession;
     if (session === undefined) {
       const bootstrapCredential = await this.#abortable(
-        Promise.resolve().then(() =>
-          this.#options.bootstrapCredentialProvider(signal),
-        ),
+        () => this.#options.bootstrapCredentialProvider(signal),
         signal,
       );
-      if (bootstrapCredential === ABORTED) return false;
+      if (bootstrapCredential === ABORTED || signal.aborted || this.#stopping)
+        return false;
       const exchanged = await this.#abortable(
-        Promise.resolve().then(() =>
+        () =>
           this.#options.sessionTokenClient.exchange(
             {
               connectorId: this.#options.connectorId,
@@ -283,10 +282,10 @@ export class DurableConnectorClient implements ConnectorClient {
             },
             signal,
           ),
-        ),
         signal,
       );
-      if (exchanged === ABORTED) return false;
+      if (exchanged === ABORTED || signal.aborted || this.#stopping)
+        return false;
       session = exchanged;
     }
     if (signal.aborted) return false;
@@ -356,6 +355,7 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   async #afterOpen(socket: WebSocket, signal: AbortSignal): Promise<void> {
+    if (signal.aborted || this.#stopping || this.#socket !== socket) return;
     const hello = this.#helloMessage;
     if (hello === undefined) throw new Error("CONNECTOR_HELLO_MISSING");
     if (hello.message.type !== "connector.hello") {
@@ -372,12 +372,18 @@ export class DurableConnectorClient implements ConnectorClient {
         this.#closeSocket(socket);
     }, 1_000);
     await this.#welcomeWaiter;
-    if (signal.aborted || this.#socket !== socket || !this.#welcomeReceived)
+    if (
+      signal.aborted ||
+      this.#stopping ||
+      this.#socket !== socket ||
+      !this.#welcomeReceived
+    )
       return;
     await this.#sendPending(socket);
   }
 
   #prepareHello(): void {
+    if (this.#stopping) return;
     if (this.#helloMessage !== undefined) {
       const message = this.#helloMessage.message;
       if (
@@ -504,6 +510,7 @@ export class DurableConnectorClient implements ConnectorClient {
       }
     }
 
+    if (this.#stopping) return;
     if (message.type === "connector.welcome") {
       this.#welcomeReceived = true;
       const hello = this.#helloMessage?.message;
@@ -513,9 +520,11 @@ export class DurableConnectorClient implements ConnectorClient {
       // The hello remains pinned separately after its receipt retires the row
       // from the pending queue. Reconnect retains its immutable identity.
       await this.#recoverPendingInbound(socket);
+      if (this.#stopping) return;
       if (existing?.delivered === true) {
         await this.#completeInbound(message, true);
       }
+      if (this.#stopping) return;
       this.#resolveWelcome?.();
       return;
     }
@@ -605,8 +614,13 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   async #recoverPendingInbound(socket: WebSocket): Promise<void> {
+    if (this.#stopping) return;
     for (const stored of this.#options.store.pendingInboundMessages()) {
-      if (this.#socket !== socket || socket.readyState !== WebSocket.OPEN) {
+      if (
+        this.#stopping ||
+        this.#socket !== socket ||
+        socket.readyState !== WebSocket.OPEN
+      ) {
         return;
       }
       const message = this.#parseStoredInbound(stored);
@@ -644,6 +658,7 @@ export class DurableConnectorClient implements ConnectorClient {
     message: ConnectorServerMessage,
     delivered: boolean,
   ): Promise<void> {
+    if (this.#stopping) return;
     if (!delivered) {
       if (message.type === "ack") {
         this.#acknowledgeOutbound(
@@ -658,16 +673,23 @@ export class DurableConnectorClient implements ConnectorClient {
           return;
         }
         for (const handler of [...this.#handlers]) {
+          if (this.#stopping) return;
           if (Date.parse(message.expires_at) <= this.#now().getTime()) {
             this.#options.store.markInboundExpired(message.message_id);
             this.#enqueueAck(message.sequence);
             return;
           }
           await handler(message);
+          // start() does not await uncooperative application handlers on abort.
+          // A late completion retains the unfinished receipt for recovery and
+          // must never invoke another handler or touch a possibly closed store.
+          if (this.#stopping) return;
         }
       }
     }
+    if (this.#stopping) return;
     if (message.type !== "ack") this.#enqueueAck(message.sequence);
+    if (this.#stopping) return;
     if (!delivered) {
       // ACK persistence precedes this marker. A crash after handler success but
       // before the marker can redeliver, giving commands at-least-once rather
@@ -678,7 +700,9 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   #acknowledgeOutbound(sequence: number, correlationId: string): void {
+    if (this.#stopping) return;
     this.#options.store.acknowledgeThrough(sequence, correlationId);
+    if (this.#stopping) return;
     const prefix = this.#options.store.provenClientSequence();
     for (const candidate of this.#outboundBySequence.keys()) {
       if (candidate <= prefix) this.#outboundBySequence.delete(candidate);
@@ -695,6 +719,7 @@ export class DurableConnectorClient implements ConnectorClient {
   #validReceipt(
     message: Extract<ConnectorServerMessage, { type: "ack" }>,
   ): boolean {
+    if (this.#stopping) return false;
     const stored = this.#options.store.outboundEvent(message.payload.sequence);
     if (stored === undefined) return false;
     const parsed = ConnectorClientMessageSchema.safeParse(
@@ -709,6 +734,7 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   #enqueueAck(sequence: number): void {
+    if (this.#stopping) return;
     if (
       this.#pendingMessages().some(
         ({ message }) =>
@@ -730,6 +756,7 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   #enqueueHeartbeat(): void {
+    if (this.#stopping) return;
     this.#persistMessage((nextSequence) =>
       messageEnvelope(
         "connector.heartbeat",
@@ -746,12 +773,14 @@ export class DurableConnectorClient implements ConnectorClient {
   #persistMessage(
     build: (sequence: number) => ConnectorClientMessage,
   ): PendingMessage {
+    if (this.#stopping) throw new Error("CONNECTOR_STOPPED");
     const sequence = this.#clientSequence + 1;
     if (!Number.isSafeInteger(sequence)) {
       throw new Error("CONNECTOR_SEQUENCE_EXHAUSTED");
     }
     const message = build(sequence);
     const serialized = JSON.stringify(message);
+    if (this.#stopping) throw new Error("CONNECTOR_STOPPED");
     try {
       this.#options.store.enqueueEvent(
         {
@@ -788,6 +817,7 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   #sendRenewed(socket: WebSocket, pending: PendingMessage): void {
+    if (this.#stopping) return;
     const stored = this.#options.store.renewDelivery(
       pending.stored.sequence,
       new Date(this.#now().getTime() + MESSAGE_TTL_MS).toISOString(),
@@ -824,6 +854,7 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   #pendingMessages(): PendingMessage[] {
+    if (this.#stopping) return [];
     return this.#options.store.pendingEvents(0).flatMap((stored) => {
       try {
         const message = ConnectorClientMessageSchema.parse(
@@ -844,7 +875,9 @@ export class DurableConnectorClient implements ConnectorClient {
 
   #sendPending(socket: WebSocket): Promise<void> {
     const operation = this.#sendPump.then(async () => {
+      if (this.#stopping || this.#socket !== socket) return;
       for (const pending of this.#pendingMessages()) {
+        if (this.#stopping) return;
         if (pending.message.type === "connector.hello") continue;
         if (this.#sentOnConnection.has(pending.stored.sequence)) continue;
         if (
@@ -875,6 +908,7 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   #scheduleSendPump(): void {
+    if (this.#stopping) return;
     const socket = this.#socket;
     if (socket === undefined || !this.#welcomeReceived) return;
     void this.#sendPending(socket).catch(() => this.#closeSocket(socket));
@@ -911,14 +945,13 @@ export class DurableConnectorClient implements ConnectorClient {
     if (signal.aborted || this.#stopping) return;
     try {
       const bootstrapCredential = await this.#abortable(
-        Promise.resolve().then(() =>
-          this.#options.bootstrapCredentialProvider(signal),
-        ),
+        () => this.#options.bootstrapCredentialProvider(signal),
         signal,
       );
-      if (bootstrapCredential === ABORTED) return;
+      if (bootstrapCredential === ABORTED || signal.aborted || this.#stopping)
+        return;
       const session = await this.#abortable(
-        Promise.resolve().then(() =>
+        () =>
           this.#options.sessionTokenClient.exchange(
             {
               connectorId: this.#options.connectorId,
@@ -926,10 +959,9 @@ export class DurableConnectorClient implements ConnectorClient {
             },
             signal,
           ),
-        ),
         signal,
       );
-      if (session === ABORTED) return;
+      if (session === ABORTED || signal.aborted || this.#stopping) return;
       this.#nextSession = session;
       this.#scheduleTokenRefresh(session.expiresAt, signal);
       const socket = this.#socket;
@@ -950,11 +982,10 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   #abortable<T>(
-    operation: Promise<T>,
+    operation: () => Promise<T>,
     signal: AbortSignal,
   ): Promise<T | typeof ABORTED> {
-    if (signal.aborted) {
-      void operation.catch(() => undefined);
+    if (signal.aborted || this.#stopping) {
       return Promise.resolve(ABORTED);
     }
     return new Promise<T | typeof ABORTED>((resolve, reject) => {
@@ -973,7 +1004,11 @@ export class DurableConnectorClient implements ConnectorClient {
       };
       const onAbort = (): void => finish(ABORTED);
       signal.addEventListener("abort", onAbort, { once: true });
-      void operation.then(finish, fail);
+      void Promise.resolve()
+        .then<T | typeof ABORTED>(() =>
+          signal.aborted || this.#stopping ? ABORTED : operation(),
+        )
+        .then(finish, fail);
     });
   }
 

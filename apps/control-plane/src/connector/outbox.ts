@@ -707,6 +707,56 @@ const lockClientJob = async (
   return rows[0];
 };
 
+const hasExpiredOriginalOffer = async (
+  database: QueryDatabase,
+  identity: ConnectorIdentity,
+  message: Extract<ConnectorClientMessage, { type: "job.claim" }>,
+  now: Date,
+): Promise<boolean> => {
+  // The current job lock deliberately authorizes only its current connector.
+  // Historical proof can authorize a rejection, never a mutation of that job.
+  // Dispatch audits survive both reassignment and outbox tombstones. These
+  // tuple fields are server-only (excluded from the client event allowlist).
+  const rows = await database
+    .select({
+      payload: jobEvents.payload,
+      repositoryId: jobs.repositoryId,
+      leaseId: jobs.leaseId,
+    })
+    .from(jobEvents)
+    .innerJoin(jobs, eq(jobs.id, jobEvents.jobId))
+    .where(
+      and(
+        eq(jobEvents.jobId, message.payload.job_id),
+        eq(jobs.ownerId, identity.ownerId),
+        eq(jobEvents.source, "control-plane"),
+        inArray(jobEvents.eventType, ["job.dispatched", "job.redispatched"]),
+        sql`${jobEvents.payload}->>'lease_id' = ${message.payload.lease_id}`,
+      ),
+    )
+    .limit(2);
+  if (rows.length !== 1) return false;
+  const row = rows[0];
+  if (row === undefined || row.leaseId === message.payload.lease_id)
+    return false;
+  const proof = asRecord(row.payload);
+  if (
+    proof?.owner_id !== identity.ownerId ||
+    proof.connector_id !== identity.connectorId ||
+    proof.repository_id !== row.repositoryId ||
+    proof.attempt !== message.payload.attempt ||
+    proof.lease_id !== message.payload.lease_id ||
+    typeof proof.lease_expires_at !== "string"
+  )
+    return false;
+  const deadline = Date.parse(proof.lease_expires_at);
+  return (
+    Number.isFinite(deadline) &&
+    new Date(deadline).toISOString() === proof.lease_expires_at &&
+    deadline <= now.getTime()
+  );
+};
+
 const readDatabaseTime = async (database: QueryDatabase): Promise<Date> => {
   const rows = await database.execute(
     sql`select clock_timestamp() as "currentTime"`,
@@ -1350,10 +1400,15 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         if (!isExactDuplicate(existing, message)) {
           throw new ConnectorStoreError("CLIENT_REPLAY_MISMATCH");
         }
-        if (
+        // Only the immutable profile on this receipt grants expired replay.
+        // Reject legacy expiry before restoring responses or refreshing health.
+        const durableReceipt =
           asRecord(existing.payload)?.[RECEIPT_PROFILE_KEY] ===
-            DURABLE_RECEIPTS &&
-          Date.parse(message.expires_at) > currentTime.getTime() + 60_000
+          DURABLE_RECEIPTS;
+        if (
+          durableReceipt
+            ? Date.parse(message.expires_at) > currentTime.getTime() + 60_000
+            : Date.parse(message.expires_at) <= currentTime.getTime()
         ) {
           throw new ConnectorStoreError("CLIENT_REPLAY_MISMATCH");
         }
@@ -1490,8 +1545,19 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
 
       let claimResult: "claimed" | "cancelled" | undefined;
       let rejection: BusinessDeadlineExpired | undefined;
+      let historicalClaimExpired = false;
       const applyBusiness = async (businessTx: Transaction): Promise<void> => {
         if (message.type === "job.claim") {
+          if (durable && lockedJob?.leaseId !== message.payload.lease_id) {
+            historicalClaimExpired = await hasExpiredOriginalOffer(
+              businessTx,
+              identity,
+              message,
+              currentTime,
+            );
+            if (historicalClaimExpired)
+              throw new BusinessDeadlineExpired("CLAIM_REJECTED");
+          }
           claimResult = await claimOfferedJob(
             businessTx,
             identity,
@@ -1530,7 +1596,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         } catch (error) {
           if (
             !(error instanceof BusinessDeadlineExpired) ||
-            lockedJob === undefined
+            (lockedJob === undefined && !historicalClaimExpired)
           )
             throw error;
           rejection = error;
@@ -1813,9 +1879,12 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
       await appendJobEvent(tx, job.id, {
         type: redispatch ? "job.redispatched" : "job.dispatched",
         payload: {
+          owner_id: job.ownerId,
+          repository_id: job.repositoryId,
           connector_id: identity.connectorId,
           attempt,
           lease_id: leaseId,
+          lease_expires_at: leaseExpiresAt.toISOString(),
           ...(redispatch ? { previous_lease_id: job.leaseId } : {}),
         },
         source: "control-plane",
