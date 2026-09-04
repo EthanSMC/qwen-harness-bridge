@@ -100,26 +100,37 @@ const workflowStep = (workflow: string, name: string): string => {
   return lines.slice(start, end === -1 ? lines.length : end).join("\n");
 };
 
-const copyWorkingTree = (): string => {
+const copyWorkingTree = (runFreshBuildCommand: FreshBuildCommand): string => {
   const target = mkdtempSync(join(tmpdir(), "qhb-runtime-build-"));
-  const files = execFileSync(
-    "git",
-    ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
-    { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 8 * 1024 * 1024 },
-  )
-    .split("\0")
-    .filter(
-      (path) =>
-        path.length > 0 &&
-        !path.startsWith(".superpowers/") &&
-        !path.includes("/dist/"),
-    );
-  for (const path of files) {
-    const destination = join(target, path);
-    mkdirSync(dirname(destination), { recursive: true });
-    cpSync(absolute(path), destination);
+  try {
+    const files = String(
+      runFreshBuildCommand(
+        "git",
+        ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        {
+          cwd: repositoryRoot,
+          encoding: "utf8",
+          maxBuffer: 8 * 1024 * 1024,
+        },
+      ),
+    )
+      .split("\0")
+      .filter(
+        (path) =>
+          path.length > 0 &&
+          !path.startsWith(".superpowers/") &&
+          !path.includes("/dist/"),
+      );
+    for (const path of files) {
+      const destination = join(target, path);
+      mkdirSync(dirname(destination), { recursive: true });
+      cpSync(absolute(path), destination);
+    }
+    return target;
+  } catch (error) {
+    rmSync(target, { recursive: true, force: true });
+    throw error;
   }
-  return target;
 };
 
 const buildEnvironment = (): NodeJS.ProcessEnv => {
@@ -673,7 +684,10 @@ describe("release runtime build contract", () => {
   });
 
   it("freshly builds non-empty executable artifacts and exact migrations", () => {
-    const buildRoot = copyWorkingTree();
+    const runFreshBuildCommand = createFreshBuildCommandRunner(
+      FRESH_BUILD_COMMAND_BUDGET_MS,
+    );
+    const buildRoot = copyWorkingTree(runFreshBuildCommand);
     const built = (path: string): string => join(buildRoot, path);
     const readBuilt = (path: string): string =>
       readFileSync(built(path), "utf8");
@@ -685,9 +699,6 @@ describe("release runtime build contract", () => {
         expect(existsSync(built(path))).toBe(false);
       }
       const environment = buildEnvironment();
-      const runFreshBuildCommand = createFreshBuildCommandRunner(
-        FRESH_BUILD_COMMAND_BUDGET_MS,
-      );
       runFreshBuildCommand(
         "pnpm",
         ["install", "--offline", "--frozen-lockfile", "--ignore-scripts"],
