@@ -170,7 +170,7 @@ jobs:
           grep --fixed-strings 'qhb_mcp_submit_duration_seconds' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
           grep --fixed-strings 'qhb_connector_online' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
           grep --fixed-strings 'qhb_job_queue_age_seconds' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
-          if grep -E -i 'owner[_-]?id|job[_-]?id|(^|[^[:alnum:]_])repository([^[:alnum:]_]|$)|repository[_-]?(id|name)|prompt|path|https?://|url|secret|error:|stack trace|ECONNREFUSED|SQLSTATE' "$RUNTIME_HEALTH_METRICS_BODY_FILE"; then exit 1; fi
+          if grep -E -i 'owner[_-]?id|job[_-]?id|(^|[^[:alnum:]_])[[:alnum:]_-]*repository([_-]?(id|name|url|path|context)|[^[:alnum:]_]|$)|prompt|path|https?://|url|secret|error:|stack trace|ECONNREFUSED|SQLSTATE' "$RUNTIME_HEALTH_METRICS_BODY_FILE"; then exit 1; fi
           privacy_observation=passed
           {
             printf 'live_status=%s\n' "$live_status"
@@ -237,7 +237,7 @@ jobs:
           test "$live_body" = '{"status":"ok"}'
           test "$readiness_body" = '{"status":"not_ready"}'
           test "$readiness_content_type" = 'application/json; charset=utf-8'
-          if grep -E -i 'owner[_-]?id|job[_-]?id|(^|[^[:alnum:]_])repository([^[:alnum:]_]|$)|repository[_-]?(id|name)|prompt|path|https?://|url|secret|error:|stack trace|ECONNREFUSED|SQLSTATE' "$readiness_body_file"; then exit 1; fi
+          if grep -E -i 'owner[_-]?id|job[_-]?id|(^|[^[:alnum:]_])[[:alnum:]_-]*repository([_-]?(id|name|url|path|context)|[^[:alnum:]_]|$)|prompt|path|https?://|url|secret|error:|stack trace|ECONNREFUSED|SQLSTATE' "$readiness_body_file"; then exit 1; fi
           db_loss_privacy=passed
           {
             printf 'db_loss_readiness_status=%s\n' "$readiness_status"
