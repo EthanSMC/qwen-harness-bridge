@@ -605,6 +605,119 @@ const dockerCopyOperands = (
   };
 };
 
+const dockerBuildCopyOperands = (
+  instruction: string,
+): { sources: string[]; destination: string } => {
+  const tokens = instruction
+    .trim()
+    .split(/\s+/)
+    .slice(1)
+    .map((token) => token.replace(/^[\x5b"']+|[\x5d"',]+$/g, ""))
+    .filter((token) => token.length > 0);
+  const operands = tokens.filter((token) => !token.startsWith("--"));
+  expect(
+    operands.length,
+    `COPY must have at least one source and one destination: ${instruction}`,
+  ).toBeGreaterThanOrEqual(2);
+  return {
+    sources: operands.slice(0, -1),
+    destination: operands.at(-1) ?? "",
+  };
+};
+
+const workspacePackageDirectories = (): string[] => {
+  const lines = read("pnpm-workspace.yaml").split("\n");
+  const packagesIndex = lines.findIndex((line) => line.trim() === "packages:");
+  expect(
+    packagesIndex,
+    "workspace manifest must declare packages",
+  ).toBeGreaterThanOrEqual(0);
+  const packagesIndent =
+    (lines[packagesIndex ?? -1]?.length ?? 0) -
+    (lines[packagesIndex ?? -1]?.trimStart().length ?? 0);
+  const patterns: string[] = [];
+  for (const line of lines.slice((packagesIndex ?? -1) + 1)) {
+    if (line.trim().length === 0 || line.trimStart().startsWith("#")) continue;
+    const indentation = line.length - line.trimStart().length;
+    if (indentation <= packagesIndent) break;
+    const match = line.match(/^\s+-\s+(.+?)\s*$/);
+    if (match?.[1] !== undefined) {
+      patterns.push(match[1].replace(/^['"]|['"]$/g, ""));
+    }
+  }
+  expect(
+    patterns,
+    "workspace manifest must contain package patterns",
+  ).not.toHaveLength(0);
+
+  return [
+    ...new Set(
+      patterns.flatMap((pattern) => {
+        const segments = pattern.split("/");
+        const wildcardIndex = segments.findIndex((segment) =>
+          segment.includes("*"),
+        );
+        if (wildcardIndex === -1) return [pattern];
+        expect(wildcardIndex, `unsupported workspace pattern: ${pattern}`).toBe(
+          segments.length - 1,
+        );
+        const parent = segments.slice(0, wildcardIndex).join("/");
+        const parentPath = absolute(parent || ".");
+        if (!existsSync(parentPath)) return [];
+        return readdirSync(parentPath, { withFileTypes: true })
+          .filter((entry) => entry.isDirectory())
+          .map((entry) =>
+            [...segments.slice(0, wildcardIndex), entry.name].join("/"),
+          );
+      }),
+    ),
+  ]
+    .filter((path) => existsSync(absolute(join(path, "package.json"))))
+    .sort();
+};
+
+const dockerBuildPreInstallSnapshot = (): Map<string, string> => {
+  const dockerfile = read("apps/control-plane/Dockerfile");
+  const buildStage = dockerStageBlocks(dockerfile).find((stage) =>
+    /^FROM\s+.*\s+AS\s+build\s*$/im.test(stage),
+  );
+  expect(buildStage, "Dockerfile must declare a build stage").toBeDefined();
+  const instructions = dockerfileInstructions(buildStage ?? "");
+  const installIndex = instructions.findIndex(
+    (instruction) =>
+      /^RUN\s+pnpm\s+install\b/.test(instruction) &&
+      /--frozen-lockfile\b/.test(instruction),
+  );
+  expect(
+    installIndex,
+    "build stage must install from the frozen lockfile",
+  ).toBeGreaterThan(-1);
+  const workdir = dockerStageWorkdir(buildStage ?? "");
+  expect(workdir, "build stage must declare a workdir").toBeDefined();
+
+  const snapshot = new Map<string, string>();
+  for (const instruction of instructions.slice(0, installIndex)) {
+    if (!/^COPY\s+/i.test(instruction)) continue;
+    const { sources, destination } = dockerBuildCopyOperands(instruction);
+    const destinationPath = destination.startsWith("/")
+      ? normalizeDockerPath(destination)
+      : normalizeDockerPath(`${workdir ?? "/"}/${destination}`);
+    for (const source of sources) {
+      const sourcePath = absolute(source);
+      expect(existsSync(sourcePath), `COPY source must exist: ${source}`).toBe(
+        true,
+      );
+      const sourceName = source.split("/").at(-1) ?? source;
+      const target =
+        sources.length > 1 || destination.endsWith("/")
+          ? normalizeDockerPath(`${destinationPath}/${sourceName}`)
+          : destinationPath;
+      snapshot.set(target, readFileSync(sourcePath, "utf8"));
+    }
+  }
+  return snapshot;
+};
+
 const runtimeCopyAllowlist = new Set(["runtime"]);
 
 const runtimeCopyKey = (source: string): string | undefined => {
@@ -1399,6 +1512,74 @@ describe("release runtime build contract", () => {
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
+  });
+
+  it("makes every workspace package built after install visible to the install layer", () => {
+    const dockerfile = read("apps/control-plane/Dockerfile");
+    const buildStage = dockerStageBlocks(dockerfile).find((stage) =>
+      /^FROM\s+.*\s+AS\s+build\s*$/im.test(stage),
+    );
+    expect(buildStage).toBeDefined();
+    const instructions = dockerfileInstructions(buildStage ?? "");
+    const installIndex = instructions.findIndex(
+      (instruction) =>
+        /^RUN\s+pnpm\s+install\b/.test(instruction) &&
+        /--frozen-lockfile\b/.test(instruction),
+    );
+    const buildIndex = instructions.findIndex(
+      (instruction, index) =>
+        index > installIndex && /^RUN\s+pnpm\s+build(?:\s|$)/.test(instruction),
+    );
+    expect(
+      installIndex,
+      "build stage must install before the recursive build",
+    ).toBeGreaterThan(-1);
+    expect(
+      buildIndex,
+      "build stage must run the recursive build after install",
+    ).toBeGreaterThan(installIndex);
+
+    const rootManifest = JSON.parse(read("package.json")) as {
+      scripts?: { build?: unknown };
+    };
+    expect(rootManifest.scripts?.build).toMatch(/\bpnpm\s+-r\b/);
+
+    const buildableWorkspacePackages = workspacePackageDirectories().filter(
+      (path) => {
+        const manifest = JSON.parse(read(join(path, "package.json"))) as {
+          scripts?: { build?: unknown };
+        };
+        return typeof manifest.scripts?.build === "string";
+      },
+    );
+    expect(buildableWorkspacePackages).not.toHaveLength(0);
+
+    const preInstallSnapshot = dockerBuildPreInstallSnapshot();
+    const missingManifests: string[] = [];
+    for (const path of buildableWorkspacePackages) {
+      const expectedManifest = JSON.parse(read(join(path, "package.json"))) as {
+        name?: unknown;
+      };
+      const snapshotManifest = preInstallSnapshot.get(
+        `/app/${path}/package.json`,
+      );
+      if (snapshotManifest === undefined) {
+        missingManifests.push(`${path}/package.json`);
+        continue;
+      }
+      const installedManifest = JSON.parse(snapshotManifest) as {
+        name?: unknown;
+      };
+      expect(
+        installedManifest.name,
+        `snapshot manifest identity: ${path}`,
+      ).toBe(expectedManifest.name);
+    }
+    expect(
+      missingManifests,
+      "Docker install snapshot is missing workspace package manifest(s): " +
+        missingManifests.join(", "),
+    ).toEqual([]);
   });
 
   it("builds a self-contained production deployment for both runtime entrypoints", () => {
