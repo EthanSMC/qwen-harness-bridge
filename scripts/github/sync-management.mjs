@@ -2,9 +2,9 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { closingIssueNumbers } from "./ai-issue-controller.mjs";
 import {
   assertIssueInvariant,
+  closingIssueNumbers,
   parseDependencies,
   STATUS_LABELS,
 } from "./ai-issue-policy.mjs";
@@ -12,6 +12,39 @@ import { validateMigrationRegistry } from "./verify-ai-lifecycle.mjs";
 import { eligibleCollaborators } from "./verify-pr-review-evidence.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
+const GH_COMMAND_TIMEOUT_MS = 10_000;
+const MAX_HISTORICAL_PR_CANDIDATES_PER_ISSUE = 20;
+const HISTORICAL_EVIDENCE_QUERY = `
+query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(first: 100, states: CLOSED, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number
+        closedAt
+        timelineItems(first: 100, itemTypes: [CROSS_REFERENCED_EVENT]) {
+          pageInfo { hasNextPage }
+          nodes {
+            ... on CrossReferencedEvent {
+              source {
+                __typename
+                ... on PullRequest {
+                  number
+                  state
+                  mergedAt
+                  mergeCommit { oid }
+                  body
+                  baseRefName
+                  repository { nameWithOwner }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
 
 export const PLAN_DEFINITIONS = Object.freeze([
   {
@@ -228,6 +261,57 @@ export const renderPlanIssueBody = ({
   ].join("\n");
 };
 
+const dependencyDeclaration = (blockedBy) =>
+  blockedBy.length === 0
+    ? "Blocked by none"
+    : `Blocked by ${blockedBy.map((number) => `#${number}`).join(", ")}`;
+
+export const mergePlanIssueBody = ({
+  existingBody,
+  canonicalBody,
+  blockedBy,
+  active,
+}) => {
+  const existing = String(existingBody ?? "");
+  if (active) {
+    const currentDependencies = parseDependencies(existing);
+    if (!sameValues(currentDependencies, blockedBy)) {
+      throw new Error(
+        "Active Issue dependencies cannot change without an explicit migration",
+      );
+    }
+    return existing;
+  }
+  const declarations = existing.match(/^Blocked by[\t ]+.+$/gimu) ?? [];
+  if (declarations.length > 1) {
+    throw new Error("Issue body has multiple dependency declarations");
+  }
+  if (existing.trim() === "" || existing.split(/\r?\n/u).length <= 3) {
+    return canonicalBody;
+  }
+  const desiredDependency = dependencyDeclaration(blockedBy);
+  let merged =
+    declarations.length === 1
+      ? existing.replace(/^Blocked by[\t ]+.+$/imu, desiredDependency)
+      : `${existing.trimEnd()}\n\n${desiredDependency}`;
+  for (const heading of [
+    "## Outcome",
+    "## Verification",
+    "## Risk and rollback",
+    "## Definition of done",
+  ]) {
+    if (merged.includes(heading)) continue;
+    const start = canonicalBody.indexOf(heading);
+    const next = canonicalBody.indexOf("\n## ", start + heading.length);
+    const section = canonicalBody.slice(
+      start,
+      next < 0 ? canonicalBody.length : next,
+    );
+    merged = `${merged.trimEnd()}\n\n${section.trim()}\n`;
+  }
+  return merged;
+};
+
 const statusNames = (issue) =>
   (issue.labels ?? [])
     .map((label) => (typeof label === "string" ? label : label?.name))
@@ -246,6 +330,7 @@ export const deriveLifecycleState = ({
   dependencies,
   closingPullRequests = [],
   migrationOwner = null,
+  historicalEvidence = null,
 }) => {
   const states = statusNames(issue);
   const assignees = assigneeLogins(issue);
@@ -253,7 +338,7 @@ export const deriveLifecycleState = ({
     if (
       String(issue.state_reason ?? issue.stateReason).toLowerCase() !==
         "completed" ||
-      !issue.body?.includes("<!-- qhb-plan-task:")
+      !historicalEvidence?.verified
     ) {
       throw new Error(
         `Issue #${issue.number} is closed without completed historical evidence`,
@@ -306,16 +391,164 @@ export const deriveLifecycleState = ({
   };
 };
 
-const createGh = (execFileSyncImpl, workspaceRoot) => {
-  const json = (args, input) =>
-    JSON.parse(
-      execFileSyncImpl("gh", args, {
-        cwd: workspaceRoot,
-        encoding: "utf8",
-        input: input === undefined ? undefined : JSON.stringify(input),
-        stdio: ["pipe", "pipe", "pipe"],
-      }).trim() || "null",
+export const verifyHistoricalClosure = ({
+  issue,
+  pullRequests,
+  repository,
+  defaultBranch,
+  gh,
+}) => {
+  const issueNumber = Number(issue.number);
+  const candidates = pullRequests.filter((pullRequest) => {
+    const closing = closingIssueNumbers(pullRequest.body);
+    const uniqueClosing = new Set(closing);
+    return (
+      pullRequest.state === "closed" &&
+      Boolean(pullRequest.merged_at) &&
+      Boolean(pullRequest.merge_commit_sha) &&
+      closing.length > 0 &&
+      uniqueClosing.size === 1 &&
+      closing[0] === issueNumber &&
+      pullRequest.base?.ref === defaultBranch &&
+      pullRequest.base?.repo?.full_name?.toLowerCase() ===
+        repository.toLowerCase()
     );
+  });
+  if (candidates.length !== 1) {
+    throw new Error(
+      `Issue #${issueNumber} needs exactly one historical merged closing pull request`,
+    );
+  }
+  const pullRequest = candidates[0];
+  const mergedAt = Date.parse(pullRequest.merged_at);
+  const closedAt = Date.parse(issue.closed_at ?? "");
+  if (Number.isNaN(mergedAt) || Number.isNaN(closedAt) || closedAt < mergedAt) {
+    throw new Error(`Issue #${issueNumber} has invalid closure chronology`);
+  }
+  const comparison = gh.api(
+    `repos/${repository}/compare/${pullRequest.merge_commit_sha}...${encodeURIComponent(defaultBranch)}`,
+  );
+  if (!["ahead", "identical"].includes(comparison.status)) {
+    throw new Error(
+      `Issue #${issueNumber} merge commit is not reachable from ${defaultBranch}`,
+    );
+  }
+  return {
+    verified: true,
+    pullRequest: pullRequest.number,
+    mergeCommit: pullRequest.merge_commit_sha,
+  };
+};
+
+export const loadHistoricalPullRequests = ({ gh, issues, repository }) => {
+  const [owner, name] = repository.split("/");
+  const closedNumbers = new Set(
+    issues
+      .filter((issue) => String(issue.state).toLowerCase() === "closed")
+      .map((issue) => Number(issue.number)),
+  );
+  const pullRequests = new Map();
+  let cursor = null;
+  for (let page = 1; page <= 100; page += 1) {
+    const response = gh.graphql(HISTORICAL_EVIDENCE_QUERY, {
+      owner,
+      name,
+      ...(cursor ? { cursor } : {}),
+    });
+    const connection = response?.data?.repository?.issues;
+    if (!connection || !Array.isArray(connection.nodes)) {
+      throw new Error(`Historical Issue evidence page ${page} is invalid`);
+    }
+    for (const issue of connection.nodes) {
+      if (!closedNumbers.has(Number(issue.number))) continue;
+      const timeline = issue.timelineItems;
+      if (!timeline || !Array.isArray(timeline.nodes)) {
+        throw new Error(`Issue #${issue.number} timeline evidence is invalid`);
+      }
+      if (timeline.pageInfo?.hasNextPage === true) {
+        throw new Error(
+          `Issue #${issue.number} exceeds the 100-event historical timeline cap`,
+        );
+      }
+      const sources = timeline.nodes
+        .map((event) => event?.source)
+        .filter(
+          (source) =>
+            source?.__typename === "PullRequest" &&
+            source.repository?.nameWithOwner?.toLowerCase() ===
+              repository.toLowerCase(),
+        );
+      if (sources.length > MAX_HISTORICAL_PR_CANDIDATES_PER_ISSUE) {
+        throw new Error(
+          `Issue #${issue.number} exceeds the historical pull-request candidate cap`,
+        );
+      }
+      for (const source of sources) {
+        pullRequests.set(source.number, {
+          number: source.number,
+          state:
+            source.state === "MERGED" ? "closed" : source.state.toLowerCase(),
+          merged_at: source.mergedAt,
+          merge_commit_sha: source.mergeCommit?.oid ?? null,
+          body: source.body,
+          base: {
+            ref: source.baseRefName,
+            repo: { full_name: source.repository.nameWithOwner },
+          },
+        });
+      }
+    }
+    if (connection.pageInfo?.hasNextPage !== true) {
+      return [...pullRequests.values()];
+    }
+    if (typeof connection.pageInfo.endCursor !== "string") {
+      throw new Error(`Historical Issue evidence page ${page} has no cursor`);
+    }
+    cursor = connection.pageInfo.endCursor;
+  }
+  if (cursor) {
+    throw new Error(
+      "Historical Issue evidence reached the 100-page safety cap",
+    );
+  }
+  if (closedNumbers.size > 0) {
+    throw new Error("Historical Issue evidence was not returned by GitHub");
+  }
+  return [...pullRequests.values()];
+};
+
+export const createGh = (execFileSyncImpl, workspaceRoot) => {
+  const run = (args, input, { readOnly = false } = {}) => {
+    const methodIndex = args.indexOf("--method");
+    const method =
+      methodIndex >= 0 ? String(args[methodIndex + 1]).toUpperCase() : "GET";
+    const attempts = method === "GET" || readOnly ? 3 : 1;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        return execFileSyncImpl("gh", args, {
+          cwd: workspaceRoot,
+          encoding: "utf8",
+          timeout: GH_COMMAND_TIMEOUT_MS,
+          input: input === undefined ? undefined : JSON.stringify(input),
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (error) {
+        if (error?.code === "ETIMEDOUT" && attempt < attempts) continue;
+        const target = args[1] ?? args[0] ?? "command";
+        const reason = error?.code === "ETIMEDOUT" ? "timed out" : "failed";
+        throw new Error(`GitHub CLI request ${reason}: ${target}`);
+      }
+    }
+    throw new Error("GitHub CLI request exhausted its bounded attempts");
+  };
+  const json = (args, input) => JSON.parse(run(args, input).trim() || "null");
+  const graphql = (query, variables) => {
+    const args = ["api", "graphql", "-f", `query=${query}`];
+    for (const [key, value] of Object.entries(variables)) {
+      args.push("-F", `${key}=${value}`);
+    }
+    return JSON.parse(run(args, undefined, { readOnly: true }).trim());
+  };
   const api = (path, method = "GET", body) =>
     json(
       [
@@ -328,20 +561,53 @@ const createGh = (execFileSyncImpl, workspaceRoot) => {
       body,
     );
   const paginatedApi = (path) => {
-    const pages = json([
-      "api",
-      path,
-      "--method",
-      "GET",
-      "--paginate",
-      "--slurp",
-    ]);
-    if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page))) {
-      throw new Error("GitHub paginated response was not an array of pages");
+    const separator = path.includes("?") ? "&" : "?";
+    const items = [];
+    for (let page = 1; page <= 100; page += 1) {
+      const pageItems = api(`${path}${separator}page=${page}`);
+      if (!Array.isArray(pageItems) || pageItems.length > 100) {
+        throw new Error(`GitHub pagination page ${page} is invalid`);
+      }
+      items.push(...pageItems);
+      if (pageItems.length < 100) return items;
     }
-    return pages.flat();
+    throw new Error("GitHub pagination reached the 100-page safety cap");
   };
-  return { json, api, paginatedApi };
+  const paginatedSearchApi = (path) => {
+    const separator = path.includes("?") ? "&" : "?";
+    const items = [];
+    for (let page = 1; page <= 10; page += 1) {
+      const response = api(`${path}${separator}per_page=100&page=${page}`);
+      if (
+        !response ||
+        !Number.isSafeInteger(response.total_count) ||
+        response.total_count < 0 ||
+        !Array.isArray(response.items) ||
+        response.items.length > 100
+      ) {
+        throw new Error(`GitHub search page ${page} is invalid`);
+      }
+      if (response.total_count > 1_000) {
+        throw new Error("GitHub search exceeds the 1000-result safety cap");
+      }
+      items.push(...response.items);
+      if (items.length >= response.total_count) return items;
+    }
+    throw new Error("GitHub search reached the 10-page safety cap");
+  };
+  const serverTime = () => {
+    const output = run(
+      ["api", "rate_limit", "--method", "GET", "--include"],
+      undefined,
+    );
+    const date = /^date:\s*(.+)$/imu.exec(output)?.[1]?.trim();
+    const timestamp = Date.parse(date ?? "");
+    if (Number.isNaN(timestamp)) {
+      throw new Error("GitHub API did not return a valid Date header");
+    }
+    return new Date(timestamp).toISOString();
+  };
+  return { json, api, graphql, paginatedApi, paginatedSearchApi, serverTime };
 };
 
 const findTaskIssue = (task, issues) => {
@@ -380,11 +646,13 @@ export const main = ({
   argv = process.argv.slice(2),
   execFileSyncImpl = execFileSync,
   workspaceRoot = root,
+  now = null,
 } = {}) => {
   const unknown = argv.filter((value) => value !== "--dry-run");
   if (unknown.length > 0) throw new Error(`Unknown sync option: ${unknown[0]}`);
   const dryRun = argv.includes("--dry-run");
   const gh = createGh(execFileSyncImpl, workspaceRoot);
+  const authoritativeNow = now ?? gh.serverTime();
   const repository = gh.json([
     "repo",
     "view",
@@ -411,7 +679,7 @@ export const main = ({
     `repos/${repository}/labels?per_page=100`,
   );
   const desiredMilestones = parseMilestones(workspaceRoot);
-  const existingMilestones = gh.api(
+  const existingMilestones = gh.paginatedApi(
     `repos/${repository}/milestones?state=all&per_page=100`,
   );
   const milestoneNumbers = new Map();
@@ -462,9 +730,22 @@ export const main = ({
   const existingIssues = gh
     .paginatedApi(`repos/${repository}/issues?state=all&per_page=100`)
     .filter((item) => !item.pull_request);
-  const openPullRequests = gh.paginatedApi(
-    `repos/${repository}/pulls?state=open&per_page=100`,
+  const openPullRequests = gh.paginatedSearchApi(
+    `search/issues?q=${encodeURIComponent(`repo:${repository} is:pr is:open`)}`,
   );
+  const historicalPullRequests = loadHistoricalPullRequests({
+    gh,
+    issues: existingIssues,
+    repository,
+  });
+  const pullRequests = [
+    ...new Map(
+      [...openPullRequests, ...historicalPullRequests].map((pullRequest) => [
+        pullRequest.number,
+        pullRequest,
+      ]),
+    ).values(),
+  ];
   const taskIdentities = [];
   for (const definition of definitions) {
     for (const task of definition.tasks) {
@@ -512,7 +793,7 @@ export const main = ({
         throw new Error(`Issue #${number} dependency is unavailable`);
       return dependency;
     });
-    const body = renderPlanIssueBody({
+    const canonicalBody = renderPlanIssueBody({
       definition,
       task,
       repository,
@@ -527,19 +808,36 @@ export const main = ({
           mode: "report",
           pullRequestNumber: pullRequest.number,
           issueNumber: issue.number,
-          now: new Date().toISOString(),
+          now: authoritativeNow,
         }).migrated,
     );
     if (migratedPullRequests.length > 1) {
       throw new Error(`Issue #${issue.number} has multiple migration records`);
     }
     const migrationOwner = migratedPullRequests[0]?.user?.login ?? null;
+    const historicalEvidence =
+      String(issue.state).toLowerCase() === "closed"
+        ? verifyHistoricalClosure({
+            issue,
+            pullRequests,
+            repository,
+            defaultBranch: "main",
+            gh,
+          })
+        : null;
     const lifecycle = deriveLifecycleState({
       issue,
-      body,
+      body: canonicalBody,
       dependencies,
       closingPullRequests,
       migrationOwner,
+      historicalEvidence,
+    });
+    const body = mergePlanIssueBody({
+      existingBody: issue.body,
+      canonicalBody,
+      blockedBy,
+      active: ["in-progress", "review", "blocked"].includes(lifecycle.state),
     });
     const milestone = milestoneFor(definition, task);
     const desired = {

@@ -1,25 +1,36 @@
-import { randomUUID as nodeRandomUUID } from "node:crypto";
+import { createHash, randomUUID as nodeRandomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   assertIssueInvariant,
+  closingIssueNumbers,
   currentClaimFromReceipts,
   evaluateReadiness,
   LifecycleError,
+  MANAGED_TYPE_LABELS,
   parseDependencies,
   parseLifecycleCommand,
   parseReceipts,
   planLifecycleCommand,
   receiptBody,
   STATUS_LABELS,
+  stripMarkdownCode,
 } from "./ai-issue-policy.mjs";
+import { validateLifecycleMutationMode } from "./ai-lifecycle-registry.mjs";
 import { createGitHubClient } from "./github-api.mjs";
 
 const WORKFLOW_LOGIN = "github-actions[bot]";
 const LEASE_MILLISECONDS = 24 * 60 * 60 * 1000;
 const COMMAND_PREFIX = "/ai-";
+const MAX_COMMANDS_PER_DRAIN = 1_000;
+const MAX_RECONCILIATION_OBJECTS = 1_000;
+const SYSTEM_EVENT_BASE = 8_000_000_000_000_000;
+const MIGRATION_PATH = resolve(
+  import.meta.dirname,
+  "../../docs/github/ai-lifecycle-migrations.json",
+);
 
 const requirePositiveInteger = (value, label) => {
   const number = Number(value);
@@ -40,6 +51,13 @@ const requireRepository = (event, repository) => {
   }
 };
 
+export const stableSystemEventId = (...parts) => {
+  const digest = createHash("sha256")
+    .update(parts.map((part) => String(part ?? "")).join("\u0000"))
+    .digest();
+  return SYSTEM_EVENT_BASE + digest.readUIntBE(0, 6);
+};
+
 const labelsOf = (issue) =>
   (issue.labels ?? []).map((label) =>
     typeof label === "string" ? label : label?.name,
@@ -49,6 +67,19 @@ const assigneesOf = (issue) =>
   (issue.assignees ?? []).map((assignee) =>
     typeof assignee === "string" ? assignee : assignee?.login,
   );
+
+const managedTypeCount = (issue) =>
+  labelsOf(issue).filter((label) => MANAGED_TYPE_LABELS.includes(label)).length;
+
+const assertManagedIssue = (issue) => {
+  const count = managedTypeCount(issue);
+  if (count !== 1) {
+    throw new LifecycleError(
+      count === 0 ? "NOT_READY" : "STATE_MISMATCH",
+      "The Issue must have exactly one managed type label.",
+    );
+  }
+};
 
 const statusOf = (issue) => {
   const statuses = labelsOf(issue).filter((label) =>
@@ -81,36 +112,9 @@ const plusOneLease = (now) => {
   return new Date(timestamp + LEASE_MILLISECONDS).toISOString();
 };
 
-const stripFencedCode = (body) => {
-  let fenced = false;
-  return String(body ?? "")
-    .split(/\r?\n/u)
-    .flatMap((line) => {
-      if (/^\s*```/u.test(line)) {
-        fenced = !fenced;
-        return [];
-      }
-      return fenced ? [] : [line.replace(/`[^`]*`/gu, "")];
-    })
-    .join("\n");
-};
-
-export const closingIssueNumbers = (body) => {
-  const publicBody = stripFencedCode(body);
-  return [
-    ...new Set(
-      [
-        ...publicBody.matchAll(
-          /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9]\d*)\b/giu,
-        ),
-      ].map((match) => Number(match[1])),
-    ),
-  ];
-};
-
 export const primaryIssueNumber = (body) => {
   const matches = [
-    ...stripFencedCode(body).matchAll(
+    ...stripMarkdownCode(body).matchAll(
       /^\s*-\s*Primary Issue:\s*#([1-9]\d*)\s*$/gimu,
     ),
   ];
@@ -131,6 +135,85 @@ export const primaryIssueNumber = (body) => {
   return primary;
 };
 
+const claimReceiptCommentId = ({ body, repository, issueNumber }) => {
+  const matches = [
+    ...stripMarkdownCode(body).matchAll(
+      /^\s*-\s*Claim receipt:\s*(\S+)\s*$/gimu,
+    ),
+  ];
+  if (matches.length !== 1) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "A governed pull request must name exactly one claim receipt.",
+    );
+  }
+  let url;
+  try {
+    url = new URL(matches[0][1]);
+  } catch {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "The pull request claim receipt URL is invalid.",
+    );
+  }
+  const [owner, name] = repository.split("/");
+  const expectedPath = `/${owner}/${name}/issues/${issueNumber}`;
+  const commentMatch = /^#issuecomment-([1-9]\d*)$/u.exec(url.hash);
+  if (
+    url.protocol !== "https:" ||
+    url.hostname.toLowerCase() !== "github.com" ||
+    url.pathname.toLowerCase() !== expectedPath.toLowerCase() ||
+    url.search ||
+    !commentMatch
+  ) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "The pull request claim receipt must be the current Issue claim comment.",
+    );
+  }
+  return Number(commentMatch[1]);
+};
+
+const requireChronology = ({ claim, pullRequest, issueClosedAt }) => {
+  const claimedAt = Date.parse(claim?.claimedAt ?? "");
+  const mergedAt = Date.parse(pullRequest?.merged_at ?? "");
+  const closedAt = Date.parse(issueClosedAt ?? "");
+  if (
+    Number.isNaN(claimedAt) ||
+    Number.isNaN(mergedAt) ||
+    Number.isNaN(closedAt) ||
+    mergedAt < claimedAt ||
+    closedAt < mergedAt
+  ) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "The claim, merge, and Issue closure chronology is invalid.",
+    );
+  }
+};
+
+const assertMergeReachable = async ({
+  github,
+  mergeCommitSha,
+  defaultBranch,
+}) => {
+  if (!/^[0-9a-f]{7,64}$/iu.test(mergeCommitSha ?? "")) {
+    throw new LifecycleError(
+      "GITHUB_STATE_UNAVAILABLE",
+      "The closing pull request has no valid merge commit.",
+    );
+  }
+  const comparison = await github.get(
+    `/compare/${mergeCommitSha}...${encodeURIComponent(defaultBranch)}`,
+  );
+  if (!["ahead", "identical"].includes(comparison.status)) {
+    throw new LifecycleError(
+      "GITHUB_STATE_UNAVAILABLE",
+      "The closing merge commit is not reachable from the default branch.",
+    );
+  }
+};
+
 const closingPullRequestsFor = (pullRequests, issueNumber) =>
   pullRequests.filter(
     (pullRequest) =>
@@ -143,7 +226,16 @@ const mergedPullRequestForIssue = async ({
   issueNumber,
   repository,
   defaultBranch,
+  claim,
+  issueClosedAt,
+  openClosingPullRequests,
 }) => {
+  if (openClosingPullRequests.length !== 0) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Completed closure is invalid while a closing pull request is still open.",
+    );
+  }
   const timeline = await github.getAll(
     `/issues/${issueNumber}/timeline`,
     "Issue timeline",
@@ -166,26 +258,39 @@ const mergedPullRequestForIssue = async ({
   const candidates = await Promise.all(
     candidateNumbers.map((number) => github.get(`/pulls/${number}`)),
   );
-  const merged = candidates.filter(
-    (pullRequest) =>
-      pullRequest.merged === true &&
-      pullRequest.state === "closed" &&
-      primaryIssueNumber(pullRequest.body) === issueNumber &&
-      pullRequest.base?.ref === defaultBranch &&
-      pullRequest.base?.repo?.full_name?.toLowerCase() ===
-        repository.toLowerCase(),
-  );
-  if (merged.length !== 1 || !merged[0].merge_commit_sha) {
+  const merged = [];
+  for (const pullRequest of candidates) {
+    let matchesCurrentClaim = false;
+    try {
+      matchesCurrentClaim =
+        pullRequest.merged === true &&
+        pullRequest.state === "closed" &&
+        primaryIssueNumber(pullRequest.body) === issueNumber &&
+        claimReceiptCommentId({
+          body: pullRequest.body,
+          repository,
+          issueNumber,
+        }) === claim.claimCommentId &&
+        pullRequest.user?.login === claim.owner &&
+        pullRequest.base?.ref === defaultBranch &&
+        pullRequest.base?.repo?.full_name?.toLowerCase() ===
+          repository.toLowerCase();
+    } catch (error) {
+      if (!(error instanceof LifecycleError)) throw error;
+    }
+    if (!matchesCurrentClaim) continue;
+    requireChronology({ claim, pullRequest, issueClosedAt });
+    await assertMergeReachable({
+      github,
+      mergeCommitSha: pullRequest.merge_commit_sha,
+      defaultBranch,
+    });
+    merged.push(pullRequest);
+  }
+  if (merged.length !== 1) {
     throw new LifecycleError(
       "STATE_MISMATCH",
-      "Completed closure requires exactly one verified merged pull request.",
-    );
-  }
-  const commit = await github.get(`/commits/${merged[0].merge_commit_sha}`);
-  if (commit.sha !== merged[0].merge_commit_sha) {
-    throw new LifecycleError(
-      "GITHUB_STATE_UNAVAILABLE",
-      "The closing merge commit is not reachable through the repository API.",
+      "Completed closure requires exactly one merged pull request bound to the current claim.",
     );
   }
   return merged[0];
@@ -193,6 +298,23 @@ const mergedPullRequestForIssue = async ({
 
 const commentsFor = (github, issueNumber) =>
   github.getAll(`/issues/${issueNumber}/comments`, "Issue comments");
+
+export const fetchDependencies = async (github, numbers, concurrency = 4) => {
+  const results = new Array(numbers.length);
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, numbers.length) },
+    async () => {
+      while (nextIndex < numbers.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await github.get(`/issues/${numbers[index]}`);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
+};
 
 const dependenciesFor = async (github, issue) => {
   let numbers;
@@ -203,15 +325,21 @@ const dependenciesFor = async (github, issue) => {
       return [];
     throw error;
   }
-  return Promise.all(numbers.map((number) => github.get(`/issues/${number}`)));
+  return fetchDependencies(github, numbers);
 };
 
-const loadIssueContext = async (github, issueNumber) => {
-  const issue = await github.get(`/issues/${issueNumber}`);
+const loadIssueContext = async (
+  github,
+  issueNumber,
+  knownIssue = null,
+  knownOpenPullRequests = null,
+) => {
+  const issue = knownIssue ?? (await github.get(`/issues/${issueNumber}`));
   const [comments, dependencies, openPullRequests] = await Promise.all([
     commentsFor(github, issueNumber),
     dependenciesFor(github, issue),
-    github.getAll("/pulls?state=open", "open pull requests"),
+    knownOpenPullRequests ??
+      github.getAll("/pulls?state=open", "open pull requests"),
   ]);
   return {
     issue,
@@ -260,7 +388,7 @@ const pendingIntentFor = (comments, receipts, eventId) => {
       comment.body?.includes("<!-- qhb-ai-intent:v1") &&
       comment.body.includes(`event-id=${eventId}`),
   );
-  if (intents.length > 1) {
+  if (new Set(intents.map(({ body }) => body)).size > 1) {
     throw new LifecycleError(
       "STATE_MISMATCH",
       "One lifecycle event has conflicting pending intents.",
@@ -417,6 +545,14 @@ const recoverPendingIntent = async ({
   await mutateIssueToPlan(github, issueNumber, loaded.issue, plan);
   await postReceipt(github, issueNumber, plan.receipt);
   const issue = await github.get(`/issues/${issueNumber}`);
+  try {
+    assertManagedIssue(issue);
+  } catch (error) {
+    if (error instanceof LifecycleError && error.code === "NOT_READY") {
+      return { status: "ignored", code: error.code };
+    }
+    throw error;
+  }
   assertIssueInvariant(issue);
   return { status: "applied", plan, issue, recovered: true };
 };
@@ -475,6 +611,15 @@ const postInvalidCommandNotice = async (github, issueNumber, eventId) => {
     "code=INVALID_COMMAND",
     "-->",
   ].join("\n");
+  const existing = await commentsFor(github, issueNumber);
+  if (
+    existing.some(
+      (comment) =>
+        comment.user?.login === WORKFLOW_LOGIN && comment.body === body,
+    )
+  ) {
+    return;
+  }
   await github.mutateAndVerify({
     mutation: {
       method: "POST",
@@ -502,7 +647,6 @@ export const handleIssueComment = async ({
   event,
   repository,
   mode = "report",
-  now,
   eventId,
   randomUUID = nodeRandomUUID,
 }) => {
@@ -537,6 +681,9 @@ export const handleIssueComment = async ({
     throw new Error("Live GitHub comment does not match the webhook event");
   }
   const issue = await github.get(`/issues/${issueNumber}`);
+  const typeCount = managedTypeCount(issue);
+  if (typeCount === 0) return { status: "ignored" };
+  assertManagedIssue(issue);
 
   let command;
   try {
@@ -566,7 +713,7 @@ export const handleIssueComment = async ({
 
   let loaded;
   try {
-    loaded = await loadIssueContext(github, issueNumber);
+    loaded = await loadIssueContext(github, issueNumber, issue);
   } catch (error) {
     if (!(error instanceof LifecycleError)) throw error;
     return rejectCommand({
@@ -612,7 +759,7 @@ export const handleIssueComment = async ({
       dependencies: loaded.dependencies,
       closingPullRequests: loaded.closingPullRequests,
       receipts: loaded.receipts,
-      now,
+      now: liveComment.created_at,
       eventId: commentId,
       randomUUID,
     });
@@ -699,6 +846,7 @@ export const handlePullRequest = async ({
   mode = "report",
   now,
   eventId,
+  openPullRequests = null,
 }) => {
   assertMode(mode);
   requireRepository(event, repository);
@@ -732,11 +880,20 @@ export const handlePullRequest = async ({
     );
   }
 
-  const loaded = await loadIssueContext(github, issueNumber);
+  const issue = await github.get(`/issues/${issueNumber}`);
+  assertManagedIssue(issue);
+  const loaded = await loadIssueContext(
+    github,
+    issueNumber,
+    issue,
+    openPullRequests,
+  );
   const prior = loaded.receipts.find(
     ({ eventId: id }) => id === Number(eventId),
   );
-  if (prior) return { status: "applied", receipt: prior, idempotent: true };
+  if (!(pullRequest.merged === true && prior?.action === "pr-open") && prior) {
+    return { status: "applied", receipt: prior, idempotent: true };
+  }
   if (mode === "enforce") {
     const recovered = await recoverPendingIntent({
       github,
@@ -779,6 +936,18 @@ export const handlePullRequest = async ({
       "The pull request does not have a current verified claim.",
     );
   }
+  if (
+    claimReceiptCommentId({
+      body: pullRequest.body,
+      repository,
+      issueNumber,
+    }) !== claim.claimCommentId
+  ) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "The pull request claim receipt is not the current claim generation.",
+    );
+  }
 
   let plan;
   if (pullRequest.state === "open") {
@@ -798,10 +967,10 @@ export const handlePullRequest = async ({
       leaseExpiresAt: claim.leaseExpiresAt,
     });
   } else if (pullRequest.merged === true) {
-    if (state !== "review") {
+    if (!["in-progress", "review"].includes(state)) {
       throw new LifecycleError(
         "INVALID_TRANSITION",
-        "Only review work can merge.",
+        "Only active or review work can reconcile a verified merge.",
       );
     }
     if (
@@ -815,23 +984,71 @@ export const handlePullRequest = async ({
         "Merged work must close its Issue as completed and expose a merge commit.",
       );
     }
-    const mergeCommit = await github.get(
-      `/commits/${pullRequest.merge_commit_sha}`,
-    );
-    if (mergeCommit.sha !== pullRequest.merge_commit_sha) {
-      throw new LifecycleError(
-        "GITHUB_STATE_UNAVAILABLE",
-        "The merge commit is not reachable through the repository API.",
-      );
+    requireChronology({
+      claim,
+      pullRequest,
+      issueClosedAt: loaded.issue.closed_at,
+    });
+    await assertMergeReachable({
+      github,
+      mergeCommitSha: pullRequest.merge_commit_sha,
+      defaultBranch,
+    });
+    const mergeEventId =
+      state === "in-progress"
+        ? stableSystemEventId(
+            "pull-merge",
+            pullRequest.number,
+            pullRequest.merged_at,
+            pullRequest.merge_commit_sha,
+          )
+        : eventId;
+    if (state === "in-progress") {
+      const catchup = systemPlan({
+        eventId,
+        claim,
+        action: "pr-open",
+        from: "in-progress",
+        to: "review",
+        leaseExpiresAt: claim.leaseExpiresAt,
+      });
+      if (mode === "report") {
+        return {
+          status: "report",
+          plans: [
+            catchup,
+            systemPlan({
+              eventId: mergeEventId,
+              claim,
+              action: "merge",
+              from: "review",
+              to: "done",
+            }),
+          ],
+        };
+      }
+      await ensureIntent(github, issueNumber, catchup);
+      await postReceipt(github, issueNumber, catchup.receipt);
+      const existingMerge = parseReceipts(
+        await commentsFor(github, issueNumber),
+      ).find(({ eventId: id }) => id === mergeEventId);
+      if (existingMerge) {
+        return {
+          status: "applied",
+          receipt: existingMerge,
+          idempotent: true,
+        };
+      }
     }
     plan = systemPlan({
-      eventId,
+      eventId: mergeEventId,
       claim,
       action: "merge",
-      from: state,
+      from: "review",
       to: "done",
     });
   } else {
+    if (state === "in-progress") return { status: "unchanged" };
     if (state !== "review") {
       throw new LifecycleError(
         "INVALID_TRANSITION",
@@ -857,6 +1074,7 @@ export const handleIssueChange = async ({
   repository,
   mode = "report",
   eventId,
+  openPullRequests = null,
 }) => {
   assertMode(mode);
   requireRepository(event, repository);
@@ -864,7 +1082,16 @@ export const handleIssueChange = async ({
     event.issue?.number,
     "Issue number",
   );
-  const loaded = await loadIssueContext(github, issueNumber);
+  const issue = await github.get(`/issues/${issueNumber}`);
+  const typeCount = managedTypeCount(issue);
+  if (typeCount === 0) return { status: "ignored" };
+  assertManagedIssue(issue);
+  const loaded = await loadIssueContext(
+    github,
+    issueNumber,
+    issue,
+    openPullRequests,
+  );
   const prior = loaded.receipts.find(
     ({ eventId: id }) => id === Number(eventId),
   );
@@ -932,6 +1159,9 @@ export const handleIssueChange = async ({
         issueNumber,
         repository,
         defaultBranch: event.repository.default_branch,
+        claim,
+        issueClosedAt: loaded.issue.closed_at,
+        openClosingPullRequests: loaded.closingPullRequests,
       });
       plan = systemPlan({
         eventId,
@@ -1028,13 +1258,22 @@ export const reconcileExpiredClaims = async ({
     "/issues?state=open&labels=status%3Ain-progress",
     "in-progress Issues",
   );
+  const openPullRequests = await github.getAll(
+    "/pulls?state=open",
+    "open pull requests",
+  );
   const released = [];
   for (const listedIssue of issues) {
     const issueNumber = requirePositiveInteger(
       listedIssue.number,
       "Issue number",
     );
-    const loaded = await loadIssueContext(github, issueNumber);
+    const loaded = await loadIssueContext(
+      github,
+      issueNumber,
+      null,
+      openPullRequests,
+    );
     if (mode === "enforce") {
       const recovered = await recoverPendingIntent({
         github,
@@ -1094,6 +1333,225 @@ export const reconcileExpiredClaims = async ({
   return { status: mode === "enforce" ? "applied" : "report", released };
 };
 
+const completedCommandEventIds = (comments) =>
+  new Set(
+    comments.flatMap((comment) => {
+      if (
+        comment.user?.login !== WORKFLOW_LOGIN ||
+        typeof comment.body !== "string"
+      ) {
+        return [];
+      }
+      const match =
+        /<!-- qhb-ai-(?:lifecycle|command-rejection):v1[\s\S]*?^event-id=([1-9]\d*)$/mu.exec(
+          comment.body,
+        );
+      return match ? [Number(match[1])] : [];
+    }),
+  );
+
+const issueNumberFromComment = (comment, repository) => {
+  let url;
+  try {
+    url = new URL(comment.issue_url);
+  } catch {
+    throw new Error("Repository comment is missing a valid Issue URL");
+  }
+  const escapedRepository = repository.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const match = new RegExp(
+    `^/repos/${escapedRepository}/issues/([1-9]\\d*)$`,
+    "iu",
+  ).exec(url.pathname);
+  if (
+    url.protocol !== "https:" ||
+    url.hostname.toLowerCase() !== "api.github.com" ||
+    url.search ||
+    url.hash ||
+    !match
+  ) {
+    throw new Error("Repository comment Issue URL is outside the repository");
+  }
+  return Number(match[1]);
+};
+
+export const reconcileLifecycleCommands = async ({
+  github,
+  repository,
+  defaultBranch,
+  mode = "report",
+  now,
+  issueNumber = null,
+  maxCommands = MAX_COMMANDS_PER_DRAIN,
+}) => {
+  assertMode(mode);
+  const comments = issueNumber
+    ? await commentsFor(github, issueNumber)
+    : await github.getAll(
+        "/issues/comments?sort=created&direction=asc",
+        "repository Issue comments",
+      );
+  const completed = completedCommandEventIds(comments);
+  const pending = comments
+    .filter(
+      (comment) =>
+        comment.user?.login !== WORKFLOW_LOGIN &&
+        typeof comment.body === "string" &&
+        comment.body.trimStart().startsWith(COMMAND_PREFIX) &&
+        !completed.has(Number(comment.id)),
+    )
+    .sort((left, right) => Number(left.id) - Number(right.id));
+  if (pending.length > maxCommands) {
+    throw new Error(
+      `AI lifecycle command backlog exceeds the ${maxCommands}-command drain cap`,
+    );
+  }
+  const results = [];
+  const failures = [];
+  for (const comment of pending) {
+    try {
+      const number = issueNumber ?? issueNumberFromComment(comment, repository);
+      results.push(
+        await handleIssueComment({
+          github,
+          event: {
+            repository: {
+              full_name: repository,
+              default_branch: defaultBranch,
+            },
+            issue: { number },
+            comment,
+          },
+          repository,
+          mode,
+          now,
+          eventId: comment.id,
+        }),
+      );
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      `${failures.length} lifecycle command(s) failed after the ordered drain continued`,
+    );
+  }
+  return { status: mode, processed: pending.length, results };
+};
+
+export const reconcileRepositoryState = async ({
+  github,
+  repository,
+  defaultBranch,
+  mode = "report",
+  now,
+  maxObjects = MAX_RECONCILIATION_OBJECTS,
+}) => {
+  assertMode(mode);
+  const [listedIssues, listedPullRequests] = await Promise.all([
+    github.getAll(
+      "/issues?state=all&sort=updated&direction=asc",
+      "repository Issues",
+    ),
+    github.getAll(
+      "/pulls?state=all&sort=updated&direction=asc",
+      "repository pull requests",
+    ),
+  ]);
+  const issues = listedIssues.filter(
+    (issue) => !issue.pull_request && managedTypeCount(issue) > 0,
+  );
+  const openPullRequests = listedPullRequests.filter(
+    (pullRequest) => pullRequest.state === "open",
+  );
+  const pullRequests = listedPullRequests.filter((pullRequest) => {
+    try {
+      const issueNumber = primaryIssueNumber(pullRequest.body);
+      claimReceiptCommentId({
+        body: pullRequest.body,
+        repository,
+        issueNumber,
+      });
+      return true;
+    } catch (error) {
+      if (error instanceof LifecycleError) return false;
+      throw error;
+    }
+  });
+  if (issues.length + pullRequests.length > maxObjects) {
+    throw new Error(
+      `AI lifecycle reconciliation exceeds the ${maxObjects}-object cap`,
+    );
+  }
+  const failures = [];
+  const results = [];
+  for (const issue of issues) {
+    try {
+      results.push(
+        await handleIssueChange({
+          github,
+          event: {
+            repository: {
+              full_name: repository,
+              default_branch: defaultBranch,
+            },
+            issue,
+          },
+          repository,
+          mode,
+          eventId: stableSystemEventId(
+            "issue-reconcile",
+            issue.number,
+            issue.updated_at,
+            issue.state,
+            issue.state_reason,
+          ),
+          openPullRequests,
+        }),
+      );
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  for (const pullRequest of pullRequests) {
+    try {
+      results.push(
+        await handlePullRequest({
+          github,
+          event: {
+            repository: {
+              full_name: repository,
+              default_branch: defaultBranch,
+            },
+            pull_request: pullRequest,
+          },
+          repository,
+          mode,
+          now,
+          openPullRequests,
+          eventId: stableSystemEventId(
+            "pull-reconcile",
+            pullRequest.number,
+            pullRequest.updated_at,
+            pullRequest.head?.sha,
+            pullRequest.merged_at,
+          ),
+        }),
+      );
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      `${failures.length} repository lifecycle object(s) failed after reconciliation continued`,
+    );
+  }
+  return { status: mode, processed: results.length, results };
+};
+
 export const runLifecycleController = async (context) => {
   switch (context.eventName) {
     case "issue_comment":
@@ -1115,10 +1573,11 @@ export const main = async ({
   eventName = process.env.GITHUB_EVENT_NAME,
   repository = process.env.GITHUB_REPOSITORY,
   token = process.env.GITHUB_TOKEN,
-  mode = process.env.AI_LIFECYCLE_MODE ?? "report",
+  mode = process.env.AI_LIFECYCLE_MUTATION_MODE ?? "report",
   runId = process.env.GITHUB_RUN_ID,
   fetchImpl = globalThis.fetch,
-  now = new Date().toISOString(),
+  now = null,
+  migrationsPath = MIGRATION_PATH,
 } = {}) => {
   if (typeof eventPath !== "string" || eventPath.length === 0) {
     throw new Error("GITHUB_EVENT_PATH is required");
@@ -1129,20 +1588,133 @@ export const main = async ({
   } catch {
     throw new Error("GITHUB_EVENT_PATH must contain valid JSON");
   }
-  const eventId =
-    eventName === "issue_comment"
-      ? requirePositiveInteger(event.comment?.id, "comment ID")
-      : requirePositiveInteger(runId, "GITHUB_RUN_ID");
   const github = createGitHubClient({ fetchImpl, repository, token });
-  const result = await runLifecycleController({
-    github,
-    event,
-    eventName,
-    repository,
+  const authoritativeNow = now ?? (await github.serverTime());
+  let migrations;
+  try {
+    migrations = JSON.parse(readFileSync(resolve(migrationsPath), "utf8"));
+  } catch {
+    throw new Error("Lifecycle migration registry must contain valid JSON");
+  }
+  const activation = validateLifecycleMutationMode(migrations, {
     mode,
-    now,
-    eventId,
+    now: authoritativeNow,
   });
+  if (activation.phase === "activated") {
+    const comparison = await github.get(
+      `/compare/${activation.activationCommit}...${encodeURIComponent(event.repository.default_branch)}`,
+    );
+    if (!["ahead", "identical"].includes(comparison.status)) {
+      throw new Error(
+        "Lifecycle activation commit is not reachable from the default branch",
+      );
+    }
+  }
+  const defaultBranch = event.repository?.default_branch;
+  if (typeof defaultBranch !== "string" || defaultBranch.length === 0) {
+    throw new Error("GitHub event default branch is required");
+  }
+  let result;
+  if (eventName === "issue_comment") {
+    if (event.issue?.pull_request) {
+      result = { status: "ignored" };
+      process.stdout.write(`${JSON.stringify(result)}\n`);
+      return result;
+    }
+    const issueNumber = requirePositiveInteger(
+      event.issue?.number,
+      "Issue number",
+    );
+    const lifecycle = await handleIssueChange({
+      github,
+      event,
+      repository,
+      mode,
+      eventId: stableSystemEventId(
+        "issue-reconcile",
+        issueNumber,
+        event.issue?.updated_at,
+        event.issue?.state,
+        event.issue?.state_reason,
+      ),
+    });
+    const commandDrain = await reconcileLifecycleCommands({
+      github,
+      repository,
+      defaultBranch,
+      mode,
+      now: authoritativeNow,
+      issueNumber,
+    });
+    result = { lifecycle, commandDrain };
+  } else if (eventName === "issues") {
+    const issueNumber = requirePositiveInteger(
+      event.issue?.number,
+      "Issue number",
+    );
+    const lifecycle = await runLifecycleController({
+      github,
+      event,
+      eventName,
+      repository,
+      mode,
+      now: authoritativeNow,
+      eventId: stableSystemEventId(
+        eventName,
+        issueNumber,
+        event.issue?.updated_at,
+        event.action,
+      ),
+    });
+    const commandDrain = await reconcileLifecycleCommands({
+      github,
+      repository,
+      defaultBranch,
+      mode,
+      now: authoritativeNow,
+      issueNumber,
+    });
+    result = { lifecycle, commandDrain };
+  } else if (["schedule", "workflow_dispatch"].includes(eventName)) {
+    const repositoryState = await reconcileRepositoryState({
+      github,
+      repository,
+      defaultBranch,
+      mode,
+      now: authoritativeNow,
+    });
+    const commandDrain = await reconcileLifecycleCommands({
+      github,
+      repository,
+      defaultBranch,
+      mode,
+      now: authoritativeNow,
+    });
+    const lifecycle = await reconcileExpiredClaims({
+      github,
+      mode,
+      now: authoritativeNow,
+      eventId: requirePositiveInteger(runId, "GITHUB_RUN_ID"),
+    });
+    result = { repositoryState, commandDrain, lifecycle };
+  } else {
+    result = await runLifecycleController({
+      github,
+      event,
+      eventName,
+      repository,
+      mode,
+      now: authoritativeNow,
+      eventId: stableSystemEventId(
+        eventName,
+        event.pull_request?.number,
+        event.pull_request?.updated_at,
+        event.action,
+        event.pull_request?.head?.sha,
+        event.pull_request?.merged_at,
+      ),
+    });
+  }
   process.stdout.write(`${JSON.stringify(result)}\n`);
   return result;
 };

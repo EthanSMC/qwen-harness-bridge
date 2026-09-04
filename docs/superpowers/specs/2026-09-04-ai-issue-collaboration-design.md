@@ -118,7 +118,7 @@ done -> waiting | ready      # only when GitHub reopens the Issue
 
 Invariants:
 
-- At most one managed `status:*` label is present.
+- Exactly one managed work `type:*` and exactly one managed `status:*` label are present after initialization.
 - `status:waiting`, `status:ready`, and `status:done` have no assignee.
 - `status:in-progress`, `status:review`, and owner-retained `status:blocked` have exactly one assignee.
 - A closed Issue has `status:done`; an open Issue never has `status:done`.
@@ -148,6 +148,7 @@ Blocked by #12, #19
 ```
 
 `Blocked by none` is explicit when an implementation Issue has no dependencies.
+The declaration is bounded to 512 UTF-8 bytes and at most 20 unique, non-self Issue references. The controller hydrates dependencies through a four-request worker pool and ignores untyped Issues before hydration.
 
 ## 7. Exclusive claim protocol
 
@@ -162,15 +163,17 @@ agent: codex
 
 `agent` is a lowercase provider-neutral identifier matching `[a-z0-9][a-z0-9._-]{0,31}`. `none` represents a human-only implementation. No thread URL or local path is accepted.
 
-### 7.2 Serialized decision
+### 7.2 Durable serialized decision
 
-The lifecycle workflow uses repository-scoped concurrency with `cancel-in-progress: false`. This deliberately serializes Issue, pull-request, and scheduled events even though their event numbers differ, closing the cross-event race that a PR-number or Issue-number key would leave open. It checks the live Issue, all readiness rules, current assignees, labels, open closing pull requests, and the comment author's current repository permission. The workflow never checks out contributor-controlled code and uses only the default branch implementation.
+The lifecycle workflow uses per-Issue concurrency with `cancel-in-progress: false`. GitHub may replace an older pending run even when cancellation is disabled, so concurrency alone is not a queue. Every Issue-triggered run lists the Issue comments, finds commands without a workflow receipt or bounded rejection marker, and drains them in immutable comment-ID order. The hourly run performs the same bounded repository-wide recovery scan. Pull-request and Issue reconciliation use deterministic system event IDs and converge from current live state, including reconstruction of a missed PR-open transition when the final merge is already verifiable.
+
+The controller checks the live Issue, all readiness rules, current assignees, labels, open closing pull requests, and the comment author's current repository permission. The workflow never checks out contributor-controlled code and uses only the default branch implementation.
 
 If eligible, the workflow performs and verifies this transition:
 
 1. replace `status:ready` with `status:in-progress`;
 2. assign exactly the command author;
-3. create a claim receipt with a random identifier, agent identifier, GitHub actor, Issue number, claim time, and lease deadline;
+3. create a claim receipt with a random identifier, agent identifier, GitHub actor, Issue number, GitHub-verified comment time, and lease deadline;
 4. re-read the Issue and receipt; and
 5. report success only if the postconditions hold.
 
@@ -185,7 +188,7 @@ An active claim has a 24-hour renewable lease. Meaningful public activity on the
 summary: protocol schema implemented; integration tests remain
 ```
 
-The summary is required, is limited to 240 UTF-8 bytes, and must contain no private execution material. The workflow verifies ownership and extends the lease from GitHub server time.
+The summary is required, is limited to 240 UTF-8 bytes, and must contain no private execution material. The workflow verifies ownership and extends the lease from the immutable command-comment timestamp. Scheduled expiry and migration decisions use the GitHub response `Date` header, never the runner's local clock.
 
 A scheduled hourly reconciliation releases an expired `status:in-progress` claim by removing the assignee, restoring `status:ready` when readiness still passes or `status:waiting` otherwise, and writing a stale-release receipt. It does not automatically release `status:review` or `status:blocked`; those states require an explicit resolution because a pull request or external dependency may still exist. The owner may heartbeat `status:review` without changing its state; an expired review lease blocks merge until renewed.
 
@@ -263,9 +266,9 @@ A review finding returns work to the implementation/fix loop without creating a 
 
 The controller merges only through the protected `main` branch after independently querying required checks and review state. It then verifies:
 
-1. the pull request is merged into `main`;
-2. the primary Issue closed as completed through `Closes #N`;
-3. the closing commit is reachable from current `origin/main`;
+1. the pull request names the current claim receipt and is authored by that claim's owner;
+2. the pull request is merged into `main` after the current claim began;
+3. the primary Issue closed as completed after that merge, no closing pull request remains open, and the merge commit is an ancestor of current `main`;
 4. the lifecycle workflow removed the assignee and replaced the active label with `status:done`;
 5. acceptance evidence required by the Issue is present; and
 6. the implementation branch and disposable worktree are removed after their commits are recoverable from `main`.
@@ -298,9 +301,9 @@ Implementation adds or updates these bounded components:
 - `.github/ISSUE_TEMPLATE/implementation.yml` and `bug.yml`: outcome, dependencies, verification, readiness, and AI-safe evidence fields.
 - `.github/pull_request_template.md`: claim receipt, accountable owner, agent class, lifecycle, review, and closure evidence.
 - `.github/labels.yml`: the six mutually exclusive lifecycle labels.
-- `.github/workflows/ai-issue-lifecycle.yml`: serialized commands, scheduled expiry, pull-request transitions, close/reopen reconciliation, and receipts.
+- `.github/workflows/ai-issue-lifecycle.yml`: per-Issue serialization, durable command draining, scheduled expiry, pull-request transitions, close/reopen reconciliation, and receipts.
 - `.github/workflows/governance.yml`: read-only lifecycle validation as a required pull-request gate.
-- `scripts/github/issue-lifecycle.mjs`: strict command parsing, transition policy, GitHub adapter boundary, and reconciliation logic.
+- `scripts/github/ai-issue-policy.mjs` and `ai-issue-controller.mjs`: strict command parsing, transition policy, trusted GitHub adapter boundary, and reconciliation logic.
 - `scripts/github/verify-ai-lifecycle.mjs`: fail-closed live Issue/claim/PR validation.
 - focused Node tests and fixtures for both scripts.
 - `scripts/github/sync-management.mjs`: managed-label synchronization and branch-protection check registration.
@@ -319,7 +322,9 @@ The lifecycle policy lives in testable JavaScript modules. Workflow YAML supplie
 - Pull-request code runs only with read permissions and cannot mutate claims.
 - Workflow receipts include stable machine markers but no reusable credential or private agent identifier.
 - Duplicate deliveries are idempotent by event/comment ID and claim generation.
+- Non-idempotent POST requests are never replayed after an uncertain response; the controller performs bounded live reads and accepts identical duplicate intent markers while rejecting conflicting ones.
 - Pagination is complete and bounded; malformed or truncated external state fails closed.
+- Every REST request has a hard deadline.
 - Manual state edits, deleted receipts, ambiguous closing keywords, multiple assignees, multiple lifecycle labels, or stale evidence block merge.
 - Maintainer repair actions create explicit audit receipts.
 
@@ -339,7 +344,7 @@ Every rejected command receives one bounded public explanation and one safe next
 - `STATE_MISMATCH`
 - `GITHUB_STATE_UNAVAILABLE`
 
-GitHub API timeouts, permission ambiguity, pagination exhaustion, and post-write verification failures do not become success. Retryable deliveries are idempotent; uncertain writes are reconciled from live state before another mutation.
+GitHub API timeouts, permission ambiguity, pagination exhaustion, and post-write verification failures do not become success. Naturally idempotent mutations may be retried only after bounded postcondition reads. A POST is never automatically repeated; later event delivery reconciles its stable intent from live state.
 
 ## 16. Verification strategy
 
@@ -401,11 +406,12 @@ The design is complete when all of the following are proven on the protected def
 
 Rollout is fail-closed and staged:
 
-1. land documentation, labels, pure policy modules, tests, and read-only validation;
+1. land documentation, labels, pure policy modules, tests, and read-only validation with both rollout variables defaulting to `report`;
 2. synchronize managed labels and classify existing open Issues as `status:ready` or `status:waiting` from explicit dependency evidence;
-3. enable command handling and scheduled reconciliation;
+3. enable `AI_LIFECYCLE_MUTATION_MODE=enforce` only inside the registry's bounded `mutation_acceptance` window while `AI_LIFECYCLE_VALIDATION_MODE=report`;
 4. run the disposable live acceptance lifecycle;
-5. make lifecycle validation a required `governance` dependency; and
-6. record activation evidence in `docs/github/repository-status.md`.
+5. merge a registry change that removes every migration, clears `mutation_acceptance`, and records a full protected-`main` activation commit;
+6. set both mutation and validation modes to `enforce`; and
+7. record activation evidence in `docs/github/repository-status.md`.
 
-Existing closed Issues remain historical and do not require synthetic claim receipts. Existing open pull requests receive a documented one-time migration receipt or must re-enter the lifecycle from `status:ready`; the validator never fabricates prior evidence.
+Existing closed Issues do not require synthetic claim receipts, but synchronization accepts `status:done` only after finding exactly one merged closing pull request, valid close-after-merge chronology, and a merge commit reachable from `main`. Existing open pull requests receive a documented one-time migration receipt or must re-enter the lifecycle from `status:ready`; migrations are honored only while activation is null and are never accepted afterward, even in report mode.

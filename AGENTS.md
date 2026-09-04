@@ -5,7 +5,7 @@ GitHub is the shared source of truth for repository work. The Issue assignee is 
 ## Before editing
 
 1. Read `CONTRIBUTING.md`, `docs/github/ai-collaboration.md`, the target Issue, and every linked specification or implementation-plan task.
-2. Confirm the Issue is open, has `status:ready`, has no assignee, has no open declared dependency, and has no open pull request that closes it.
+2. Confirm the Issue is open, has exactly one managed `type:*`, has `status:ready`, has no assignee, has no open declared dependency, and has no open pull request that closes it.
 3. Post `/ai-claim` with a safe agent class and wait for the repository workflow's success receipt. A command comment by itself is not a claim.
 4. Do not work on an Issue claimed by somebody else or begin before the success receipt exists.
 
@@ -32,7 +32,7 @@ summary: protocol schema implemented; integration tests remain
 ## Pull request and completion
 
 - The pull request author and accountable Issue assignee must match.
-- Include exactly one primary `Closes #N`, the workflow claim receipt URL, accountable owner, safe implementer agent class, exact verification evidence, risk, compatibility, migration/privacy impact, and rollback.
+- Include exactly one standalone primary `Closes #N`, the current workflow claim receipt URL, accountable owner, safe implementer agent class, exact verification evidence, risk, compatibility, migration/privacy impact, and rollback.
 - A different agent or eligible collaborator reviews the complete final commit range. Follow the formal-collaborator or solo-maintainer review gate in `CONTRIBUTING.md`; never self-approve or fabricate evidence.
 - Every new push invalidates stale review evidence. Merge only after the required current-head checks pass and all conversations are resolved.
 - After merge, verify that the intended Issue closed as completed, `status:done` is present, the assignee was removed, the merge commit is reachable from `origin/main`, and the branch/worktree can be safely removed.

@@ -109,8 +109,12 @@ const lifecycleMigrations = JSON.parse(
   contents.get("docs/github/ai-lifecycle-migrations.json"),
 );
 if (
-  lifecycleMigrations.schema_version !== 1 ||
+  lifecycleMigrations.schema_version !== 2 ||
   !Array.isArray(lifecycleMigrations.entries) ||
+  !(
+    lifecycleMigrations.mutation_acceptance === null ||
+    typeof lifecycleMigrations.mutation_acceptance === "object"
+  ) ||
   !(
     lifecycleMigrations.activation_commit === null ||
     /^[0-9a-f]{40}$/u.test(lifecycleMigrations.activation_commit)
@@ -129,6 +133,7 @@ for (const template of [
     [/label: Outcome/, "the Outcome field"],
     [/label: Verification/, "the Verification field"],
     [/label: Risk and rollback/, "the Risk and rollback field"],
+    [/label: Definition of done/, "the Definition of done field"],
   ]) {
     requireGovernanceField(template, pattern, message);
   }
@@ -271,8 +276,8 @@ for (const [pattern, message] of [
     /collaborators\?affiliation=direct&per_page=100/,
     "the direct-collaborator query",
   ],
-  [/--paginate/, "complete GitHub API pagination"],
-  [/--slurp/, "paginated GitHub API page collection"],
+  [/page <= 100/, "bounded GitHub API pagination"],
+  [/100-page safety cap/, "fail-closed pagination cap"],
   [
     /eligibleCollaborators\(directCollaborators, owner\)/,
     "shared strict collaborator eligibility and owner exclusion",
@@ -368,6 +373,7 @@ for (const [pattern, message] of [
   [/ai-issue-policy\.test\.mjs/, "the AI lifecycle policy tests"],
   [/github-api\.test\.mjs/, "the strict GitHub API tests"],
   [/ai-issue-controller\.test\.mjs/, "the lifecycle controller tests"],
+  [/ai-lifecycle-registry\.test\.mjs/, "the lifecycle rollout registry tests"],
   [/verify-ai-lifecycle\.test\.mjs/, "the PR-to-claim lifecycle tests"],
   [/verify-pr-review-evidence\.test\.mjs/, "the review evidence tests"],
   [/verify-pr-review-state\.test\.mjs/, "the live review-state tests"],
@@ -378,6 +384,10 @@ for (const [pattern, message] of [
   [
     /GITHUB_STATIC_RESULT:\s*\$\{\{\s*needs\.static\.result\s*\}\}/,
     "the static result passed to the live validator",
+  ],
+  [
+    /vars\.AI_LIFECYCLE_VALIDATION_MODE\s*\|\|\s*'report'/,
+    "report-only validation rollout",
   ],
   [
     /if: github\.event_name == 'pull_request'/,
@@ -393,19 +403,42 @@ for (const [pattern, message] of [
   [/issues:[\s\S]*?opened[\s\S]*?edited/, "new and edited Issue triggers"],
   [/issues:\s*write/, "Issue write permission"],
   [/pull-requests:\s*read/, "pull-request read permission"],
-  [/cancel-in-progress:\s*false/, "serialized lifecycle queue"],
+  [/github\.event\.issue\.number/, "per-Issue lifecycle queue"],
+  [/cancel-in-progress:\s*false/, "non-cancelling lifecycle queue"],
   [
     /ref:\s*\$\{\{\s*github\.event\.repository\.default_branch\s*\}\}/,
     "explicit default-branch checkout",
   ],
   [/persist-credentials:\s*false/, "disabled checkout credentials"],
-  [/vars\.AI_LIFECYCLE_MODE\s*\|\|\s*'report'/, "report-only default rollout"],
+  [
+    /vars\.AI_LIFECYCLE_MUTATION_MODE\s*\|\|\s*'report'/,
+    "report-only mutation rollout",
+  ],
   [
     /node scripts\/github\/ai-issue-controller\.mjs/,
     "the trusted lifecycle controller command",
   ],
 ]) {
   requireGovernanceField(lifecycleWorkflow, pattern, message);
+}
+
+const lifecycleController = readFileSync(
+  resolve(root, "scripts/github/ai-issue-controller.mjs"),
+  "utf8",
+);
+for (const [pattern, message] of [
+  [/reconcileLifecycleCommands/, "durable lifecycle command draining"],
+  [/Number\(left\.id\) - Number\(right\.id\)/, "immutable comment-ID ordering"],
+  [/reconcileRepositoryState/, "scheduled repository state reconciliation"],
+  [/MAX_COMMANDS_PER_DRAIN = 1_000/, "bounded command draining"],
+  [/stableSystemEventId/, "deterministic system event identities"],
+]) {
+  requireSourceField(
+    lifecycleController,
+    "scripts/github/ai-issue-controller.mjs",
+    pattern,
+    message,
+  );
 }
 
 for (const [pattern, message] of [

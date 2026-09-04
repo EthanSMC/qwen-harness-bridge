@@ -7,12 +7,17 @@ import test from "node:test";
 
 import {
   buildPlanIssueGraph,
+  createGh,
   deriveLifecycleState,
+  loadHistoricalPullRequests,
+  mergePlanIssueBody,
   renderPlanIssueBody,
+  verifyHistoricalClosure,
 } from "./sync-management.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
 const syncManagement = resolve(root, "scripts/github/sync-management.mjs");
+const NOW = "2026-09-04T12:00:00.000Z";
 
 const definitions = [
   { file: "foundation.md", milestone: "M0", taskCount: 7 },
@@ -52,6 +57,30 @@ test("orders tasks within each plan and gates each stable plan", () => {
   assert.deepEqual(graph.get(27).blockedBy, [26]);
 });
 
+test("restarts one timed-out GET but never replays a write", () => {
+  let getAttempts = 0;
+  const getGh = createGh(() => {
+    getAttempts += 1;
+    if (getAttempts === 1) {
+      throw Object.assign(new Error("timeout"), { code: "ETIMEDOUT" });
+    }
+    return "{}";
+  }, root);
+  assert.deepEqual(getGh.api("repos/octo/example"), {});
+  assert.equal(getAttempts, 2);
+
+  let postAttempts = 0;
+  const postGh = createGh(() => {
+    postAttempts += 1;
+    throw Object.assign(new Error("timeout"), { code: "ETIMEDOUT" });
+  }, root);
+  assert.throws(
+    () => postGh.api("repos/octo/example/issues", "POST", { title: "test" }),
+    /timed out/i,
+  );
+  assert.equal(postAttempts, 1);
+});
+
 test("renders one canonical dependency declaration and definition of done", () => {
   const body = renderPlanIssueBody({
     definition: {
@@ -70,6 +99,179 @@ test("renders one canonical dependency declaration and definition of done", () =
   });
   assert.equal(body.match(/^Blocked by #1$/gmu)?.length, 1);
   assert.equal(body.match(/^## Definition of done$/gmu)?.length, 1);
+});
+
+test("preserves contributor notes and refuses active dependency rewrites", () => {
+  const canonicalBody = [
+    "<!-- qhb-plan-task:plan.md#task-2 -->",
+    "",
+    "Blocked by #1",
+    "",
+    "## Outcome",
+    "Canonical outcome",
+    "## Verification",
+    "Canonical verification",
+    "## Risk and rollback",
+    "Canonical risk",
+    "## Definition of done",
+    "- [ ] Complete",
+  ].join("\n");
+  const existingBody = `${canonicalBody}\n\n## Contributor notes\nKeep this note.`;
+  assert.match(
+    mergePlanIssueBody({
+      existingBody,
+      canonicalBody,
+      blockedBy: [3],
+      active: false,
+    }),
+    /Contributor notes\nKeep this note/u,
+  );
+  assert.equal(
+    mergePlanIssueBody({
+      existingBody,
+      canonicalBody,
+      blockedBy: [1],
+      active: true,
+    }),
+    existingBody,
+  );
+  assert.throws(
+    () =>
+      mergePlanIssueBody({
+        existingBody,
+        canonicalBody,
+        blockedBy: [3],
+        active: true,
+      }),
+    /cannot change/i,
+  );
+});
+
+test("verifies one historical merge is reachable from main", () => {
+  const issue = {
+    number: 7,
+    closed_at: "2026-09-04T12:00:00Z",
+  };
+  const pullRequest = {
+    number: 36,
+    state: "closed",
+    merged_at: "2026-09-04T11:00:00Z",
+    merge_commit_sha: "abcdef1",
+    body: "Closes #7\n\n- Closes #7",
+    base: { ref: "main", repo: { full_name: "octo/example" } },
+  };
+  const gh = { api: () => ({ status: "ahead" }) };
+  assert.deepEqual(
+    verifyHistoricalClosure({
+      issue,
+      pullRequests: [pullRequest],
+      repository: "octo/example",
+      defaultBranch: "main",
+      gh,
+    }),
+    { verified: true, pullRequest: 36, mergeCommit: "abcdef1" },
+  );
+  assert.throws(
+    () =>
+      verifyHistoricalClosure({
+        issue,
+        pullRequests: [],
+        repository: "octo/example",
+        defaultBranch: "main",
+        gh,
+      }),
+    /exactly one historical/i,
+  );
+});
+
+test("loads paginated historical evidence and rejects truncated timelines", () => {
+  let calls = 0;
+  const pullSource = {
+    __typename: "PullRequest",
+    number: 36,
+    state: "MERGED",
+    mergedAt: "2026-09-04T11:00:00Z",
+    mergeCommit: { oid: "abcdef1" },
+    body: "Closes #7",
+    baseRefName: "main",
+    repository: { nameWithOwner: "octo/example" },
+  };
+  const gh = {
+    graphql: () => {
+      calls += 1;
+      return {
+        data: {
+          repository: {
+            issues: {
+              pageInfo: {
+                hasNextPage: calls === 1,
+                endCursor: calls === 1 ? "cursor-1" : null,
+              },
+              nodes:
+                calls === 1
+                  ? []
+                  : [
+                      {
+                        number: 7,
+                        timelineItems: {
+                          pageInfo: { hasNextPage: false },
+                          nodes: [{ source: pullSource }],
+                        },
+                      },
+                    ],
+            },
+          },
+        },
+      };
+    },
+  };
+  assert.deepEqual(
+    loadHistoricalPullRequests({
+      gh,
+      issues: [{ number: 7, state: "closed" }],
+      repository: "octo/example",
+    }),
+    [
+      {
+        number: 36,
+        state: "closed",
+        merged_at: "2026-09-04T11:00:00Z",
+        merge_commit_sha: "abcdef1",
+        body: "Closes #7",
+        base: { ref: "main", repo: { full_name: "octo/example" } },
+      },
+    ],
+  );
+  assert.equal(calls, 2);
+
+  assert.throws(
+    () =>
+      loadHistoricalPullRequests({
+        gh: {
+          graphql: () => ({
+            data: {
+              repository: {
+                issues: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [
+                    {
+                      number: 7,
+                      timelineItems: {
+                        pageInfo: { hasNextPage: true },
+                        nodes: [],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+        },
+        issues: [{ number: 7, state: "closed" }],
+        repository: "octo/example",
+      }),
+    /timeline cap/i,
+  );
 });
 
 test("derives ready, waiting, active, and historical states conservatively", () => {
@@ -121,9 +323,11 @@ test("derives ready, waiting, active, and historical states conservatively", () 
         ...base,
         state: "closed",
         state_reason: "completed",
+        closed_at: NOW,
       },
       body,
       dependencies: [],
+      historicalEvidence: { verified: true },
     }),
     { state: "done", assignees: [] },
   );
@@ -166,6 +370,10 @@ test("dry-run selects paginated review mode and performs no writes", async (t) =
     fakeGh,
     `#!/usr/bin/env node
 const args = process.argv.slice(2);
+if (args[0] === "api" && args[1] === "rate_limit" && args.includes("--include")) {
+  process.stdout.write("HTTP/2 200 OK\\ndate: Fri, 04 Sep 2026 12:00:00 GMT\\n\\n{}");
+  process.exit(0);
+}
 const owner = {
   login: "EthanSMC",
   role_name: "admin",
@@ -214,18 +422,29 @@ if (args.includes("POST") || args.includes("PATCH") || args.includes("PUT") || a
 let response = {};
 if (args[0] === "repo" && args[1] === "view") {
   response = { nameWithOwner: "EthanSMC/qwen-harness-bridge" };
+} else if (args[0] === "api" && args[1] === "graphql") {
+  response = {
+    data: {
+      repository: {
+        issues: {
+          pageInfo: { hasNextPage: false, endCursor: null },
+          nodes: [],
+        },
+      },
+    },
+  };
 } else if (args[0] === "api" && args[1].includes("/collaborators?")) {
-  response = args.includes("--paginate") && args.includes("--slurp")
-    ? [pageOne, pageTwo]
-    : pageOne;
+  response = args[1].includes("page=2") ? pageTwo : pageOne;
 } else if (args[0] === "api" && args[1].includes("/milestones?")) {
   response = milestones;
 } else if (args[0] === "api" && args[1].includes("/labels?")) {
-  response = args.includes("--paginate") && args.includes("--slurp") ? [[]] : [];
+  response = [];
+} else if (args[0] === "api" && args[1].startsWith("search/issues?")) {
+  response = { total_count: 0, items: [] };
 } else if (args[0] === "api" && args[1].includes("/issues?")) {
-  response = args.includes("--paginate") && args.includes("--slurp") ? [issues] : issues;
+  response = issues;
 } else if (args[0] === "api" && args[1].includes("/pulls?")) {
-  response = args.includes("--paginate") && args.includes("--slurp") ? [[]] : [];
+  response = [];
 }
 process.stdout.write(JSON.stringify(response));
 `,

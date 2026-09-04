@@ -6,9 +6,13 @@ import { createGitHubClient, GitHubApiError } from "./github-api.mjs";
 const REPOSITORY = "octo/example";
 const TOKEN = "github-token-that-must-not-leak";
 
-const response = (value, { ok = true, status = 200 } = {}) => ({
+const response = (
+  value,
+  { ok = true, status = 200, date = "Fri, 04 Sep 2026 12:34:56 GMT" } = {},
+) => ({
   ok,
   status,
+  headers: { get: (name) => (name.toLowerCase() === "date" ? date : null) },
   json: async () => value,
 });
 
@@ -29,6 +33,38 @@ test("sets strict headers and validates object responses", async () => {
   assert.equal(calls[0].options.headers.Authorization, `Bearer ${TOKEN}`);
   assert.equal(calls[0].options.headers.Accept, "application/vnd.github+json");
   assert.equal(calls[0].options.headers["X-GitHub-Api-Version"], "2022-11-28");
+  assert.ok(calls[0].options.signal instanceof AbortSignal);
+  assert.equal(calls[0].options.headers["X-GitHub-Idempotency-Key"], undefined);
+});
+
+test("uses the GitHub response Date as the server clock", async () => {
+  let requestedUrl;
+  const client = createGitHubClient({
+    fetchImpl: async (url) => {
+      requestedUrl = url;
+      return response([]);
+    },
+    repository: REPOSITORY,
+    token: TOKEN,
+  });
+  assert.equal(await client.serverTime(), "2026-09-04T12:34:56.000Z");
+  assert.equal(
+    requestedUrl,
+    "https://api.github.com/repos/octo/example/issues?state=open&per_page=1",
+  );
+});
+
+test("aborts requests at the configured deadline", async () => {
+  const client = createGitHubClient({
+    fetchImpl: async (_url, { signal }) =>
+      new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")));
+      }),
+    repository: REPOSITORY,
+    token: TOKEN,
+    timeoutMs: 10,
+  });
+  await assert.rejects(() => client.get("/issues/46"), /network boundary/i);
 });
 
 test("rejects unsafe paths, invalid response shapes, and invalid IDs", async () => {
@@ -220,14 +256,16 @@ test("retries an idempotent uncertain mutation only after failed verification", 
   assert.equal(patches, 2);
 });
 
-test("does not replay an uncertain non-idempotent POST without a key", async () => {
+test("never replays an uncertain POST, even when given a stable intent key", async () => {
   let posts = 0;
+  let reads = 0;
   const client = createGitHubClient({
     fetchImpl: async (_url, options) => {
       if (options.method === "POST") {
         posts += 1;
         throw new TypeError("connect reset");
       }
+      reads += 1;
       return response({ id: 46, comments: [] });
     },
     repository: REPOSITORY,
@@ -241,11 +279,13 @@ test("does not replay an uncertain non-idempotent POST without a key", async () 
           method: "POST",
           path: "/issues/46/comments",
           body: { body: "hello" },
+          idempotencyKey: "comment-intent:46",
         },
         read: () => client.get("/issues/46"),
         verify: () => false,
       }),
-    /cannot safely retry/i,
+    /cannot safely replay/i,
   );
   assert.equal(posts, 1);
+  assert.equal(reads, 3);
 });

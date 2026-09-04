@@ -9,6 +9,17 @@ export const STATUS_LABELS = Object.freeze([
   "status:done",
 ]);
 
+export const MANAGED_TYPE_LABELS = Object.freeze([
+  "type:feature",
+  "type:bug",
+  "type:test",
+  "type:docs",
+  "type:security",
+]);
+
+export const MAX_DEPENDENCIES = 20;
+export const MAX_DEPENDENCY_DECLARATION_BYTES = 512;
+
 export const COMMAND_NAMES = Object.freeze([
   "claim",
   "heartbeat",
@@ -125,6 +136,27 @@ const normalizedAssignees = (issue) =>
 const normalizedPermission = (permission) =>
   permission === "push" ? "write" : String(permission ?? "").toLowerCase();
 
+export const stripMarkdownCode = (body) => {
+  let fenced = false;
+  return String(body ?? "")
+    .split(/\r?\n/u)
+    .flatMap((line) => {
+      if (/^\s*```/u.test(line)) {
+        fenced = !fenced;
+        return [];
+      }
+      return fenced ? [] : [line.replace(/`[^`]*`/gu, "")];
+    })
+    .join("\n");
+};
+
+export const closingIssueNumbers = (body) =>
+  [
+    ...stripMarkdownCode(body).matchAll(
+      /^\s*-?\s*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9]\d*)\s*$/gimu,
+    ),
+  ].map((match) => Number(match[1]));
+
 const isCompletedDependency = (dependency) =>
   String(dependency.state).toLowerCase() === "closed" &&
   String(dependency.state_reason ?? dependency.stateReason).toLowerCase() ===
@@ -132,13 +164,15 @@ const isCompletedDependency = (dependency) =>
 
 const nonemptySection = (body, heading) => {
   const lines = body.replace(/\r\n?/gu, "\n").split("\n");
-  const expectedHeading = `## ${heading}`.toLowerCase();
-  const start = lines.findIndex(
-    (line) => line.trim().toLowerCase() === expectedHeading,
+  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  const expectedHeading = new RegExp(
+    `^#{2,3}[\\t ]+${escapedHeading}[\\t ]*$`,
+    "iu",
   );
+  const start = lines.findIndex((line) => expectedHeading.test(line));
   if (start < 0) return false;
   const nextHeading = lines.findIndex(
-    (line, index) => index > start && /^##[\t ]+/u.test(line),
+    (line, index) => index > start && /^#{2,3}[\t ]+/u.test(line),
   );
   const end = nextHeading < 0 ? lines.length : nextHeading;
   return lines.slice(start + 1, end).some((line) => line.trim().length > 0);
@@ -194,6 +228,8 @@ export const currentClaimFromReceipts = (receipts) => {
         owner: receipt.actor,
         agent: receipt.agent,
         leaseExpiresAt: receipt.leaseExpiresAt,
+        claimCommentId: receipt.commentId ?? null,
+        claimedAt: receipt.createdAt ?? null,
       };
       continue;
     }
@@ -362,6 +398,11 @@ export const parseDependencies = (body) => {
     fail("NOT_READY", "The issue needs exactly one dependency declaration.");
   }
   const declaration = declarations[0].trim();
+  if (
+    Buffer.byteLength(declaration, "utf8") > MAX_DEPENDENCY_DECLARATION_BYTES
+  ) {
+    fail("NOT_READY", "The dependency declaration is too large.");
+  }
   if (/^Blocked by[\t ]+none$/iu.test(declaration)) return [];
 
   const match = /^Blocked by[\t ]+(#[1-9]\d*(?:,[\t ]*#[1-9]\d*)*)$/iu.exec(
@@ -376,6 +417,12 @@ export const parseDependencies = (body) => {
   if (new Set(numbers).size !== numbers.length) {
     fail("NOT_READY", "The dependency declaration contains duplicates.");
   }
+  if (numbers.length > MAX_DEPENDENCIES) {
+    fail(
+      "NOT_READY",
+      `The dependency declaration exceeds ${MAX_DEPENDENCIES} Issues.`,
+    );
+  }
   return numbers;
 };
 
@@ -388,6 +435,15 @@ export const assertIssueInvariant = (issue) => {
   );
   if (managedLabels.length !== 1) {
     fail("STATE_MISMATCH", "The issue must have exactly one lifecycle label.");
+  }
+  const managedTypes = normalizedLabels(issue).filter((label) =>
+    MANAGED_TYPE_LABELS.includes(label),
+  );
+  if (managedTypes.length !== 1) {
+    fail(
+      "STATE_MISMATCH",
+      "The issue must have exactly one managed type label.",
+    );
   }
   const state = managedLabels[0].slice(STATUS_PREFIX.length);
   const assignees = normalizedAssignees(issue).filter(Boolean);
@@ -440,6 +496,16 @@ export const evaluateReadiness = ({
   } catch (error) {
     if (!(error instanceof LifecycleError)) throw error;
     return { ready: false, code: error.code, dependencyNumbers: [] };
+  }
+
+  const managedTypes = normalizedLabels(issue).filter((label) =>
+    MANAGED_TYPE_LABELS.includes(label),
+  );
+  if (managedTypes.length !== 1) {
+    return { ready: false, code: "NOT_READY", dependencyNumbers };
+  }
+  if (dependencyNumbers.includes(Number(issue.number))) {
+    return { ready: false, code: "NOT_READY", dependencyNumbers };
   }
 
   const body = issue.body;

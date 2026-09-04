@@ -6,7 +6,7 @@ This is a public, issue-driven repository. The approved Spec and linked implemen
 
 Every contributor may use an AI agent, but the named human Issue assignee remains accountable. GitHub Issue state, one lifecycle label, one assignee where required, workflow receipts, the linked pull request, and current-head checks are authoritative. Private agent threads and local execution records are not shared state.
 
-1. Select an open `status:ready` Issue with no assignee, no open declared dependency, and no open closing pull request.
+1. Select an open `status:ready` Issue with exactly one managed `type:*`, no assignee, no open declared dependency, and no open closing pull request.
 2. Read [AGENTS.md](AGENTS.md), [the AI collaboration guide](docs/github/ai-collaboration.md), the Issue's linked plan task, and every interface it consumes.
 3. Post `/ai-claim` with a safe agent class and wait for the repository workflow's success receipt. A command comment alone does not grant ownership.
 4. From current `origin/main`, create `feat/<issue>-<slug>`, `fix/<issue>-<slug>`, `security/<issue>-<slug>`, or `docs/<issue>-<slug>` in an isolated worktree.

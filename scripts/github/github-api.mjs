@@ -1,6 +1,8 @@
 const DEFAULT_API_BASE_URL = "https://api.github.com";
 const DEFAULT_PAGE_SIZE = 100;
 const DEFAULT_MAX_PAGES = 100;
+const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_CONVERGENCE_READS = 3;
 const API_VERSION = "2022-11-28";
 
 const NATURALLY_IDEMPOTENT_METHODS = new Set(["PATCH", "PUT", "DELETE"]);
@@ -90,6 +92,8 @@ export const createGitHubClient = ({
   token,
   pageSize = DEFAULT_PAGE_SIZE,
   maxPages = DEFAULT_MAX_PAGES,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  convergenceReads = DEFAULT_CONVERGENCE_READS,
   apiBaseUrl = DEFAULT_API_BASE_URL,
 } = {}) => {
   if (typeof fetchImpl !== "function") {
@@ -112,12 +116,24 @@ export const createGitHubClient = ({
       "GitHub maximum page count cannot exceed the safety cap of 100",
     );
   }
+  requirePositiveInteger(timeoutMs, "GitHub request timeout");
+  if (timeoutMs > 120_000) {
+    throw new Error("GitHub request timeout cannot exceed 120 seconds");
+  }
+  requirePositiveInteger(convergenceReads, "GitHub convergence read count");
+  if (convergenceReads > 5) {
+    throw new Error("GitHub convergence read count cannot exceed 5");
+  }
   if (typeof apiBaseUrl !== "string" || !/^https:\/\//u.test(apiBaseUrl)) {
     throw new Error("GitHub API base URL must use HTTPS");
   }
   const base = apiBaseUrl.replace(/\/+$/u, "");
 
-  const request = async (method, path, { body, idempotencyKey } = {}) => {
+  const request = async (
+    method,
+    path,
+    { body, idempotencyKey, includeServerDate = false } = {},
+  ) => {
     const normalizedMethod = String(method).toUpperCase();
     const normalizedPath = validatePath(path);
     const headers = {
@@ -126,8 +142,7 @@ export const createGitHubClient = ({
       "X-GitHub-Api-Version": API_VERSION,
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    const stableKey = safeIdempotencyKey(idempotencyKey);
-    if (stableKey) headers["X-GitHub-Idempotency-Key"] = stableKey;
+    safeIdempotencyKey(idempotencyKey);
 
     let serializedBody;
     if (body !== undefined) {
@@ -139,16 +154,20 @@ export const createGitHubClient = ({
     }
 
     let response;
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), timeoutMs);
     try {
       response = await fetchImpl(
         `${base}/repos/${repository}${normalizedPath}`,
         {
           method: normalizedMethod,
           headers,
+          signal: abortController.signal,
           ...(serializedBody === undefined ? {} : { body: serializedBody }),
         },
       );
     } catch {
+      clearTimeout(timeout);
       throw requestError(
         `GitHub API request failed: ${normalizedMethod} ${normalizedPath} reached a network boundary error`,
         {
@@ -160,6 +179,7 @@ export const createGitHubClient = ({
     }
 
     if (response?.ok !== true) {
+      clearTimeout(timeout);
       const status = Number.isInteger(response?.status)
         ? response.status
         : null;
@@ -174,12 +194,18 @@ export const createGitHubClient = ({
         },
       );
     }
-    if (response.status === 204) return null;
+    if (response.status === 204) {
+      clearTimeout(timeout);
+      return includeServerDate
+        ? { value: null, serverDate: response.headers?.get?.("date") ?? null }
+        : null;
+    }
 
     let value;
     try {
       value = await response.json();
     } catch {
+      clearTimeout(timeout);
       throw requestError(
         `GitHub API ${normalizedMethod} ${normalizedPath} returned invalid JSON`,
         {
@@ -189,10 +215,17 @@ export const createGitHubClient = ({
         },
       );
     }
-    return validateResponseShape(
+    clearTimeout(timeout);
+    const validated = validateResponseShape(
       value,
       `GitHub API ${normalizedMethod} ${normalizedPath} response`,
     );
+    return includeServerDate
+      ? {
+          value: validated,
+          serverDate: response.headers?.get?.("date") ?? null,
+        }
+      : validated;
   };
 
   const get = (path) => request("GET", path);
@@ -203,6 +236,20 @@ export const createGitHubClient = ({
   const put = (path, body, options = {}) =>
     request("PUT", path, { ...options, body });
   const remove = (path, options = {}) => request("DELETE", path, options);
+  const serverTime = async () => {
+    const { serverDate } = await request(
+      "GET",
+      "/issues?state=open&per_page=1",
+      { includeServerDate: true },
+    );
+    const timestamp = Date.parse(serverDate ?? "");
+    if (Number.isNaN(timestamp)) {
+      throw new Error(
+        "GitHub API response did not include a valid Date header",
+      );
+    }
+    return new Date(timestamp).toISOString();
+  };
 
   const getAll = async (path, label = "GitHub collection") => {
     const normalizedPath = validatePath(path);
@@ -239,8 +286,7 @@ export const createGitHubClient = ({
       throw new Error("GitHub mutation method is unsupported");
     }
     const idempotencyKey = safeIdempotencyKey(mutation.idempotencyKey);
-    const retryable =
-      NATURALLY_IDEMPOTENT_METHODS.has(method) || Boolean(idempotencyKey);
+    const retryable = NATURALLY_IDEMPOTENT_METHODS.has(method);
     const apply = () =>
       request(method, mutation.path, {
         body: mutation.body,
@@ -256,11 +302,20 @@ export const createGitHubClient = ({
       uncertain = true;
     }
 
-    const firstRead = await read();
-    if (await verify(firstRead)) {
+    const verifyConvergence = async () => {
+      let value;
+      for (let attempt = 0; attempt < convergenceReads; attempt += 1) {
+        value = await read();
+        if (await verify(value)) return { verified: true, value };
+      }
+      return { verified: false, value };
+    };
+
+    const firstVerification = await verifyConvergence();
+    if (firstVerification.verified) {
       return {
         verified: true,
-        value: firstRead,
+        value: firstVerification.value,
         mutationResult,
         reconciled: uncertain,
         retried: false,
@@ -268,20 +323,20 @@ export const createGitHubClient = ({
     }
     if (!retryable) {
       throw new Error(
-        `GitHub ${method} ${validatePath(mutation.path)} cannot safely retry after failed verification`,
+        `GitHub ${method} ${validatePath(mutation.path)} cannot safely replay after bounded verification`,
       );
     }
 
     mutationResult = await apply();
-    const finalRead = await read();
-    if (!(await verify(finalRead))) {
+    const finalVerification = await verifyConvergence();
+    if (!finalVerification.verified) {
       throw new Error(
         `GitHub ${method} ${validatePath(mutation.path)} failed postcondition verification`,
       );
     }
     return {
       verified: true,
-      value: finalRead,
+      value: finalVerification.value,
       mutationResult,
       reconciled: uncertain,
       retried: true,
@@ -295,6 +350,7 @@ export const createGitHubClient = ({
     patch,
     put,
     delete: remove,
+    serverTime,
     mutateAndVerify,
   });
 };

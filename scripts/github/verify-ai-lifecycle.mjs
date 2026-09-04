@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   assertIssueInvariant,
+  closingIssueNumbers,
   currentClaimFromReceipts,
   evaluateReadiness,
   LifecycleError,
@@ -11,6 +12,10 @@ import {
   parseReceipts,
   safePublicText,
 } from "./ai-issue-policy.mjs";
+import {
+  LifecycleRegistryError,
+  validateLifecycleValidationMode,
+} from "./ai-lifecycle-registry.mjs";
 import { createGitHubClient } from "./github-api.mjs";
 
 const WORKFLOW_LOGIN = "github-actions[bot]";
@@ -77,19 +82,19 @@ const safePullRequestBody = (body) => {
   if (typeof body !== "string" || body.trim().length === 0) {
     fail("Pull request body is required");
   }
-  const publicBody = stripFencedCode(body);
-  if (Buffer.byteLength(publicBody, "utf8") > 60_000) {
+  if (Buffer.byteLength(body, "utf8") > 60_000) {
     fail("Pull request body exceeds the public evidence limit");
   }
   try {
-    for (const line of publicBody.split(/\r?\n/u)) {
-      if (line.trim()) safePublicText(line, 10_000);
+    for (const line of body.split(/\r?\n/u)) {
+      const evidenceText = line.replace(/[`*_~]/gu, "");
+      if (evidenceText.trim()) safePublicText(evidenceText, 10_000);
     }
   } catch (error) {
     if (error instanceof LifecycleError) fail(error.message);
     throw error;
   }
-  return publicBody;
+  return stripFencedCode(body);
 };
 
 const fieldValue = (body, label) => {
@@ -104,14 +109,10 @@ const fieldValue = (body, label) => {
 };
 
 const closingIssueNumber = (body) => {
-  const matches = [
-    ...body.matchAll(
-      /^\s*-?\s*(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9]\d*)\s*$/gimu,
-    ),
-  ];
+  const matches = closingIssueNumbers(body);
   if (matches.length !== 1)
     fail("PR body must contain exactly one closing Issue");
-  return Number(matches[0][1]);
+  return matches[0];
 };
 
 const parseReceiptUrl = (value) => {
@@ -169,86 +170,21 @@ export const extractLifecycleFields = (body) => {
   return { issueNumber: closing, receiptUrl, owner, agent };
 };
 
-const validateMigrationEntry = (entry, index) => {
-  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-    fail(`Migration entry ${index + 1} must be an object`);
-  }
-  const keys = Object.keys(entry).sort();
-  const expected = [
-    "approved_by",
-    "expires_at",
-    "issue",
-    "pull_request",
-    "reason",
-  ];
-  if (JSON.stringify(keys) !== JSON.stringify(expected)) {
-    fail(`Migration entry ${index + 1} has unknown or missing fields`);
-  }
-  requirePositiveInteger(entry.pull_request, "Migration pull request");
-  requirePositiveInteger(entry.issue, "Migration Issue");
-  try {
-    safePublicText(entry.reason, 240);
-  } catch {
-    fail(`Migration entry ${index + 1} reason is unsafe`);
-  }
-  if (
-    !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/u.test(entry.approved_by)
-  ) {
-    fail(`Migration entry ${index + 1} approver is invalid`);
-  }
-  requireTimestamp(entry.expires_at, `Migration entry ${index + 1} expiry`);
-};
-
 export const validateMigrationRegistry = (
   migrations,
   { mode, pullRequestNumber, issueNumber, now },
 ) => {
-  if (
-    !migrations ||
-    typeof migrations !== "object" ||
-    Array.isArray(migrations)
-  ) {
-    fail("Lifecycle migration registry must be an object");
+  try {
+    return validateLifecycleValidationMode(migrations, {
+      mode,
+      pullRequestNumber,
+      issueNumber,
+      now,
+    });
+  } catch (error) {
+    if (error instanceof LifecycleRegistryError) fail(error.message);
+    throw error;
   }
-  if (migrations.schema_version !== 1) {
-    fail("Lifecycle migration registry schema_version must be 1");
-  }
-  if (!Array.isArray(migrations.entries) || migrations.entries.length > 100) {
-    fail("Lifecycle migration entries must be a bounded array");
-  }
-  migrations.entries.forEach(validateMigrationEntry);
-  const nowTimestamp = requireTimestamp(now, "Lifecycle validation time");
-  const pairs = new Set();
-  for (const entry of migrations.entries) {
-    const pair = `${entry.pull_request}:${entry.issue}`;
-    if (pairs.has(pair)) fail("Lifecycle migration pairs must be unique");
-    pairs.add(pair);
-  }
-  if (mode === "enforce") {
-    if (!/^[0-9a-f]{40}$/u.test(migrations.activation_commit ?? "")) {
-      fail("Strict lifecycle mode requires a full activation commit");
-    }
-    if (migrations.entries.length > 0) {
-      fail("Strict lifecycle mode forbids every remaining migration entry");
-    }
-    return { migrated: false, activationCommit: migrations.activation_commit };
-  }
-  if (
-    migrations.activation_commit !== null &&
-    !/^[0-9a-f]{40}$/u.test(migrations.activation_commit ?? "")
-  ) {
-    fail("Lifecycle activation commit must be null or a full commit SHA");
-  }
-  const migration = migrations.entries.find(
-    (entry) =>
-      entry.pull_request === pullRequestNumber && entry.issue === issueNumber,
-  );
-  return {
-    migrated: Boolean(
-      migration && Date.parse(migration.expires_at) > nowTimestamp,
-    ),
-    activationCommit: migrations.activation_commit,
-  };
 };
 
 const requireIdentityMatch = (actual, expected, label) => {
@@ -284,6 +220,9 @@ const strictLifecycleEvidence = ({
   if (!expectedBranch.test(pullRequest.head?.ref ?? "")) {
     fail("Pull request branch must contain its Primary Issue number");
   }
+  if (!issue || typeof issue !== "object") {
+    throw new Error("Live Issue state is unavailable");
+  }
   if (issue.number !== fields.issueNumber) {
     fail("Live Issue does not match the Primary Issue");
   }
@@ -291,6 +230,12 @@ const strictLifecycleEvidence = ({
     try {
       return assertIssueInvariant(issue);
     } catch (error) {
+      if (
+        error instanceof LifecycleError &&
+        error.code === "GITHUB_STATE_UNAVAILABLE"
+      ) {
+        throw new Error(error.message);
+      }
       if (error instanceof LifecycleError) fail(error.message);
       throw error;
     }
@@ -346,6 +291,11 @@ const strictLifecycleEvidence = ({
     closingPullRequests: [],
   });
   if (!readiness.ready) {
+    if (readiness.code === "GITHUB_STATE_UNAVAILABLE") {
+      throw new Error(
+        "Primary Issue dependency/readiness evidence is unavailable",
+      );
+    }
     fail(
       `Primary Issue dependency/readiness evidence failed: ${readiness.code}`,
     );
@@ -375,27 +325,26 @@ export const validatePullRequestLifecycleState = (input) => {
     input.pullRequest?.number,
     "Pull request number",
   );
-  const publicBody = safePullRequestBody(input.pullRequest.body);
-  const issueNumber = closingIssueNumber(publicBody);
-  const migration = validateMigrationRegistry(input.migrations, {
-    mode,
-    pullRequestNumber,
-    issueNumber,
-    now: input.now,
-  });
-  if (migration.migrated) {
-    return {
-      valid: true,
-      mode,
-      migrated: true,
-      issueNumber,
-      pullRequestNumber,
-    };
-  }
-
-  const fields = extractLifecycleFields(input.pullRequest.body);
-
+  let issueNumber = null;
   try {
+    const publicBody = safePullRequestBody(input.pullRequest.body);
+    issueNumber = closingIssueNumber(publicBody);
+    const migration = validateMigrationRegistry(input.migrations, {
+      mode,
+      pullRequestNumber,
+      issueNumber,
+      now: input.now,
+    });
+    if (migration.migrated) {
+      return {
+        valid: true,
+        mode,
+        migrated: true,
+        issueNumber,
+        pullRequestNumber,
+      };
+    }
+    const fields = extractLifecycleFields(input.pullRequest.body);
     const strict = strictLifecycleEvidence({ ...input, fields });
     return {
       valid: true,
@@ -410,27 +359,19 @@ export const validatePullRequestLifecycleState = (input) => {
       headSha: input.pullRequest.head.sha,
     };
   } catch (error) {
-    if (mode === "enforce") throw error;
+    if (mode === "enforce" || !(error instanceof LifecycleValidationError)) {
+      throw error;
+    }
     return {
       valid: false,
       mode,
       migrated: false,
-      issueNumber: fields.issueNumber,
+      issueNumber,
       pullRequestNumber,
       violations: [error.message],
     };
   }
 };
-
-const closingIssueNumbers = (body) => [
-  ...new Set(
-    [
-      ...stripFencedCode(body).matchAll(
-        /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#([1-9]\d*)\b/giu,
-      ),
-    ].map((match) => Number(match[1])),
-  ),
-];
 
 const reviewedHeadFromBody = (body) => {
   const value = fieldValue(
@@ -455,10 +396,10 @@ export const main = async ({
   token = process.env.GITHUB_TOKEN,
   repository = process.env.GITHUB_REPOSITORY,
   staticResult = process.env.GITHUB_STATIC_RESULT,
-  mode = process.env.AI_LIFECYCLE_MODE ?? "report",
+  mode = process.env.AI_LIFECYCLE_VALIDATION_MODE ?? "report",
   migrationsPath = MIGRATION_PATH,
   fetchImpl = globalThis.fetch,
-  now = new Date().toISOString(),
+  now = null,
 } = {}) => {
   if (staticResult !== "success") {
     fail("Static governance checks must succeed before lifecycle validation");
@@ -473,6 +414,7 @@ export const main = async ({
     "Event pull request number",
   );
   const github = createGitHubClient({ fetchImpl, repository, token });
+  const authoritativeNow = now ?? (await github.serverTime());
   const pullRequest = await github.get(`/pulls/${pullNumber}`);
   if (
     pullRequest.body !== eventPull.body ||
@@ -481,18 +423,50 @@ export const main = async ({
   ) {
     fail("Pull request event is stale relative to the live GitHub PR");
   }
-  const publicBody = safePullRequestBody(pullRequest.body);
-  const issueNumber = closingIssueNumber(publicBody);
   const migrations = readJson(migrationsPath, "Lifecycle migration registry");
-  const migration = validateMigrationRegistry(migrations, {
-    mode,
-    pullRequestNumber: pullNumber,
-    issueNumber,
-    now,
-  });
+  const reportSemanticFailure = () => {
+    const result = validatePullRequestLifecycleState({
+      repository,
+      defaultBranch: event.repository.default_branch,
+      pullRequest,
+      issue: null,
+      comments: [],
+      dependencies: [],
+      closingPullRequests: [],
+      reviewedHeadSha: null,
+      now: authoritativeNow,
+      mode,
+      migrations,
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return result;
+  };
+  let issueNumber;
+  try {
+    issueNumber = closingIssueNumber(safePullRequestBody(pullRequest.body));
+  } catch (error) {
+    if (mode === "report" && error instanceof LifecycleValidationError) {
+      return reportSemanticFailure();
+    }
+    throw error;
+  }
   const issue = await github.get(`/issues/${issueNumber}`);
   if (issue.number !== issueNumber) {
     fail("Live Issue does not match the migrated or primary Issue");
+  }
+  let migration;
+  try {
+    migration = validateMigrationRegistry(migrations, {
+      mode,
+      pullRequestNumber: pullNumber,
+      issueNumber,
+      now: authoritativeNow,
+    });
+  } catch (error) {
+    if (mode === "report" && error instanceof LifecycleValidationError) {
+      return reportSemanticFailure();
+    }
+    throw error;
   }
   if (migration.migrated) {
     const result = validatePullRequestLifecycleState({
@@ -504,7 +478,7 @@ export const main = async ({
       dependencies: [],
       closingPullRequests: [],
       reviewedHeadSha: null,
-      now,
+      now: authoritativeNow,
       mode,
       migrations,
     });
@@ -512,8 +486,21 @@ export const main = async ({
     return result;
   }
 
-  const fields = extractLifecycleFields(pullRequest.body);
-  const dependencyNumbers = parseDependencies(issue.body);
+  let fields;
+  try {
+    fields = extractLifecycleFields(pullRequest.body);
+  } catch (error) {
+    if (mode === "report" && error instanceof LifecycleValidationError) {
+      return reportSemanticFailure();
+    }
+    throw error;
+  }
+  let dependencyNumbers = [];
+  try {
+    dependencyNumbers = parseDependencies(issue.body);
+  } catch (error) {
+    if (!(error instanceof LifecycleError)) throw error;
+  }
   const [comments, dependencies, openPullRequests] = await Promise.all([
     github.getAll(`/issues/${fields.issueNumber}/comments`, "Issue comments"),
     Promise.all(
@@ -524,6 +511,14 @@ export const main = async ({
   const closingPullRequests = openPullRequests.filter((candidate) =>
     closingIssueNumbers(candidate.body).includes(fields.issueNumber),
   );
+  let reviewedHeadSha = null;
+  try {
+    reviewedHeadSha = reviewedHeadFromBody(pullRequest.body);
+  } catch (error) {
+    if (mode === "enforce" || !(error instanceof LifecycleValidationError)) {
+      throw error;
+    }
+  }
   const result = validatePullRequestLifecycleState({
     repository,
     defaultBranch: event.repository.default_branch,
@@ -532,8 +527,8 @@ export const main = async ({
     comments,
     dependencies,
     closingPullRequests,
-    reviewedHeadSha: reviewedHeadFromBody(pullRequest.body),
-    now,
+    reviewedHeadSha,
+    now: authoritativeNow,
     mode,
     migrations,
   });

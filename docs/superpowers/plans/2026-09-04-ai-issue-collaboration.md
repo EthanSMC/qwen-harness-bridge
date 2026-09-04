@@ -362,7 +362,7 @@ Expected: FAIL because the API client does not exist.
 
 Every request sets `Accept`, `Authorization`, and `X-GitHub-Api-Version`. Require object/array response shapes, positive numeric IDs, page sizes no larger than requested, and a short page before the configured cap. Include method/path/status in errors without echoing tokens or response bodies.
 
-`mutateAndVerify` performs one mutation, then a live read. On network uncertainty it reads first; it retries only when the verified postcondition is false and the operation has a stable idempotency key or is naturally idempotent.
+`mutateAndVerify` performs one mutation, then up to three bounded live reads. On network uncertainty it reads first and retries only naturally idempotent PATCH/PUT/DELETE operations. POST is never automatically replayed; a later delivery reconciles the stable intent. Every request has a hard deadline.
 
 - [x] **Step 4: Replace duplicated read helpers in the review verifier**
 
@@ -488,7 +488,7 @@ git commit -m "feat(governance): add AI issue lifecycle controller"
 
 **Interfaces:**
 - Consumes: Issue comments, Issue close/reopen events, pull-request-target lifecycle events, and hourly schedule.
-- Produces: serialized write-capable controller runs and a read-only governance test surface.
+- Produces: per-Issue serialized runs, immutable-ID command backlog draining, deterministic live-state reconciliation, and a read-only governance test surface.
 
 - [x] **Step 1: Add failing static workflow assertions**
 
@@ -517,9 +517,9 @@ on:
   issue_comment:
     types: [created]
   issues:
-    types: [closed, reopened, labeled, unlabeled, assigned, unassigned]
+    types: [opened, edited, closed, reopened, labeled, unlabeled, assigned, unassigned]
   pull_request_target:
-    types: [opened, reopened, synchronize, converted_to_draft, ready_for_review, closed]
+    types: [opened, reopened, edited, synchronize, converted_to_draft, ready_for_review, closed]
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
@@ -530,16 +530,16 @@ permissions:
   pull-requests: read
 
 concurrency:
-  # Repository scope serializes Issue, PR, and scheduled events that use different IDs.
-  group: ai-issue-lifecycle-${{ github.repository }}
+  # Per-Issue serialization plus durable comment draining prevents lost commands.
+  group: ai-issue-lifecycle-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || 'scheduled' }}
   cancel-in-progress: false
 ```
 
 Checkout `github.event.repository.default_branch` explicitly, set `persist-credentials: false`, and run only `node scripts/github/ai-issue-controller.mjs`. Do not interpolate comment bodies into shell or environment variables; the controller reads the immutable event file.
 
-- [x] **Step 4: Add a report-only rollout switch**
+- [x] **Step 4: Add independent report-first rollout switches**
 
-Set `AI_LIFECYCLE_MODE` from repository variable `AI_LIFECYCLE_MODE`, defaulting to `report`. In `report`, command handling may create a rejection/report comment but cannot change assignees or labels. In `enforce`, all verified mutations are enabled. Unit tests must prove report mode emits no mutation requests.
+Set `AI_LIFECYCLE_MUTATION_MODE` for the write-capable controller and `AI_LIFECYCLE_VALIDATION_MODE` for the read-only PR gate; both default to `report`. Mutation enforcement requires either the registry's unexpired bounded acceptance window or full activation. Validation enforcement requires full activation, an empty migration list, and no acceptance window. Unit tests prove report mode emits no mutation requests and the two phases cannot be enabled in an unsafe order.
 
 - [x] **Step 5: Add lifecycle tests to static governance**
 
@@ -631,8 +631,13 @@ Use this schema with bounded entries:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "activation_commit": null,
+  "mutation_acceptance": {
+    "reason": "Bounded live acceptance after bootstrap",
+    "approved_by": "EthanSMC",
+    "expires_at": "2026-09-11T00:00:00Z"
+  },
   "entries": [
     {
       "pull_request": 45,
@@ -645,7 +650,7 @@ Use this schema with bounded entries:
 }
 ```
 
-The validator accepts a migration only in report/pre-activation mode, only for the exact PR/Issue pair, and only before expiry. Strict activation requires `activation_commit` to be a full 40-character commit on `main` and forbids every remaining migration entry.
+The validator accepts a migration only in report/pre-activation mode, only for the exact PR/Issue pair, and only before expiry. A non-null activation commit forbids every migration and the acceptance window in every mode. Strict activation requires `activation_commit` to be a full 40-character commit on `main`, `mutation_acceptance: null`, and an empty `entries` array.
 
 - [x] **Step 7: Integrate the read-only validator into governance**
 
@@ -709,7 +714,7 @@ Refactor synchronization into two passes: resolve/create every marker-linked Iss
 
 - [x] **Step 4: Derive lifecycle classification without overwriting active work**
 
-For open Issues with no active claim or PR, set `status:ready` only when all dependencies are closed as completed and required fields exist; otherwise set `status:waiting`. Preserve valid `in-progress`, `review`, and `blocked` states. Set closed-completed Issues to `status:done` and remove assignees only after verifying the closing PR or recorded historical state.
+For open Issues with no active claim or PR, set `status:ready` only when all dependencies are closed as completed and required fields exist; otherwise set `status:waiting`. Preserve valid `in-progress`, `review`, and `blocked` bodies byte-for-byte and reject active dependency changes without an explicit migration. Set a closed-completed Issue to `status:done` only after finding exactly one merged closing PR, verifying close-after-merge chronology, and proving its merge commit is reachable from `main`.
 
 - [x] **Step 5: Add dry-run and postcondition verification**
 
@@ -806,15 +811,15 @@ Merge only when protected-branch requirements pass. Verify PR merged, Issue #46 
 
 **Interfaces:**
 - Consumes: report-mode implementation merged from Task 8.
-- Produces: a child activation Issue, disposable live acceptance Issue/PR, strict `AI_LIFECYCLE_MODE=enforce`, activation commit, and end-to-end public evidence.
+- Produces: a child activation Issue, disposable live acceptance Issue/PR, strict mutation and validation modes, activation commit, and end-to-end public evidence.
 
 - [ ] **Step 1: Create and classify the activation Issue**
 
-Create a child Issue titled `[Governance] Activate and prove AI Issue lifecycle`, with `Blocked by #46`, the ten live acceptance cases from Spec section 16.3, exact rollback (`AI_LIFECYCLE_MODE=report`), and no private data. After #46 closes, run synchronization and verify it becomes `status:ready`.
+Create a child Issue titled `[Governance] Activate and prove AI Issue lifecycle`, with `Blocked by #46`, the ten live acceptance cases from Spec section 16.3, exact rollback (set both lifecycle mode variables to `report`), and no private data. After #46 closes, run synchronization and verify it becomes `status:ready`.
 
 - [ ] **Step 2: Enable command mutations for the acceptance repository**
 
-Set repository variable `AI_LIFECYCLE_MODE=enforce`. Immediately verify the workflow still uses protected `main`; if the first enforce run fails unexpectedly, set the variable back to `report` before any manual state edit.
+Keep `AI_LIFECYCLE_VALIDATION_MODE=report` and set only `AI_LIFECYCLE_MUTATION_MODE=enforce` while the committed `mutation_acceptance` window remains unexpired. Immediately verify the workflow still uses protected `main`; if the first enforce run fails unexpectedly, set the mutation variable back to `report` before any manual state edit.
 
 - [ ] **Step 3: Execute the live command lifecycle**
 
@@ -826,11 +831,11 @@ Make a harmless documentation change in the disposable PR. Obtain the applicable
 
 - [ ] **Step 5: Remove bootstrap migrations and set activation commit**
 
-Set `activation_commit` to the exact 40-character protected-main commit containing the active workflow and set `entries` to `[]`. Update repository status with acceptance Issue/PR/workflow URLs and timestamps. Run the strict validator fixtures and live read-only gate.
+Set `activation_commit` to the exact 40-character protected-main commit containing the trusted workflow, set `mutation_acceptance` to `null`, and set `entries` to `[]`. Update repository status with acceptance Issue/PR/workflow URLs and GitHub-derived timestamps. Merge this registry change while validation is still report-only, verify reachability, and then set both repository variables to `enforce`.
 
-- [ ] **Step 6: Commit and open the activation PR through the new workflow**
+- [ ] **Step 6: Commit and open the activation PR through mutation acceptance**
 
-The activation Issue itself must be claimed through `/ai-claim`, use a new `docs/<issue>-activate-ai-lifecycle` branch/worktree, and create a PR whose lifecycle evidence passes strict mode. This proves that the system can govern its own activation change.
+The activation Issue itself must be claimed through `/ai-claim`, use a new `docs/<issue>-activate-ai-lifecycle` branch/worktree, and create a PR with complete lifecycle evidence while validation remains report-only. After it merges and both variables enter enforce, create one final disposable documentation smoke PR whose lifecycle evidence passes strict validation. This proves that the system can govern work before and after its own activation without a circular gate.
 
 - [ ] **Step 7: Verify final closure and repository-wide invariants**
 
@@ -838,7 +843,7 @@ After merge, query every governed Issue and assert exactly one lifecycle label, 
 
 - [ ] **Step 8: Record final completion**
 
-Update Issue #46 or the activation Issue with the public acceptance evidence. The objective is complete only after strict mode is live, all tests pass, migration entries are empty, and the repository-wide invariant audit succeeds.
+Update Issue #46 or the activation Issue with the public acceptance evidence. The objective is complete only after both strict modes are live, the post-activation smoke PR passes, all tests pass, migration entries are empty, `mutation_acceptance` is null, and the repository-wide invariant audit succeeds.
 
 ## Plan completion evidence
 

@@ -115,14 +115,15 @@ const issue = (overrides = {}) => ({
   state: "open",
   state_reason: null,
   body: issueBody(),
-  labels: [{ name: "status:review" }],
+  labels: [{ name: "type:docs" }, { name: "status:review" }],
   assignees: [{ login: "alice" }],
   ...overrides,
 });
 
 const strictMigrations = (overrides = {}) => ({
-  schema_version: 1,
+  schema_version: 2,
   activation_commit: ACTIVATION,
+  mutation_acceptance: null,
   entries: [],
   ...overrides,
 });
@@ -160,6 +161,24 @@ test("rejects multiple closing Issues and private agent references", () => {
     () =>
       extractLifecycleFields(pullBody({ agent: "codex://threads/private" })),
     /agent class|private codex/i,
+  );
+});
+
+test("rejects prohibited public evidence inside fenced and inline code", () => {
+  assert.throws(
+    () =>
+      extractLifecycleFields(
+        `${pullBody()}\n\n\`\`\`text\ncodex://threads/private\n\`\`\``,
+      ),
+    /private codex/i,
+  );
+  assert.throws(
+    () => extractLifecycleFields(`${pullBody()}\n\n\`token=secret\``),
+    /credential/i,
+  );
+  assert.throws(
+    () => extractLifecycleFields(`${pullBody()}\n\n\`/Users/alice/repo\``),
+    /absolute path|local/i,
   );
 });
 
@@ -274,7 +293,7 @@ test("rejects owner, assignee, and lifecycle state drift", () => {
             issue: issue({
               state: state === "done" ? "closed" : "open",
               state_reason: state === "done" ? "completed" : null,
-              labels: [{ name: `status:${state}` }],
+              labels: [{ name: `status:${state}` }, { name: "type:docs" }],
               assignees,
             }),
           }),
@@ -287,7 +306,11 @@ test("rejects owner, assignee, and lifecycle state drift", () => {
       validatePullRequestLifecycleState(
         validInput({
           issue: issue({
-            labels: [{ name: "status:review" }, { name: "status:blocked" }],
+            labels: [
+              { name: "status:review" },
+              { name: "status:blocked" },
+              { name: "type:docs" },
+            ],
           }),
         }),
       ),
@@ -347,10 +370,44 @@ test("report mode returns violations without weakening enforce mode", () => {
   );
 });
 
+test("report mode contains missing fields and malformed registry semantics", () => {
+  const missingFields = validatePullRequestLifecycleState(
+    validInput({
+      mode: "report",
+      pullRequest: pullRequest("## Tracking\n\nCloses #46"),
+    }),
+  );
+  assert.equal(missingFields.valid, false);
+  assert.match(missingFields.violations.join("\n"), /Primary Issue/i);
+
+  const malformed = strictMigrations();
+  delete malformed.mutation_acceptance;
+  const malformedResult = validatePullRequestLifecycleState(
+    validInput({ mode: "report", migrations: malformed }),
+  );
+  assert.equal(malformedResult.valid, false);
+  assert.match(malformedResult.violations.join("\n"), /missing fields/i);
+});
+
+test("report mode still fails on unavailable external GitHub state", () => {
+  assert.throws(
+    () =>
+      validatePullRequestLifecycleState(
+        validInput({ mode: "report", issue: null }),
+      ),
+    /unavailable/i,
+  );
+});
+
 test("allows only an exact unexpired migration before activation", () => {
   const migrations = {
-    schema_version: 1,
+    schema_version: 2,
     activation_commit: null,
+    mutation_acceptance: {
+      reason: "Bounded live acceptance",
+      approved_by: "maintainer",
+      expires_at: "2026-09-11T00:00:00.000Z",
+    },
     entries: [
       {
         pull_request: 51,
@@ -415,8 +472,13 @@ test("CLI resolves an exact legacy migration before claim-field lookup", async (
   await writeFile(
     migrationsPath,
     JSON.stringify({
-      schema_version: 1,
+      schema_version: 2,
       activation_commit: null,
+      mutation_acceptance: {
+        reason: "Bounded live acceptance",
+        approved_by: "maintainer",
+        expires_at: "2026-09-11T00:00:00Z",
+      },
       entries: [
         {
           pull_request: 51,

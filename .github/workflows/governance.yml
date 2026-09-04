@@ -37,6 +37,7 @@ jobs:
         run: >-
           node --test
           scripts/github/ai-issue-policy.test.mjs
+          scripts/github/ai-lifecycle-registry.test.mjs
           scripts/github/github-api.test.mjs
           scripts/github/ai-issue-controller.test.mjs
           scripts/github/verify-ai-lifecycle.test.mjs
@@ -68,7 +69,7 @@ jobs:
       - name: Verify live AI Issue lifecycle
         if: github.event_name == 'pull_request'
         env:
-          AI_LIFECYCLE_MODE: ${{ vars.AI_LIFECYCLE_MODE || 'report' }}
+          AI_LIFECYCLE_VALIDATION_MODE: ${{ vars.AI_LIFECYCLE_VALIDATION_MODE || 'report' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
           GITHUB_REPOSITORY: ${{ github.repository }}

@@ -4,24 +4,24 @@ Verified on 2026-09-04 against [EthanSMC/qwen-harness-bridge](https://github.com
 
 ## AI Issue lifecycle rollout
 
-- Activation: pre-activation bootstrap. The lifecycle workflow is not yet on `main`, the `AI_LIFECYCLE_MODE` repository variable is absent, and strict enforcement is not claimed.
-- Candidate mode: `report`, using the workflow default until an explicit repository variable is set after activation evidence lands.
+- Activation: pre-activation bootstrap. The lifecycle workflow is not yet on `main`, the `AI_LIFECYCLE_MUTATION_MODE` and `AI_LIFECYCLE_VALIDATION_MODE` repository variables are absent, and strict enforcement is not claimed.
+- Candidate modes: mutation `report` and validation `report`, using workflow defaults until the staged live acceptance begins.
 - Candidate workflows/checks: `AI Issue Lifecycle / lifecycle` handles commands and reconciliation; `Governance / governance` includes the read-only PR lifecycle validator.
 - Managed lifecycle labels: six (`status:waiting`, `status:ready`, `status:in-progress`, `status:review`, `status:blocked`, and `status:done`), bringing the candidate managed-label total from 19 to 25.
-- Activation commit: `null` until a full 40-character commit reachable from `main` contains the complete implementation.
-- Open migration entries: PR [#45](https://github.com/EthanSMC/qwen-harness-bridge/pull/45) / Issue [#7](https://github.com/EthanSMC/qwen-harness-bridge/issues/7), and bootstrap PR [#47](https://github.com/EthanSMC/qwen-harness-bridge/pull/47) / Issue [#46](https://github.com/EthanSMC/qwen-harness-bridge/issues/46). Both are approved by `EthanSMC`, expire at 2026-09-11T00:00:00Z, accept only their exact pre-activation pairs, and avoid inventing historical claim receipts. Every entry must be removed before enforce mode.
-- Last reconciliation evidence: a no-write dry-run at 2026-09-04T05:46:37Z resolved all 34 marker-linked plan Issues, all six milestones, the complete paginated collaborator set, all open PRs, and the branch-protection payload. It proposed #1 and #28 as ready, #7 as migrated review owned by its PR author, #2–#6 as historical done, and the remaining open plan Issues as waiting.
+- Activation commit: `null` until a full 40-character commit reachable from `main` contains the complete implementation. The committed mutation-acceptance window is approved by `EthanSMC` and expires at 2026-09-11T00:00:00Z; it permits only mutation enforcement before activation while validation remains report-only.
+- Open migration entries: PR [#45](https://github.com/EthanSMC/qwen-harness-bridge/pull/45) / Issue [#7](https://github.com/EthanSMC/qwen-harness-bridge/issues/7), and bootstrap PR [#47](https://github.com/EthanSMC/qwen-harness-bridge/pull/47) / Issue [#46](https://github.com/EthanSMC/qwen-harness-bridge/issues/46). Both are approved by `EthanSMC`, expire at 2026-09-11T00:00:00Z, accept only their exact pre-activation pairs, and avoid inventing historical claim receipts. Every entry must be removed before activation and validation enforcement.
+- Last reconciliation evidence: a no-write dry-run at 2026-09-04T06:56:56Z resolved all 34 marker-linked plan Issues, all six milestones, the complete paginated collaborator set, all open PRs, and the branch-protection payload. It verified #1–#7 as historical done from unique merged PR evidence and `main` ancestry, proposed #8 and #28 as ready, and proposed the remaining open plan Issues as waiting. Historical evidence was fetched through bounded GraphQL pagination; active Issue bodies were preserved.
 - Live acceptance links: none yet. The disposable claim/heartbeat/PR/merge/close/reopen acceptance cycle is required after the bootstrap merge and before strict activation.
 
 ## Bootstrap verification evidence
 
 Observed locally on 2026-09-04 before opening the bootstrap pull request:
 
-- `node --test scripts/github/*.test.mjs`: PASS, 126 tests, including the legacy-migration CLI path.
+- `node --test scripts/github/*.test.mjs`: PASS, 152 tests, including ordered backlog recovery, current-claim terminal binding, bounded rollout, GraphQL historical proof, and the legacy-migration CLI path.
 - `node scripts/github/verify-planning.mjs`: PASS, 25 governance/planning files and 34 implementation tasks.
-- `pnpm check`: PASS after rebasing onto current `main`; Biome checked 68 files, both workspace TypeScript projects passed, and Vitest passed 17 files / 325 tests.
+- `pnpm check`: PASS before the final rebase; Biome checked 70 files, both workspace TypeScript projects passed, and Vitest passed 17 files / 325 tests. This command must be rerun after rebasing onto current `main`.
 - `git diff --check origin/main`: PASS after removing Markdown-only trailing whitespace from the candidate range.
-- Security inspection: the write-capable workflow uses `pull_request_target`, serializes at repository scope, checks out only `github.event.repository.default_branch`, disables persisted checkout credentials, grants `contents: read` plus `issues: write` and `pull-requests: read`, never grants `contents: write`, and reads untrusted comment data only from the event JSON inside Node.
+- Security inspection: the write-capable workflow uses `pull_request_target`, serializes per Issue/PR, drains unprocessed commands by immutable comment ID, checks out only `github.event.repository.default_branch`, disables persisted checkout credentials, grants `contents: read` plus `issues: write` and `pull-requests: read`, never grants `contents: write`, and reads untrusted comment data only inside Node.
 
 These local results do not substitute for current-head GitHub checks or independent final review.
 

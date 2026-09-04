@@ -5,8 +5,11 @@ import {
   ALLOWED_TRANSITIONS,
   assertIssueInvariant,
   COMMAND_NAMES,
+  closingIssueNumbers,
   evaluateReadiness,
   LifecycleError,
+  MANAGED_TYPE_LABELS,
+  MAX_DEPENDENCIES,
   parseDependencies,
   parseLifecycleCommand,
   parseReceipts,
@@ -92,6 +95,13 @@ test("exports exactly the six managed lifecycle labels", () => {
     "release",
   ]);
   assert.deepEqual(ALLOWED_TRANSITIONS.ready, ["in-progress"]);
+  assert.deepEqual(MANAGED_TYPE_LABELS, [
+    "type:feature",
+    "type:bug",
+    "type:test",
+    "type:docs",
+    "type:security",
+  ]);
   assert.deepEqual(RECEIPT_ACTIONS, [
     ...COMMAND_NAMES,
     "expire",
@@ -210,7 +220,34 @@ test("accepts exactly one canonical dependency declaration", () => {
     "NOT_READY",
   );
   expectCode(() => parseDependencies("Blocked by #12, #12"), "NOT_READY");
+  expectCode(
+    () =>
+      parseDependencies(
+        `Blocked by ${Array.from(
+          { length: MAX_DEPENDENCIES + 1 },
+          (_, index) => `#${index + 1}`,
+        ).join(", ")}`,
+      ),
+    "NOT_READY",
+  );
+  expectCode(
+    () => parseDependencies(`Blocked by #${"9".repeat(600)}`),
+    "NOT_READY",
+  );
   expectCode(() => parseDependencies("No dependencies"), "NOT_READY");
+});
+
+test("recognizes only one standalone closing line outside Markdown code", () => {
+  assert.deepEqual(closingIssueNumbers("- Closes #46"), [46]);
+  assert.deepEqual(
+    closingIssueNumbers("This prose closes #46 eventually."),
+    [],
+  );
+  assert.deepEqual(closingIssueNumbers("Closes #46\nCloses #46"), [46, 46]);
+  assert.deepEqual(
+    closingIssueNumbers("```text\nCloses #46\n```\n`Closes #47`"),
+    [],
+  );
 });
 
 test("enforces lifecycle label, assignee, and open/closed invariants", () => {
@@ -256,6 +293,52 @@ test("enforces lifecycle label, assignee, and open/closed invariants", () => {
     () =>
       assertIssueInvariant(issue({ state: "open", labels: ["status:done"] })),
     "STATE_MISMATCH",
+  );
+  expectCode(
+    () => assertIssueInvariant(issue({ labels: ["status:ready"] })),
+    "STATE_MISMATCH",
+  );
+  expectCode(
+    () =>
+      assertIssueInvariant(
+        issue({ labels: ["type:docs", "type:test", "status:ready"] }),
+      ),
+    "STATE_MISMATCH",
+  );
+});
+
+test("accepts canonical GitHub Issue Form section headings", () => {
+  const formBody = validBody.replace(/^## /gmu, "### ");
+  assert.equal(
+    evaluateReadiness({
+      issue: issue({ body: formBody }),
+      dependencies: [],
+      closingPullRequests: [],
+    }).ready,
+    true,
+  );
+});
+
+test("readiness rejects an unmanaged type and a self dependency", () => {
+  assert.equal(
+    evaluateReadiness({
+      issue: issue({ labels: ["status:ready"] }),
+      dependencies: [],
+      closingPullRequests: [],
+    }).code,
+    "NOT_READY",
+  );
+  assert.equal(
+    evaluateReadiness({
+      issue: issue({
+        body: validBody.replace("Blocked by none", "Blocked by #46"),
+      }),
+      dependencies: [
+        { number: 46, state: "closed", state_reason: "completed" },
+      ],
+      closingPullRequests: [],
+    }).code,
+    "NOT_READY",
   );
 });
 
@@ -435,7 +518,7 @@ test("rejects malformed, unsupported, or inconsistent receipts", () => {
       "/ai-heartbeat\nsummary: implementation continues",
     ),
     issue: issue({
-      labels: ["status:in-progress"],
+      labels: ["type:docs", "status:in-progress"],
       assignees: ["alice"],
     }),
     receipts: [claim],
@@ -507,7 +590,7 @@ test("parses system transitions and retains the active claim generation", () => 
       "/ai-heartbeat\nsummary: resumed after a closed pull request",
     ),
     issue: issue({
-      labels: ["status:in-progress"],
+      labels: ["type:docs", "status:in-progress"],
       assignees: ["alice"],
     }),
     receipts: parsed,
@@ -633,7 +716,10 @@ test("renews a review-state claim so an expired lease cannot merge", () => {
     command: parseLifecycleCommand(
       "/ai-heartbeat\nsummary: final review is still in progress",
     ),
-    issue: issue({ labels: ["status:review"], assignees: ["alice"] }),
+    issue: issue({
+      labels: ["type:docs", "status:review"],
+      assignees: ["alice"],
+    }),
     receipts: [claim, review],
     eventId: 903,
     now: "2026-09-05T00:00:00.000Z",
@@ -676,7 +762,7 @@ test("plans owner block and resume with the same claim generation", () => {
           "/ai-block\nreason: invalid repeat\nresume-when: never",
         ),
         issue: issue({
-          labels: ["status:blocked"],
+          labels: ["type:docs", "status:blocked"],
           assignees: ["alice"],
         }),
         receipts: [claim, blocked.receipt],

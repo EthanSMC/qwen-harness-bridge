@@ -16,6 +16,7 @@ The normative design is [AI-Assisted Issue Collaboration Design](../superpowers/
 | `status:done` | Completed closed Issue | none |
 
 An Issue may carry only one managed `status:*` label. Manual label or assignee edits that violate this table stop the workflow until a maintainer repairs the state.
+Every governed Issue also carries exactly one managed work type: `type:feature`, `type:bug`, `type:test`, `type:docs`, or `type:security`. Untyped Issues are ignored; multiple managed types fail closed.
 
 ## Readiness
 
@@ -30,6 +31,8 @@ An Issue can be claimed only when it:
 
 Outside contributors may propose changes, but a maintainer must first assign and classify the work before it enters this governed lifecycle.
 
+The dependency declaration is limited to 512 UTF-8 bytes and 20 unique Issue numbers. Dependency reads use a four-request worker pool, so a public Issue cannot create an unbounded authenticated request burst.
+
 ## Claim
 
 Post this as an Issue comment:
@@ -41,9 +44,9 @@ agent: codex
 
 `agent` is a safe lowercase class such as `codex`, `claude-code`, `copilot`, `gemini-cli`, `other`, or `none`. Do not include a thread URL, prompt, local path, or log.
 
-Repository automation serializes commands per Issue, verifies live GitHub state and permissions, assigns the human commenter, changes the label to `status:in-progress`, and writes a versioned claim receipt. Work starts only after that success receipt appears. A competing claim receives `ALREADY_CLAIMED` and must not start.
+Repository automation serializes commands per Issue, verifies live GitHub state and permissions, assigns the human commenter, changes the label to `status:in-progress`, and writes a versioned claim receipt. Each run drains every unprocessed `/ai-*` comment in immutable comment-ID order; the hourly run performs a repository-wide recovery drain. A superseded pending workflow run therefore cannot silently discard a command. Work starts only after the success receipt appears. A competing claim receives `ALREADY_CLAIMED` and must not start.
 
-Claims expire after 24 hours without an explicit heartbeat.
+Claims expire after 24 hours without an explicit heartbeat. Lease deadlines are calculated from the verified GitHub comment timestamp; scheduled expiry and migration checks use the GitHub API `Date` header, not runner-local time.
 
 ## Work and heartbeat
 
@@ -110,13 +113,15 @@ Opening a qualifying pull request moves the Issue to `status:review`. The review
 
 Protected `main` is the only merge target. Before merge, the controller independently verifies the current checks, review state, Issue owner, claim receipt, branch, and lifecycle state.
 
-Rollout begins in `report` mode, where the same read-only PR validator reports lifecycle gaps without weakening the existing review gate. `enforce` mode is valid only after the migration registry contains a full activation commit reachable from `main` and contains no remaining migration entries.
+Rollout uses two independent repository variables. `AI_LIFECYCLE_MUTATION_MODE` controls Issue/receipt writes; `AI_LIFECYCLE_VALIDATION_MODE` controls the read-only PR merge gate. Both default to `report`.
+
+Mutation enforcement is allowed only during the versioned registry's bounded `mutation_acceptance` window or after formal activation. Validation stays in `report` during live acceptance. Formal activation requires a full activation commit reachable from `main`, `mutation_acceptance: null`, and no migration entries; only then may validation change to `enforce`. Rollback sets either variable back to `report` without deleting receipts.
 
 After merge, verify all of these outcomes:
 
 1. the primary pull request is merged into `main`;
 2. `Closes #N` closed exactly the intended Issue as completed;
-3. the merge commit is reachable from current `origin/main`;
+3. the PR names the current claim receipt, its merge occurs after that claim, the Issue closes after the merge, no closing PR remains open, and the merge commit is an ancestor of current `main`;
 4. the Issue has `status:done` and no assignee;
 5. required acceptance evidence is current; and
 6. the implementation branch and disposable worktree are removed only after recovery from `main` is proven.
