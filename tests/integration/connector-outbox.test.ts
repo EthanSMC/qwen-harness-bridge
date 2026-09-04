@@ -1959,14 +1959,19 @@ describe("PostgreSQL Connector outbox", () => {
     const holder = holdConnectorRowUntil(testIdentity.connectorId, expiresAt);
     await holder.ready;
     const accepted = store.acceptClientMessage(testIdentity, message, now);
+    const acceptedOutcome = Promise.allSettled([accepted]);
     try {
       await waitForRowLockWaiter("connectors");
     } finally {
       holder.releaseToExpiry();
+      await holder.done;
     }
-    await holder.done;
 
-    await expectStoreError(accepted, "CLAIM_REJECTED");
+    const [outcome] = await acceptedOutcome;
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      reason: { code: "CLAIM_REJECTED" },
+    });
     await expect(
       database.query<{ status: string; attempt: number; revision: number }>(
         "SELECT status, attempt, revision FROM jobs WHERE id = $1",
@@ -2010,14 +2015,19 @@ describe("PostgreSQL Connector outbox", () => {
     const holder = holdConnectorRowUntil(testIdentity.connectorId, expiresAt);
     await holder.ready;
     const accepted = store.acceptClientMessage(testIdentity, message, now);
+    const acceptedOutcome = Promise.allSettled([accepted]);
     try {
       await waitForRowLockWaiter("connectors");
     } finally {
       holder.releaseToExpiry();
+      await holder.done;
     }
-    await holder.done;
 
-    await expectStoreError(accepted, "EVENT_REJECTED");
+    const [outcome] = await acceptedOutcome;
+    expect(outcome).toMatchObject({
+      status: "rejected",
+      reason: { code: "EVENT_REJECTED" },
+    });
     await expect(
       database.query<{ status: string; attempt: number; revision: number }>(
         "SELECT status, attempt, revision FROM jobs WHERE id = $1",
@@ -2908,12 +2918,16 @@ describe("PostgreSQL Connector outbox", () => {
       testIdentity,
       duplicateId,
     );
+    const duplicateAcceptanceOutcome = Promise.allSettled([
+      duplicateAcceptance,
+    ]);
     let outcomes: PromiseSettledResult<unknown>[] = [];
     let approvalProbe: PromiseSettledResult<unknown> | undefined;
-    let decision: Promise<unknown> | undefined;
+    let decisionOutcome: Promise<PromiseSettledResult<unknown>[]> =
+      Promise.resolve([]);
     try {
       await waitForAdvisoryWaiters([lockKey], 1);
-      decision = repository.recordApprovalDecision({
+      const decision = repository.recordApprovalDecision({
         ownerId: OWNER_ID,
         approvalId,
         decision: "approve",
@@ -2921,6 +2935,7 @@ describe("PostgreSQL Connector outbox", () => {
         expectedAttempt: 1,
         actionFingerprint: fingerprint,
       });
+      decisionOutcome = Promise.allSettled([decision]);
       await waitForRowLockWaiter("connectors");
       [approvalProbe] = await Promise.allSettled([
         database.client.transaction((tx) =>
@@ -2931,16 +2946,18 @@ describe("PostgreSQL Connector outbox", () => {
       ]);
       releaseApprovalGate();
       await approvalGateHolder;
-      outcomes = await Promise.allSettled([duplicateAcceptance, decision]);
+      outcomes = [
+        ...(await duplicateAcceptanceOutcome),
+        ...(await decisionOutcome),
+      ];
     } finally {
       releaseApprovalGate();
       await approvalGateHolder;
       if (outcomes.length === 0) {
-        outcomes = await Promise.allSettled(
-          decision === undefined
-            ? [duplicateAcceptance]
-            : [duplicateAcceptance, decision],
-        );
+        outcomes = [
+          ...(await duplicateAcceptanceOutcome),
+          ...(await decisionOutcome),
+        ];
       }
       await database.query(
         `DROP TRIGGER IF EXISTS ${approvalTrigger} ON approvals;
@@ -3047,11 +3064,12 @@ describe("PostgreSQL Connector outbox", () => {
     );
     const gate = await createWriteBoundaryGate("jobs", envelopeExpiresAt);
     const acceptance = store.acceptClientMessage(testIdentity, message);
+    const acceptanceOutcome = Promise.allSettled([acceptance]);
     let outcome: PromiseSettledResult<unknown> | undefined;
     try {
       await gate.waitUntilBlocked();
       await gate.releaseAtExpiry();
-      [outcome] = await Promise.allSettled([acceptance]);
+      [outcome] = await acceptanceOutcome;
     } finally {
       await gate.dispose();
     }
@@ -3119,11 +3137,12 @@ describe("PostgreSQL Connector outbox", () => {
     );
     const gate = await createWriteBoundaryGate("jobs", envelopeExpiresAt);
     const acceptance = store.acceptClientMessage(testIdentity, message);
+    const acceptanceOutcome = Promise.allSettled([acceptance]);
     let outcome: PromiseSettledResult<unknown> | undefined;
     try {
       await gate.waitUntilBlocked();
       await gate.releaseAtExpiry();
-      [outcome] = await Promise.allSettled([acceptance]);
+      [outcome] = await acceptanceOutcome;
     } finally {
       await gate.dispose();
     }
@@ -3198,11 +3217,12 @@ describe("PostgreSQL Connector outbox", () => {
     );
     const gate = await createWriteBoundaryGate("job_events", envelopeExpiresAt);
     const acceptance = store.acceptClientMessage(testIdentity, message);
+    const acceptanceOutcome = Promise.allSettled([acceptance]);
     let outcome: PromiseSettledResult<unknown> | undefined;
     try {
       await gate.waitUntilBlocked();
       await gate.releaseAtExpiry();
-      [outcome] = await Promise.allSettled([acceptance]);
+      [outcome] = await acceptanceOutcome;
     } finally {
       await gate.dispose();
     }
@@ -3280,11 +3300,12 @@ describe("PostgreSQL Connector outbox", () => {
         boundaryExpiresAt,
       );
       const acceptance = store.acceptClientMessage(testIdentity, message);
+      const acceptanceOutcome = Promise.allSettled([acceptance]);
       let outcome: PromiseSettledResult<unknown> | undefined;
       try {
         await gate.waitUntilBlocked();
         await gate.releaseAtExpiry();
-        [outcome] = await Promise.allSettled([acceptance]);
+        [outcome] = await acceptanceOutcome;
       } finally {
         await gate.dispose();
       }
@@ -3348,11 +3369,12 @@ describe("PostgreSQL Connector outbox", () => {
     });
     const gate = await createWriteBoundaryGate("job_events", jobExpiresAt);
     const acceptance = store.acceptClientMessage(testIdentity, message);
+    const acceptanceOutcome = Promise.allSettled([acceptance]);
     let outcome: PromiseSettledResult<unknown> | undefined;
     try {
       await gate.waitUntilBlocked();
       await gate.releaseAtExpiry();
-      [outcome] = await Promise.allSettled([acceptance]);
+      [outcome] = await acceptanceOutcome;
     } finally {
       await gate.dispose();
     }
@@ -3430,11 +3452,12 @@ describe("PostgreSQL Connector outbox", () => {
         boundaryExpiresAt,
       );
       const acceptance = store.acceptClientMessage(testIdentity, message);
+      const acceptanceOutcome = Promise.allSettled([acceptance]);
       let outcome: PromiseSettledResult<unknown> | undefined;
       try {
         await gate.waitUntilBlocked();
         await gate.releaseAtExpiry();
-        [outcome] = await Promise.allSettled([acceptance]);
+        [outcome] = await acceptanceOutcome;
       } finally {
         await gate.dispose();
       }
@@ -3515,11 +3538,12 @@ describe("PostgreSQL Connector outbox", () => {
     );
     const gate = await createWriteBoundaryGate("job_events", envelopeExpiresAt);
     const acceptance = store.acceptClientMessage(testIdentity, message);
+    const acceptanceOutcome = Promise.allSettled([acceptance]);
     let outcome: PromiseSettledResult<unknown> | undefined;
     try {
       await gate.waitUntilBlocked();
       await gate.releaseAtExpiry();
-      [outcome] = await Promise.allSettled([acceptance]);
+      [outcome] = await acceptanceOutcome;
     } finally {
       await gate.dispose();
     }
@@ -3608,11 +3632,12 @@ describe("PostgreSQL Connector outbox", () => {
       expectedAttempt: 1,
       actionFingerprint: fingerprint,
     });
+    const decisionOutcome = Promise.allSettled([decision]);
     let outcome: PromiseSettledResult<unknown> | undefined;
     try {
       await gate.waitUntilBlocked();
       await gate.releaseAtExpiry();
-      [outcome] = await Promise.allSettled([decision]);
+      [outcome] = await decisionOutcome;
     } finally {
       await gate.dispose();
     }
@@ -3677,11 +3702,12 @@ describe("PostgreSQL Connector outbox", () => {
       expectedRevision: 0,
       reason: "Final outbox boundary cancellation",
     });
+    const cancellationOutcome = Promise.allSettled([cancellation]);
     let outcome: PromiseSettledResult<unknown> | undefined;
     try {
       await gate.waitUntilBlocked();
       await gate.releaseAtExpiry();
-      [outcome] = await Promise.allSettled([cancellation]);
+      [outcome] = await cancellationOutcome;
     } finally {
       await gate.dispose();
     }
