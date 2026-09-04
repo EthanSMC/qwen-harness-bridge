@@ -342,6 +342,62 @@ const claim = async (fake, id = 901) =>
     context(fake, fake.command(id, "alice", "/ai-claim\nagent: codex")),
   );
 
+const installLaterSameLoginClaim = async (fake) => {
+  await claim(fake);
+  const firstClaim = fake.workflowReceipts()[0];
+  const releaseReceipt = {
+    ...firstClaim,
+    eventId: 902,
+    action: "release",
+    from: "in-progress",
+    to: "ready",
+    leaseExpiresAt: null,
+  };
+  fake.comments.get(46).push({
+    id: fake.nextCommentId++,
+    body: receiptBody(releaseReceipt),
+    created_at: NOW,
+    user: { login: "github-actions[bot]" },
+  });
+  fake.issues.get(46).labels = [
+    { name: "type:docs" },
+    { name: "status:ready" },
+  ];
+  fake.issues.get(46).assignees = [];
+  const secondClaimId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  await handleIssueComment(
+    context(fake, fake.command(903, "alice", "/ai-claim\nagent: codex"), {
+      randomUUID: () => secondClaimId,
+    }),
+  );
+  return { firstClaim, secondClaimId };
+};
+
+const addPendingHeartbeatIntent = (fake, claimId, eventId = 950) => {
+  const currentClaim = fake
+    .workflowReceipts()
+    .find(
+      (receipt) => receipt.action === "claim" && receipt.claimId === claimId,
+    );
+  const receipt = {
+    ...currentClaim,
+    eventId,
+    action: "heartbeat",
+    from: "in-progress",
+    to: "in-progress",
+    leaseExpiresAt: "2026-09-05T13:00:00.000Z",
+  };
+  fake.comments.get(46).push({
+    id: fake.nextCommentId++,
+    body: receiptBody(receipt)
+      .replace("AI lifecycle heartbeat:", "Pending AI lifecycle heartbeat:")
+      .replace("<!-- qhb-ai-lifecycle:v2", "<!-- qhb-ai-intent:v2"),
+    created_at: "2026-09-04T13:00:00.000Z",
+    user: { login: "github-actions[bot]" },
+  });
+  return receipt;
+};
+
 test("dependency hydration uses a bounded worker pool", async () => {
   let active = 0;
   let maximum = 0;
@@ -1063,6 +1119,100 @@ test("claim generation fences same-login lifecycle workers and permits the curre
   );
   assert.ok(fake.issue().labels.some(({ name }) => name === "status:ready"));
   assert.deepEqual(fake.issue().assignees, []);
+});
+
+test("stale same-login commands cannot recover a current generation pending intent", async () => {
+  const commands = [
+    `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: stale worker`,
+    `/ai-block\nclaim-id: ${UUID}\nreason: stale worker\nresume-when: never`,
+    `/ai-resume\nclaim-id: ${UUID}`,
+    `/ai-release\nclaim-id: ${UUID}\nreason: stale worker`,
+  ];
+  for (const [index, body] of commands.entries()) {
+    const fake = new FakeGitHub();
+    const { secondClaimId } = await installLaterSameLoginClaim(fake);
+    const pending = addPendingHeartbeatIntent(fake, secondClaimId, 950 + index);
+    const issueBefore = fake.issue();
+    const mutationStart = fake.mutations.length;
+
+    const result = await handleIssueComment(
+      context(fake, fake.command(960 + index, "alice", body)),
+    );
+
+    assert.equal(result.code, "CLAIM_MISMATCH");
+    assert.deepEqual(fake.issue(), issueBefore);
+    assert.equal(
+      fake
+        .workflowReceipts()
+        .some(
+          ({ eventId, result: receiptResult }) =>
+            eventId === pending.eventId && receiptResult === "success",
+        ),
+      false,
+    );
+    const newMutations = fake.mutations.slice(mutationStart);
+    assert.equal(
+      newMutations.some(
+        ({ method, path }) => method === "PATCH" && path === "/issues/46",
+      ),
+      false,
+    );
+    assert.equal(
+      newMutations.some(({ body: mutationBody }) =>
+        mutationBody?.body?.includes(`event-id=${pending.eventId}`),
+      ),
+      false,
+    );
+  }
+});
+
+test("current generation commands may recover their pending intent", async () => {
+  const fake = new FakeGitHub();
+  const { secondClaimId } = await installLaterSameLoginClaim(fake);
+  const pending = addPendingHeartbeatIntent(fake, secondClaimId);
+  const result = await handleIssueComment(
+    context(
+      fake,
+      fake.command(
+        960,
+        "alice",
+        `/ai-release\nclaim-id: ${secondClaimId}\nreason: current worker handoff`,
+      ),
+    ),
+  );
+  assert.equal(result.recovered, true);
+  assert.equal(result.plan.receipt.eventId, pending.eventId);
+  assert.equal(
+    fake
+      .workflowReceipts()
+      .some(
+        ({ eventId, result: receiptResult }) =>
+          eventId === pending.eventId && receiptResult === "success",
+      ),
+    true,
+  );
+});
+
+test("completed old events replay before current generation pending recovery", async () => {
+  const fake = new FakeGitHub();
+  const { secondClaimId } = await installLaterSameLoginClaim(fake);
+  const pending = addPendingHeartbeatIntent(fake, secondClaimId);
+  const mutationStart = fake.mutations.length;
+  const oldReleaseEvent = fake.command(
+    902,
+    "alice",
+    "/ai-release\nreason: completed historical release",
+  );
+
+  const result = await handleIssueComment(context(fake, oldReleaseEvent));
+
+  assert.equal(result.idempotent, true);
+  assert.equal(result.receipt.eventId, 902);
+  assert.equal(fake.mutations.length, mutationStart);
+  assert.equal(
+    fake.workflowReceipts().some(({ eventId }) => eventId === pending.eventId),
+    false,
+  );
 });
 
 test("replays an already-receipted legacy command before applying the current schema", async () => {

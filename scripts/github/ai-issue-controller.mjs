@@ -1178,6 +1178,27 @@ export const handleIssueComment = async ({
       error,
     });
   }
+  const currentClaim = currentClaimFromReceipts(loaded.receipts);
+  if (
+    command.name !== "claim" &&
+    currentClaim !== null &&
+    command.fields["claim-id"] !== currentClaim.claimId
+  ) {
+    return rejectCommand({
+      github,
+      issueNumber,
+      mode,
+      eventId: commentId,
+      action: command.name,
+      actor,
+      agent: currentClaim.agent,
+      issue: loaded.issue,
+      error: new LifecycleError(
+        "CLAIM_MISMATCH",
+        "Stop and verify the current receipt, assignee, and assigned executor before any retry or explicit handoff.",
+      ),
+    });
+  }
   if (mode === "enforce") {
     const recovered = await recoverPendingIntent({
       github,
