@@ -169,8 +169,8 @@ type FreshBuildCommandFailure = Error & {
   command?: string;
   status?: number | null;
   signal?: NodeJS.Signals | null;
-  stdout?: string | Buffer;
-  stderr?: string | Buffer;
+  stdout?: string;
+  stderr?: string;
 };
 
 const boundedChildOutput = (output: unknown): string => {
@@ -193,7 +193,13 @@ const describeFreshBuildCommandFailure = (
   file: string,
   args: readonly string[],
 ): FreshBuildCommandFailure => {
-  const original = (error ?? {}) as FreshBuildCommandFailure;
+  const original = (error ?? {}) as Error & {
+    cmd?: string;
+    status?: number | null;
+    signal?: NodeJS.Signals | null;
+    stdout?: unknown;
+    stderr?: unknown;
+  };
   const command = original.cmd ?? [file, ...args].join(" ");
   const status = original.status ?? null;
   const signal = original.signal ?? null;
@@ -208,9 +214,8 @@ const describeFreshBuildCommandFailure = (
       `stdout:\n${stdout || "<empty>"}`,
       `stderr:\n${stderr || "<empty>"}`,
     ].join("\n"),
-    { cause: error },
   ) as FreshBuildCommandFailure;
-  Object.assign(diagnostic, original, {
+  Object.assign(diagnostic, {
     cmd: command,
     command,
     status,
@@ -769,15 +774,30 @@ describe("release runtime build contract", () => {
       stdout: expect.any(String),
       stderr: expect.any(String),
     });
-    const failure = error as {
-      message: string;
+    const failure = error as FreshBuildCommandFailure & {
       stdout: string;
       stderr: string;
     };
+    expect({
+      hasCause: "cause" in failure,
+      enumerableKeys: Object.keys(failure).sort(),
+    }).toEqual({
+      hasCause: false,
+      enumerableKeys: [
+        "cmd",
+        "command",
+        "signal",
+        "status",
+        "stderr",
+        "stdout",
+      ],
+    });
     expect(failure.stdout).toContain("stdout details");
     expect(failure.stderr).toContain("stderr details");
     expect(failure.stdout.length).toBeLessThanOrEqual(4_096);
     expect(failure.stderr.length).toBeLessThanOrEqual(4_096);
+    expect(failure.stdout).toMatch(/\.\.\.\[truncated\]$/);
+    expect(failure.stderr).toMatch(/\.\.\.\[truncated\]$/);
     expect(failure.message).toContain("status: 9");
     expect(failure.message).toContain("signal: null");
     expect(failure.message).toContain("stdout details");
