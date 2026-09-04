@@ -17,6 +17,16 @@ export const COMMAND_NAMES = Object.freeze([
   "release",
 ]);
 
+export const RECEIPT_ACTIONS = Object.freeze([
+  ...COMMAND_NAMES,
+  "expire",
+  "pr-open",
+  "pr-close",
+  "merge",
+  "close",
+  "reopen",
+]);
+
 export const ALLOWED_TRANSITIONS = Object.freeze({
   waiting: Object.freeze(["ready"]),
   ready: Object.freeze(["in-progress"]),
@@ -73,7 +83,20 @@ const SUCCESS_TRANSITIONS = Object.freeze({
   heartbeat: ["in-progress", "in-progress"],
   block: ["in-progress", "blocked"],
   resume: ["blocked", "in-progress"],
+  "pr-open": ["in-progress", "review"],
+  "pr-close": ["review", "in-progress"],
 });
+
+const RECEIPT_END_ACTIONS = new Set(["release", "expire", "merge", "close"]);
+const OWNER_BOUND_ACTIONS = new Set([
+  "heartbeat",
+  "block",
+  "resume",
+  "pr-open",
+  "pr-close",
+  "merge",
+  "close",
+]);
 
 export class LifecycleError extends Error {
   constructor(code, message) {
@@ -159,7 +182,7 @@ const receiptIdentity = (receipt) =>
     code: receipt.code,
   });
 
-const activeClaim = (receipts) => {
+export const currentClaimFromReceipts = (receipts) => {
   let active = null;
   for (const receipt of receipts) {
     if (receipt.result !== "success") continue;
@@ -173,9 +196,9 @@ const activeClaim = (receipts) => {
       continue;
     }
     if (!active || receipt.claimId !== active.claimId) continue;
-    if (receipt.action === "release") {
+    if (RECEIPT_END_ACTIONS.has(receipt.action)) {
       active = null;
-    } else if (["heartbeat", "resume"].includes(receipt.action)) {
+    } else if (["heartbeat", "resume", "pr-close"].includes(receipt.action)) {
       active.leaseExpiresAt = receipt.leaseExpiresAt;
     }
   }
@@ -477,7 +500,7 @@ export const planLifecycleCommand = ({
   const { state, assignee } = assertIssueInvariant(issue);
   const permission = normalizedPermission(actorPermission);
   const action = command?.name;
-  const currentClaim = activeClaim(receipts ?? []);
+  const currentClaim = currentClaimFromReceipts(receipts ?? []);
 
   if (action === "claim") {
     if (!ELIGIBLE_PERMISSIONS.has(permission)) {
@@ -685,13 +708,14 @@ const parseReceiptBody = (body) => {
   };
   if (
     receipt.result === "success" &&
+    receipt.action !== "reopen" &&
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
       receipt.claimId ?? "",
     )
   ) {
     fail("STATE_MISMATCH", "A lifecycle receipt has an invalid claim ID.");
   }
-  if (!COMMAND_NAMES.includes(receipt.action)) {
+  if (!RECEIPT_ACTIONS.includes(receipt.action)) {
     fail("STATE_MISMATCH", "A lifecycle receipt has an invalid action.");
   }
   if (!new Set(["success", "failure"]).has(receipt.result)) {
@@ -707,7 +731,7 @@ const parseReceiptBody = (body) => {
     );
   }
   if (
-    !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?$/u.test(
+    !/^(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}[A-Za-z0-9])?|github-actions\[bot\])$/u.test(
       receipt.actor ?? "",
     )
   ) {
@@ -740,13 +764,30 @@ const parseReceiptBody = (body) => {
     ) {
       fail("STATE_MISMATCH", "A failure receipt must not claim a transition.");
     }
-  } else if (receipt.action === "release") {
+  } else if (["release", "expire"].includes(receipt.action)) {
     if (
       !["in-progress", "review", "blocked"].includes(receipt.from) ||
       !["ready", "waiting"].includes(receipt.to) ||
       receipt.leaseExpiresAt !== null
     ) {
       fail("STATE_MISMATCH", "A release receipt has an invalid transition.");
+    }
+  } else if (["merge", "close"].includes(receipt.action)) {
+    if (
+      receipt.from !== "review" ||
+      receipt.to !== "done" ||
+      receipt.leaseExpiresAt !== null
+    ) {
+      fail("STATE_MISMATCH", "A closure receipt has an invalid transition.");
+    }
+  } else if (receipt.action === "reopen") {
+    if (
+      receipt.claimId !== null ||
+      receipt.from !== "done" ||
+      !["ready", "waiting"].includes(receipt.to) ||
+      receipt.leaseExpiresAt !== null
+    ) {
+      fail("STATE_MISMATCH", "A reopen receipt has an invalid transition.");
     }
   } else {
     const transition = SUCCESS_TRANSITIONS[receipt.action];
@@ -799,6 +840,15 @@ export const parseReceipts = (
       });
       continue;
     }
+    if (parsed.action === "reopen") {
+      events.set(parsed.eventId, identity);
+      receipts.push({
+        ...parsed,
+        commentId: comment.id,
+        createdAt: comment.created_at,
+      });
+      continue;
+    }
     const claim = claims.get(parsed.claimId);
     if (parsed.action === "claim") {
       if (claim) {
@@ -819,13 +869,16 @@ export const parseReceipts = (
           "A receipt does not match an active claim generation.",
         );
       }
-      if (parsed.action !== "release" && parsed.actor !== claim.owner) {
+      if (
+        OWNER_BOUND_ACTIONS.has(parsed.action) &&
+        parsed.actor !== claim.owner
+      ) {
         fail(
           "STATE_MISMATCH",
           "A receipt actor does not match the claim owner.",
         );
       }
-      if (parsed.action === "release") claim.released = true;
+      if (RECEIPT_END_ACTIONS.has(parsed.action)) claim.released = true;
     }
     events.set(parsed.eventId, identity);
     receipts.push({

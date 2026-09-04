@@ -11,6 +11,7 @@ import {
   parseLifecycleCommand,
   parseReceipts,
   planLifecycleCommand,
+  RECEIPT_ACTIONS,
   receiptBody,
   STATUS_LABELS,
   safePublicText,
@@ -91,6 +92,15 @@ test("exports exactly the six managed lifecycle labels", () => {
     "release",
   ]);
   assert.deepEqual(ALLOWED_TRANSITIONS.ready, ["in-progress"]);
+  assert.deepEqual(RECEIPT_ACTIONS, [
+    ...COMMAND_NAMES,
+    "expire",
+    "pr-open",
+    "pr-close",
+    "merge",
+    "close",
+    "reopen",
+  ]);
 });
 
 test("parses every lifecycle command with exact fields", () => {
@@ -463,6 +473,69 @@ test("round-trips a bounded failure receipt without creating a claim", () => {
       },
     ]),
     [{ ...failure, commentId: 12, createdAt: NOW }],
+  );
+});
+
+test("parses system transitions and retains the active claim generation", () => {
+  const claim = plan().receipt;
+  const prOpen = {
+    ...claim,
+    eventId: 902,
+    action: "pr-open",
+    from: "in-progress",
+    to: "review",
+  };
+  const prClose = {
+    ...claim,
+    eventId: 903,
+    action: "pr-close",
+    from: "review",
+    to: "in-progress",
+    leaseExpiresAt: "2026-09-06T12:00:00.000Z",
+  };
+  const parsed = parseReceipts(
+    [claim, prOpen, prClose].map((receipt, index) => ({
+      id: 20 + index,
+      body: receiptBody(receipt),
+      user: { login: "github-actions[bot]" },
+    })),
+  );
+  const heartbeat = plan({
+    command: parseLifecycleCommand(
+      "/ai-heartbeat\nsummary: resumed after a closed pull request",
+    ),
+    issue: issue({
+      labels: ["status:in-progress"],
+      assignees: ["alice"],
+    }),
+    receipts: parsed,
+    eventId: 904,
+    now: "2026-09-06T00:00:00.000Z",
+  });
+  assert.equal(heartbeat.receipt.claimId, UUID);
+
+  const reopened = {
+    version: 1,
+    eventId: 905,
+    claimId: null,
+    action: "reopen",
+    result: "success",
+    actor: "github-actions[bot]",
+    agent: "none",
+    from: "done",
+    to: "ready",
+    leaseExpiresAt: null,
+    code: null,
+  };
+  assert.equal(
+    parseReceipts([
+      {
+        id: 30,
+        body: receiptBody(reopened),
+        user: { login: "github-actions[bot]" },
+      },
+    ])[0].action,
+    "reopen",
   );
 });
 

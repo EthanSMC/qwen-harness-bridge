@@ -395,7 +395,7 @@ git commit -m "refactor(governance): share strict GitHub API client"
 - Consumes: GitHub webhook event JSON, `GITHUB_EVENT_NAME`, repository, actor, token, server time, `createGitHubClient`, and pure policy functions.
 - Produces: `handleIssueComment`, `handlePullRequest`, `handleIssueChange`, `reconcileExpiredClaims`, `runLifecycleController`, and CLI exit status.
 
-- [ ] **Step 1: Write a stateful fake-GitHub acceptance harness**
+- [x] **Step 1: Write a stateful fake-GitHub acceptance harness**
 
 The fake stores issues, comments, labels, collaborators, pull requests, and server time. Start with Issue #46:
 
@@ -415,7 +415,7 @@ const initial = {
 };
 ```
 
-- [ ] **Step 2: Write the exclusive-claim race test**
+- [x] **Step 2: Write the exclusive-claim race test**
 
 ```js
 test("two serialized claim events produce one owner and one success receipt", async () => {
@@ -429,38 +429,38 @@ test("two serialized claim events produce one owner and one success receipt", as
 });
 ```
 
-- [ ] **Step 3: Run controller tests and observe failure**
+- [x] **Step 3: Run controller tests and observe failure**
 
 Run: `node --test scripts/github/ai-issue-controller.test.mjs`  
 Expected: FAIL because the controller does not exist.
 
-- [ ] **Step 4: Implement claim context loading and verified mutation**
+- [x] **Step 4: Implement claim context loading and verified mutation**
 
 For Issue comments, verify the event repository, Issue number, comment ID/body/author, and live comment identity. Ignore comments on pull requests and non-command comments. Query live permission, Issue, all Issue comments, parsed dependencies, and open pull requests whose body has a primary closing reference.
 
 Apply the pure plan in this order: create an intent record keyed by event ID, mutate label/assignee idempotently, create the success receipt, and re-read all state. If any final invariant fails, create one failure receipt with `STATE_MISMATCH` and return a failing status.
 
-- [ ] **Step 5: Implement heartbeat, block, resume, and release**
+- [x] **Step 5: Implement heartbeat, block, resume, and release**
 
 Require the current assignee for heartbeat/block/resume. Permit release by the owner or an admin/maintain collaborator. Refuse release while a closing pull request is open. Each action uses the current claim ID and produces one idempotent receipt.
 
-- [ ] **Step 6: Write lease and recovery tests**
+- [x] **Step 6: Write lease and recovery tests**
 
 Test exact expiry boundaries, scheduled release to ready, scheduled release to waiting after a dependency reopens, no automatic release for review/blocked, duplicate schedule delivery, block/resume, release with an open PR, maintainer repair, and GitHub timeout reconciliation.
 
-- [ ] **Step 7: Implement scheduled and Issue reconciliation**
+- [x] **Step 7: Implement scheduled and Issue reconciliation**
 
 `reconcileExpiredClaims` pages through open `status:in-progress` Issues and releases only those whose latest verified lease is `<= now`. `handleIssueChange` maps closed-completed to done/unassigned and reopened to ready or waiting. Manual drift creates a repair-required failure receipt without guessing ownership.
 
-- [ ] **Step 8: Write PR transition and closure tests**
+- [x] **Step 8: Write PR transition and closure tests**
 
 Cover open/draft/synchronize moving the primary Issue to review, closed-unmerged returning review to in-progress, merged requiring the Issue to close as completed, branch Issue-number matching, PR-author/assignee matching, and ambiguous/multiple primary closing references.
 
-- [ ] **Step 9: Implement pull-request reconciliation**
+- [x] **Step 9: Implement pull-request reconciliation**
 
 Read the pull request live. A qualifying open PR moves `in-progress` to `review`. A closed unmerged PR returns to `in-progress` with a renewed lease. A merged PR verifies GitHub closure, main reachability through the merge response, and terminal reconciliation before applying `status:done` and removing the assignee.
 
-- [ ] **Step 10: Run controller tests and commit**
+- [x] **Step 10: Run controller tests and commit**
 
 Run:
 
