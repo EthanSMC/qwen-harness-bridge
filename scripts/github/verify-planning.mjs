@@ -16,15 +16,25 @@ const governance = [
   "SECURITY.md",
   "CHANGELOG.md",
   ".github/CODEOWNERS",
+  ".github/ISSUE_TEMPLATE/implementation.yml",
+  ".github/ISSUE_TEMPLATE/bug.yml",
   ".github/workflows/governance.yml",
+  ".github/workflows/ai-issue-lifecycle.yml",
   ".github/pull_request_template.md",
   ".github/labels.yml",
   ".github/milestones.yml",
   "docs/github/repository-status.md",
 ];
+const aiGovernance = [
+  "AGENTS.md",
+  "docs/github/ai-collaboration.md",
+  "docs/github/ai-lifecycle-migrations.json",
+  "docs/superpowers/specs/2026-09-04-ai-issue-collaboration-design.md",
+  "docs/superpowers/plans/2026-09-04-ai-issue-collaboration.md",
+];
 const syncManagement = "scripts/github/sync-management.mjs";
 
-const files = [spec, ...plans, ...governance, syncManagement];
+const files = [spec, ...plans, ...governance, ...aiGovernance, syncManagement];
 const contents = new Map(
   files.map((file) => [file, readFileSync(resolve(root, file), "utf8")]),
 );
@@ -64,6 +74,93 @@ const requireSourceField = (source, file, pattern, message) => {
   if (!pattern.test(source))
     throw new Error(`${file} governance gate is missing ${message}`);
 };
+
+const lifecycleLabels = [
+  "status:waiting",
+  "status:ready",
+  "status:in-progress",
+  "status:review",
+  "status:blocked",
+  "status:done",
+];
+for (const label of lifecycleLabels) {
+  requireGovernanceField(
+    ".github/labels.yml",
+    new RegExp(`name: "${label}"`),
+    label,
+  );
+}
+
+for (const command of [
+  "/ai-claim",
+  "/ai-heartbeat",
+  "/ai-block",
+  "/ai-resume",
+  "/ai-release",
+]) {
+  requireGovernanceField(
+    "AGENTS.md",
+    new RegExp(command.replace("/", "\\/")),
+    command,
+  );
+}
+
+const lifecycleMigrations = JSON.parse(
+  contents.get("docs/github/ai-lifecycle-migrations.json"),
+);
+if (
+  lifecycleMigrations.schema_version !== 3 ||
+  !Array.isArray(lifecycleMigrations.entries) ||
+  !(
+    lifecycleMigrations.mutation_acceptance === null ||
+    typeof lifecycleMigrations.mutation_acceptance === "object"
+  ) ||
+  !(
+    lifecycleMigrations.activation_commit === null ||
+    /^[0-9a-f]{40}$/u.test(lifecycleMigrations.activation_commit)
+  )
+) {
+  throw new Error("AI lifecycle migration registry has an invalid schema");
+}
+if (
+  lifecycleMigrations.mutation_acceptance !== null &&
+  typeof lifecycleMigrations.mutation_acceptance.approved_at !== "string"
+) {
+  throw new Error("AI lifecycle mutation acceptance needs an approval time");
+}
+
+for (const template of [
+  ".github/ISSUE_TEMPLATE/implementation.yml",
+  ".github/ISSUE_TEMPLATE/bug.yml",
+]) {
+  for (const [pattern, message] of [
+    [/label: Dependencies/, "the Dependencies field"],
+    [/Blocked by none/, "the canonical no-dependency value"],
+    [/label: Outcome/, "the Outcome field"],
+    [/label: Verification/, "the Verification field"],
+    [/label: Risk and rollback/, "the Risk and rollback field"],
+    [/label: Definition of done/, "the Definition of done field"],
+  ]) {
+    requireGovernanceField(template, pattern, message);
+  }
+  const ids = [
+    ...contents
+      .get(template)
+      .matchAll(/^\s+id:\s*([A-Za-z][A-Za-z0-9_-]*)\s*$/gmu),
+  ].map((match) => match[1]);
+  if (ids.length === 0 || new Set(ids).size !== ids.length) {
+    throw new Error(`${template} must define unique Issue Form input IDs`);
+  }
+}
+
+for (const [pattern, message] of [
+  [/Primary Issue: #/, "the primary Issue field"],
+  [/Claim receipt: https:\/\/github\.com\//, "the claim receipt field"],
+  [/Accountable owner: @/, "the accountable owner field"],
+  [/Implementer agent class:/, "the implementer agent class field"],
+]) {
+  requireGovernanceField(".github/pull_request_template.md", pattern, message);
+}
 
 for (const [file, pattern, message] of [
   ["README.md", /public GitHub repository/i, "the public repository state"],
@@ -193,8 +290,8 @@ for (const [pattern, message] of [
     /collaborators\?affiliation=direct&per_page=100/,
     "the direct-collaborator query",
   ],
-  [/--paginate/, "complete GitHub API pagination"],
-  [/--slurp/, "paginated GitHub API page collection"],
+  [/page <= 100/, "bounded GitHub API pagination"],
+  [/100-page safety cap/, "fail-closed pagination cap"],
   [
     /eligibleCollaborators\(directCollaborators, owner\)/,
     "shared strict collaborator eligibility and owner exclusion",
@@ -234,7 +331,7 @@ if (!approvalCount || Number(approvalCount[1]) < 1) {
 const repositoryStatus = "docs/github/repository-status.md";
 for (const [pattern, message] of [
   [
-    /Verified on 2026-09-03/,
+    /Verified on 2026-09-04/,
     "the current collaborator evidence verification date",
   ],
   [/EthanSMC\/qwen-harness-bridge/, "the repository identity"],
@@ -283,9 +380,18 @@ for (const [pattern, message] of [
     "the actual pull-request body validator command",
   ],
   [
-    /node --test scripts\/github\/verify-pr-review-evidence\.test\.mjs scripts\/github\/verify-pr-review-state\.test\.mjs scripts\/github\/sync-management\.test\.mjs/,
-    "the review evidence and management-sync node:test commands",
+    /node scripts\/github\/verify-ai-lifecycle\.mjs/,
+    "the live PR-to-claim lifecycle validator command",
   ],
+  [/node --test/, "the repository governance node:test command"],
+  [/ai-issue-policy\.test\.mjs/, "the AI lifecycle policy tests"],
+  [/github-api\.test\.mjs/, "the strict GitHub API tests"],
+  [/ai-issue-controller\.test\.mjs/, "the lifecycle controller tests"],
+  [/ai-lifecycle-registry\.test\.mjs/, "the lifecycle rollout registry tests"],
+  [/verify-ai-lifecycle\.test\.mjs/, "the PR-to-claim lifecycle tests"],
+  [/verify-pr-review-evidence\.test\.mjs/, "the review evidence tests"],
+  [/verify-pr-review-state\.test\.mjs/, "the live review-state tests"],
+  [/sync-management\.test\.mjs/, "the management synchronization tests"],
   [/needs: static/, "the final gate dependency on static"],
   [/name: governance/, "the final governance job name"],
   [/if: always\(\)/, "the always-running final gate"],
@@ -294,11 +400,79 @@ for (const [pattern, message] of [
     "the static result passed to the live validator",
   ],
   [
+    /vars\.AI_LIFECYCLE_VALIDATION_MODE\s*\|\|\s*'report'/,
+    "report-only validation rollout",
+  ],
+  [
     /if: github\.event_name == 'pull_request'/,
     "the PR-only live state gate condition",
   ],
 ])
   requireGovernanceField(workflow, pattern, message);
+
+const lifecycleWorkflow = ".github/workflows/ai-issue-lifecycle.yml";
+for (const [pattern, message] of [
+  [/issue_comment:/, "the Issue comment trigger"],
+  [/pull_request_target:/, "the trusted pull-request target trigger"],
+  [/issues:[\s\S]*?opened[\s\S]*?edited/, "new and edited Issue triggers"],
+  [/issues:\s*write/, "Issue write permission"],
+  [/pull-requests:\s*read/, "pull-request read permission"],
+  [
+    /^\s*group:\s*ai-issue-lifecycle-\$\{\{\s*github\.repository\s*\}\}\s*$/m,
+    "repository-wide lifecycle mutation queue",
+  ],
+  [/cancel-in-progress:\s*false/, "non-cancelling lifecycle queue"],
+  [
+    /ref:\s*\$\{\{\s*github\.event\.repository\.default_branch\s*\}\}/,
+    "explicit default-branch checkout",
+  ],
+  [/persist-credentials:\s*false/, "disabled checkout credentials"],
+  [
+    /vars\.AI_LIFECYCLE_MUTATION_MODE\s*\|\|\s*'report'/,
+    "report-only mutation rollout",
+  ],
+  [
+    /node scripts\/github\/ai-issue-controller\.mjs/,
+    "the trusted lifecycle controller command",
+  ],
+]) {
+  requireGovernanceField(lifecycleWorkflow, pattern, message);
+}
+
+const lifecycleController = readFileSync(
+  resolve(root, "scripts/github/ai-issue-controller.mjs"),
+  "utf8",
+);
+for (const [pattern, message] of [
+  [/reconcileLifecycleCommands/, "durable lifecycle command draining"],
+  [/Number\(left\.id\) - Number\(right\.id\)/, "immutable comment-ID ordering"],
+  [/reconcileRepositoryState/, "scheduled repository state reconciliation"],
+  [/MAX_COMMANDS_PER_DRAIN = 1_000/, "bounded command draining"],
+  [/COMMAND_SCAN_MAX_PAGES = 10/, "bounded repository comment scanning"],
+  [/\.slice\(0, maxCommands\)/, "oldest bounded command batch selection"],
+  [
+    /!parentByNumber\.get\(number\)\?\.pull_request/,
+    "pre-accounting pull-request comment filtering",
+  ],
+  [/runReconciliationPhases/, "non-starving event reconciliation phases"],
+  [
+    /if \(event\.issue\?\.pull_request\) return \{ status: "ignored" \}/,
+    "pull-request comment lifecycle isolation",
+  ],
+  [/pullRequestNumber:\s*pullRequest\.number/, "receipt pull-request binding"],
+  [/pendingIntentEventIds/, "cross-run pending system-intent recovery"],
+  [/matchesCurrentClaim/, "pending-intent claim generation binding"],
+  [/supersededPlans/, "durable stale pending-intent supersession"],
+  [/pullRequest\?\.updated_at/, "timely live pull-request qualification"],
+  [/stableSystemEventId/, "deterministic system event identities"],
+]) {
+  requireSourceField(
+    lifecycleController,
+    "scripts/github/ai-issue-controller.mjs",
+    pattern,
+    message,
+  );
+}
 
 for (const [pattern, message] of [
   [
@@ -320,6 +494,26 @@ const reviewEvidenceScript = readFileSync(
   resolve(root, "scripts/github/verify-pr-review-evidence.mjs"),
   "utf8",
 );
+const githubApiScript = readFileSync(
+  resolve(root, "scripts/github/github-api.mjs"),
+  "utf8",
+);
+for (const [pattern, message] of [
+  [/DEFAULT_MAX_PAGES = 100/, "a bounded GitHub pagination default"],
+  [/maxPages > 100/, "a hard GitHub pagination safety cap"],
+  [/page <= maxPages/, "explicit GitHub API page traversal"],
+  [
+    /pagination reached.*safety cap without a short page/,
+    "fail-closed pagination cap handling",
+  ],
+]) {
+  requireSourceField(
+    githubApiScript,
+    "scripts/github/github-api.mjs",
+    pattern,
+    message,
+  );
+}
 for (const [pattern, message] of [
   [
     /needs\.static\.result must be exactly success/,
@@ -336,12 +530,7 @@ for (const [pattern, message] of [
     /repository visibility is irrelevant to direct-collaborator eligibility/i,
     "visibility-independent direct-collaborator eligibility",
   ],
-  [/GITHUB_MAX_PAGES/, "a GitHub pagination safety cap"],
-  [/page=\$\{page\}/, "explicit GitHub API page traversal"],
-  [
-    /pagination reached.*safety cap.*failing closed/,
-    "fail-closed pagination cap handling",
-  ],
+  [/github\.getAll\(/, "shared paginated GitHub API reads"],
   [/direct collaborator \$\{index \+ 1\}/, "indexed collaborator validation"],
   [/collaborator\.role_name/, "collaborator role validation"],
   [

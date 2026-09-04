@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createGitHubClient } from "./github-api.mjs";
+
 const FIELD_LABELS = {
   formalUrl: "Formal GitHub review URL (required for formal mode)",
   formalIdentity: "Formal reviewer GitHub identity (required for formal mode)",
@@ -145,47 +147,11 @@ const validateCiEvidence = (value) => {
 
 const normalizeRepository = (value) => value.trim().toLowerCase();
 
-const GITHUB_PAGE_SIZE = 100;
-const GITHUB_MAX_PAGES = 100;
-
 const requiredPositiveNumber = (value, label) => {
   const number = Number(value);
   if (!Number.isInteger(number) || number < 1)
     throw new Error(`${label} must be a positive integer`);
   return number;
-};
-
-const apiJson = async (fetchImpl, repository, path, token) => {
-  if (typeof fetchImpl !== "function")
-    throw new Error(
-      "GitHub API fetch implementation is unavailable; failing closed",
-    );
-  const url = `https://api.github.com/repos/${repository}${path}`;
-  let response;
-  try {
-    response = await fetchImpl(url, {
-      method: "GET",
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${token}`,
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
-    });
-  } catch (error) {
-    throw new Error(`GitHub API request failed for ${path}: ${error.message}`);
-  }
-  if (!response || response.ok !== true) {
-    throw new Error(
-      `GitHub API request failed for ${path}: HTTP ${response?.status ?? "unknown"}`,
-    );
-  }
-  try {
-    return await response.json();
-  } catch (error) {
-    throw new Error(
-      `GitHub API response was not valid JSON for ${path}: ${error.message}`,
-    );
-  }
 };
 
 const requireObject = (value, label) => {
@@ -197,32 +163,6 @@ const requireObject = (value, label) => {
 const requireArray = (value, label) => {
   if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
   return value;
-};
-
-const apiJsonPages = async (fetchImpl, repository, path, token, label) => {
-  const items = [];
-  const separator = path.includes("?") ? "&" : "?";
-  for (let page = 1; page <= GITHUB_MAX_PAGES; page += 1) {
-    const pageItems = requireArray(
-      await apiJson(
-        fetchImpl,
-        repository,
-        `${path}${separator}per_page=${GITHUB_PAGE_SIZE}&page=${page}`,
-        token,
-      ),
-      `${label} page ${page}`,
-    );
-    if (pageItems.length > GITHUB_PAGE_SIZE) {
-      throw new Error(
-        `${label} page ${page} exceeded the requested page size; failing closed`,
-      );
-    }
-    items.push(...pageItems);
-    if (pageItems.length < GITHUB_PAGE_SIZE) return items;
-  }
-  throw new Error(
-    `${label} pagination reached the ${GITHUB_MAX_PAGES}-page safety cap without a short page; failing closed`,
-  );
 };
 
 const requireEqual = (actual, expected, label) => {
@@ -295,7 +235,7 @@ const validateCurrentChecksUrl = (value, repository, number) => {
 };
 
 const pullRequestFromEvent = (event, repository) => {
-  if (!event || !event.pull_request)
+  if (!event?.pull_request)
     throw new Error("GitHub event must contain pull_request");
   if (
     normalizeRepository(event.repository?.full_name ?? "") !==
@@ -550,12 +490,10 @@ export async function validatePullRequestState({
     throw new Error(
       `needs.static.result must be exactly success; received ${staticResult ?? "missing"}`,
     );
+  const github = createGitHubClient({ fetchImpl, repository, token });
   const eventPullRequest = pullRequestFromEvent(event, repository);
-  const currentPullRequest = await apiJson(
-    fetchImpl,
-    repository,
+  const currentPullRequest = await github.get(
     `/pulls/${eventPullRequest.number}`,
-    token,
   );
   verifyPullRequestApiState(eventPullRequest, currentPullRequest, repository);
   if (event.pull_request.body !== currentPullRequest.body)
@@ -576,27 +514,16 @@ export async function validatePullRequestState({
     repository,
     eventPullRequest.number,
   );
-  const currentRun = await apiJson(
-    fetchImpl,
-    repository,
-    `/actions/runs/${runId}`,
-    token,
-  );
+  const currentRun = await github.get(`/actions/runs/${runId}`);
   verifyWorkflowRun(currentRun, runId, repository, eventPullRequest);
   verifyStaticCheck(
-    await apiJson(
-      fetchImpl,
-      repository,
+    await github.get(
       `/commits/${eventPullRequest.head.sha}/check-runs?per_page=100`,
-      token,
     ),
     eventPullRequest.head.sha,
   );
-  const collaborators = await apiJsonPages(
-    fetchImpl,
-    repository,
+  const collaborators = await github.getAll(
     "/collaborators?affiliation=direct",
-    token,
     "direct collaborators",
   );
   const eligible = eligibleCollaborators(
@@ -619,11 +546,8 @@ export async function validatePullRequestState({
     ) {
       throw new Error("formal reviewer is not a current eligible collaborator");
     }
-    const reviews = await apiJsonPages(
-      fetchImpl,
-      repository,
+    const reviews = await github.getAll(
       `/pulls/${eventPullRequest.number}/reviews`,
-      token,
       "pull request reviews",
     );
     const latestReview = latestReviewFor(reviews, formalIdentity);
@@ -736,7 +660,7 @@ export function validatePullRequestBody(body, { authorLogin } = {}) {
 }
 
 export function validatePullRequestEvent(event) {
-  if (!event || !event.pull_request)
+  if (!event?.pull_request)
     throw new Error("GitHub event must contain pull_request");
   const authorLogin =
     event.pull_request.user?.login || event.pull_request.author?.login;

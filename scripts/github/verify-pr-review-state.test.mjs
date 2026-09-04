@@ -295,6 +295,23 @@ test("accepts solo mode when current PR state and checks URL match", async () =>
   assert.equal(result.mode, "solo");
 });
 
+test("live review verification performs read-only GitHub requests", async () => {
+  const calls = [];
+  await validatePullRequestState({
+    event: eventFor(),
+    token: TOKEN,
+    repository: REPOSITORY,
+    runId: RUN_ID,
+    staticResult: "success",
+    fetchImpl: fixtureFetch(fixturesFor(), calls),
+  });
+  assert.ok(calls.length > 0);
+  for (const { options } of calls) {
+    assert.equal(options.method, "GET");
+    assert.equal(options.body, undefined);
+  }
+});
+
 test("accepts solo mode for a public repository with no distinct eligible direct collaborator", async () => {
   const event = publicEventFor();
   const result = await stateFor(

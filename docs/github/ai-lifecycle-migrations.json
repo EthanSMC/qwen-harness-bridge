@@ -1,0 +1,26 @@
+{
+  "schema_version": 3,
+  "activation_commit": null,
+  "mutation_acceptance": {
+    "reason": "Bounded live acceptance after the bootstrap workflow reaches protected main",
+    "approved_by": "EthanSMC",
+    "approved_at": "2026-09-04T06:56:56Z",
+    "expires_at": "2026-09-11T00:00:00Z"
+  },
+  "entries": [
+    {
+      "pull_request": 45,
+      "issue": 7,
+      "reason": "Pull request predates AI lifecycle activation",
+      "approved_by": "EthanSMC",
+      "expires_at": "2026-09-11T00:00:00Z"
+    },
+    {
+      "pull_request": 47,
+      "issue": 46,
+      "reason": "Bootstrap pull request predates AI lifecycle activation",
+      "approved_by": "EthanSMC",
+      "expires_at": "2026-09-11T00:00:00Z"
+    }
+  ]
+}

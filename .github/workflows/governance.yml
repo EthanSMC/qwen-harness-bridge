@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: read
   checks: read
   actions: read
@@ -32,8 +33,17 @@ jobs:
           fetch-depth: 2
       - name: Verify planning and repository governance
         run: node scripts/github/verify-planning.mjs
-      - name: Test pull-request review evidence validator
-        run: node --test scripts/github/verify-pr-review-evidence.test.mjs scripts/github/verify-pr-review-state.test.mjs scripts/github/sync-management.test.mjs
+      - name: Test repository governance
+        run: >-
+          node --test
+          scripts/github/ai-issue-policy.test.mjs
+          scripts/github/ai-lifecycle-registry.test.mjs
+          scripts/github/github-api.test.mjs
+          scripts/github/ai-issue-controller.test.mjs
+          scripts/github/verify-ai-lifecycle.test.mjs
+          scripts/github/verify-pr-review-evidence.test.mjs
+          scripts/github/verify-pr-review-state.test.mjs
+          scripts/github/sync-management.test.mjs
       - name: Check whitespace errors
         run: git diff --check HEAD^
 
@@ -56,3 +66,12 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_STATIC_RESULT: ${{ needs.static.result }}
         run: node scripts/github/verify-pr-review-evidence.mjs
+      - name: Verify live AI Issue lifecycle
+        if: github.event_name == 'pull_request'
+        env:
+          AI_LIFECYCLE_VALIDATION_MODE: ${{ vars.AI_LIFECYCLE_VALIDATION_MODE || 'report' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_STATIC_RESULT: ${{ needs.static.result }}
+        run: node scripts/github/verify-ai-lifecycle.mjs
