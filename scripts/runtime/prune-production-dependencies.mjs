@@ -55,21 +55,18 @@ const isPnpmWorkspaceLinkCandidate = (candidate) =>
   candidate !== pnpmWorkspaceNodeModulesRoot &&
   isContainedBy(pnpmWorkspaceNodeModulesRoot, candidate);
 
-let pnpmWorkspaceSelfLink;
-const loadPnpmWorkspaceSelfLink = async () => {
-  if (pnpmWorkspaceSelfLink !== undefined) return pnpmWorkspaceSelfLink;
-
-  const packageJson = JSON.parse(
-    await readFile(join(canonicalRoot, "package.json"), "utf8"),
-  );
+const parsePackageIdentity = (packageJsonSource, description) => {
+  const packageJson = JSON.parse(packageJsonSource);
   const packageName = packageJson?.name;
   const packageNameSegments =
     typeof packageName === "string" ? packageName.split("/") : [];
-  const hasValidShape = packageName?.startsWith("@")
-    ? packageNameSegments.length === 2 &&
-      packageNameSegments[0]?.length > 1 &&
-      packageNameSegments[1]?.length > 0
-    : packageNameSegments.length === 1 && packageNameSegments[0]?.length > 0;
+  const hasValidShape =
+    typeof packageName === "string" &&
+    (packageName.startsWith("@")
+      ? packageNameSegments.length === 2 &&
+        packageNameSegments[0]?.length > 1 &&
+        packageNameSegments[1]?.length > 0
+      : packageNameSegments.length === 1 && packageNameSegments[0]?.length > 0);
   const hasSafeSegments = packageNameSegments.every(
     (segment) =>
       segment !== "." &&
@@ -79,14 +76,43 @@ const loadPnpmWorkspaceSelfLink = async () => {
   );
 
   if (!hasValidShape || !hasSafeSegments) {
-    throw new Error("runtime package.json must contain a valid package name");
+    throw new Error(`${description} package.json must contain a valid name`);
   }
 
-  pnpmWorkspaceSelfLink = join(
-    pnpmWorkspaceNodeModulesRoot,
-    ...packageNameSegments,
+  return { packageName, packageNameSegments };
+};
+
+const runtimePackageJsonSource = await readFile(
+  join(canonicalRoot, "package.json"),
+  "utf8",
+);
+const runtimePackageIdentity = parsePackageIdentity(
+  runtimePackageJsonSource,
+  "runtime",
+);
+const pnpmWorkspaceSelfLink = join(
+  pnpmWorkspaceNodeModulesRoot,
+  ...runtimePackageIdentity.packageNameSegments,
+);
+
+const assertMatchingExternalPackage = async (canonicalTarget) => {
+  const targetPackageJsonSource = await readFile(
+    join(canonicalTarget, "package.json"),
+    "utf8",
   );
-  return pnpmWorkspaceSelfLink;
+  const targetPackageIdentity = parsePackageIdentity(
+    targetPackageJsonSource,
+    "external target",
+  );
+
+  if (
+    targetPackageIdentity.packageName !== runtimePackageIdentity.packageName ||
+    targetPackageJsonSource !== runtimePackageJsonSource
+  ) {
+    throw new Error(
+      "external pnpm self-link target must match the deployed package identity",
+    );
+  }
 };
 
 const assertInsideNodeModules = (candidate, description) => {
@@ -127,8 +153,9 @@ const prune = async (directory) => {
       if (
         !isContainedBy(canonicalNodeModulesRoot, canonicalTarget) &&
         isPnpmWorkspaceLinkCandidate(entryPath) &&
-        entryPath === (await loadPnpmWorkspaceSelfLink())
+        entryPath === pnpmWorkspaceSelfLink
       ) {
+        await assertMatchingExternalPackage(canonicalTarget);
         await rm(entryPath, { force: true });
         continue;
       }

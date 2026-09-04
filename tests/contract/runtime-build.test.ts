@@ -274,6 +274,10 @@ describe("release runtime build contract", () => {
     try {
       mkdirSync(join(packageRoot, "fixtures"), { recursive: true });
       writeFileSync(
+        join(runtimeRoot, "package.json"),
+        JSON.stringify({ name: "fixture-runtime", version: "0.1.0" }),
+      );
+      writeFileSync(
         join(packageRoot, "package.json"),
         JSON.stringify({ name: "example", version: "1.0.0", main: "index.js" }),
       );
@@ -317,17 +321,22 @@ describe("release runtime build contract", () => {
       runtimeRoot,
       "node_modules/.pnpm/node_modules/@qhb/control-plane",
     );
+    const deployedPackageJson = JSON.stringify({
+      name: "@qhb/control-plane",
+      version: "0.1.0",
+    });
     try {
       mkdirSync(join(workspacePackage, "tests"), { recursive: true });
+      writeFileSync(
+        join(workspacePackage, "package.json"),
+        deployedPackageJson,
+      );
       writeFileSync(
         join(workspacePackage, "tests/secret.spec.js"),
         "must remain outside the deployed runtime\n",
       );
       mkdirSync(dirname(workspaceLink), { recursive: true });
-      writeFileSync(
-        join(runtimeRoot, "package.json"),
-        JSON.stringify({ name: "@qhb/control-plane", version: "0.1.0" }),
-      );
+      writeFileSync(join(runtimeRoot, "package.json"), deployedPackageJson);
       symlinkSync("../../../../../apps/control-plane", workspaceLink, "dir");
 
       expect(() =>
@@ -358,17 +367,22 @@ describe("release runtime build contract", () => {
       runtimeRoot,
       "node_modules/.pnpm/node_modules/control-plane",
     );
+    const deployedPackageJson = JSON.stringify({
+      name: "control-plane",
+      version: "0.1.0",
+    });
     try {
       mkdirSync(join(workspacePackage, "tests"), { recursive: true });
+      writeFileSync(
+        join(workspacePackage, "package.json"),
+        deployedPackageJson,
+      );
       writeFileSync(
         join(workspacePackage, "tests/secret.spec.js"),
         "must remain outside the deployed runtime\n",
       );
       mkdirSync(dirname(workspaceLink), { recursive: true });
-      writeFileSync(
-        join(runtimeRoot, "package.json"),
-        JSON.stringify({ name: "control-plane", version: "0.1.0" }),
-      );
+      writeFileSync(join(runtimeRoot, "package.json"), deployedPackageJson);
       symlinkSync("../../../../apps/control-plane", workspaceLink, "dir");
 
       expect(() =>
@@ -389,6 +403,121 @@ describe("release runtime build contract", () => {
       rmSync(fixtureRoot, { force: true, recursive: true });
     }
   });
+
+  it("rejects an exact pnpm self-link whose target package identity differs", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-prune-identity-"));
+    const buildRoot = join(fixtureRoot, "buildRoot");
+    const runtimeRoot = join(buildRoot, "runtime");
+    const externalPackage = join(buildRoot, "external/control-plane");
+    const workspaceLink = join(
+      runtimeRoot,
+      "node_modules/.pnpm/node_modules/@qhb/control-plane",
+    );
+    const targetPackageJson = JSON.stringify({
+      name: "@qhb/control-plane",
+      version: "9.9.9",
+    });
+    try {
+      mkdirSync(externalPackage, { recursive: true });
+      writeFileSync(join(externalPackage, "package.json"), targetPackageJson);
+      writeFileSync(
+        join(externalPackage, "index.js"),
+        "must remain outside the deployed runtime\n",
+      );
+      mkdirSync(dirname(workspaceLink), { recursive: true });
+      writeFileSync(
+        join(runtimeRoot, "package.json"),
+        JSON.stringify({ name: "@qhb/control-plane", version: "0.1.0" }),
+      );
+      symlinkSync(
+        "../../../../../external/control-plane",
+        workspaceLink,
+        "dir",
+      );
+
+      expect(() =>
+        execFileSync(
+          process.execPath,
+          [
+            absolute("scripts/runtime/prune-production-dependencies.mjs"),
+            runtimeRoot,
+          ],
+          { stdio: "pipe" },
+        ),
+      ).toThrow();
+      expect(existsSync(workspaceLink)).toBe(true);
+      expect(readFileSync(join(externalPackage, "package.json"), "utf8")).toBe(
+        targetPackageJson,
+      );
+      expect(readFileSync(join(externalPackage, "index.js"), "utf8")).toBe(
+        "must remain outside the deployed runtime\n",
+      );
+    } finally {
+      rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["malformed", "{not-json\n"],
+  ])(
+    "rejects an exact pnpm self-link with %s target package metadata",
+    (_description, targetPackageJson) => {
+      const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-prune-target-"));
+      const buildRoot = join(fixtureRoot, "buildRoot");
+      const runtimeRoot = join(buildRoot, "runtime");
+      const externalPackage = join(buildRoot, "external/control-plane");
+      const workspaceLink = join(
+        runtimeRoot,
+        "node_modules/.pnpm/node_modules/@qhb/control-plane",
+      );
+      try {
+        mkdirSync(externalPackage, { recursive: true });
+        writeFileSync(
+          join(externalPackage, "index.js"),
+          "must remain outside the deployed runtime\n",
+        );
+        if (targetPackageJson !== undefined) {
+          writeFileSync(
+            join(externalPackage, "package.json"),
+            targetPackageJson,
+          );
+        }
+        mkdirSync(dirname(workspaceLink), { recursive: true });
+        writeFileSync(
+          join(runtimeRoot, "package.json"),
+          JSON.stringify({ name: "@qhb/control-plane", version: "0.1.0" }),
+        );
+        symlinkSync(
+          "../../../../../external/control-plane",
+          workspaceLink,
+          "dir",
+        );
+
+        expect(() =>
+          execFileSync(
+            process.execPath,
+            [
+              absolute("scripts/runtime/prune-production-dependencies.mjs"),
+              runtimeRoot,
+            ],
+            { stdio: "pipe" },
+          ),
+        ).toThrow();
+        expect(existsSync(workspaceLink)).toBe(true);
+        expect(readFileSync(join(externalPackage, "index.js"), "utf8")).toBe(
+          "must remain outside the deployed runtime\n",
+        );
+        if (targetPackageJson !== undefined) {
+          expect(
+            readFileSync(join(externalPackage, "package.json"), "utf8"),
+          ).toBe(targetPackageJson);
+        }
+      } finally {
+        rmSync(fixtureRoot, { force: true, recursive: true });
+      }
+    },
+  );
 
   it("rejects an external pnpm dependency link that is not the deployed package", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-prune-dependency-"));
@@ -438,25 +567,13 @@ describe("release runtime build contract", () => {
     "fails closed for a %s deployed package name",
     (_description, packageJson) => {
       const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-prune-name-"));
-      const buildRoot = join(fixtureRoot, "buildRoot");
-      const runtimeRoot = join(buildRoot, "runtime");
-      const workspacePackage = join(buildRoot, "apps/control-plane");
-      const workspaceLink = join(
-        runtimeRoot,
-        "node_modules/.pnpm/node_modules/control-plane",
-      );
+      const runtimeRoot = join(fixtureRoot, "runtime");
       try {
-        mkdirSync(workspacePackage, { recursive: true });
-        writeFileSync(
-          join(workspacePackage, "index.js"),
-          "must remain outside the deployed runtime\n",
-        );
-        mkdirSync(dirname(workspaceLink), { recursive: true });
+        mkdirSync(join(runtimeRoot, "node_modules"), { recursive: true });
         writeFileSync(
           join(runtimeRoot, "package.json"),
           JSON.stringify(packageJson),
         );
-        symlinkSync("../../../../apps/control-plane", workspaceLink, "dir");
 
         expect(() =>
           execFileSync(
@@ -468,10 +585,7 @@ describe("release runtime build contract", () => {
             { stdio: "pipe" },
           ),
         ).toThrow();
-        expect(existsSync(workspaceLink)).toBe(true);
-        expect(readFileSync(join(workspacePackage, "index.js"), "utf8")).toBe(
-          "must remain outside the deployed runtime\n",
-        );
+        expect(existsSync(join(runtimeRoot, "node_modules"))).toBe(true);
       } finally {
         rmSync(fixtureRoot, { force: true, recursive: true });
       }
@@ -485,6 +599,10 @@ describe("release runtime build contract", () => {
     const outsidePackage = join(fixtureRoot, "outside-package");
     try {
       mkdirSync(nodeModulesRoot, { recursive: true });
+      writeFileSync(
+        join(runtimeRoot, "package.json"),
+        JSON.stringify({ name: "fixture-runtime", version: "0.1.0" }),
+      );
       mkdirSync(outsidePackage, { recursive: true });
       writeFileSync(join(outsidePackage, "outside.spec.js"), "do not mutate\n");
       symlinkSync(
