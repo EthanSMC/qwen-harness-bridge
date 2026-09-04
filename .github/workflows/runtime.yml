@@ -51,6 +51,7 @@ jobs:
           RUNTIME_GATE_OBSERVATIONS_FILE="$runtime_dir/gate-observations.txt"
           RUNTIME_REPOSITORY_GATE_LOG="$runtime_dir/repository-gate.log"
           RUNTIME_FOCUSED_GATE_LOG="$runtime_dir/focused-gate.log"
+          RUNTIME_FOUNDATION_ACCEPTANCE_LOG="$runtime_dir/foundation-acceptance.log"
           RUNTIME_HEALTH_METRICS_BODY_FILE="$runtime_dir/health-metrics.body"
           RUNTIME_ARCHIVE="$runtime_dir/runtime-image.tar"
           QHB_TLS_KEY_FILE="$runtime_dir/qhb-runtime.key"
@@ -58,8 +59,8 @@ jobs:
           runtime_tls_key_file="$runtime_dir/qhb-runtime.uid-1000.key"
           runtime_tls_cert_file="$runtime_dir/qhb-runtime.uid-1000.crt"
           RUNTIME_IMAGE_REF=qwen-harness-bridge-control-plane
-          touch "$RUNTIME_ENV_FILE" "$RUNTIME_EVIDENCE_FILE" "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" "$RUNTIME_GATE_OBSERVATIONS_FILE" "$RUNTIME_REPOSITORY_GATE_LOG" "$RUNTIME_FOCUSED_GATE_LOG"
-          chmod 600 "$RUNTIME_ENV_FILE" "$RUNTIME_EVIDENCE_FILE" "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" "$RUNTIME_GATE_OBSERVATIONS_FILE" "$RUNTIME_REPOSITORY_GATE_LOG" "$RUNTIME_FOCUSED_GATE_LOG"
+          touch "$RUNTIME_ENV_FILE" "$RUNTIME_EVIDENCE_FILE" "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" "$RUNTIME_GATE_OBSERVATIONS_FILE" "$RUNTIME_REPOSITORY_GATE_LOG" "$RUNTIME_FOCUSED_GATE_LOG" "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
+          chmod 600 "$RUNTIME_ENV_FILE" "$RUNTIME_EVIDENCE_FILE" "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" "$RUNTIME_GATE_OBSERVATIONS_FILE" "$RUNTIME_REPOSITORY_GATE_LOG" "$RUNTIME_FOCUSED_GATE_LOG" "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
           {
             printf 'RUNTIME_DIR=%s\n' "$RUNTIME_DIR"
             printf 'RUNTIME_ENV_FILE=%s\n' "$RUNTIME_ENV_FILE"
@@ -69,6 +70,7 @@ jobs:
             printf 'RUNTIME_GATE_OBSERVATIONS_FILE=%s\n' "$RUNTIME_GATE_OBSERVATIONS_FILE"
             printf 'RUNTIME_REPOSITORY_GATE_LOG=%s\n' "$RUNTIME_REPOSITORY_GATE_LOG"
             printf 'RUNTIME_FOCUSED_GATE_LOG=%s\n' "$RUNTIME_FOCUSED_GATE_LOG"
+            printf 'RUNTIME_FOUNDATION_ACCEPTANCE_LOG=%s\n' "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
             printf 'RUNTIME_HEALTH_METRICS_BODY_FILE=%s\n' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
             printf 'RUNTIME_ARCHIVE=%s\n' "$RUNTIME_ARCHIVE"
             printf 'RUNTIME_IMAGE_REF=%s\n' "$RUNTIME_IMAGE_REF"
@@ -129,6 +131,87 @@ jobs:
             printf 'repository_test_result=passed\n'
             printf 'repository_test_count=%s\n' "$repository_test_count"
           } > "$RUNTIME_GATE_OBSERVATIONS_FILE"
+          # submit-latency-evidence-parser
+          latency_evidence_line_count=$(grep -c '^QHB_MCP_SUBMIT_LATENCY_EVIDENCE=' "$RUNTIME_REPOSITORY_GATE_LOG" || true)
+          test "$latency_evidence_line_count" -eq 1
+          latency_evidence_json=$(sed -n 's/^QHB_MCP_SUBMIT_LATENCY_EVIDENCE=//p' "$RUNTIME_REPOSITORY_GATE_LOG")
+          latency_evidence_canonical="$({
+            printf '%s\n' "$latency_evidence_json" |
+              node --input-type=module -e '
+                import { readFileSync } from "node:fs";
+
+                const expectedKeys = [
+                  "measurement",
+                  "sample_count",
+                  "samples_ms",
+                  "p50_ms",
+                  "p95_ms",
+                  "p99_ms",
+                  "max_ms",
+                  "budget_ms",
+                ];
+                const rawWithNewline = readFileSync(0, "utf8");
+                if (!rawWithNewline.endsWith("\n")) process.exit(1);
+                const raw = rawWithNewline.slice(0, -1);
+                if (raw.length === 0 || /[\r\n]/.test(raw) || raw.trim() !== raw) process.exit(1);
+                let evidence;
+                try {
+                  evidence = JSON.parse(raw);
+                } catch {
+                  process.exit(1);
+                }
+                if (typeof evidence !== "object" || evidence === null || Array.isArray(evidence)) process.exit(1);
+                if (JSON.stringify(Object.keys(evidence)) !== JSON.stringify(expectedKeys)) process.exit(1);
+                if (evidence.measurement !== "in_memory_mcp_call_tool") process.exit(1);
+                if (!Number.isInteger(evidence.sample_count) || evidence.sample_count !== 20) process.exit(1);
+                if (!Array.isArray(evidence.samples_ms) || evidence.samples_ms.length !== evidence.sample_count) process.exit(1);
+                if (!evidence.samples_ms.every((sample) => typeof sample === "number" && Number.isFinite(sample) && sample >= 0)) process.exit(1);
+                for (let index = 1; index < evidence.samples_ms.length; index += 1) {
+                  if (evidence.samples_ms[index] < evidence.samples_ms[index - 1]) process.exit(1);
+                }
+                if (evidence.budget_ms !== 2000) process.exit(1);
+                const nearestRank = (percentile) => evidence.samples_ms[Math.ceil(percentile * evidence.sample_count) - 1];
+                for (const [key, percentile] of [["p50_ms", 0.5], ["p95_ms", 0.95], ["p99_ms", 0.99]]) {
+                  if (typeof evidence[key] !== "number" || !Number.isFinite(evidence[key]) || evidence[key] !== nearestRank(percentile)) process.exit(1);
+                }
+                if (typeof evidence.max_ms !== "number" || !Number.isFinite(evidence.max_ms) || evidence.max_ms !== evidence.samples_ms.at(-1)) process.exit(1);
+                if (!(evidence.p99_ms < evidence.budget_ms && evidence.max_ms < evidence.budget_ms)) process.exit(1);
+                process.stdout.write([
+                  `submit_latency_measurement=${evidence.measurement}`,
+                  `submit_latency_sample_count=${evidence.sample_count}`,
+                  `submit_latency_samples_ms=${JSON.stringify(evidence.samples_ms)}`,
+                  `submit_latency_p50_ms=${evidence.p50_ms}`,
+                  `submit_latency_p95_ms=${evidence.p95_ms}`,
+                  `submit_latency_p99_ms=${evidence.p99_ms}`,
+                  `submit_latency_max_ms=${evidence.max_ms}`,
+                  `submit_latency_budget_ms=${evidence.budget_ms}`,
+                ].join("\n"));
+              '
+          })"
+          test -n "$latency_evidence_canonical"
+          printf '%s\n' "$latency_evidence_canonical" >> "$RUNTIME_GATE_OBSERVATIONS_FILE"
+          # end submit-latency-evidence-parser
+          : > "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
+          chmod 600 "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
+          pnpm exec vitest run --config /dev/null \
+            tests/contract/mcp-tools.test.ts \
+            tests/integration/job-repository.test.ts \
+            tests/integration/connector-outbox.test.ts \
+            tests/integration/connector-gateway.test.ts \
+            tests/integration/foundation-e2e.test.ts \
+            tests/integration/approval-flow.test.ts \
+            tests/integration/cancellation-flow.test.ts \
+            tests/integration/result-flow.test.ts \
+            tests/integration/readiness.test.ts 2>&1 | tee "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
+          # foundation-acceptance-parser
+          test -s "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
+          foundation_acceptance_count=$(sed -nE 's/.*Tests[[:space:]]+([0-9]+)[[:space:]]+passed.*/\1/p' "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG" | tail -n 1)
+          [[ "$foundation_acceptance_count" =~ ^[1-9][0-9]*$ ]]
+          {
+            printf 'foundation_acceptance_result=passed\n'
+            printf 'foundation_acceptance_count=%s\n' "$foundation_acceptance_count"
+          } >> "$RUNTIME_GATE_OBSERVATIONS_FILE"
+          # end foundation-acceptance-parser
           pnpm exec vitest run --config /dev/null tests/contract/health-metrics.test.ts tests/integration/readiness.test.ts tests/contract/runtime-build.test.ts tests/contract/shutdown.test.ts tests/integration/connector-gateway.test.ts 2>&1 | tee "$RUNTIME_FOCUSED_GATE_LOG"
           focused_test_count=$(sed -nE 's/.*Tests[[:space:]]+([0-9]+)[[:space:]]+passed.*/\1/p' "$RUNTIME_FOCUSED_GATE_LOG" | tail -n 1)
           test "$focused_test_count" -gt 0
@@ -285,6 +368,16 @@ jobs:
           repository_test_count=$(sed -n 's/^repository_test_count=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
           focused_test_result=$(sed -n 's/^focused_test_result=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
           focused_test_count=$(sed -n 's/^focused_test_count=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          submit_latency_measurement=$(sed -n 's/^submit_latency_measurement=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          submit_latency_sample_count=$(sed -n 's/^submit_latency_sample_count=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          submit_latency_samples_ms=$(sed -n 's/^submit_latency_samples_ms=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          submit_latency_p50_ms=$(sed -n 's/^submit_latency_p50_ms=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          submit_latency_p95_ms=$(sed -n 's/^submit_latency_p95_ms=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          submit_latency_p99_ms=$(sed -n 's/^submit_latency_p99_ms=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          submit_latency_max_ms=$(sed -n 's/^submit_latency_max_ms=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          submit_latency_budget_ms=$(sed -n 's/^submit_latency_budget_ms=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          foundation_acceptance_result=$(sed -n 's/^foundation_acceptance_result=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
+          foundation_acceptance_count=$(sed -n 's/^foundation_acceptance_count=//p' "$RUNTIME_GATE_OBSERVATIONS_FILE")
           source_runtime_observations=$(cat "$RUNTIME_HEALTH_OBSERVATIONS_FILE" "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE" "$RUNTIME_GATE_OBSERVATIONS_FILE")
           test -n "$source_runtime_observations"
           test "$metrics_content_type" = 'text/plain; version=0.0.4; charset=utf-8'
@@ -297,6 +390,17 @@ jobs:
           test "$focused_test_result" = passed
           [[ "$repository_test_count" =~ ^[1-9][0-9]*$ ]]
           [[ "$focused_test_count" =~ ^[1-9][0-9]*$ ]]
+          test -s "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
+          test "$submit_latency_measurement" = "in_memory_mcp_call_tool"
+          test "$submit_latency_sample_count" = "20"
+          test -n "$submit_latency_samples_ms"
+          [[ "$submit_latency_p50_ms" =~ ^[0-9]+([.][0-9]+)?$ ]]
+          [[ "$submit_latency_p95_ms" =~ ^[0-9]+([.][0-9]+)?$ ]]
+          [[ "$submit_latency_p99_ms" =~ ^[0-9]+([.][0-9]+)?$ ]]
+          [[ "$submit_latency_max_ms" =~ ^[0-9]+([.][0-9]+)?$ ]]
+          test "$submit_latency_budget_ms" = "2000"
+          test "$foundation_acceptance_result" = passed
+          [[ "$foundation_acceptance_count" =~ ^[1-9][0-9]*$ ]]
           grep --fixed-strings 'qhb_mcp_submit_duration_seconds' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
           grep --fixed-strings 'qhb_connector_online' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
           grep --fixed-strings 'qhb_job_queue_age_seconds' "$RUNTIME_HEALTH_METRICS_BODY_FILE"
@@ -385,6 +489,16 @@ jobs:
             printf 'repository_test_count=%s\n' "$repository_test_count"
             printf 'focused_test_result=%s\n' "$focused_test_result"
             printf 'focused_test_count=%s\n' "$focused_test_count"
+            printf 'submit_latency_measurement=%s\n' "$submit_latency_measurement"
+            printf 'submit_latency_sample_count=%s\n' "$submit_latency_sample_count"
+            printf 'submit_latency_samples_ms=%s\n' "$submit_latency_samples_ms"
+            printf 'submit_latency_p50_ms=%s\n' "$submit_latency_p50_ms"
+            printf 'submit_latency_p95_ms=%s\n' "$submit_latency_p95_ms"
+            printf 'submit_latency_p99_ms=%s\n' "$submit_latency_p99_ms"
+            printf 'submit_latency_max_ms=%s\n' "$submit_latency_max_ms"
+            printf 'submit_latency_budget_ms=%s\n' "$submit_latency_budget_ms"
+            printf 'foundation_acceptance_result=%s\n' "$foundation_acceptance_result"
+            printf 'foundation_acceptance_count=%s\n' "$foundation_acceptance_count"
             cat "$RUNTIME_HEALTH_OBSERVATIONS_FILE"
             cat "$RUNTIME_DB_LOSS_OBSERVATIONS_FILE"
             cat "$RUNTIME_GATE_OBSERVATIONS_FILE"

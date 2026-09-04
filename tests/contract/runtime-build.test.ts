@@ -157,6 +157,87 @@ const configDigestParserScript = (step: string): string => {
   ].join("\n");
 };
 
+const workflowParserBlock = (
+  step: string,
+  startMarker: string,
+  endMarker: string,
+): string => {
+  const lines = workflowRunScript(step).split("\n");
+  const start = lines.findIndex((line) => line.trim() === startMarker);
+  expect(start, `workflow must contain ${startMarker}`).toBeGreaterThan(-1);
+  const end = lines.findIndex(
+    (line, index) => index > start && line.trim() === endMarker,
+  );
+  expect(end, `workflow must contain ${endMarker}`).toBeGreaterThan(start);
+  return ["set -euo pipefail", ...lines.slice(start + 1, end)].join("\n");
+};
+
+type WorkflowParserResult = {
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  observations: string;
+};
+
+const runSubmitLatencyParser = (
+  parserScript: string,
+  repositoryLog: string | undefined,
+): WorkflowParserResult => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-runtime-latency-"));
+  const repositoryLogFile = join(fixtureRoot, "repository-gate.log");
+  const observationsFile = join(fixtureRoot, "gate-observations.txt");
+  if (repositoryLog !== undefined)
+    writeFileSync(repositoryLogFile, repositoryLog);
+  writeFileSync(observationsFile, "");
+  try {
+    const result = spawnSync("bash", ["-c", parserScript], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        RUNTIME_REPOSITORY_GATE_LOG: repositoryLogFile,
+        RUNTIME_GATE_OBSERVATIONS_FILE: observationsFile,
+      },
+    });
+    return {
+      status: result.status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      observations: readFileSync(observationsFile, "utf8"),
+    };
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+};
+
+const runFoundationAcceptanceParser = (
+  parserScript: string,
+  aggregateLog: string | undefined,
+): WorkflowParserResult => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-runtime-aggregate-"));
+  const aggregateLogFile = join(fixtureRoot, "foundation-acceptance.log");
+  const observationsFile = join(fixtureRoot, "gate-observations.txt");
+  if (aggregateLog !== undefined) writeFileSync(aggregateLogFile, aggregateLog);
+  writeFileSync(observationsFile, "");
+  try {
+    const result = spawnSync("bash", ["-c", parserScript], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        RUNTIME_FOUNDATION_ACCEPTANCE_LOG: aggregateLogFile,
+        RUNTIME_GATE_OBSERVATIONS_FILE: observationsFile,
+      },
+    });
+    return {
+      status: result.status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      observations: readFileSync(observationsFile, "utf8"),
+    };
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+};
+
 const runConfigDigestParser = (
   parserScript: string,
   composeOutput: string,
@@ -1992,6 +2073,204 @@ describe("release runtime build contract", () => {
     expect(parserScript).not.toMatch(/2>\s*&1|&>\s*/);
     expect(parserScript).not.toMatch(/\b(?:head|tail|tr)\b/);
     expect(parserScript).not.toMatch(/\bgrep\s+-[A-Za-z]*o/);
+  });
+
+  it("executes the frozen submit latency parser with exact nearest-rank validation", () => {
+    const workflow = read(".github/workflows/runtime.yml");
+    const runtimeJob = yamlMappingBlock(workflow, "jobs", "runtime");
+    const start = workflowStep(runtimeJob, "Build and start runtime");
+    const parserScript = workflowParserBlock(
+      start,
+      "# submit-latency-evidence-parser",
+      "# end submit-latency-evidence-parser",
+    );
+    const samples = Array.from({ length: 20 }, (_, index) => index + 1);
+    const baseEvidence = {
+      measurement: "in_memory_mcp_call_tool",
+      sample_count: samples.length,
+      samples_ms: samples,
+      p50_ms: 10,
+      p95_ms: 19,
+      p99_ms: 20,
+      max_ms: 20,
+      budget_ms: 2000,
+    };
+    const latencyLine = (evidence: Record<string, unknown>): string =>
+      `Tests 381 passed\nQHB_MCP_SUBMIT_LATENCY_EVIDENCE=${JSON.stringify(evidence)}\n`;
+    const accepted = runSubmitLatencyParser(
+      parserScript,
+      latencyLine(baseEvidence),
+    );
+    expect(accepted.status).toBe(0);
+    expect(accepted.stderr).toBe("");
+    expect(accepted.observations).toContain(
+      "submit_latency_measurement=in_memory_mcp_call_tool",
+    );
+    expect(accepted.observations).toContain("submit_latency_sample_count=20");
+    expect(accepted.observations).toContain(
+      "submit_latency_samples_ms=[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]",
+    );
+    expect(accepted.observations).toContain("submit_latency_p50_ms=10");
+    expect(accepted.observations).toContain("submit_latency_p95_ms=19");
+    expect(accepted.observations).toContain("submit_latency_p99_ms=20");
+    expect(accepted.observations).toContain("submit_latency_max_ms=20");
+    expect(accepted.observations).toContain("submit_latency_budget_ms=2000");
+
+    const unsortedSamples = [...samples];
+    [unsortedSamples[8], unsortedSamples[9]] = [
+      unsortedSamples[9] ?? 0,
+      unsortedSamples[8] ?? 0,
+    ];
+    const rejectedCases: Array<{ name: string; log?: string }> = [
+      { name: "missing evidence line", log: "Tests 381 passed\n" },
+      {
+        name: "multiple evidence lines",
+        log: `${latencyLine(baseEvidence)}${latencyLine(baseEvidence)}`,
+      },
+      {
+        name: "malformed JSON",
+        log: "QHB_MCP_SUBMIT_LATENCY_EVIDENCE={not-json}\n",
+      },
+      {
+        name: "missing key",
+        log: latencyLine({ ...baseEvidence, p50_ms: undefined }),
+      },
+      {
+        name: "extra key",
+        log: latencyLine({ ...baseEvidence, extra: true }),
+      },
+      {
+        name: "sample count mismatch",
+        log: latencyLine({
+          ...baseEvidence,
+          sample_count: 19,
+        }),
+      },
+      {
+        name: "sample count below ten",
+        log: latencyLine({
+          ...baseEvidence,
+          sample_count: 9,
+          samples_ms: samples.slice(0, 9),
+        }),
+      },
+      {
+        name: "sample array length mismatch",
+        log: latencyLine({
+          ...baseEvidence,
+          samples_ms: samples.slice(0, 19),
+        }),
+      },
+      {
+        name: "unsorted samples",
+        log: latencyLine({ ...baseEvidence, samples_ms: unsortedSamples }),
+      },
+      {
+        name: "nonfinite sample",
+        log: latencyLine({
+          ...baseEvidence,
+          samples_ms: [...samples.slice(0, -1), "NaN"],
+        }),
+      },
+      {
+        name: "negative sample",
+        log: latencyLine({
+          ...baseEvidence,
+          samples_ms: [-1, ...samples.slice(1)],
+        }),
+      },
+      {
+        name: "wrong p50",
+        log: latencyLine({ ...baseEvidence, p50_ms: 11 }),
+      },
+      {
+        name: "wrong p95",
+        log: latencyLine({ ...baseEvidence, p95_ms: 18 }),
+      },
+      {
+        name: "wrong p99",
+        log: latencyLine({ ...baseEvidence, p99_ms: 19 }),
+      },
+      {
+        name: "wrong max",
+        log: latencyLine({ ...baseEvidence, max_ms: 19 }),
+      },
+      {
+        name: "wrong budget",
+        log: latencyLine({ ...baseEvidence, budget_ms: 1999 }),
+      },
+      {
+        name: "wrong measurement",
+        log: latencyLine({
+          ...baseEvidence,
+          measurement: "network_mcp_call_tool",
+        }),
+      },
+    ];
+    for (const rejectedCase of rejectedCases) {
+      const result = runSubmitLatencyParser(parserScript, rejectedCase.log);
+      expect(result.status, rejectedCase.name).not.toBe(0);
+    }
+    expect(parserScript).toContain("JSON.parse");
+    expect(parserScript).toContain("Object.keys");
+    expect(parserScript).toContain("Math.ceil");
+    expect(parserScript).toContain("Number.isFinite");
+    expect(parserScript).toContain("submit_latency_samples_ms");
+  });
+
+  it("runs and records the explicit nine-file M0 foundation acceptance aggregate", () => {
+    const workflow = read(".github/workflows/runtime.yml");
+    const runtimeJob = yamlMappingBlock(workflow, "jobs", "runtime");
+    const material = workflowStep(
+      runtimeJob,
+      "Generate ephemeral runtime material",
+    );
+    const start = workflowStep(runtimeJob, "Build and start runtime");
+    const parserScript = workflowParserBlock(
+      start,
+      "# foundation-acceptance-parser",
+      "# end foundation-acceptance-parser",
+    );
+    const aggregateFiles = [
+      "tests/contract/mcp-tools.test.ts",
+      "tests/integration/job-repository.test.ts",
+      "tests/integration/connector-outbox.test.ts",
+      "tests/integration/connector-gateway.test.ts",
+      "tests/integration/foundation-e2e.test.ts",
+      "tests/integration/approval-flow.test.ts",
+      "tests/integration/cancellation-flow.test.ts",
+      "tests/integration/result-flow.test.ts",
+      "tests/integration/readiness.test.ts",
+    ];
+    const aggregateStart = start.indexOf(
+      "pnpm exec vitest run --config /dev/null",
+    );
+    const parserStart = start.indexOf("# foundation-acceptance-parser");
+    expect(aggregateStart).toBeGreaterThan(-1);
+    expect(parserStart).toBeGreaterThan(aggregateStart);
+    for (const file of aggregateFiles) expect(start).toContain(file);
+    expect(start).toContain('tee "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"');
+    expect(material).toContain("RUNTIME_FOUNDATION_ACCEPTANCE_LOG");
+    expect(material).toMatch(
+      /chmod\s+600[^\n]*RUNTIME_FOUNDATION_ACCEPTANCE_LOG/i,
+    );
+
+    const accepted = runFoundationAcceptanceParser(
+      parserScript,
+      "Test Files 9 passed (9)\nTests 202 passed (202)\n",
+    );
+    expect(accepted.status).toBe(0);
+    expect(accepted.stderr).toBe("");
+    expect(accepted.observations).toContain(
+      "foundation_acceptance_result=passed",
+    );
+    expect(accepted.observations).toContain("foundation_acceptance_count=202");
+    const missingLog = runFoundationAcceptanceParser(parserScript);
+    expect(missingLog.status).not.toBe(0);
+    expect(parserScript).toContain("test -s");
+    expect(parserScript).toContain("foundation_acceptance_result=passed");
+    expect(parserScript).toContain("foundation_acceptance_count");
+    expect(parserScript).toMatch(/\[\[\s*"\$foundation_acceptance_count"/);
   });
 
   it("keeps the fixed repository error enum out of privacy matches", () => {
