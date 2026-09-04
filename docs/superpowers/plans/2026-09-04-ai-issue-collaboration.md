@@ -62,7 +62,7 @@
 - Consumes: the approved design and existing formal/solo review contract.
 - Produces: six exact lifecycle labels; exact Issue fields `Dependencies`, `Outcome`, `Verification`, and `Risk and rollback`; exact PR fields `Primary Issue`, `Claim receipt`, `Accountable owner`, and `Implementer agent class`; canonical `/ai-*` command documentation.
 
-- [ ] **Step 1: Make the planning verifier require the new contract before adding it**
+- [x] **Step 1: Make the planning verifier require the new contract before adding it**
 
 Add the spec, plan, `AGENTS.md`, and `docs/github/ai-collaboration.md` to the verified file set. Add exact requirements:
 
@@ -91,12 +91,12 @@ for (const command of ["/ai-claim", "/ai-heartbeat", "/ai-block", "/ai-resume", 
 }
 ```
 
-- [ ] **Step 2: Run the verifier and observe the missing-contract failure**
+- [x] **Step 2: Run the verifier and observe the missing-contract failure**
 
 Run: `node scripts/github/verify-planning.mjs`  
 Expected: FAIL naming missing `AGENTS.md` or a required lifecycle artifact.
 
-- [ ] **Step 3: Add the canonical agent contract**
+- [x] **Step 3: Add the canonical agent contract**
 
 `AGENTS.md` must state, in imperative language:
 
@@ -110,7 +110,7 @@ Read `CONTRIBUTING.md`, `docs/github/ai-collaboration.md`, the claimed Issue, an
 Use test-first development for behavior changes. A different agent or eligible collaborator reviews the complete final commit range. A pull request must contain `Closes #N`, the claim receipt, exact verification evidence, risk, rollback, and current review evidence. Merge only after all required current-head checks pass, then verify Issue closure and cleanup.
 ```
 
-- [ ] **Step 4: Add contributor documentation and workflow overview**
+- [x] **Step 4: Add contributor documentation and workflow overview**
 
 Document the exact state table, readiness conditions, command syntax, success receipts, safe evidence, branch/worktree convention, review/fix loop, handoff, closure, and Release gate in `docs/github/ai-collaboration.md`. Update `README.md` to link it and summarize:
 
@@ -120,7 +120,7 @@ Every eligible contributor may use an AI agent. The human Issue assignee remains
 
 Replace the generic start-work steps in `CONTRIBUTING.md` with the normative claim-first lifecycle without weakening the existing review gate.
 
-- [ ] **Step 5: Add managed lifecycle labels**
+- [x] **Step 5: Add managed lifecycle labels**
 
 Append these exact entries to `.github/labels.yml`:
 
@@ -133,7 +133,7 @@ Append these exact entries to `.github/labels.yml`:
   - { name: "status:done", color: "6f7781", description: "Derived terminal state for a completed closed Issue" }
 ```
 
-- [ ] **Step 6: Extend Issue templates with readiness evidence**
+- [x] **Step 6: Extend Issue templates with readiness evidence**
 
 Both governed templates must require a single-line dependency declaration (`Blocked by none` or `Blocked by #12, #19`), outcome, observed verification commands/results, and risk/rollback. Add this implementation-template input:
 
@@ -148,7 +148,7 @@ Both governed templates must require a single-line dependency declaration (`Bloc
       required: true
 ```
 
-- [ ] **Step 7: Extend the PR template with claim evidence**
+- [x] **Step 7: Extend the PR template with claim evidence**
 
 Immediately after `## Tracking`, add:
 
@@ -161,12 +161,12 @@ Immediately after `## Tracking`, add:
 
 Explain that private task/thread URLs and local paths are prohibited. Keep all existing review-mode fields verbatim so the current review validator remains compatible.
 
-- [ ] **Step 8: Run the normative contract checks**
+- [x] **Step 8: Run the normative contract checks**
 
 Run: `node scripts/github/verify-planning.mjs && git diff --check`  
 Expected: PASS with the new files and all six labels verified.
 
-- [ ] **Step 9: Commit the public contract**
+- [x] **Step 9: Commit the public contract**
 
 ```bash
 git add AGENTS.md README.md CONTRIBUTING.md docs/github/ai-collaboration.md .github/ISSUE_TEMPLATE .github/pull_request_template.md .github/labels.yml scripts/github/verify-planning.mjs
@@ -185,7 +185,7 @@ git commit -m "docs(governance): define AI issue lifecycle"
 - Consumes: Issue/label/assignee/comment data already normalized from GitHub.
 - Produces: `STATUS_LABELS`, `COMMAND_NAMES`, `parseLifecycleCommand(body)`, `parseDependencies(body)`, `assertIssueInvariant(issue)`, `evaluateReadiness(input)`, `parseReceipts(comments)`, `planLifecycleCommand(input)`, `receiptBody(input)`, and `safePublicText(value, maxBytes)`.
 
-- [ ] **Step 1: Write parser and safe-field tests**
+- [x] **Step 1: Write parser and safe-field tests**
 
 Create tests with these concrete cases:
 
@@ -205,12 +205,12 @@ test("rejects private URLs, duplicate fields, unknown fields, and oversized UTF-
 });
 ```
 
-- [ ] **Step 2: Run the parser tests to verify failure**
+- [x] **Step 2: Run the parser tests to verify failure**
 
 Run: `node --test scripts/github/ai-issue-policy.test.mjs`  
 Expected: FAIL because `ai-issue-policy.mjs` does not exist.
 
-- [ ] **Step 3: Implement exact command schemas**
+- [x] **Step 3: Implement exact command schemas**
 
 Use these allowed fields:
 
@@ -234,7 +234,7 @@ const COMMAND_FIELDS = Object.freeze({
 
 Only one leading `/ai-<name>` line is accepted. Agent identifiers match `/^[a-z0-9][a-z0-9._-]{0,31}$/`. Summary, reason, and resume condition allow one line and at most 240 UTF-8 bytes. Reject `codex://`, credential-like assignments, absolute Unix/Windows paths, NUL/control characters, and URLs outside `https://github.com/` when a public reference is allowed.
 
-- [ ] **Step 4: Write lifecycle invariant and readiness tests**
+- [x] **Step 4: Write lifecycle invariant and readiness tests**
 
 ```js
 test("requires one waiting or terminal label without an assignee", () => {
@@ -249,7 +249,7 @@ test("readiness fails on an open dependency or closing PR", () => {
 });
 ```
 
-- [ ] **Step 5: Implement states, dependencies, readiness, and transition planning**
+- [x] **Step 5: Implement states, dependencies, readiness, and transition planning**
 
 Export the six labels and the transition graph exactly:
 
@@ -285,11 +285,11 @@ export const ALLOWED_TRANSITIONS = Object.freeze({
 
 Accept `now` and `randomUUID` as injected dependencies. Never read wall-clock time or create randomness inside pure validation branches.
 
-- [ ] **Step 6: Write claim, lease, block, resume, release, and replay tests**
+- [x] **Step 6: Write claim, lease, block, resume, release, and replay tests**
 
 Cover first claim success, second claim rejection, non-owner heartbeat rejection, exact 24-hour renewal, expired lease, owner block/resume, owner/maintainer release, release to waiting when dependencies reopened, duplicate event idempotency, and invalid transition rejection. Assert stable error codes from the design.
 
-- [ ] **Step 7: Implement versioned machine receipts**
+- [x] **Step 7: Implement versioned machine receipts**
 
 Generate a human-readable comment followed by this bounded marker:
 
@@ -298,17 +298,19 @@ Generate a human-readable comment followed by this bounded marker:
 event-id=901
 claim-id=550e8400-e29b-41d4-a716-446655440000
 action=claim
+result=success
 actor=alice
 agent=codex
 from=ready
 to=in-progress
 lease-expires-at=2026-09-05T12:00:00.000Z
+code=-
 -->
 ```
 
 Reject unknown keys, duplicate keys, unsupported versions, invalid timestamps/UUIDs, and actor/claim mismatches. `parseReceipts` sorts by GitHub comment ID, rejects duplicate event IDs with different content, and selects only workflow-authored verified receipts supplied by the adapter.
 
-- [ ] **Step 8: Run policy tests and commit**
+- [x] **Step 8: Run policy tests and commit**
 
 Run: `node --test scripts/github/ai-issue-policy.test.mjs && git diff --check`  
 Expected: PASS.
@@ -844,4 +846,3 @@ Update Issue #46 or the activation Issue with the public acceptance evidence. Th
 - Task 8 proves the complete implementation in safe report mode and merges the bootstrap change.
 - Task 9 proves claim concurrency, recovery, review, CI, merge, close/reopen, and strict activation on live GitHub state.
 - Rollback remains one repository-variable change to report mode; no lifecycle evidence is deleted.
-
