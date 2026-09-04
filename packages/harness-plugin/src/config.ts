@@ -155,7 +155,7 @@ const canonicalDatabasePath = (databasePath: string): string => {
   }
 
   try {
-    if (realpathSync.native(databasePath) !== databasePath) {
+    if (realpathSync.native(databasePath) !== resolvedPath) {
       throw new ConfigValidationError("DATABASE_PATH_NOT_CANONICAL");
     }
   } catch (error) {

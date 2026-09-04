@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConfigValidationError, parsePluginConfig } from "./config.js";
@@ -17,6 +17,7 @@ import {
   CredentialUnavailableError,
   MacOSKeychainCredentialReader,
 } from "./keychain.js";
+import { SqlitePluginStore } from "./store/plugin-store.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -252,6 +253,20 @@ describe("Harness plugin configuration", () => {
     expect(() =>
       parsePluginConfig(makeConfig(fixture, { databasePath })),
     ).not.toThrow();
+  });
+
+  it("accepts the same noncanonical database spelling after the store creates the file", () => {
+    const fixture = makeFixture();
+    const databasePath = `${fixture.directory}/../${basename(fixture.directory)}/state.sqlite`;
+    const rawConfig = makeConfig(fixture, { databasePath });
+
+    const firstConfig = parsePluginConfig(rawConfig);
+    const store = new SqlitePluginStore(firstConfig.databasePath);
+    store.close();
+
+    const reopenedConfig = parsePluginConfig(rawConfig);
+
+    expect(reopenedConfig.databasePath).toBe(firstConfig.databasePath);
   });
 
   it.each(["existing", "dangling"])(
