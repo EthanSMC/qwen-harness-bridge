@@ -4,13 +4,20 @@ Verified on 2026-09-04 against [EthanSMC/qwen-harness-bridge](https://github.com
 
 ## AI Issue lifecycle rollout
 
-- Activation: pre-activation live acceptance is complete. Bootstrap PR [#47](https://github.com/EthanSMC/qwen-harness-bridge/pull/47) merged the trusted workflow as `b06aceb805f03dc809b37b80cb45a240bb5be66d`; this activation candidate records that reachable commit, removes every migration, and clears the bounded mutation-acceptance window. Strict activation is claimed only after this change reaches protected `main` and both repository variables are verified as `enforce`.
-- Observed modes during acceptance: mutation `enforce` and validation `report`. Validation remains report-only until the activation registry change merges; rollback sets both variables to `report` without deleting receipts.
+- Activation: strict. Bootstrap PR [#47](https://github.com/EthanSMC/qwen-harness-bridge/pull/47) merged the trusted workflow as `b06aceb805f03dc809b37b80cb45a240bb5be66d`; activation PR [#54](https://github.com/EthanSMC/qwen-harness-bridge/pull/54) recorded that reachable commit, removed every migration, and cleared the bounded mutation-acceptance window as protected-main commit `c3a2dd1896ea6a9e3b49d01d7aa4b98876ea87b9`.
+- Observed modes after activation: mutation `enforce` and validation `enforce`, verified on 2026-09-04T11:12:44Z. Rollback sets either variable to `report` without deleting receipts.
 - Live workflows/checks: `AI Issue Lifecycle / lifecycle` handles commands and reconciliation; `Governance / governance` includes the read-only PR lifecycle validator.
 - Managed lifecycle labels: six (`status:waiting`, `status:ready`, `status:in-progress`, `status:review`, `status:blocked`, and `status:done`), for 25 managed labels total.
-- Activation commit: `b06aceb805f03dc809b37b80cb45a240bb5be66d`, the protected-main bootstrap merge containing the complete trusted workflow. Candidate registry state has `mutation_acceptance: null` and `entries: []`.
-- Last reconciliation evidence: the apply-mode synchronization completed after bootstrap merge and verified solo review mode, 25 labels, six milestones, 34 marker-linked plan Issues, and branch-protection postconditions. Issue [#51](https://github.com/EthanSMC/qwen-harness-bridge/issues/51) then initialized to ready at 2026-09-04T10:31:29Z and was claimed through its [workflow receipt](https://github.com/EthanSMC/qwen-harness-bridge/issues/51#issuecomment-5539185321).
-- Live acceptance: Issue [#52](https://github.com/EthanSMC/qwen-harness-bridge/issues/52), PR [#53](https://github.com/EthanSMC/qwen-harness-bridge/pull/53), and [current-head checks](https://github.com/EthanSMC/qwen-harness-bridge/pull/53/checks) prove the pre-activation command, review, merge, close, terminal, and reopen paths. The reopened Issue is intentionally ready for a fresh strict-mode post-activation smoke claim and closing PR.
+- Activation commit: `b06aceb805f03dc809b37b80cb45a240bb5be66d`, the protected-main bootstrap merge containing the complete trusted workflow. The live registry has `mutation_acceptance: null` and `entries: []`.
+- Last reconciliation evidence: Issue [#51](https://github.com/EthanSMC/qwen-harness-bridge/issues/51) reached unassigned `status:done` through activation PR #54 and its [verified merge receipt](https://github.com/EthanSMC/qwen-harness-bridge/issues/51#issuecomment-5539609643). The apply-mode management synchronization had already verified solo review mode, 25 labels, six milestones, 34 marker-linked plan Issues, and branch-protection postconditions.
+- Live acceptance: Issue [#52](https://github.com/EthanSMC/qwen-harness-bridge/issues/52), PR [#53](https://github.com/EthanSMC/qwen-harness-bridge/pull/53), and [current-head checks](https://github.com/EthanSMC/qwen-harness-bridge/pull/53/checks) prove the pre-activation command, review, merge, close, terminal, and reopen paths. The reopened Issue entered a new strict-mode generation through its [fresh claim receipt](https://github.com/EthanSMC/qwen-harness-bridge/issues/52#issuecomment-5539621678); the final closing smoke PR must bind to this claim.
+
+### Strict activation evidence
+
+- Activation review and CI: PR [#54](https://github.com/EthanSMC/qwen-harness-bridge/pull/54) received an independent exact-range PASS and all [current-head checks](https://github.com/EthanSMC/qwen-harness-bridge/pull/54/checks) passed before merge at 2026-09-04T11:11:25Z.
+- Activation terminal state: Issue #51 is closed as completed, has only `status:done`, has no assignee, and records the [workflow merge receipt](https://github.com/EthanSMC/qwen-harness-bridge/issues/51#issuecomment-5539609643).
+- Strict configuration: both lifecycle variables are `enforce`; activation commit `b06aceb805f03dc809b37b80cb45a240bb5be66d` is reachable from `main`; the migration list is empty and the mutation-acceptance value is null.
+- Post-activation smoke: Issue #52 has a fresh strict-mode claim distinct from its pre-activation generation. Its new closing PR, strict lifecycle gate, merge receipt, and terminal state provide the final live proof.
 
 ### Pre-activation live acceptance evidence
 
@@ -40,7 +47,7 @@ These local results do not substitute for current-head GitHub checks or independ
 - Milestones: 6 (`M0` through `M5`).
 - Plan implementation issues: 34.
 - Distribution: M0 7, M1 7, M2 6, M3 6, M4 7, M5 1.
-- Source commits: bootstrap workflow commit `b06aceb805f03dc809b37b80cb45a240bb5be66d` and live-acceptance fixture commit `657f619755cbffa784d12519f3f4d166b2118286` are reachable from protected `main`; strict activation and post-activation smoke remain in progress through Issues #51 and #52.
+- Source commits: bootstrap workflow commit `b06aceb805f03dc809b37b80cb45a240bb5be66d`, live-acceptance fixture commit `657f619755cbffa784d12519f3f4d166b2118286`, and strict activation commit `c3a2dd1896ea6a9e3b49d01d7aa4b98876ea87b9` are reachable from protected `main`; only the final strict smoke for Issue #52 remains in progress.
 
 ## Review gate status
 
