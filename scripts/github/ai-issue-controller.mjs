@@ -1181,8 +1181,7 @@ export const handleIssueComment = async ({
   const currentClaim = currentClaimFromReceipts(loaded.receipts);
   if (
     command.name !== "claim" &&
-    currentClaim !== null &&
-    command.fields["claim-id"] !== currentClaim.claimId
+    command.fields["claim-id"] !== (currentClaim?.claimId ?? null)
   ) {
     return rejectCommand({
       github,
@@ -1191,11 +1190,13 @@ export const handleIssueComment = async ({
       eventId: commentId,
       action: command.name,
       actor,
-      agent: currentClaim.agent,
+      agent: currentClaim?.agent ?? "none",
       issue: loaded.issue,
       error: new LifecycleError(
         "CLAIM_MISMATCH",
-        "Stop and verify the current receipt, assignee, and assigned executor before any retry or explicit handoff.",
+        currentClaim === null
+          ? "No active claim matches this generation. Stop and verify release or handoff before any retry."
+          : "Stop and verify the current receipt, assignee, and assigned executor before any retry or explicit handoff.",
       ),
     });
   }

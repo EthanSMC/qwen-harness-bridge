@@ -342,7 +342,7 @@ const claim = async (fake, id = 901) =>
     context(fake, fake.command(id, "alice", "/ai-claim\nagent: codex")),
   );
 
-const installLaterSameLoginClaim = async (fake) => {
+const installReleasedClaim = async (fake) => {
   await claim(fake);
   const firstClaim = fake.workflowReceipts()[0];
   const releaseReceipt = {
@@ -364,6 +364,11 @@ const installLaterSameLoginClaim = async (fake) => {
     { name: "status:ready" },
   ];
   fake.issues.get(46).assignees = [];
+  return firstClaim;
+};
+
+const installLaterSameLoginClaim = async (fake) => {
+  const firstClaim = await installReleasedClaim(fake);
   const secondClaimId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   await handleIssueComment(
     context(fake, fake.command(903, "alice", "/ai-claim\nagent: codex"), {
@@ -391,6 +396,32 @@ const addPendingHeartbeatIntent = (fake, claimId, eventId = 950) => {
     id: fake.nextCommentId++,
     body: receiptBody(receipt)
       .replace("AI lifecycle heartbeat:", "Pending AI lifecycle heartbeat:")
+      .replace("<!-- qhb-ai-lifecycle:v2", "<!-- qhb-ai-intent:v2"),
+    created_at: "2026-09-04T13:00:00.000Z",
+    user: { login: "github-actions[bot]" },
+  });
+  return receipt;
+};
+
+const addPendingClaimIntent = (fake, claimId, eventId = 950) => {
+  const receipt = {
+    version: 2,
+    eventId,
+    claimId,
+    action: "claim",
+    result: "success",
+    actor: "bob",
+    agent: "codex",
+    from: "ready",
+    to: "in-progress",
+    leaseExpiresAt: "2026-09-05T13:00:00.000Z",
+    pullRequestNumber: null,
+    code: null,
+  };
+  fake.comments.get(46).push({
+    id: fake.nextCommentId++,
+    body: receiptBody(receipt)
+      .replace("AI lifecycle claim:", "Pending AI lifecycle claim:")
       .replace("<!-- qhb-ai-lifecycle:v2", "<!-- qhb-ai-intent:v2"),
     created_at: "2026-09-04T13:00:00.000Z",
     user: { login: "github-actions[bot]" },
@@ -1190,6 +1221,76 @@ test("current generation commands may recover their pending intent", async () =>
           eventId === pending.eventId && receiptResult === "success",
       ),
     true,
+  );
+});
+
+test("post-claim commands cannot recover a pending initial claim without an active generation", async () => {
+  const commands = [
+    `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: released worker`,
+    `/ai-block\nclaim-id: ${UUID}\nreason: released worker\nresume-when: never`,
+    `/ai-resume\nclaim-id: ${UUID}`,
+    `/ai-release\nclaim-id: ${UUID}\nreason: released worker`,
+  ];
+  for (const [index, body] of commands.entries()) {
+    const fake = new FakeGitHub();
+    await installReleasedClaim(fake);
+    const pending = addPendingClaimIntent(
+      fake,
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      950 + index,
+    );
+    const issueBefore = fake.issue();
+    const mutationStart = fake.mutations.length;
+
+    const result = await handleIssueComment(
+      context(fake, fake.command(960 + index, "alice", body)),
+    );
+
+    assert.equal(result.code, "CLAIM_MISMATCH");
+    assert.deepEqual(fake.issue(), issueBefore);
+    assert.equal(
+      fake
+        .workflowReceipts()
+        .some(
+          ({ eventId, result: receiptResult }) =>
+            eventId === pending.eventId && receiptResult === "success",
+        ),
+      false,
+    );
+    const newMutations = fake.mutations.slice(mutationStart);
+    assert.equal(
+      newMutations.some(
+        ({ method, path }) => method === "PATCH" && path === "/issues/46",
+      ),
+      false,
+    );
+    assert.equal(
+      newMutations.some(({ body: mutationBody }) =>
+        mutationBody?.body?.includes(`event-id=${pending.eventId}`),
+      ),
+      false,
+    );
+  }
+});
+
+test("an initial claim command may recover its own pending claim intent", async () => {
+  const fake = new FakeGitHub();
+  await installReleasedClaim(fake);
+  const nextClaimId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const pending = addPendingClaimIntent(fake, nextClaimId);
+
+  const result = await handleIssueComment(
+    context(fake, fake.command(960, "bob", "/ai-claim\nagent: codex"), {
+      randomUUID: () => nextClaimId,
+    }),
+  );
+
+  assert.equal(result.recovered, true);
+  assert.equal(result.plan.receipt.eventId, pending.eventId);
+  assert.deepEqual(fake.issue().assignees, [{ login: "bob" }]);
+  assert.equal(
+    currentClaimFromReceipts(fake.workflowReceipts()).claimId,
+    nextClaimId,
   );
 });
 
