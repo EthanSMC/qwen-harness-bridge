@@ -16,6 +16,7 @@ import {
   runLifecycleController,
   runReconciliationPhases,
   stableSystemEventId,
+  validateHistoricalExemptions,
 } from "./ai-issue-controller.mjs";
 import { currentClaimFromReceipts, parseReceipts } from "./ai-issue-policy.mjs";
 
@@ -476,6 +477,275 @@ test("scheduled live-state reconciliation recovers a dropped PR event", async ()
   assert.equal(result.processed, 2);
   assert.ok(fake.issue().labels.some(({ name }) => name === "status:review"));
   assert.equal(fake.workflowReceipts().at(-1).action, "pr-open");
+});
+
+test("repository reconciliation isolates pre-lifecycle closed history", async () => {
+  const closedAt = "2026-09-03T12:00:00.000Z";
+  const exemptions = new Map([
+    [
+      46,
+      {
+        closedAt,
+        lifecycleStatus: null,
+        reason: "Closed before lifecycle enrollment",
+      },
+    ],
+  ]);
+  const historical = new FakeGitHub();
+  const historicalIssue = historical.issues.get(46);
+  historicalIssue.state = "closed";
+  historicalIssue.state_reason = "completed";
+  historicalIssue.closed_at = closedAt;
+  historicalIssue.labels = [{ name: "type:docs" }];
+  historicalIssue.assignees = [{ login: "legacy-owner" }];
+
+  const result = await reconcileRepositoryState({
+    github: historical.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+    historicalIssueExemptions: exemptions,
+  });
+  assert.deepEqual(result, {
+    status: "enforce",
+    processed: 0,
+    historicalSkipped: [46],
+    results: [],
+  });
+  assert.deepEqual(historical.mutations, []);
+  await assert.rejects(
+    () =>
+      reconcileRepositoryState({
+        github: historical.client,
+        repository: REPOSITORY,
+        defaultBranch: "main",
+        mode: "enforce",
+        now: NOW,
+        maxObjects: 0,
+        historicalIssueExemptions: exemptions,
+      }),
+    /reconciliation exceeds the 0-object cap/i,
+  );
+
+  const labeledHistorical = new FakeGitHub();
+  const labeledHistoricalIssue = labeledHistorical.issues.get(46);
+  labeledHistoricalIssue.state = "closed";
+  labeledHistoricalIssue.state_reason = "completed";
+  labeledHistoricalIssue.closed_at = closedAt;
+  labeledHistoricalIssue.labels = [
+    { name: "type:docs" },
+    { name: "status:done" },
+  ];
+  assert.deepEqual(
+    await reconcileRepositoryState({
+      github: labeledHistorical.client,
+      repository: REPOSITORY,
+      defaultBranch: "main",
+      mode: "enforce",
+      now: NOW,
+      historicalIssueExemptions: new Map([
+        [
+          46,
+          {
+            closedAt,
+            lifecycleStatus: "done",
+            reason: "Completed before lifecycle activation",
+          },
+        ],
+      ]),
+    }),
+    {
+      status: "enforce",
+      processed: 0,
+      historicalSkipped: [46],
+      results: [],
+    },
+  );
+
+  for (const { configure, exemptions: scenarioExemptions, message } of [
+    {
+      configure: (issue) => {
+        issue.labels = [{ name: "type:docs" }, { name: "status:ready" }];
+      },
+      message: /Only claimed review work can reconcile to done/i,
+    },
+    {
+      configure: (issue) => {
+        issue.labels = [{ name: "type:docs" }, { name: "type:bug" }];
+      },
+      message: /exactly one managed type label/i,
+    },
+    {
+      configure: (issue) => {
+        issue.labels = [{ name: "area:operations" }];
+      },
+      message: /exactly one managed type label/i,
+    },
+    {
+      configure: (issue) => {
+        issue.labels = [{ name: "type:docs" }, { name: "status:done" }];
+        issue.assignees = [];
+      },
+      message: /final terminal receipt/i,
+    },
+    {
+      configure: (issue) => {
+        issue.closed_at = "2026-09-03T12:00:01.000Z";
+      },
+      message: /exactly one managed lifecycle label/i,
+    },
+    {
+      configure: (issue) => {
+        issue.state_reason = "not_planned";
+      },
+      message: /exactly one managed lifecycle label/i,
+    },
+    {
+      configure: () => {},
+      exemptions: new Map(),
+      message: /exactly one managed lifecycle label/i,
+    },
+  ]) {
+    const malformedManaged = new FakeGitHub();
+    const malformedIssue = malformedManaged.issues.get(46);
+    malformedIssue.state = "closed";
+    malformedIssue.state_reason = "completed";
+    malformedIssue.closed_at = closedAt;
+    malformedIssue.labels = [{ name: "type:docs" }];
+    configure(malformedIssue);
+    await assert.rejects(
+      () =>
+        reconcileRepositoryState({
+          github: malformedManaged.client,
+          repository: REPOSITORY,
+          defaultBranch: "main",
+          mode: "enforce",
+          now: NOW,
+          historicalIssueExemptions: scenarioExemptions ?? exemptions,
+        }),
+      (error) =>
+        error instanceof AggregateError &&
+        error.errors.some((failure) => message.test(failure.message)),
+    );
+  }
+
+  const receiptBearing = new FakeGitHub();
+  await claim(receiptBearing);
+  const receiptBearingIssue = receiptBearing.issues.get(46);
+  receiptBearingIssue.state = "closed";
+  receiptBearingIssue.state_reason = "completed";
+  receiptBearingIssue.closed_at = closedAt;
+  receiptBearingIssue.labels = [{ name: "type:docs" }];
+  await assert.rejects(
+    () =>
+      reconcileRepositoryState({
+        github: receiptBearing.client,
+        repository: REPOSITORY,
+        defaultBranch: "main",
+        mode: "enforce",
+        now: NOW,
+        historicalIssueExemptions: exemptions,
+      }),
+    (error) =>
+      error instanceof AggregateError &&
+      error.errors.some((failure) =>
+        /exactly one managed lifecycle label/i.test(failure.message),
+      ),
+  );
+
+  const missingHistorical = new FakeGitHub();
+  missingHistorical.issues.delete(46);
+  await assert.rejects(
+    () =>
+      reconcileRepositoryState({
+        github: missingHistorical.client,
+        repository: REPOSITORY,
+        defaultBranch: "main",
+        mode: "enforce",
+        now: NOW,
+        historicalIssueExemptions: exemptions,
+      }),
+    (error) =>
+      error instanceof AggregateError &&
+      error.errors.some((failure) =>
+        /exemption Issue #46 is missing/i.test(failure.message),
+      ),
+  );
+});
+
+test("historical exemption registry is bounded and activation-bound", () => {
+  const activationCommit = "a".repeat(40);
+  const valid = {
+    schema_version: 1,
+    activation_commit: activationCommit,
+    entries: [
+      {
+        issue: 46,
+        closed_at: "2026-09-03T12:00:00.000Z",
+        lifecycle_status: null,
+        reason: "Closed before lifecycle enrollment",
+      },
+    ],
+  };
+  assert.deepEqual(
+    validateHistoricalExemptions(valid, { activationCommit }),
+    new Map([
+      [
+        46,
+        {
+          closedAt: "2026-09-03T12:00:00.000Z",
+          lifecycleStatus: null,
+          reason: "Closed before lifecycle enrollment",
+        },
+      ],
+    ]),
+  );
+  for (const { mutate, message } of [
+    {
+      mutate: (registry) => {
+        registry.activation_commit = "b".repeat(40);
+      },
+      message: /match.*activation commit/i,
+    },
+    {
+      mutate: (registry) => {
+        registry.entries.push(structuredClone(registry.entries[0]));
+      },
+      message: /Issues must be unique/i,
+    },
+    {
+      mutate: (registry) => {
+        registry.entries[0].closed_at = "not-a-timestamp";
+      },
+      message: /timestamp/i,
+    },
+    {
+      mutate: (registry) => {
+        registry.entries[0].unexpected = true;
+      },
+      message: /unknown or missing fields/i,
+    },
+    {
+      mutate: (registry) => {
+        registry.entries[0].issue = "46";
+      },
+      message: /positive safe integer/i,
+    },
+    {
+      mutate: (registry) => {
+        registry.entries[0].lifecycle_status = "ready";
+      },
+      message: /lifecycle status must be null or done/i,
+    },
+  ]) {
+    const malformed = structuredClone(valid);
+    mutate(malformed);
+    assert.throws(
+      () => validateHistoricalExemptions(malformed, { activationCommit }),
+      message,
+    );
+  }
 });
 
 test("reconciliation phases continue after an earlier phase fails", async () => {
@@ -1394,6 +1664,65 @@ test("merged pull request verifies completed closure and reaches done", async ()
   assert.equal(fake.workflowReceipts().at(-1).action, "merge");
 });
 
+test("completed idempotency requires terminal receipt and merge evidence", async () => {
+  const fake = new FakeGitHub();
+  const governedIssue = fake.issues.get(46);
+  governedIssue.state = "closed";
+  governedIssue.state_reason = "completed";
+  governedIssue.closed_at = NOW;
+  governedIssue.labels = [{ name: "type:docs" }, { name: "status:done" }];
+  const pull = fake.pull({ state: "closed", merged: true });
+  pull.merged_at = NOW;
+  pull.merge_commit_sha = "abc1234";
+  fake.pulls.set(51, pull);
+
+  await assert.rejects(
+    () => handleIssueChange(context(fake, fake.issueEvent(), { eventId: 920 })),
+    /final terminal receipt/i,
+  );
+  await assert.rejects(
+    () =>
+      handlePullRequest(context(fake, fake.pullEvent(pull), { eventId: 921 })),
+    /final terminal receipt/i,
+  );
+});
+
+test("completed idempotency rejects stale claim binding and unreachable merge", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const pull = fake.pull();
+  await handlePullRequest(
+    context(fake, fake.pullEvent(pull, "opened"), { eventId: 910 }),
+  );
+  const merged = fake.pulls.get(51);
+  merged.state = "closed";
+  merged.merged = true;
+  merged.merged_at = NOW;
+  merged.merge_commit_sha = "abc1234";
+  const governedIssue = fake.issues.get(46);
+  governedIssue.state = "closed";
+  governedIssue.state_reason = "completed";
+  governedIssue.closed_at = NOW;
+  await handlePullRequest(
+    context(fake, fake.pullEvent(merged), { eventId: 912 }),
+  );
+
+  fake.comparisonStatus = "diverged";
+  await assert.rejects(
+    () => handleIssueChange(context(fake, fake.issueEvent(), { eventId: 920 })),
+    /not reachable/i,
+  );
+  fake.comparisonStatus = "ahead";
+  merged.body = merged.body.replace(
+    /issuecomment-[1-9]\d*/u,
+    "issuecomment-999",
+  );
+  await assert.rejects(
+    () => handleIssueChange(context(fake, fake.issueEvent(), { eventId: 921 })),
+    /exactly one merged pull request/i,
+  );
+});
+
 test("a final merge event reconstructs a dropped pull-request-open transition", async () => {
   const fake = new FakeGitHub();
   await claim(fake);
@@ -1483,6 +1812,172 @@ test("merged pull event is idempotent when Issue close reconciliation won", asyn
   );
   assert.deepEqual(result, { status: "unchanged" });
   assert.ok(fake.issue().labels.some(({ name }) => name === "status:done"));
+});
+
+test("repository reconciliation verifies a released prior unmerged pull request generation", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const firstPull = fake.pull();
+  await handlePullRequest(
+    context(fake, fake.pullEvent(firstPull, "opened"), { eventId: 910 }),
+  );
+  const closedFirstPull = fake.pulls.get(51);
+  closedFirstPull.state = "closed";
+  closedFirstPull.updated_at = NOW;
+  await handlePullRequest(
+    context(fake, fake.pullEvent(closedFirstPull, "closed"), { eventId: 911 }),
+  );
+  await handleIssueComment(
+    context(
+      fake,
+      fake.command(912, "alice", "/ai-release\nreason: handoff requested"),
+    ),
+  );
+  let result = await reconcileRepositoryState({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+  });
+  assert.equal(result.processed, 2);
+  assert.deepEqual(result.historicalSkipped, []);
+  assert.ok(result.results.every(({ status }) => status === "unchanged"));
+
+  await handleIssueComment(
+    context(fake, fake.command(913, "bob", "/ai-claim\nagent: codex"), {
+      randomUUID: () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    }),
+  );
+  result = await reconcileRepositoryState({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+  });
+  assert.equal(result.processed, 2);
+  assert.deepEqual(result.historicalSkipped, []);
+  assert.ok(result.results.every(({ status }) => status === "unchanged"));
+
+  const finalPull = fake.pull({ number: 52, user: "bob" });
+  await handlePullRequest(
+    context(fake, fake.pullEvent(finalPull, "opened"), { eventId: 914 }),
+  );
+  result = await reconcileRepositoryState({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+  });
+  assert.equal(result.processed, 3);
+  assert.deepEqual(result.historicalSkipped, []);
+  assert.ok(result.results.every(({ status }) => status === "unchanged"));
+
+  const mergedFinalPull = fake.pulls.get(52);
+  mergedFinalPull.state = "closed";
+  mergedFinalPull.merged = true;
+  mergedFinalPull.merged_at = NOW;
+  mergedFinalPull.updated_at = NOW;
+  mergedFinalPull.merge_commit_sha = "abc1234";
+  const governedIssue = fake.issues.get(46);
+  governedIssue.state = "closed";
+  governedIssue.state_reason = "completed";
+  governedIssue.closed_at = NOW;
+  await handlePullRequest(
+    context(fake, fake.pullEvent(mergedFinalPull, "closed"), { eventId: 915 }),
+  );
+
+  result = await reconcileRepositoryState({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+  });
+  assert.equal(result.processed, 3);
+  assert.deepEqual(result.historicalSkipped, []);
+  assert.ok(result.results.every(({ status }) => status === "unchanged"));
+
+  const validComments = structuredClone(fake.comments.get(46));
+  const validFirstPullBody = closedFirstPull.body;
+  const assertReconciliationFailure = async (message) =>
+    assert.rejects(
+      () =>
+        reconcileRepositoryState({
+          github: fake.client,
+          repository: REPOSITORY,
+          defaultBranch: "main",
+          mode: "enforce",
+          now: NOW,
+        }),
+      (error) =>
+        error instanceof AggregateError &&
+        error.errors.some((failure) => message.test(failure.message)),
+    );
+
+  fake.comments.set(
+    46,
+    validComments.filter(({ body }) => !body.includes("\naction=merge\n")),
+  );
+  await assertReconciliationFailure(/final terminal receipt/i);
+
+  fake.comments.set(
+    46,
+    validComments.map((comment) =>
+      comment.body.includes("\naction=merge\n")
+        ? {
+            ...comment,
+            body: comment.body.replace(
+              "\npull-request=52\n",
+              "\npull-request=51\n",
+            ),
+          }
+        : comment,
+    ),
+  );
+  await assertReconciliationFailure(/pull request receipt|claim generation/i);
+
+  fake.comments.set(46, validComments);
+  fake.comparisonStatus = "diverged";
+  await assertReconciliationFailure(/not reachable/i);
+  fake.comparisonStatus = "ahead";
+
+  closedFirstPull.body = closedFirstPull.body.replace(
+    /issuecomment-[1-9]\d*/u,
+    "issuecomment-999",
+  );
+  await assertReconciliationFailure(/does not match its claim binding/i);
+  closedFirstPull.body = validFirstPullBody;
+
+  fake.comments.set(
+    46,
+    validComments.filter(({ body }) => !body.includes("\naction=pr-close\n")),
+  );
+  await assertReconciliationFailure(/receipt|claim|transition/i);
+
+  fake.comments.set(
+    46,
+    validComments.filter(({ body }) => !body.includes("\naction=release\n")),
+  );
+  await assertReconciliationFailure(/released claim-bound review cycle/i);
+
+  fake.comments.set(
+    46,
+    validComments.map((comment) =>
+      comment.body.includes("\naction=pr-close\n")
+        ? {
+            ...comment,
+            body: comment.body.replace(
+              "\npull-request=51\n",
+              "\npull-request=52\n",
+            ),
+          }
+        : comment,
+    ),
+  );
+  await assertReconciliationFailure(/pull request receipt|claim generation/i);
 });
 
 test("reopened completed Issue returns to ready with a fresh generation required", async () => {

@@ -18,9 +18,13 @@ import {
   RECEIPT_ACTIONS,
   receiptBody,
   STATUS_LABELS,
+  safePublicText,
   stripMarkdownCode,
 } from "./ai-issue-policy.mjs";
-import { validateLifecycleMutationMode } from "./ai-lifecycle-registry.mjs";
+import {
+  requireRegistryTimestamp,
+  validateLifecycleMutationMode,
+} from "./ai-lifecycle-registry.mjs";
 import { createGitHubClient } from "./github-api.mjs";
 
 const WORKFLOW_LOGIN = "github-actions[bot]";
@@ -35,6 +39,12 @@ const MIGRATION_PATH = resolve(
   import.meta.dirname,
   "../../docs/github/ai-lifecycle-migrations.json",
 );
+const HISTORICAL_EXEMPTIONS_PATH = resolve(
+  import.meta.dirname,
+  "../../docs/github/ai-lifecycle-historical-exemptions.json",
+);
+const FULL_SHA = /^[0-9a-f]{40}$/u;
+const MAX_HISTORICAL_EXEMPTIONS = 100;
 
 const requirePositiveInteger = (value, label) => {
   const number = Number(value);
@@ -74,6 +84,91 @@ const assigneesOf = (issue) =>
 
 const managedTypeCount = (issue) =>
   labelsOf(issue).filter((label) => MANAGED_TYPE_LABELS.includes(label)).length;
+
+const managedStatusCount = (issue) =>
+  labelsOf(issue).filter((label) => STATUS_LABELS.includes(label)).length;
+
+const requireExactKeys = (value, expected, label) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const actual = Object.keys(value).sort();
+  if (JSON.stringify(actual) !== JSON.stringify([...expected].sort())) {
+    throw new Error(`${label} has unknown or missing fields`);
+  }
+};
+
+export const validateHistoricalExemptions = (
+  registry,
+  { activationCommit },
+) => {
+  requireExactKeys(
+    registry,
+    ["activation_commit", "entries", "schema_version"],
+    "Historical lifecycle exemption registry",
+  );
+  if (registry.schema_version !== 1) {
+    throw new Error(
+      "Historical lifecycle exemption registry schema_version must be 1",
+    );
+  }
+  if (
+    !FULL_SHA.test(registry.activation_commit ?? "") ||
+    registry.activation_commit !== activationCommit
+  ) {
+    throw new Error(
+      "Historical lifecycle exemptions must match the lifecycle activation commit",
+    );
+  }
+  if (
+    !Array.isArray(registry.entries) ||
+    registry.entries.length > MAX_HISTORICAL_EXEMPTIONS
+  ) {
+    throw new Error("Historical lifecycle exemptions must be a bounded array");
+  }
+  const entries = new Map();
+  for (const [index, entry] of registry.entries.entries()) {
+    const label = `Historical lifecycle exemption ${index + 1}`;
+    requireExactKeys(
+      entry,
+      ["closed_at", "issue", "lifecycle_status", "reason"],
+      label,
+    );
+    if (!Number.isSafeInteger(entry.issue) || entry.issue < 1) {
+      throw new Error(`${label} Issue must be a positive safe integer`);
+    }
+    const issue = entry.issue;
+    requireRegistryTimestamp(entry.closed_at, `${label} close time`);
+    if (![null, "done"].includes(entry.lifecycle_status)) {
+      throw new Error(`${label} lifecycle status must be null or done`);
+    }
+    try {
+      safePublicText(entry.reason, 240);
+    } catch {
+      throw new Error(`${label} reason is unsafe`);
+    }
+    if (entries.has(issue)) {
+      throw new Error("Historical lifecycle exemption Issues must be unique");
+    }
+    entries.set(issue, {
+      closedAt: entry.closed_at,
+      lifecycleStatus: entry.lifecycle_status,
+      reason: entry.reason,
+    });
+  }
+  return entries;
+};
+
+const matchesHistoricalExemptionSnapshot = (issue, exemption) =>
+  Boolean(exemption) &&
+  issue.state === "closed" &&
+  issue.state_reason === "completed" &&
+  issue.closed_at === exemption.closedAt &&
+  managedTypeCount(issue) === 1 &&
+  (exemption.lifecycleStatus === null
+    ? managedStatusCount(issue) === 0
+    : managedStatusCount(issue) === 1 &&
+      labelsOf(issue).includes(`status:${exemption.lifecycleStatus}`));
 
 const assertManagedIssue = (issue) => {
   const count = managedTypeCount(issue);
@@ -342,6 +437,154 @@ const mergedPullRequestForIssue = async ({
     );
   }
   return merged[0];
+};
+
+const verifyCompletedIssueEvidence = async ({
+  github,
+  issueNumber,
+  repository,
+  defaultBranch,
+  loaded,
+  pullRequestNumber = null,
+}) => {
+  const successfulReceipts = loaded.receipts.filter(
+    ({ result }) => result === "success",
+  );
+  const terminalReceipt =
+    pullRequestNumber === null
+      ? successfulReceipts.at(-1)
+      : successfulReceipts.findLast(
+          ({ action, pullRequestNumber: receiptPullRequestNumber }) =>
+            ["merge", "close"].includes(action) &&
+            receiptPullRequestNumber === pullRequestNumber,
+        );
+  if (
+    !terminalReceipt ||
+    !["merge", "close"].includes(terminalReceipt.action) ||
+    terminalReceipt.to !== "done" ||
+    (pullRequestNumber === null &&
+      currentClaimFromReceipts(loaded.receipts) !== null)
+  ) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Completed lifecycle state requires a final terminal receipt.",
+    );
+  }
+  const claimReceipt = successfulReceipts.find(
+    ({ action, claimId }) =>
+      action === "claim" && claimId === terminalReceipt.claimId,
+  );
+  if (!claimReceipt) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Completed lifecycle state requires its original claim receipt.",
+    );
+  }
+  const claim = {
+    claimId: claimReceipt.claimId,
+    owner: claimReceipt.actor,
+    agent: claimReceipt.agent,
+    leaseExpiresAt: claimReceipt.leaseExpiresAt,
+    pullRequestNumber: terminalReceipt.pullRequestNumber,
+    claimCommentId: claimReceipt.commentId,
+    claimedAt: claimReceipt.createdAt,
+  };
+  const pullRequest = await mergedPullRequestForIssue({
+    github,
+    issueNumber,
+    repository,
+    defaultBranch,
+    claim,
+    issueClosedAt: loaded.issue.closed_at,
+    openClosingPullRequests: loaded.closingPullRequests,
+  });
+  return { claim, pullRequest, terminalReceipt };
+};
+
+const verifyClosedUnmergedPullRequestEvidence = ({
+  pullRequest,
+  issueNumber,
+  repository,
+  defaultBranch,
+  receipts,
+}) => {
+  if (pullRequest.state !== "closed" || pullRequest.merged === true) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Historical pull request evidence must be closed without a merge.",
+    );
+  }
+  const successfulReceipts = receipts.filter(
+    ({ result }) => result === "success",
+  );
+  const prCloseIndex = successfulReceipts.findLastIndex(
+    ({ action, pullRequestNumber }) =>
+      action === "pr-close" && pullRequestNumber === pullRequest.number,
+  );
+  const prCloseReceipt = successfulReceipts[prCloseIndex];
+  const prOpenReceipt = successfulReceipts
+    .slice(0, prCloseIndex)
+    .findLast(
+      ({ action, claimId, pullRequestNumber }) =>
+        action === "pr-open" &&
+        claimId === prCloseReceipt?.claimId &&
+        pullRequestNumber === pullRequest.number,
+    );
+  const claimReceipt = successfulReceipts.find(
+    ({ action, claimId }) =>
+      action === "claim" && claimId === prCloseReceipt?.claimId,
+  );
+  const released = successfulReceipts
+    .slice(prCloseIndex + 1)
+    .some(
+      ({ action, claimId }) =>
+        ["release", "expire"].includes(action) &&
+        claimId === prCloseReceipt?.claimId,
+    );
+  if (!prCloseReceipt || !prOpenReceipt || !claimReceipt || !released) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Closed unmerged pull request history requires a released claim-bound review cycle.",
+    );
+  }
+  const leaseReceipt = successfulReceipts
+    .slice(0, successfulReceipts.indexOf(prOpenReceipt))
+    .findLast(
+      ({ claimId, leaseExpiresAt }) =>
+        claimId === claimReceipt.claimId && leaseExpiresAt !== null,
+    );
+  const claim = {
+    claimId: claimReceipt.claimId,
+    owner: claimReceipt.actor,
+    agent: claimReceipt.agent,
+    leaseExpiresAt: leaseReceipt?.leaseExpiresAt ?? claimReceipt.leaseExpiresAt,
+    pullRequestNumber: pullRequest.number,
+    claimCommentId: claimReceipt.commentId,
+    claimedAt: claimReceipt.createdAt,
+  };
+  if (
+    primaryIssueNumber(pullRequest.body) !== issueNumber ||
+    claimReceiptCommentId({
+      body: pullRequest.body,
+      repository,
+      issueNumber,
+    }) !== claim.claimCommentId ||
+    pullRequest.user?.login !== claim.owner ||
+    pullRequest.base?.ref !== defaultBranch ||
+    pullRequest.base?.repo?.full_name?.toLowerCase() !==
+      repository.toLowerCase()
+  ) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Closed unmerged pull request history does not match its claim binding.",
+    );
+  }
+  requireReviewAdmissionChronology({
+    claim,
+    pullRequest,
+    eventAction: "opened",
+  });
+  return { claim, prCloseReceipt, prOpenReceipt };
 };
 
 const commentsFor = (github, issueNumber) =>
@@ -1070,6 +1313,7 @@ export const handlePullRequest = async ({
     issue,
     openPullRequests,
   );
+  const currentClaim = currentClaimFromReceipts(loaded.receipts);
   if (pullRequest.state === "open") {
     if (
       loaded.closingPullRequests.length !== 1 ||
@@ -1080,7 +1324,32 @@ export const handlePullRequest = async ({
         "An open pull request must be the Issue's only open closing pull request.",
       );
     }
-  } else if (loaded.closingPullRequests.length > 0) {
+  }
+  if (
+    pullRequest.state === "closed" &&
+    pullRequest.merged !== true &&
+    currentClaim?.pullRequestNumber !== pullRequest.number
+  ) {
+    const { state } = assertIssueInvariant(loaded.issue);
+    if (state === "done") {
+      await verifyCompletedIssueEvidence({
+        github,
+        issueNumber,
+        repository,
+        defaultBranch,
+        loaded,
+      });
+    }
+    verifyClosedUnmergedPullRequestEvidence({
+      pullRequest,
+      issueNumber,
+      repository,
+      defaultBranch,
+      receipts: loaded.receipts,
+    });
+    return { status: "unchanged" };
+  }
+  if (pullRequest.state !== "open" && loaded.closingPullRequests.length > 0) {
     throw new LifecycleError(
       "CLOSING_PR_EXISTS",
       "A terminal pull request event cannot leave another open closing pull request.",
@@ -1104,13 +1373,31 @@ export const handlePullRequest = async ({
   }
   const observedState = statusOf(loaded.issue);
   if (
-    pullRequest.merged === true &&
     observedState === "done" &&
     loaded.issue.state === "closed" &&
     loaded.issue.state_reason === "completed" &&
     assigneesOf(loaded.issue).length === 0
   ) {
-    return { status: "unchanged" };
+    const verified = await verifyCompletedIssueEvidence({
+      github,
+      issueNumber,
+      repository,
+      defaultBranch,
+      loaded,
+    });
+    if (pullRequest.merged === true) {
+      if (verified.pullRequest.number !== pullRequest.number) {
+        await verifyCompletedIssueEvidence({
+          github,
+          issueNumber,
+          repository,
+          defaultBranch,
+          loaded,
+          pullRequestNumber: pullRequest.number,
+        });
+      }
+      return { status: "unchanged" };
+    }
   }
   const { state, assignee } = assertIssueInvariant(
     pullRequest.merged ? { ...loaded.issue, state: "open" } : loaded.issue,
@@ -1121,7 +1408,7 @@ export const handlePullRequest = async ({
       "The pull request author must be the accountable Issue owner.",
     );
   }
-  const claim = currentClaimFromReceipts(loaded.receipts);
+  const claim = currentClaim;
   if (!claim || claim.owner !== assignee) {
     throw new LifecycleError(
       "STATE_MISMATCH",
@@ -1371,6 +1658,13 @@ export const handleIssueChange = async ({
       loaded.issue.state_reason === "completed"
     ) {
       if (state === "done" && assigneesOf(loaded.issue).length === 0) {
+        await verifyCompletedIssueEvidence({
+          github,
+          issueNumber,
+          repository,
+          defaultBranch: event.repository.default_branch,
+          loaded,
+        });
         return { status: "unchanged" };
       }
       if (
@@ -1750,8 +2044,12 @@ export const reconcileRepositoryState = async ({
   mode = "report",
   now,
   maxObjects = MAX_RECONCILIATION_OBJECTS,
+  historicalIssueExemptions = new Map(),
 }) => {
   assertMode(mode);
+  if (!(historicalIssueExemptions instanceof Map)) {
+    throw new Error("Historical lifecycle exemptions must be a Map");
+  }
   const [listedIssues, listedPullRequests] = await Promise.all([
     github.getAll(
       "/issues?state=all&sort=updated&direction=asc",
@@ -1762,9 +2060,40 @@ export const reconcileRepositoryState = async ({
       "repository pull requests",
     ),
   ]);
-  const issues = listedIssues.filter(
-    (issue) => !issue.pull_request && managedTypeCount(issue) > 0,
+  const repositoryIssues = listedIssues.filter((issue) => !issue.pull_request);
+  const repositoryIssueNumbers = new Set(
+    repositoryIssues.map(({ number }) =>
+      requirePositiveInteger(number, "Issue number"),
+    ),
   );
+  const missingHistoricalIssues = [...historicalIssueExemptions.keys()].filter(
+    (issueNumber) => !repositoryIssueNumbers.has(issueNumber),
+  );
+  const managedIssues = repositoryIssues.filter(
+    (issue) =>
+      managedTypeCount(issue) > 0 ||
+      historicalIssueExemptions.has(
+        requirePositiveInteger(issue.number, "Issue number"),
+      ),
+  );
+  const historicalSkipped = [];
+  const issues = [];
+  for (const issue of managedIssues) {
+    const issueNumber = requirePositiveInteger(issue.number, "Issue number");
+    const exemption = historicalIssueExemptions.get(issueNumber);
+    if (matchesHistoricalExemptionSnapshot(issue, exemption)) {
+      const comments = await github.getAll(
+        `/issues/${issueNumber}/comments`,
+        `Issue #${issueNumber} comments`,
+      );
+      if (parseReceipts(comments).length === 0) {
+        historicalSkipped.push(issueNumber);
+        continue;
+      }
+    }
+    issues.push(issue);
+  }
+  historicalSkipped.sort((left, right) => left - right);
   const openPullRequests = listedPullRequests.filter(
     (pullRequest) => pullRequest.state === "open",
   );
@@ -1782,15 +2111,28 @@ export const reconcileRepositoryState = async ({
       throw error;
     }
   });
-  if (issues.length + pullRequests.length > maxObjects) {
+  if (managedIssues.length + pullRequests.length > maxObjects) {
     throw new Error(
       `AI lifecycle reconciliation exceeds the ${maxObjects}-object cap`,
     );
   }
-  const failures = [];
+  const failures = missingHistoricalIssues.map(
+    (issueNumber) =>
+      new LifecycleError(
+        "STATE_MISMATCH",
+        `Historical lifecycle exemption Issue #${issueNumber} is missing from repository state.`,
+      ),
+  );
   const results = [];
   for (const issue of issues) {
     try {
+      if (
+        historicalIssueExemptions.has(
+          requirePositiveInteger(issue.number, "Issue number"),
+        )
+      ) {
+        assertManagedIssue(issue);
+      }
       results.push(
         await handleIssueChange({
           github,
@@ -1852,7 +2194,12 @@ export const reconcileRepositoryState = async ({
       `${failures.length} repository lifecycle object(s) failed after reconciliation continued`,
     );
   }
-  return { status: mode, processed: results.length, results };
+  return {
+    status: mode,
+    processed: results.length,
+    historicalSkipped,
+    results,
+  };
 };
 
 export const runReconciliationPhases = async (phases) => {
@@ -1904,6 +2251,7 @@ export const main = async ({
   fetchImpl = globalThis.fetch,
   now = null,
   migrationsPath = MIGRATION_PATH,
+  historicalExemptionsPath = HISTORICAL_EXEMPTIONS_PATH,
 } = {}) => {
   if (typeof eventPath !== "string" || eventPath.length === 0) {
     throw new Error("GITHUB_EVENT_PATH is required");
@@ -1926,6 +2274,20 @@ export const main = async ({
     mode,
     now: authoritativeNow,
   });
+  let historicalExemptions;
+  try {
+    historicalExemptions = JSON.parse(
+      readFileSync(resolve(historicalExemptionsPath), "utf8"),
+    );
+  } catch {
+    throw new Error(
+      "Historical lifecycle exemption registry must contain valid JSON",
+    );
+  }
+  const historicalIssueExemptions = validateHistoricalExemptions(
+    historicalExemptions,
+    { activationCommit: activation.activationCommit },
+  );
   if (activation.phase === "activated") {
     const comparison = await github.get(
       `/compare/${activation.activationCommit}...${encodeURIComponent(event.repository.default_branch)}`,
@@ -2034,6 +2396,7 @@ export const main = async ({
             defaultBranch,
             mode,
             now: authoritativeNow,
+            historicalIssueExemptions,
           }),
       },
       {
