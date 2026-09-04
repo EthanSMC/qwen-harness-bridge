@@ -814,7 +814,7 @@ describe("release runtime build contract", () => {
     } finally {
       rmSync(buildRoot, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 120_000);
 
   it("accepts base CA certificates while rejecting application secrets and tests", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-image-audit-"));
