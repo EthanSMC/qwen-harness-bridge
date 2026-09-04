@@ -28,6 +28,16 @@ const requirePositiveInteger = (value, label) => {
   return value;
 };
 
+const requireGitObjectId = (value, label) => {
+  if (
+    typeof value !== "string" ||
+    !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(value)
+  ) {
+    throw new Error(`${label} must be a 40- or 64-character Git object ID`);
+  }
+  return value;
+};
+
 const validatePath = (path) => {
   if (
     typeof path !== "string" ||
@@ -42,17 +52,23 @@ const validatePath = (path) => {
   return path;
 };
 
-const validateResponseIds = (value, seen = new Set()) => {
+const validateResponseIds = (value, seen = new Set(), contextKey = null) => {
   if (!value || typeof value !== "object" || seen.has(value)) return;
   seen.add(value);
   if (Object.hasOwn(value, "id")) {
-    requirePositiveInteger(value.id, "GitHub response review/object id");
+    if (contextKey === "head_commit") {
+      requireGitObjectId(value.id, "GitHub response head commit id");
+    } else {
+      requirePositiveInteger(value.id, "GitHub response review/object id");
+    }
   }
   if (Array.isArray(value)) {
-    for (const item of value) validateResponseIds(item, seen);
+    for (const item of value) validateResponseIds(item, seen, contextKey);
     return;
   }
-  for (const child of Object.values(value)) validateResponseIds(child, seen);
+  for (const [key, child] of Object.entries(value)) {
+    validateResponseIds(child, seen, key);
+  }
 };
 
 const validateResponseShape = (value, label) => {

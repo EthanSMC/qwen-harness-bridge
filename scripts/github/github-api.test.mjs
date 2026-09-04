@@ -37,6 +37,28 @@ test("sets strict headers and validates object responses", async () => {
   assert.equal(calls[0].options.headers["X-GitHub-Idempotency-Key"], undefined);
 });
 
+test("accepts Git object IDs without weakening numeric object ID checks", async () => {
+  const clientFor = (value) =>
+    createGitHubClient({
+      fetchImpl: async () => response(value),
+      repository: REPOSITORY,
+      token: TOKEN,
+    });
+  const oid = "ee7d4742ac18067bb502fe8c1c9fd4c315d6a98d";
+
+  assert.deepEqual(await clientFor({ head_commit: { id: oid } }).get("/run"), {
+    head_commit: { id: oid },
+  });
+  await assert.rejects(
+    () => clientFor({ head_commit: { id: "not-a-git-object" } }).get("/run"),
+    /id.*positive|Git object/i,
+  );
+  await assert.rejects(
+    () => clientFor({ id: oid }).get("/issues/46"),
+    /id.*positive|positive.*id/i,
+  );
+});
+
 test("uses the GitHub response Date as the server clock", async () => {
   let requestedUrl;
   const client = createGitHubClient({

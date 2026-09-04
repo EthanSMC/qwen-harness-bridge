@@ -361,7 +361,7 @@ Expected: FAIL because the API client does not exist.
 
 - [x] **Step 3: Implement strict REST requests and pagination**
 
-Every request sets `Accept`, `Authorization`, and `X-GitHub-Api-Version`. Require object/array response shapes, positive numeric IDs, page sizes no larger than requested, and a short page before the configured cap. Include method/path/status in errors without echoing tokens or response bodies.
+Every request sets `Accept`, `Authorization`, and `X-GitHub-Api-Version`. Require object/array response shapes, positive safe numeric object IDs or exact 40/64-character Git object IDs where GitHub uses the same `id` field name, page sizes no larger than requested, and a short page before the configured cap. Include method/path/status in errors without echoing tokens or response bodies.
 
 `mutateAndVerify` performs one mutation, then up to three bounded live reads. On network uncertainty it reads first and retries only naturally idempotent PATCH/PUT/DELETE operations. POST is never automatically replayed; a later delivery reconciles the stable intent. Every request has a hard deadline.
 
