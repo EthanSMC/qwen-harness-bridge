@@ -66,7 +66,7 @@ These local results do not substitute for current-head GitHub checks or independ
 ## Branch-protection state
 
 - Branch protection: enabled on `main`, verified through the GitHub API on 2026-09-03.
-- The required status check is `governance` with strict up-to-date branch enforcement.
+- The historical live protection verified on 2026-09-03 required `governance`. The managed protection target now requires both `governance` and `runtime` with strict up-to-date branch enforcement; the controller applies and verifies that narrow protection update after the reviewed code merges.
 - Protection requires linear history and resolved review conversations and applies to administrators.
 - Force pushes and branch deletions are disabled.
 - `required_pull_request_reviews` is unset while no distinct eligible direct collaborator exists; the live governance check still requires truthful solo-fallback evidence, an independent exact-range PASS, and current-head checks.

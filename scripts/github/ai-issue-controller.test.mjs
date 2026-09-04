@@ -18,7 +18,11 @@ import {
   stableSystemEventId,
   validateHistoricalExemptions,
 } from "./ai-issue-controller.mjs";
-import { currentClaimFromReceipts, parseReceipts } from "./ai-issue-policy.mjs";
+import {
+  currentClaimFromReceipts,
+  parseReceipts,
+  receiptBody,
+} from "./ai-issue-policy.mjs";
 
 const REPOSITORY = "octo/example";
 const NOW = "2026-09-04T12:00:00.000Z";
@@ -387,7 +391,7 @@ test("a bounded command drain processes the oldest batch instead of wedging", as
   fake.command(
     902,
     "alice",
-    "/ai-heartbeat\nsummary: implementation continues",
+    `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: implementation continues`,
     46,
     "2026-09-04T13:00:00.000Z",
   );
@@ -904,7 +908,7 @@ test("owner blocks, resumes, and releases while maintainer recovery is allowed",
       fake.command(
         902,
         "alice",
-        "/ai-block\nreason: staging unavailable\nresume-when: staging recovers",
+        `/ai-block\nclaim-id: ${UUID}\nreason: staging unavailable\nresume-when: staging recovers`,
       ),
     ),
   );
@@ -912,7 +916,13 @@ test("owner blocks, resumes, and releases while maintainer recovery is allowed",
   await handleIssueComment(
     context(
       fake,
-      fake.command(903, "alice", "/ai-resume", 46, "2026-09-04T13:00:00.000Z"),
+      fake.command(
+        903,
+        "alice",
+        `/ai-resume\nclaim-id: ${UUID}`,
+        46,
+        "2026-09-04T13:00:00.000Z",
+      ),
       {
         now: "2026-09-04T13:00:00.000Z",
       },
@@ -927,12 +937,191 @@ test("owner blocks, resumes, and releases while maintainer recovery is allowed",
       fake.command(
         904,
         "maintainer",
-        "/ai-release\nreason: maintainer recovery",
+        `/ai-release\nclaim-id: ${UUID}\nreason: maintainer recovery`,
       ),
     ),
   );
   assert.ok(fake.issue().labels.some(({ name }) => name === "status:ready"));
   assert.deepEqual(fake.issue().assignees, []);
+});
+
+test("claim generation fences same-login lifecycle workers and permits the current generation", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const firstClaim = fake.workflowReceipts()[0];
+  const released = {
+    ...firstClaim,
+    eventId: 902,
+    action: "release",
+    from: "in-progress",
+    to: "ready",
+    leaseExpiresAt: null,
+  };
+  fake.comments.get(46).push({
+    id: fake.nextCommentId++,
+    body: receiptBody(released),
+    created_at: NOW,
+    user: { login: "github-actions[bot]" },
+  });
+  fake.issues.get(46).labels = [
+    { name: "type:docs" },
+    { name: "status:ready" },
+  ];
+  fake.issues.get(46).assignees = [];
+
+  const secondClaimId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  await handleIssueComment(
+    context(fake, fake.command(903, "alice", "/ai-claim\nagent: codex"), {
+      randomUUID: () => secondClaimId,
+    }),
+  );
+
+  const assertCurrentClaimUnchanged = async (
+    id,
+    body,
+    expectedCode,
+    actor = "alice",
+  ) => {
+    const before = currentClaimFromReceipts(fake.workflowReceipts());
+    const result = await handleIssueComment(
+      context(fake, fake.command(id, actor, body)),
+    );
+    assert.equal(result.code, expectedCode);
+    assert.deepEqual(currentClaimFromReceipts(fake.workflowReceipts()), before);
+    assert.deepEqual(fake.issue().assignees, [{ login: "alice" }]);
+  };
+
+  await assertCurrentClaimUnchanged(
+    904,
+    "/ai-heartbeat\nsummary: legacy worker without a generation",
+    "INVALID_COMMAND",
+  );
+  await assertCurrentClaimUnchanged(
+    905,
+    `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: stale worker`,
+    "CLAIM_MISMATCH",
+  );
+  const heartbeat = await handleIssueComment(
+    context(
+      fake,
+      fake.command(
+        906,
+        "alice",
+        `/ai-heartbeat\nclaim-id: ${secondClaimId}\nsummary: current worker`,
+      ),
+    ),
+  );
+  assert.equal(heartbeat.plan.receipt.claimId, secondClaimId);
+
+  await assertCurrentClaimUnchanged(
+    907,
+    `/ai-block\nclaim-id: ${UUID}\nreason: stale worker\nresume-when: never`,
+    "CLAIM_MISMATCH",
+  );
+  await handleIssueComment(
+    context(
+      fake,
+      fake.command(
+        908,
+        "alice",
+        `/ai-block\nclaim-id: ${secondClaimId}\nreason: external dependency\nresume-when: dependency clears`,
+      ),
+    ),
+  );
+  assert.ok(fake.issue().labels.some(({ name }) => name === "status:blocked"));
+
+  await assertCurrentClaimUnchanged(
+    909,
+    `/ai-resume\nclaim-id: ${UUID}`,
+    "CLAIM_MISMATCH",
+  );
+  await handleIssueComment(
+    context(
+      fake,
+      fake.command(910, "alice", `/ai-resume\nclaim-id: ${secondClaimId}`),
+    ),
+  );
+  assert.ok(
+    fake.issue().labels.some(({ name }) => name === "status:in-progress"),
+  );
+
+  await assertCurrentClaimUnchanged(
+    911,
+    `/ai-release\nclaim-id: ${UUID}\nreason: stale worker`,
+    "CLAIM_MISMATCH",
+    "maintainer",
+  );
+  await handleIssueComment(
+    context(
+      fake,
+      fake.command(
+        912,
+        "alice",
+        `/ai-release\nclaim-id: ${secondClaimId}\nreason: current worker completed handoff`,
+      ),
+    ),
+  );
+  assert.ok(fake.issue().labels.some(({ name }) => name === "status:ready"));
+  assert.deepEqual(fake.issue().assignees, []);
+});
+
+test("replays an already-receipted legacy command before applying the current schema", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const legacyEvent = fake.command(
+    902,
+    "alice",
+    "/ai-heartbeat\nsummary: historical command",
+    46,
+    "2026-09-04T13:00:00.000Z",
+  );
+  const legacyReceipt = {
+    ...fake.workflowReceipts()[0],
+    eventId: 902,
+    action: "heartbeat",
+    from: "in-progress",
+    to: "in-progress",
+    leaseExpiresAt: "2026-09-05T13:00:00.000Z",
+  };
+  fake.comments.get(46).push({
+    id: fake.nextCommentId++,
+    body: receiptBody(legacyReceipt),
+    created_at: "2026-09-04T13:00:00.000Z",
+    user: { login: "github-actions[bot]" },
+  });
+
+  const result = await handleIssueComment(context(fake, legacyEvent));
+  assert.equal(result.status, "applied");
+  assert.equal(result.idempotent, true);
+  assert.equal(result.receipt.eventId, 902);
+  assert.equal(
+    fake.workflowReceipts().filter(({ eventId }) => eventId === 902).length,
+    1,
+  );
+});
+
+test("rejects an unprocessed legacy command before unrelated context hydration", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const getAll = fake.getAll.bind(fake);
+  fake.getAll = async (path) => {
+    if (path === "/pulls?state=open") {
+      throw new Error("unrelated pull request state unavailable");
+    }
+    return getAll(path);
+  };
+  const result = await handleIssueComment(
+    context(
+      fake,
+      fake.command(
+        902,
+        "alice",
+        "/ai-heartbeat\nsummary: unprocessed historical command",
+      ),
+    ),
+  );
+  assert.equal(result.code, "INVALID_COMMAND");
+  assert.equal(currentClaimFromReceipts(fake.workflowReceipts()).claimId, UUID);
 });
 
 test("same-second renewals advance the lease before durable receipt writes", async () => {
@@ -946,25 +1135,31 @@ test("same-second renewals advance the lease before durable receipt writes", asy
       }),
     );
 
-  await run(902, "/ai-heartbeat\nsummary: first same-second renewal");
+  await run(
+    902,
+    `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: first same-second renewal`,
+  );
   assert.equal(
     currentClaimFromReceipts(fake.workflowReceipts()).leaseExpiresAt,
     "2026-09-05T13:00:00.000Z",
   );
-  await run(903, "/ai-heartbeat\nsummary: second same-second renewal");
+  await run(
+    903,
+    `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: second same-second renewal`,
+  );
   assert.equal(
     currentClaimFromReceipts(fake.workflowReceipts()).leaseExpiresAt,
     "2026-09-05T13:00:01.000Z",
   );
   await run(
     904,
-    "/ai-block\nreason: same-second dependency\nresume-when: dependency clears",
+    `/ai-block\nclaim-id: ${UUID}\nreason: same-second dependency\nresume-when: dependency clears`,
   );
   assert.equal(
     currentClaimFromReceipts(fake.workflowReceipts()).leaseExpiresAt,
     "2026-09-05T13:00:01.000Z",
   );
-  await run(905, "/ai-resume");
+  await run(905, `/ai-resume\nclaim-id: ${UUID}`);
   assert.equal(
     currentClaimFromReceipts(fake.workflowReceipts()).leaseExpiresAt,
     "2026-09-05T13:00:02.000Z",
@@ -981,7 +1176,7 @@ test("release is rejected while an open closing pull request exists", async () =
       fake.command(
         902,
         "alice",
-        "/ai-release\nreason: abandoning implementation",
+        `/ai-release\nclaim-id: ${UUID}\nreason: abandoning implementation`,
       ),
     ),
   );
@@ -1069,7 +1264,11 @@ test("release and fresh claim implement an explicit handoff generation", async (
   await handleIssueComment(
     context(
       fake,
-      fake.command(902, "alice", "/ai-release\nreason: handoff requested"),
+      fake.command(
+        902,
+        "alice",
+        `/ai-release\nclaim-id: ${UUID}\nreason: handoff requested`,
+      ),
     ),
   );
   const nextClaimId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -1484,7 +1683,7 @@ test("a pending user intent completes before a later system transition", async (
   const heartbeatEvent = fake.command(
     902,
     "alice",
-    "/ai-heartbeat\nsummary: implementation continues",
+    `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: implementation continues`,
   );
   heartbeatEvent.comment.created_at = "2026-09-04T13:00:00.000Z";
   fake.comments.get(46).find(({ id }) => id === 902).created_at =
@@ -1521,7 +1720,7 @@ test("a later receipt supersedes an older unfinished intent without replay", asy
   const oldHeartbeat = fake.command(
     902,
     "alice",
-    "/ai-heartbeat\nsummary: implementation continues",
+    `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: implementation continues`,
   );
   oldHeartbeat.comment.created_at = "2026-09-04T13:00:00.000Z";
   fake.comments.get(46).find(({ id }) => id === 902).created_at =
@@ -1564,7 +1763,7 @@ test("a later receipt supersedes an older unfinished intent without replay", asy
   const newHeartbeat = fake.command(
     903,
     "alice",
-    "/ai-heartbeat\nsummary: final verification",
+    `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: final verification`,
   );
   newHeartbeat.comment.created_at = "2026-09-04T15:00:00.000Z";
   fake.comments.get(46).find(({ id }) => id === 903).created_at =
@@ -1830,7 +2029,11 @@ test("repository reconciliation verifies a released prior unmerged pull request 
   await handleIssueComment(
     context(
       fake,
-      fake.command(912, "alice", "/ai-release\nreason: handoff requested"),
+      fake.command(
+        912,
+        "alice",
+        `/ai-release\nclaim-id: ${UUID}\nreason: handoff requested`,
+      ),
     ),
   );
   let result = await reconcileRepositoryState({
@@ -2091,7 +2294,11 @@ test("rejects ambiguous primary closure and repository event mismatches", async 
     /exactly one primary issue/i,
   );
 
-  const event = fake.command(902, "alice", "/ai-heartbeat\nsummary: safe");
+  const event = fake.command(
+    902,
+    "alice",
+    `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: safe`,
+  );
   event.repository.full_name = "evil/repository";
   await assert.rejects(
     () => handleIssueComment(context(fake, event)),

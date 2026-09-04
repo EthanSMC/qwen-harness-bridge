@@ -63,6 +63,7 @@ Keep public progress bounded and useful:
 
 ```text
 /ai-heartbeat
+claim-id: 550e8400-e29b-41d4-a716-446655440000
 summary: claim parser and state tests pass; controller integration remains
 ```
 
@@ -74,6 +75,7 @@ Use a blocker only when work cannot continue until a specific external condition
 
 ```text
 /ai-block
+claim-id: 550e8400-e29b-41d4-a716-446655440000
 reason: staging credential is unavailable
 resume-when: repository owner provisions the documented test credential
 ```
@@ -82,16 +84,22 @@ After verifying recovery, the owner posts:
 
 ```text
 /ai-resume
+claim-id: 550e8400-e29b-41d4-a716-446655440000
 ```
 
 To abandon work, close any primary pull request and post:
 
 ```text
 /ai-release
+claim-id: 550e8400-e29b-41d4-a716-446655440000
 reason: implementation is being abandoned; no pull request is open
 ```
 
 Release removes the assignee and returns the Issue to `status:ready` when readiness passes or `status:waiting` otherwise. Handoff is deliberately two-step: the current owner releases with a bounded summary and public branch/PR reference, then the recipient creates a fresh claim. Direct reassignment is not an accepted handoff.
+
+Use the canonical claim UUID from the current success receipt. It fences one generation and does not prove which local executor holds it. On `CLAIM_MISMATCH`, stop and verify the current receipt, assignee, and assigned executor. Only that generation's executor may retry; otherwise close any open primary pull request and use explicit release followed by a fresh claim.
+
+At task start, record the deliverable's in-scope work, out-of-scope work, and completion condition, and update that boundary only when scope changes. Subsequent checkpoints state concrete progress, remaining work or the exact external blocker, and bounded verification. Unrelated side tasks do not block a completed deliverable. After three repetitions of the same failure, change method or state the exact blocker. Review fixes cover blocking correctness findings; optional enhancements belong in follow-up work. Record the observed verification result and repeat an expensive full suite only after a relevant change or when an unresolved concern requires it.
 
 ## Implementation and review
 
@@ -150,6 +158,7 @@ The workflow fails closed with one safe next action. Common codes are:
 - `DEPENDENCY_OPEN`: finish the named dependency.
 - `CLOSING_PR_EXISTS`: continue or close the existing pull request.
 - `NOT_OWNER`: ask the current owner or a maintainer.
+- `CLAIM_MISMATCH`: stop, verify the current receipt and assigned executor, and use explicit handoff/reclaim if this executor does not own that generation.
 - `LEASE_EXPIRED`: renew before review admission, or claim again after the Issue returns to ready.
 - `STATE_MISMATCH`: stop and ask a maintainer to repair labels/assignees.
 - `GITHUB_STATE_UNAVAILABLE`: retry after GitHub state can be verified.

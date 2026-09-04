@@ -624,10 +624,11 @@ const loadIssueContext = async (
   issueNumber,
   knownIssue = null,
   knownOpenPullRequests = null,
+  knownComments = null,
 ) => {
   const issue = knownIssue ?? (await github.get(`/issues/${issueNumber}`));
   const [comments, dependencies, openPullRequests] = await Promise.all([
-    commentsFor(github, issueNumber),
+    knownComments ?? commentsFor(github, issueNumber),
     dependenciesFor(github, issue),
     knownOpenPullRequests ??
       github.getAll("/pulls?state=open", "open pull requests"),
@@ -1089,14 +1090,14 @@ export const handleIssueComment = async ({
   }
   assertManagedIssue(issue);
 
-  let command;
-  try {
-    command = parseLifecycleCommand(body);
-  } catch (error) {
-    if (!(error instanceof LifecycleError)) throw error;
-    const inferredAction =
-      /^\/ai-(claim|heartbeat|block|resume|release)\b/u.exec(body)?.[1];
-    if (!inferredAction) {
+  const inferredAction = /^\/ai-(claim|heartbeat|block|resume|release)\b/u.exec(
+    body,
+  )?.[1];
+  if (!inferredAction) {
+    try {
+      parseLifecycleCommand(body);
+    } catch (error) {
+      if (!(error instanceof LifecycleError)) throw error;
       if (mode === "enforce") {
         await postCommandRejectionNotice(
           github,
@@ -1107,6 +1108,15 @@ export const handleIssueComment = async ({
       }
       return { status: "rejected", code: error.code };
     }
+  }
+
+  let commandComments;
+  let receipts;
+  try {
+    commandComments = await commentsFor(github, issueNumber);
+    receipts = parseReceipts(commandComments);
+  } catch (error) {
+    if (!(error instanceof LifecycleError)) throw error;
     return rejectCommand({
       github,
       issueNumber,
@@ -1119,10 +1129,41 @@ export const handleIssueComment = async ({
       error,
     });
   }
-
+  const prior = receipts.find(({ eventId: id }) => id === commentId);
+  if (prior) {
+    return {
+      status: prior.result === "success" ? "applied" : "rejected",
+      ...(prior.code ? { code: prior.code } : {}),
+      receipt: prior,
+      idempotent: true,
+    };
+  }
+  let command;
+  try {
+    command = parseLifecycleCommand(body);
+  } catch (error) {
+    if (!(error instanceof LifecycleError)) throw error;
+    return rejectCommand({
+      github,
+      issueNumber,
+      mode,
+      eventId: commentId,
+      action: inferredAction,
+      actor,
+      agent: currentClaimFromReceipts(receipts)?.agent ?? "none",
+      issue,
+      error,
+    });
+  }
   let loaded;
   try {
-    loaded = await loadIssueContext(github, issueNumber, issue);
+    loaded = await loadIssueContext(
+      github,
+      issueNumber,
+      issue,
+      null,
+      commandComments,
+    );
   } catch (error) {
     if (!(error instanceof LifecycleError)) throw error;
     return rejectCommand({
@@ -1136,15 +1177,6 @@ export const handleIssueComment = async ({
       issue,
       error,
     });
-  }
-  const prior = loaded.receipts.find(({ eventId: id }) => id === commentId);
-  if (prior) {
-    return {
-      status: prior.result === "success" ? "applied" : "rejected",
-      ...(prior.code ? { code: prior.code } : {}),
-      receipt: prior,
-      idempotent: true,
-    };
   }
   if (mode === "enforce") {
     const recovered = await recoverPendingIntent({

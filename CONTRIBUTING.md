@@ -17,6 +17,34 @@ Every contributor may use an AI agent, but the named human Issue assignee remain
 
 Use `/ai-block`, `/ai-resume`, and `/ai-release` exactly as documented. A handoff is a release followed by a fresh claim from the recipient; do not transfer responsibility through an unverified manual reassignment.
 
+Every post-claim command includes the current workflow-generated claim UUID:
+
+```text
+/ai-heartbeat
+claim-id: 550e8400-e29b-41d4-a716-446655440000
+summary: focused tests pass; full governance remains
+```
+
+```text
+/ai-block
+claim-id: 550e8400-e29b-41d4-a716-446655440000
+reason: staging credential is unavailable
+resume-when: the repository owner provisions the documented credential
+```
+
+```text
+/ai-resume
+claim-id: 550e8400-e29b-41d4-a716-446655440000
+```
+
+```text
+/ai-release
+claim-id: 550e8400-e29b-41d4-a716-446655440000
+reason: implementation is being abandoned; no pull request is open
+```
+
+The UUID fences one claim generation; it does not transfer ownership. On `CLAIM_MISMATCH`, stop and verify the current receipt and assigned executor. Only the executor for that generation may retry. Otherwise complete an explicit release and fresh claim. At task start, record in-scope work, out-of-scope work, and the completion condition, then update that boundary only when scope changes. Subsequent checkpoints report concrete progress, remaining work or the exact blocker, and bounded verification. Unrelated side work does not block a finished deliverable. After three repeats of the same failure, change method or state the exact blocker. Address blocking correctness findings in the review loop and move optional enhancements to follow-up work. Reuse an observed full-suite result until a relevant change or unresolved concern justifies another expensive run.
+
 ## Required engineering rules
 
 - TypeScript uses strict mode and Zod at every untrusted runtime boundary.

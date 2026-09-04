@@ -105,7 +105,7 @@ Expected: FAIL naming missing `AGENTS.md` or a required lifecycle artifact.
 
 GitHub is the shared source of truth. Do not begin work until the lifecycle bot has accepted `/ai-claim` and issued a claim receipt. The Issue assignee is the accountable human; never publish a private agent thread, prompt, raw log, credential, source body, or local absolute path.
 
-Read `CONTRIBUTING.md`, `docs/github/ai-collaboration.md`, the claimed Issue, and every linked spec/plan before editing. Use one Issue, one supported branch, one isolated worktree, and one primary pull request. Keep the 24-hour lease alive with `/ai-heartbeat`. Use `/ai-block`, `/ai-resume`, or `/ai-release` exactly as documented.
+Read `CONTRIBUTING.md`, `docs/github/ai-collaboration.md`, the claimed Issue, and every linked spec/plan before editing. Use one Issue, one supported branch, one isolated worktree, and one primary pull request. Keep the 24-hour lease alive with `/ai-heartbeat`. Include the canonical workflow-generated `claim-id` UUID on `/ai-heartbeat`, `/ai-block`, `/ai-resume`, and `/ai-release` exactly as documented.
 
 Use test-first development for behavior changes. A different agent or eligible collaborator reviews the complete final commit range. A pull request must contain `Closes #N`, the claim receipt, exact verification evidence, risk, rollback, and current review evidence. Merge only after all required current-head checks pass, then verify Issue closure and cleanup.
 ```
@@ -199,8 +199,8 @@ test("parses a bounded claim command", () => {
 
 test("rejects private URLs, duplicate fields, unknown fields, and oversized UTF-8", () => {
   assert.throws(() => parseLifecycleCommand("/ai-claim\nagent: codex\nagent: other"), /duplicate/i);
-  assert.throws(() => parseLifecycleCommand("/ai-heartbeat\nsummary: codex:\/\/threads\/private"), /private|prohibited/i);
-  assert.throws(() => parseLifecycleCommand("/ai-block\nreason: x\nresume-when: y\nextra: z"), /unknown/i);
+  assert.throws(() => parseLifecycleCommand("/ai-heartbeat\nclaim-id: 550e8400-e29b-41d4-a716-446655440000\nsummary: codex:\/\/threads\/private"), /private|prohibited/i);
+  assert.throws(() => parseLifecycleCommand("/ai-block\nclaim-id: 550e8400-e29b-41d4-a716-446655440000\nreason: x\nresume-when: y\nextra: z"), /unknown/i);
   assert.throws(() => safePublicText("界".repeat(81), 240), /240 UTF-8 bytes/i);
 });
 ```

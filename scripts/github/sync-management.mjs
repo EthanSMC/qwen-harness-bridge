@@ -610,6 +610,32 @@ export const createGh = (execFileSyncImpl, workspaceRoot) => {
   return { json, api, graphql, paginatedApi, paginatedSearchApi, serverTime };
 };
 
+export const branchProtectionFor = (reviewMode) => {
+  if (!new Set(["formal", "solo"]).has(reviewMode)) {
+    throw new Error("Review mode must be formal or solo");
+  }
+  const formalReviewRequirements = {
+    dismiss_stale_reviews: true,
+    require_code_owner_reviews: false,
+    required_approving_review_count: 1,
+    require_last_push_approval: true,
+  };
+  return {
+    required_status_checks: {
+      strict: true,
+      contexts: ["governance", "runtime"],
+    },
+    enforce_admins: true,
+    required_pull_request_reviews:
+      reviewMode === "formal" ? formalReviewRequirements : null,
+    restrictions: null,
+    required_linear_history: true,
+    allow_force_pushes: false,
+    allow_deletions: false,
+    required_conversation_resolution: true,
+  };
+};
+
 const findTaskIssue = (task, issues) => {
   const matches = issues.filter((issue) => issue.body?.includes(task.marker));
   if (matches.length > 1) {
@@ -866,24 +892,7 @@ export const main = ({
     }
   }
 
-  const formalReviewRequirements = {
-    dismiss_stale_reviews: true,
-    require_code_owner_reviews: false,
-    required_approving_review_count: 1,
-    require_last_push_approval: true,
-  };
-  const requiredPullRequestReviews =
-    reviewMode === "formal" ? formalReviewRequirements : null;
-  const protection = {
-    required_status_checks: { strict: true, contexts: ["governance"] },
-    enforce_admins: true,
-    required_pull_request_reviews: requiredPullRequestReviews,
-    restrictions: null,
-    required_linear_history: true,
-    allow_force_pushes: false,
-    allow_deletions: false,
-    required_conversation_resolution: true,
-  };
+  const protection = branchProtectionFor(reviewMode);
   if (!dryRun) {
     gh.api(`repos/${repository}/branches/main/protection`, "PUT", protection);
     for (const [issueNumber, desiredState] of desiredByNumber) {
