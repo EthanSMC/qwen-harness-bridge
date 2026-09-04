@@ -93,7 +93,7 @@ for (const command of ["/ai-claim", "/ai-heartbeat", "/ai-block", "/ai-resume", 
 
 - [x] **Step 2: Run the verifier and observe the missing-contract failure**
 
-Run: `node scripts/github/verify-planning.mjs`  
+Run: `node scripts/github/verify-planning.mjs`
 Expected: FAIL naming missing `AGENTS.md` or a required lifecycle artifact.
 
 - [x] **Step 3: Add the canonical agent contract**
@@ -163,7 +163,7 @@ Explain that private task/thread URLs and local paths are prohibited. Keep all e
 
 - [x] **Step 8: Run the normative contract checks**
 
-Run: `node scripts/github/verify-planning.mjs && git diff --check`  
+Run: `node scripts/github/verify-planning.mjs && git diff --check`
 Expected: PASS with the new files and all six labels verified.
 
 - [x] **Step 9: Commit the public contract**
@@ -207,7 +207,7 @@ test("rejects private URLs, duplicate fields, unknown fields, and oversized UTF-
 
 - [x] **Step 2: Run the parser tests to verify failure**
 
-Run: `node --test scripts/github/ai-issue-policy.test.mjs`  
+Run: `node --test scripts/github/ai-issue-policy.test.mjs`
 Expected: FAIL because `ai-issue-policy.mjs` does not exist.
 
 - [x] **Step 3: Implement exact command schemas**
@@ -312,7 +312,7 @@ Reject unknown keys, duplicate keys, unsupported versions, invalid timestamps/UU
 
 - [x] **Step 8: Run policy tests and commit**
 
-Run: `node --test scripts/github/ai-issue-policy.test.mjs && git diff --check`  
+Run: `node --test scripts/github/ai-issue-policy.test.mjs && git diff --check`
 Expected: PASS.
 
 ```bash
@@ -355,7 +355,7 @@ test("reconciles an uncertain mutation before retrying", async () => {
 
 - [x] **Step 2: Run tests and observe the missing-module failure**
 
-Run: `node --test scripts/github/github-api.test.mjs`  
+Run: `node --test scripts/github/github-api.test.mjs`
 Expected: FAIL because the API client does not exist.
 
 - [x] **Step 3: Implement strict REST requests and pagination**
@@ -431,7 +431,7 @@ test("two serialized claim events produce one owner and one success receipt", as
 
 - [x] **Step 3: Run controller tests and observe failure**
 
-Run: `node --test scripts/github/ai-issue-controller.test.mjs`  
+Run: `node --test scripts/github/ai-issue-controller.test.mjs`
 Expected: FAIL because the controller does not exist.
 
 - [x] **Step 4: Implement claim context loading and verified mutation**
@@ -504,7 +504,7 @@ requireGovernanceField(".github/workflows/ai-issue-lifecycle.yml", /ref:\s*\$\{\
 
 - [x] **Step 2: Run the planning verifier and observe the missing-workflow failure**
 
-Run: `node scripts/github/verify-planning.mjs`  
+Run: `node scripts/github/verify-planning.mjs`
 Expected: FAIL naming `.github/workflows/ai-issue-lifecycle.yml`.
 
 - [x] **Step 3: Create the trusted workflow**
@@ -610,7 +610,7 @@ test("rejects multiple closing Issues and private agent references", () => {
 
 - [x] **Step 2: Run the verifier tests and observe failure**
 
-Run: `node --test scripts/github/verify-ai-lifecycle.test.mjs`  
+Run: `node --test scripts/github/verify-ai-lifecycle.test.mjs`
 Expected: FAIL because the verifier does not exist.
 
 - [x] **Step 3: Implement body and branch validation**
@@ -700,7 +700,7 @@ Within a plan, Task N depends on Task N-1. The first task of M1, M2, and M3 depe
 
 - [x] **Step 2: Run sync tests and observe failure**
 
-Run: `node --test scripts/github/sync-management.test.mjs`  
+Run: `node --test scripts/github/sync-management.test.mjs`
 Expected: FAIL because the graph and lifecycle payload do not exist.
 
 - [x] **Step 3: Build all Issue identities before rendering bodies**
@@ -749,7 +749,7 @@ git commit -m "feat(governance): synchronize AI issue lifecycle"
 - Consumes: complete implementation branch and GitHub report-mode runs.
 - Produces: PR for Issue #46, current review/CI evidence, and a safe activation handoff.
 
-- [ ] **Step 1: Run the full local verification matrix**
+- [x] **Step 1: Run the full local verification matrix**
 
 Run:
 
@@ -762,7 +762,7 @@ git diff --check origin/main...HEAD
 
 Expected: every command passes; no ignored or untracked artifact is included.
 
-- [ ] **Step 2: Run security-focused static inspection**
+- [x] **Step 2: Run security-focused static inspection**
 
 Confirm the lifecycle workflow checks out only the default branch, never uses `pull_request` head code with `issues: write`, never passes comment text to a shell, and grants no `contents: write`. Search:
 
@@ -772,11 +772,11 @@ rg -n "pull_request_target|issues: write|contents: write|persist-credentials|git
 
 Expected: the trusted workflow matches the design, `contents: write` is absent, and comment bodies are read only from parsed event JSON in Node.
 
-- [ ] **Step 3: Add changelog and report-mode evidence**
+- [x] **Step 3: Add changelog and report-mode evidence**
 
 Under `Unreleased`, describe human-accountable AI claims, leases, safe provenance, independent review, closure reconciliation, and report-mode rollout. Record the exact local commands and results in `docs/github/repository-status.md` without local paths or raw logs.
 
-- [ ] **Step 4: Commit verification evidence**
+- [x] **Step 4: Commit verification evidence**
 
 ```bash
 git add CHANGELOG.md docs/github/repository-status.md

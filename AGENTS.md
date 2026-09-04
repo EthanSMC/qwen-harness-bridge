@@ -39,4 +39,3 @@ summary: protocol schema implemented; integration tests remain
 - A milestone is complete only when its Issues, acceptance evidence, checks, changelog, versions, rollback artifacts, tag, and GitHub Release all pass the documented release gate.
 
 If GitHub state is missing, contradictory, malformed, stale, or unavailable, stop and fail closed. Do not infer ownership or completion from local files or an agent conversation.
-

@@ -6,6 +6,7 @@ All notable changes use synchronized Semantic Versioning and are recorded here. 
 
 ### Added
 
+- Human-accountable AI Issue claims with exclusive 24-hour leases, safe public provenance, explicit handoff/block/resume commands, independent current-head review, merge/close/reopen reconciliation, and a report-first activation path.
 - Approved Qwen Harness Bridge product and system Spec.
 - Five detailed test-driven implementation plans and master roadmap.
 - Public-repository governance, issue templates, planning validation, and GitHub synchronization tooling.

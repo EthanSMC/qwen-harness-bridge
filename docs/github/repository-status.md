@@ -13,6 +13,18 @@ Verified on 2026-09-04 against [EthanSMC/qwen-harness-bridge](https://github.com
 - Last reconciliation evidence: a no-write dry-run at 2026-09-04T05:46:37Z resolved all 34 marker-linked plan Issues, all six milestones, the complete paginated collaborator set, all open PRs, and the branch-protection payload. It proposed #1 and #28 as ready, #7 as migrated review owned by its PR author, #2–#6 as historical done, and the remaining open plan Issues as waiting.
 - Live acceptance links: none yet. The disposable claim/heartbeat/PR/merge/close/reopen acceptance cycle is required after the bootstrap merge and before strict activation.
 
+## Bootstrap verification evidence
+
+Observed locally on 2026-09-04 before opening the bootstrap pull request:
+
+- `node --test scripts/github/*.test.mjs`: PASS, 125 tests.
+- `node scripts/github/verify-planning.mjs`: PASS, 25 governance/planning files and 34 implementation tasks.
+- `pnpm check`: PASS; Biome checked 65 files, both workspace TypeScript projects passed, and Vitest passed 14 files / 278 tests.
+- `git diff --check origin/main`: PASS after removing Markdown-only trailing whitespace from the candidate range.
+- Security inspection: the write-capable workflow uses `pull_request_target`, serializes at repository scope, checks out only `github.event.repository.default_branch`, disables persisted checkout credentials, grants `contents: read` plus `issues: write` and `pull-requests: read`, never grants `contents: write`, and reads untrusted comment data only from the event JSON inside Node.
+
+These local results do not substitute for current-head GitHub checks or independent final review.
+
 ## Active management state
 
 - Visibility: public.

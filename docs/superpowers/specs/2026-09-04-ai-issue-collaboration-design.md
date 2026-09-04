@@ -1,8 +1,11 @@
 # AI-Assisted Issue Collaboration Design
 
-**Status:** Approved direction; written specification under review  
-**Date:** 2026-09-04  
-**Tracking issue:** [#46](https://github.com/EthanSMC/qwen-harness-bridge/issues/46)  
+**Status:** Approved direction; written specification under review
+
+**Date:** 2026-09-04
+
+**Tracking issue:** [#46](https://github.com/EthanSMC/qwen-harness-bridge/issues/46)
+
 **Scope:** Repository contribution workflow and GitHub governance
 
 ## 1. Executive summary
