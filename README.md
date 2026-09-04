@@ -22,6 +22,8 @@ Qwen Harness Bridge（眼镜任务台）让单一所有者通过千问 AI 眼镜
 - [Qwen Skill and Device UX plan](docs/superpowers/plans/2026-09-01-qwen-skill-device-ux.md)
 - [Reliability, Security, and Operations plan](docs/superpowers/plans/2026-09-01-reliability-operations.md)
 - [Experimental RTC plan](docs/superpowers/plans/2026-09-01-experimental-rtc.md)
+- [AI-assisted Issue collaboration design](docs/superpowers/specs/2026-09-04-ai-issue-collaboration-design.md)
+- [AI-assisted Issue collaboration implementation plan](docs/superpowers/plans/2026-09-04-ai-issue-collaboration.md)
 
 ## Release roadmap
 
@@ -37,6 +39,8 @@ Qwen Harness Bridge（眼镜任务台）让单一所有者通过千问 AI 眼镜
 ## Development workflow
 
 Implementation is issue-driven. Each numbered task in the five plans maps to one GitHub issue and one milestone. Work starts at Plan 1 Task 1, follows test-first steps in the issue, and merges through a short-lived pull request with a focused Conventional Commit.
+
+Every eligible contributor may use an AI agent. The human Issue assignee remains accountable, and repository automation serializes claims, records bounded receipts, enforces independent review and current-head CI, and verifies closure. AI agents must read [AGENTS.md](AGENTS.md); contributors should follow [AI-assisted Issue collaboration](docs/github/ai-collaboration.md).
 
 Repository governance is defined in [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [.github/](.github/). `node scripts/github/verify-planning.mjs` validates the planning baseline; `node scripts/github/sync-management.mjs` synchronizes labels, milestones, implementation issues, and main-branch protection for the public GitHub repository.
 

@@ -16,15 +16,23 @@ const governance = [
   "SECURITY.md",
   "CHANGELOG.md",
   ".github/CODEOWNERS",
+  ".github/ISSUE_TEMPLATE/implementation.yml",
+  ".github/ISSUE_TEMPLATE/bug.yml",
   ".github/workflows/governance.yml",
   ".github/pull_request_template.md",
   ".github/labels.yml",
   ".github/milestones.yml",
   "docs/github/repository-status.md",
 ];
+const aiGovernance = [
+  "AGENTS.md",
+  "docs/github/ai-collaboration.md",
+  "docs/superpowers/specs/2026-09-04-ai-issue-collaboration-design.md",
+  "docs/superpowers/plans/2026-09-04-ai-issue-collaboration.md",
+];
 const syncManagement = "scripts/github/sync-management.mjs";
 
-const files = [spec, ...plans, ...governance, syncManagement];
+const files = [spec, ...plans, ...governance, ...aiGovernance, syncManagement];
 const contents = new Map(
   files.map((file) => [file, readFileSync(resolve(root, file), "utf8")]),
 );
@@ -64,6 +72,60 @@ const requireSourceField = (source, file, pattern, message) => {
   if (!pattern.test(source))
     throw new Error(`${file} governance gate is missing ${message}`);
 };
+
+const lifecycleLabels = [
+  "status:waiting",
+  "status:ready",
+  "status:in-progress",
+  "status:review",
+  "status:blocked",
+  "status:done",
+];
+for (const label of lifecycleLabels) {
+  requireGovernanceField(
+    ".github/labels.yml",
+    new RegExp(`name: "${label}"`),
+    label,
+  );
+}
+
+for (const command of [
+  "/ai-claim",
+  "/ai-heartbeat",
+  "/ai-block",
+  "/ai-resume",
+  "/ai-release",
+]) {
+  requireGovernanceField(
+    "AGENTS.md",
+    new RegExp(command.replace("/", "\\/")),
+    command,
+  );
+}
+
+for (const template of [
+  ".github/ISSUE_TEMPLATE/implementation.yml",
+  ".github/ISSUE_TEMPLATE/bug.yml",
+]) {
+  for (const [pattern, message] of [
+    [/label: Dependencies/, "the Dependencies field"],
+    [/Blocked by none/, "the canonical no-dependency value"],
+    [/label: Outcome/, "the Outcome field"],
+    [/label: Verification/, "the Verification field"],
+    [/label: Risk and rollback/, "the Risk and rollback field"],
+  ]) {
+    requireGovernanceField(template, pattern, message);
+  }
+}
+
+for (const [pattern, message] of [
+  [/Primary Issue: #/, "the primary Issue field"],
+  [/Claim receipt: https:\/\/github\.com\//, "the claim receipt field"],
+  [/Accountable owner: @/, "the accountable owner field"],
+  [/Implementer agent class:/, "the implementer agent class field"],
+]) {
+  requireGovernanceField(".github/pull_request_template.md", pattern, message);
+}
 
 for (const [file, pattern, message] of [
   ["README.md", /public GitHub repository/i, "the public repository state"],

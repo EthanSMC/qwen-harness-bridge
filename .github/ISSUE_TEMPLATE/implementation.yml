@@ -12,6 +12,14 @@ body:
       placeholder: docs/superpowers/plans/...md#task-n
     validations:
       required: true
+  - type: input
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Use exactly "Blocked by none" or "Blocked by #12, #19".
+      placeholder: Blocked by none
+    validations:
+      required: true
   - type: textarea
     id: outcome
     attributes:
@@ -44,4 +52,3 @@ body:
           required: true
         - label: Documentation and acceptance evidence are current.
           required: true
-

@@ -20,10 +20,39 @@ body:
     validations:
       required: true
   - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: State the concrete engineering outcome that will resolve the defect.
+    validations:
+      required: true
+  - type: textarea
     id: reproduce
     attributes:
       label: Minimal reproduction
       description: Use redacted identifiers and safe fixtures.
+    validations:
+      required: true
+  - type: input
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Use exactly "Blocked by none" or "Blocked by #12, #19".
+      placeholder: Blocked by none
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: List exact commands and observed results that reproduce or verify the fix.
+    validations:
+      required: true
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risk and rollback
+      description: Cover security, privacy, protocol, migration, compatibility, and rollback as applicable.
     validations:
       required: true
   - type: input
@@ -42,4 +71,3 @@ body:
         - Not applicable
     validations:
       required: true
-

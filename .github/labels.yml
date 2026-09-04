@@ -18,4 +18,9 @@ labels:
   - { name: "risk:low", color: "0e8a16", description: "Low change risk" }
   - { name: "risk:medium", color: "fbca04", description: "Material behavior or operational risk" }
   - { name: "risk:high", color: "b60205", description: "Security, data, protocol, or release-critical risk" }
-
+  - { name: "status:waiting", color: "d4c5f9", description: "Requirements or dependencies are not ready" }
+  - { name: "status:ready", color: "0e8a16", description: "Ready for one eligible contributor to claim" }
+  - { name: "status:in-progress", color: "1d76db", description: "Exclusively claimed and under implementation" }
+  - { name: "status:review", color: "5319e7", description: "Pull request is in CI, review, or fix rounds" }
+  - { name: "status:blocked", color: "b60205", description: "Claimed work awaits a named external condition" }
+  - { name: "status:done", color: "6f7781", description: "Derived terminal state for a completed closed Issue" }

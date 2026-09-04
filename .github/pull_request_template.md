@@ -5,8 +5,14 @@
 ## Tracking
 
 - Closes # (required for GitHub Issue auto-close)
+- Primary Issue: #
+- Claim receipt: https://github.com/<owner>/<repo>/issues/<number>#issuecomment-<id>
+- Accountable owner: @
+- Implementer agent class: codex / other / none
 - Spec section:
 - Implementation plan/task:
+
+<!-- Do not include private agent/thread URLs, prompts, raw logs, source bodies, credentials, private paths, or local absolute paths. -->
 
 ## Review evidence
 
@@ -60,6 +66,8 @@
 ## Checklist
 
 - [ ] Scope matches the approved Spec and linked issue.
+- [ ] PR author, accountable owner, Issue assignee, and verified claim actor match.
+- [ ] Branch, primary Issue, `Closes` reference, and claim receipt identify the same Issue.
 - [ ] Tests were written or updated before implementation behavior.
 - [ ] Relevant checks pass.
 - [ ] Exactly one review mode is selected; the other mode is not used.
