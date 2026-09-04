@@ -391,86 +391,62 @@ describe("classifyAction", () => {
   });
 
   it.each([
-    [
-      "absolute outside path",
-      (fixture: ReturnType<typeof makeFixture>) => `-C${fixture.outsidePath}`,
-      "PATH_OUTSIDE_REPOSITORY",
-    ],
-    ["relative traversal", () => "-C../outside", "PATH_TRAVERSAL"],
-    ["missing attached value", () => "-C", "PATH_UNAVAILABLE"],
-    ["equals-prefixed value", () => "-C=../outside", "PATH_UNAVAILABLE"],
-    ["network URL", () => "-Chttps://example.com/archive", "PATH_UNAVAILABLE"],
-    [
-      "other short option with outside path",
-      (fixture: ReturnType<typeof makeFixture>) => `-I${fixture.outsidePath}`,
-      "PATH_OUTSIDE_REPOSITORY",
-    ],
-    [
-      "other short option with traversal",
-      () => "-o../outside",
-      "PATH_TRAVERSAL",
-    ],
-    [
-      "outside file URL",
-      (fixture: ReturnType<typeof makeFixture>) =>
-        `-Cfile://${fixture.outsidePath}`,
-      "PATH_OUTSIDE_REPOSITORY",
-    ],
+    ["-p../outside", "PATH_TRAVERSAL"],
+    ["--outDir=..", "PATH_TRAVERSAL"],
+    ["-o..", "PATH_TRAVERSAL"],
+    ["-C..", "UNSUPPORTED_ARGUMENTS"],
+    ["--unknown=src", "UNSUPPORTED_ARGUMENTS"],
+    ["--outDir", "UNSUPPORTED_ARGUMENTS"],
   ])(
-    "denies malformed or outside BSD tar attached -C form: %s",
-    (_label, argumentFor, reasonCode) => {
+    "rejects unsafe or unsupported compiler argument %s",
+    (argument, reasonCode) => {
       const fixture = makeFixture();
-
-      const decision = classifyAction(
-        makeAction(fixture, { argv: [argumentFor(fixture)] }),
-        trustedOptions(fixture),
-      );
-
-      expect(decision).toMatchObject({ classification: "denied", reasonCode });
+      expect(
+        classifyAction(
+          makeAction(fixture, {
+            toolName: "build",
+            executable: "tsc",
+            argv: [argument],
+          }),
+          trustedOptions(fixture),
+        ),
+      ).toMatchObject({ classification: "denied", reasonCode });
     },
   );
 
-  it("canonicalizes a safe attached -C path without changing its option spelling", () => {
+  it.each(["-p", "--outDir="])(
+    "canonicalizes an attached compiler path %s",
+    (prefix) => {
+      const fixture = makeFixture();
+      const canonical = canonicalizeAction(
+        makeAction(fixture, {
+          toolName: "build",
+          executable: "tsc",
+          argv: [`${prefix}src/./`],
+        }),
+        trustedOptions(fixture),
+      );
+      expect(canonical).toMatchObject({
+        action: {
+          argv: [prefix + join(fixture.repository.canonicalPath, "src")],
+        },
+        violations: [],
+      });
+    },
+  );
+
+  it("denies a split compiler output path outside the repository", () => {
     const fixture = makeFixture();
-
-    const canonical = canonicalizeAction(
-      makeAction(fixture, {
-        argv: [`-C${fixture.repository.canonicalPath}/src/./`],
-      }),
-      trustedOptions(fixture),
-    );
-
-    expect(canonical).toMatchObject({
-      action: { argv: [`-C${join(fixture.repository.canonicalPath, "src")}`] },
-      violations: [],
-    });
-  });
-
-  it("canonicalizes a visibly path-bearing attached short option", () => {
-    const fixture = makeFixture();
-
-    const canonical = canonicalizeAction(
-      makeAction(fixture, {
-        argv: [`-I${fixture.repository.canonicalPath}/src/./`],
-      }),
-      trustedOptions(fixture),
-    );
-
-    expect(canonical).toMatchObject({
-      action: { argv: [`-I${join(fixture.repository.canonicalPath, "src")}`] },
-      violations: [],
-    });
-  });
-
-  it("denies an outside path in the split -C form", () => {
-    const fixture = makeFixture();
-
-    const decision = classifyAction(
-      makeAction(fixture, { argv: ["-C", fixture.outsidePath] }),
-      trustedOptions(fixture),
-    );
-
-    expect(decision).toMatchObject({
+    expect(
+      classifyAction(
+        makeAction(fixture, {
+          toolName: "build",
+          executable: "tsc",
+          argv: ["--outDir", fixture.outsidePath],
+        }),
+        trustedOptions(fixture),
+      ),
+    ).toMatchObject({
       classification: "denied",
       reasonCode: "PATH_OUTSIDE_REPOSITORY",
     });

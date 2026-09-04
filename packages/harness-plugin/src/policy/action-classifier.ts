@@ -8,8 +8,14 @@ import {
   normalize,
   resolve,
 } from "node:path";
-import { fileURLToPath } from "node:url";
+import { parseArguments } from "./argv-policy.js";
 import { CanonicalPathError, canonicalizePath } from "./canonical-path.js";
+import {
+  assertSearchResources,
+  isProtectedPath,
+  type ProtectedPaths,
+  resolveProtectedPaths,
+} from "./protected-paths.js";
 import type {
   CanonicalAction,
   CanonicalActionResult,
@@ -23,6 +29,7 @@ export type ActionPolicyOptions = Readonly<{
   repositories: RepositoryPolicySource;
   /** Trusted command identity -> immutable canonical executable path. */
   trustedExecutables?: Readonly<Record<string, string>>;
+  protectedPaths?: ProtectedPaths;
 }>;
 
 export type ActionInput = Readonly<{
@@ -98,6 +105,19 @@ export function snapshotActionPolicy(
       ),
     ),
     trustedExecutables,
+    protectedPaths: Object.freeze(
+      Object.fromEntries(
+        Object.entries(options.protectedPaths ?? {}).map(([id, paths]) => [
+          id,
+          Object.freeze(
+            resolveProtectedPaths(
+              repositoryFor(options, id)?.canonicalPath ?? "",
+              paths,
+            ),
+          ),
+        ]),
+      ),
+    ),
   });
 }
 
@@ -217,61 +237,6 @@ const canonicalizeExecutable = (
   }
 };
 
-const splitPathArgument = (
-  value: string,
-): { prefix: string; candidate: string } | undefined => {
-  const shortOption = /^(-[a-z])(.+)$/iu.exec(value);
-  const shortOptionCandidate = shortOption?.[2];
-  const isKnownAttachedPathOption = value.startsWith("-C") && value !== "-C";
-  const isVisiblyAttachedPathOption =
-    shortOptionCandidate !== undefined &&
-    (isAbsolute(shortOptionCandidate) ||
-      /^\.{1,2}(?:[/\\]|$)/u.test(shortOptionCandidate) ||
-      hasPathSeparator(shortOptionCandidate) ||
-      /^[a-z][a-z0-9+.-]*:\/\//iu.test(shortOptionCandidate));
-  const isAttachedPathOption =
-    isKnownAttachedPathOption || isVisiblyAttachedPathOption;
-  const separator =
-    !isAttachedPathOption && value.startsWith("-") ? value.indexOf("=") : -1;
-  const prefix = isAttachedPathOption
-    ? (shortOption?.[1] ?? "")
-    : separator >= 0
-      ? value.slice(0, separator + 1)
-      : "";
-  const candidate = isAttachedPathOption
-    ? (shortOptionCandidate ?? "")
-    : separator >= 0
-      ? value.slice(separator + 1)
-      : value;
-  if (isKnownAttachedPathOption && candidate.startsWith("=")) {
-    throw new CanonicalPathError("PATH_UNAVAILABLE");
-  }
-  if (candidate.startsWith("file://")) {
-    return { prefix: `${prefix}file://`, candidate: fileURLToPath(candidate) };
-  }
-  if (candidate.length === 0 || /^[a-z][a-z0-9+.-]*:\/\//iu.test(candidate)) {
-    if (isAttachedPathOption) {
-      throw new CanonicalPathError("PATH_UNAVAILABLE");
-    }
-    return undefined;
-  }
-  if (
-    /^git@[^:]+:/u.test(candidate) ||
-    /^@[^/\\]+[/\\][^/\\]+$/u.test(candidate)
-  ) {
-    return undefined;
-  }
-  if (isAttachedPathOption) return { prefix, candidate };
-  if (
-    !isAbsolute(candidate) &&
-    !/^\.{1,2}(?:[/\\]|$)/u.test(candidate) &&
-    !hasPathSeparator(candidate)
-  ) {
-    return undefined;
-  }
-  return { prefix, candidate };
-};
-
 const addViolation = (
   violations: PolicyPathViolation[],
   error: unknown,
@@ -283,65 +248,6 @@ const addViolation = (
   if (!violations.includes("PATH_UNAVAILABLE")) {
     violations.push("PATH_UNAVAILABLE");
   }
-};
-
-const canonicalizeArgument = (
-  root: string,
-  value: string,
-  cwd: string,
-  violations: PolicyPathViolation[],
-): string => {
-  let pathArgument: ReturnType<typeof splitPathArgument>;
-  try {
-    pathArgument = splitPathArgument(value);
-  } catch {
-    if (!violations.includes("PATH_UNAVAILABLE")) {
-      violations.push("PATH_UNAVAILABLE");
-    }
-    return value;
-  }
-  if (pathArgument === undefined) return value;
-  try {
-    return `${pathArgument.prefix}${canonicalizePath(
-      root,
-      pathArgument.candidate,
-      {
-        basePath: cwd,
-      },
-    )}`;
-  } catch (error) {
-    addViolation(violations, error);
-    return `${pathArgument.prefix}${lexicalFallback(pathArgument.candidate, cwd)}`;
-  }
-};
-
-const canonicalizeArguments = (
-  root: string,
-  argv: readonly string[],
-  cwd: string,
-  violations: PolicyPathViolation[],
-): readonly string[] => {
-  const canonical: string[] = [];
-  for (let index = 0; index < argv.length; index += 1) {
-    const value = argv[index] as string;
-    if (value !== "-C") {
-      canonical.push(canonicalizeArgument(root, value, cwd, violations));
-      continue;
-    }
-
-    canonical.push(value);
-    const path = argv[index + 1];
-    if (path === undefined || path.startsWith("-")) {
-      if (!violations.includes("PATH_UNAVAILABLE")) {
-        violations.push("PATH_UNAVAILABLE");
-      }
-      continue;
-    }
-    const attached = canonicalizeArgument(root, `-C${path}`, cwd, violations);
-    canonical.push(attached.slice(2));
-    index += 1;
-  }
-  return canonical;
 };
 
 /**
@@ -397,32 +303,66 @@ export function canonicalizeAction(
     }
   }
 
-  const canonicalTouchedPaths = canonical.touchedPaths.map((path) => {
-    if (repository === undefined) return lexicalFallback(path, canonicalCwd);
+  let configured =
+    source !== undefined && "repositories" in source
+      ? (source.protectedPaths?.[repositoryId] ?? [])
+      : [];
+  if (repository !== undefined) {
     try {
-      return canonicalizePath(repository.canonicalPath, path, {
-        basePath: canonicalCwd,
-      });
+      configured = resolveProtectedPaths(repository.canonicalPath, configured);
+    } catch (error) {
+      addViolation(violations, error);
+    }
+  }
+  const resolvePath = (path: string): string => {
+    if (repository === undefined) return lexicalFallback(path, canonicalCwd);
+    const lexical = resolve(canonicalCwd, path);
+    if (isProtectedPath(repository.canonicalPath, lexical, configured)) {
+      violations.push("PROTECTED_RESOURCE");
+    }
+    const resolved = canonicalizePath(repository.canonicalPath, path, {
+      basePath: canonicalCwd,
+    });
+    if (isProtectedPath(repository.canonicalPath, resolved, configured)) {
+      violations.push("PROTECTED_RESOURCE");
+    }
+    return resolved;
+  };
+  const canonicalTouchedPaths = canonical.touchedPaths.map((path) => {
+    try {
+      return resolvePath(path);
     } catch (error) {
       addViolation(violations, error);
       return lexicalFallback(path, canonicalCwd);
     }
   });
-
-  const canonicalArgv =
-    repository === undefined
-      ? [...canonical.argv]
-      : canonicalizeArguments(
-          repository.canonicalPath,
-          canonical.argv,
-          canonicalCwd,
-          violations,
-        );
   const canonicalExecutable = canonicalizeExecutable(
     canonical.executable,
     canonicalCwd,
     violations,
   );
+  const command =
+    canonicalExecutable === undefined
+      ? undefined
+      : (Object.entries(executableMap(source)).find(
+          ([, path]) => path === canonicalExecutable,
+        )?.[0] ??
+        executableName({ ...canonical, executable: canonicalExecutable }));
+  let canonicalArgv = [...canonical.argv];
+  try {
+    const parsed = parseArguments(
+      command,
+      canonical.toolName.toLowerCase(),
+      canonical.argv,
+      resolvePath,
+      canonicalCwd,
+    );
+    canonicalArgv = parsed.argv;
+    if (parsed.search === "content" && repository !== undefined)
+      assertSearchResources(repository.canonicalPath, parsed.paths, configured);
+  } catch (error) {
+    addViolation(violations, error);
+  }
 
   const normalized: CanonicalAction = {
     ...canonical,
@@ -485,11 +425,6 @@ export function fingerprintAction(
     .digest("hex");
 }
 
-const lowerTokens = (action: CanonicalAction): string[] =>
-  [action.toolName, action.executable ?? "", ...action.argv].map((value) =>
-    value.toLowerCase(),
-  );
-
 const executableName = (action: CanonicalAction): string => {
   const resolvedName = basename(action.executable ?? "").toLowerCase();
   if (resolvedName === "pnpm.cjs" || resolvedName === "pnpm.mjs") {
@@ -502,73 +437,65 @@ const executableName = (action: CanonicalAction): string => {
   return resolvedName;
 };
 
-const hasToken = (tokens: readonly string[], pattern: RegExp): boolean =>
-  tokens.some((token) => pattern.test(token));
-
 const denialForCommand = (action: CanonicalAction): string | undefined => {
-  const tokens = lowerTokens(action);
   const tool = action.toolName.toLowerCase();
   const command = executableName(action);
-
   if (
-    action.argv.some(
-      (argument) =>
-        /^(?:&&|\|\||[;&|])$/u.test(argument) ||
-        argument.includes("$(") ||
-        argument.includes("`"),
-    ) ||
     /^(arbitrary[-_ ]?command|cloud[-_ ]?command|shell|exec|execute[-_ ]?command)$/u.test(
       tool,
     ) ||
-    /^(?:sh|bash|zsh|fish|dash|ksh|csh|tcsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh(?:\.exe)?)$/u.test(
+    /^(sh|bash|zsh|fish|dash|ksh|csh|tcsh|cmd(?:\\.exe)?|powershell(?:\\.exe)?|pwsh(?:\\.exe)?)$/u.test(
       command,
     )
-  ) {
+  )
     return "ARBITRARY_COMMAND";
-  }
   if (
-    /keychain|credential[-_ ]?store|secret[-_ ]?store/u.test(
-      tokens.join(" "),
-    ) ||
+    /^(keychain(?:_read)?|credential_store|secret_store)$/u.test(tool) ||
     command === "security"
-  ) {
+  )
     return "KEYCHAIN_ACCESS";
-  }
+  if (action.environmentRead === "arbitrary") return "ENVIRONMENT_ARBITRARY";
   if (
-    action.environmentRead === "arbitrary" ||
-    hasToken(tokens, /(^|[/_ -])(printenv|env|set|export)([/_ -]|$)/u) ||
-    (/^python(?:\d+(?:\.\d+)*)?$/u.test(command) &&
-      hasToken(
-        tokens,
-        /(?:os\.(?:environ|getenv)|process\.env|dotenv|\benviron\b)/u,
-      )) ||
-    hasToken(
-      tokens,
-      /(secret|token|password|credential|api[-_ ]?key|private[-_ ]?key)/u,
-    )
-  ) {
-    return action.environmentRead === "arbitrary"
-      ? "ENVIRONMENT_ARBITRARY"
-      : "SECRET_ACCESS";
-  }
+    /^(env|printenv|secret_read|environment_dump)$/u.test(tool) ||
+    /^(env|printenv)$/u.test(command)
+  )
+    return "SECRET_ACCESS";
   if (
-    /system[-_ ]?settings|system[-_ ]?preferences/u.test(tool) ||
-    command === "defaults" ||
-    command === "launchctl" ||
-    command === "systemsetup" ||
-    command === "networksetup" ||
-    command === "scutil" ||
-    (command === "osascript" && hasToken(tokens, /-e/u))
-  ) {
+    /^python(?:\\d+(?:\\.\\d+)*)?$/u.test(command) &&
+    action.argv.some((arg) => /os\\.(?:environ|getenv)/u.test(arg))
+  )
+    return "SECRET_ACCESS";
+  if (
+    /^(system_settings|system_preferences)$/u.test(tool) ||
+    [
+      "defaults",
+      "launchctl",
+      "systemsetup",
+      "networksetup",
+      "scutil",
+      "osascript",
+    ].includes(command)
+  )
     return "SYSTEM_SETTINGS";
-  }
   return undefined;
+};
+
+const semanticAction = (
+  action: CanonicalAction,
+  source?: RepositoryPolicySource | ActionPolicyOptions,
+): CanonicalAction => {
+  const identity = Object.entries(executableMap(source)).find(
+    ([, path]) => path === action.executable,
+  )?.[0];
+  return identity === undefined ? action : { ...action, executable: identity };
 };
 
 const approvalForCommand = (action: CanonicalAction): string | undefined => {
   const executable = executableName(action);
   const args = action.argv.map((value) => value.toLowerCase());
   const tool = action.toolName.toLowerCase();
+  if (executable === "tsc" && args.includes("--clean"))
+    return "DESTRUCTIVE_FILE_CHANGE";
   const packageCommand = /^(npm|pnpm|yarn|bun|pip|pip3|cargo|brew)$/u.test(
     executable,
   );
@@ -673,14 +600,14 @@ const automaticReason = (
   }
   if (
     /^(test|tests|run[-_ ]?tests?)$/u.test(tool) &&
-    action.fileChange === "none" &&
+    action.fileChange !== "destructive" &&
     runnerExecutableMatches(action, "test")
   ) {
     return "TEST";
   }
   if (
     /^(build|compile)$/u.test(tool) &&
-    action.fileChange === "none" &&
+    action.fileChange !== "destructive" &&
     runnerExecutableMatches(action, "build")
   ) {
     return "BUILD";
@@ -789,7 +716,7 @@ export function classifyAction(
   if (!isKnownTool(canonical.action.toolName)) {
     return decision("denied", "UNKNOWN_TOOL", fingerprint);
   }
-  const approval = approvalForCommand(canonical.action);
+  const approval = approvalForCommand(semanticAction(canonical.action, source));
   if (approval !== undefined) {
     return decision("approval_required", approval, fingerprint);
   }

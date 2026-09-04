@@ -12,6 +12,15 @@ import { delimiter, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Context } from "../../packages/harness-plugin/node_modules/@deepseek-ai/cordis/lib/index.js";
 import {
+  createScope,
+  scopeTarget,
+} from "../../packages/harness-plugin/node_modules/@deepseek-ai/dsh-scope/lib/index.js";
+import {
+  type ToolExecution,
+  ToolRuntime,
+} from "../../packages/harness-plugin/node_modules/@deepseek-ai/dsh-tools/lib/index.js";
+import { ApprovalService } from "../../packages/harness-plugin/node_modules/@deepseek-ai/dsh-user-approval/lib/index.js";
+import {
   type ActionPolicyOptions,
   canonicalizeAction,
   classifyAction,
@@ -21,6 +30,7 @@ import {
   recheckCanonicalPath,
 } from "../../packages/harness-plugin/src/policy/canonical-path.js";
 import {
+  createPolicyAgentSetup,
   type PolicyGuardRegistrationOptions,
   registerPolicyGuard,
   type TrustedPolicyAction,
@@ -75,18 +85,573 @@ const makeAction = (
   ...overrides,
 });
 
+describe("accepted complete-range findings", () => {
+  const commandFixture = () => {
+    const fixture = makeFixture();
+    mkdirSync(join(fixture.repositoryPath, "src"));
+    writeFileSync(
+      join(fixture.repositoryPath, "src", "keychain.ts"),
+      "export const token = 'example';\n",
+    );
+    for (const name of [
+      ".env",
+      ".npmrc",
+      "id_rsa",
+      ".env.example",
+      "credential.ts",
+      "password.txt",
+      "private-data",
+    ]) {
+      writeFileSync(
+        join(fixture.repositoryPath, name),
+        "nonsecret test fixture\n",
+      );
+    }
+    symlinkSync(fixture.outsidePath, join(fixture.repositoryPath, "linked"));
+    const trustedExecutables: Record<string, string> = {};
+    for (const name of ["rg", "grep", "tsc", "vitest", "pnpm"]) {
+      const file = join(fixture.executableDirectory, name);
+      writeFileSync(file, "fixture\n", { mode: 0o755 });
+      trustedExecutables[name] = realpathSync(file);
+    }
+    return {
+      ...fixture,
+      options: {
+        repositories: [fixture.repository],
+        trustedExecutables,
+        protectedPaths: { "repo-one": ["private-data"] },
+      },
+    };
+  };
+
+  it.each([
+    ["--", "--files", "src"],
+    ["-e", "--files", "src"],
+    ["-e/api/v1", "src"],
+    ["--regexp=.", "src"],
+  ])("preserves option-like and attached regex data %j", (...argv) => {
+    const f = commandFixture();
+    const action = makeAction(f, {
+      toolName: "search",
+      executable: "rg",
+      argv,
+    });
+    expect(classifyAction(action, f.options).classification).toBe("automatic");
+    expect(canonicalizeAction(action, f.options).action.argv).toEqual([
+      ...argv.slice(0, -1),
+      join(f.repository.canonicalPath, "src"),
+    ]);
+  });
+
+  it("rejects an outside custom test reporter entrypoint", () => {
+    const f = commandFixture();
+    expect(
+      classifyAction(
+        makeAction(f, {
+          toolName: "test",
+          executable: "vitest",
+          argv: ["run", "--reporter", join(f.outsidePath, "reporter.js")],
+        }),
+        f.options,
+      ).classification,
+    ).toBe("denied");
+  });
+
+  it.each(["rg", "grep"])(
+    "does not read protected files through a %s directory search",
+    (executable) => {
+      const f = commandFixture();
+      const argv =
+        executable === "rg"
+          ? ["--hidden", "needle", "."]
+          : ["-r", "needle", "."];
+      expect(
+        classifyAction(
+          makeAction(f, { toolName: "search", executable, argv }),
+          f.options,
+        ).classification,
+      ).toBe("denied");
+    },
+  );
+
+  it("matches configured protected paths through an alias and retains a registration snapshot", async () => {
+    const f = commandFixture();
+    symlinkSync(
+      join(f.repositoryPath, "private-data"),
+      join(f.repositoryPath, "alias"),
+    );
+    expect(
+      classifyAction(makeAction(f, { argv: ["alias"] }), f.options)
+        .classification,
+    ).toBe("denied");
+    const { agentContext, guards } = makeAgentScope();
+    const trusted = new WeakMap<object, TrustedPolicyAction>();
+    installPolicy(agentContext, {
+      ...f.options,
+      resolveAction: (exec) => trusted.get(exec),
+    });
+    f.options.protectedPaths["repo-one"].splice(0);
+    const action = makeAction(f, { argv: ["private-data"] });
+    const execution = makeExecution(action);
+    trustExecution(trusted, execution, action, f);
+    expect(guards[0]?.(execution)).toMatch(/PROTECTED_RESOURCE/u);
+  });
+
+  it("protects the canonical target of a registered protected alias", () => {
+    const f = commandFixture();
+    symlinkSync(
+      join(f.repositoryPath, "password.txt"),
+      join(f.repositoryPath, "protected-alias"),
+    );
+    const options = {
+      ...f.options,
+      protectedPaths: { "repo-one": ["protected-alias"] },
+    };
+    expect(
+      classifyAction(makeAction(f, { argv: ["password.txt"] }), options)
+        .classification,
+    ).toBe("denied");
+  });
+
+  it.each([
+    ["rg", "search", ["needle", "linked"]],
+    ["grep", "search", ["needle", "linked"]],
+    ["grep", "search", ["-f", "linked"]],
+    ["rg", "search", ["--file=linked"]],
+    ["tsc", "build", ["--outDir", "linked"]],
+    ["tsc", "build", ["--outDir=linked"]],
+    ["tsc", "build", ["--project", "linked"]],
+    ["rg", "search", ["-L", "--files", "."]],
+    ["rg", "search", ["--follow", "needle", "."]],
+    ["grep", "search", ["-R", "needle", "."]],
+    ["grep", "search", ["--dereference-recursive", "needle", "."]],
+    ["rg", "search", ["--unknown-path-option", "src"]],
+  ])("F2/F3 reject %s %s %j", (executable, toolName, argv) => {
+    const f = commandFixture();
+    expect(
+      classifyAction(makeAction(f, { executable, toolName, argv }), f.options)
+        .classification,
+    ).toBe("denied");
+  });
+
+  it.each([
+    "/api/v1",
+    ".",
+    "credential",
+    "token",
+    "password",
+    "$(example)",
+    "`literal`",
+  ])("F2/F6 preserve search data %s", (pattern) => {
+    const f = commandFixture();
+    const action = makeAction(f, {
+      toolName: "search",
+      executable: "rg",
+      argv: [pattern, "src"],
+    });
+    const canonical = canonicalizeAction(action, f.options);
+    expect(canonical.action.argv).toEqual([
+      pattern,
+      join(f.repository.canonicalPath, "src"),
+    ]);
+    expect(classifyAction(action, f.options).classification).toBe("automatic");
+    expect(classifyAction(action, f.options).fingerprint).not.toBe(
+      classifyAction(
+        { ...action, argv: [f.repository.canonicalPath, "src"] },
+        f.options,
+      ).fingerprint,
+    );
+  });
+
+  it.each([".env", ".npmrc", "id_rsa", "private-data"])(
+    "F4 denies protected resource %s even with approval effects",
+    (path) => {
+      const f = commandFixture();
+      for (const fileChange of ["none", "destructive"] as const) {
+        expect(
+          classifyAction(
+            makeAction(f, { argv: [path], touchedPaths: [path], fileChange }),
+            f.options,
+          ).classification,
+        ).toBe("denied");
+      }
+    },
+  );
+
+  it.each(["src/keychain.ts", ".env.example", "credential.ts", "password.txt"])(
+    "F6 permits nonsecret source/example %s",
+    (path) => {
+      const f = commandFixture();
+      expect(
+        classifyAction(
+          makeAction(f, { argv: [path], touchedPaths: [path] }),
+          f.options,
+        ).classification,
+      ).toBe("automatic");
+    },
+  );
+
+  it("F5 requires approval for compiler clean", () => {
+    const f = commandFixture();
+    expect(
+      classifyAction(
+        makeAction(f, {
+          toolName: "build",
+          executable: "tsc",
+          argv: ["--build", "--clean"],
+        }),
+        f.options,
+      ),
+    ).toMatchObject({ classification: "approval_required" });
+  });
+
+  it.each([
+    ["tsc", "build", ["--outDir", "dist"]],
+    [
+      "vitest",
+      "test",
+      ["run", "--coverage", "--coverage.reportsDirectory=coverage"],
+    ],
+    ["pnpm", "test", ["test", "--", "--coverage"]],
+  ])("F7 allows bounded output %s", (executable, toolName, argv) => {
+    const f = commandFixture();
+    expect(
+      classifyAction(
+        makeAction(f, {
+          executable,
+          toolName,
+          argv,
+          fileChange: "bounded",
+          touchedPaths: ["dist", "coverage"],
+        }),
+        f.options,
+      ).classification,
+    ).toBe("automatic");
+  });
+});
+
+const runtimeFixture = (
+  outcome:
+    | "allowed-once"
+    | "rejected"
+    | "unavailable"
+    | "cancelled" = "allowed-once",
+) => {
+  const fixture = makeFixture();
+  const root = new Context();
+  root.provide("systemPrompt", {
+    tools() {},
+    context() {},
+    getContextOrder() {
+      return 0;
+    },
+  });
+  new ToolRuntime(root);
+  new ApprovalService(root, { policy: "ask" });
+  const events: { type: string; data?: unknown }[] = [{ type: "turn/start" }];
+  const agent = {
+    id: "bridge-owned",
+    ctx: root,
+    session: {
+      get seq() {
+        return events.length;
+      },
+      eventAt(seq: number) {
+        return events[seq];
+      },
+      append(type: string, data: unknown) {
+        events.push({ type, data });
+      },
+    },
+  };
+  const scope = createScope(root, agent);
+  agent.ctx = scope.ctx.extend({ agent });
+  let bodies = 0;
+  let action = makeAction(fixture, {
+    toolName: "delete_file",
+    fileChange: "destructive",
+    touchedPaths: ["output.txt"],
+  });
+  agent.ctx.tools.register({
+    name: "delete_file",
+    description: "counter-only fixture",
+    parameters: { type: "object", properties: {} },
+    output: {
+      schema: { type: "number" },
+      render: () => [{ type: "text", text: "fixture" }],
+    },
+    async execute() {
+      bodies++;
+      return bodies;
+    },
+  });
+  agent.ctx.on("approval/request", async () => outcome);
+  const options = {
+    repositories: [fixture.repository],
+    agentId: agent.id,
+    resolveAction: () => ({ action, provenance: "local_tool" as const }),
+  };
+  createPolicyAgentSetup(options)(agent.ctx);
+  const execute = (signal = new AbortController().signal) =>
+    root.tools.execute({
+      callId: "call" as never,
+      name: "delete_file",
+      arguments: {},
+      agent: agent as never,
+      signal,
+    });
+  return {
+    root,
+    agent,
+    events,
+    execute,
+    scope,
+    options,
+    bodies: () => bodies,
+    changeAction: () => {
+      action = { ...action, touchedPaths: ["other.txt"] };
+    },
+  };
+};
+
+describe("actual scoped runtime approval and ownership", () => {
+  it("does not mint proof when the approval audit cannot commit", async () => {
+    const f = runtimeFixture();
+    const append = f.agent.session.append;
+    f.agent.session.append = (type, data) => {
+      if (type === "approval/decided")
+        throw new Error("fixture audit unavailable");
+      append(type, data);
+    };
+    f.agent.ctx.on(
+      "tools/pre-execute",
+      async (_exec, next) => {
+        await next();
+        return { kind: "allow" as const };
+      },
+      { prepend: true },
+    );
+    expect((await f.execute()).isError).toBe(true);
+    expect(f.bodies()).toBe(0);
+  });
+
+  it("rejects a scope tag belonging to another Agent", () => {
+    const f = runtimeFixture();
+    const wrong = { id: "bridge-owned", ctx: f.root };
+    wrong.ctx = createScope(f.root, {}).ctx.extend({ agent: wrong });
+    expect(() => createPolicyAgentSetup(f.options)(wrong.ctx)).toThrow(
+      "POLICY_AGENT_SCOPE_REQUIRED",
+    );
+  });
+
+  it("does not reuse one setup capability on a different object with the same ID", () => {
+    const f = runtimeFixture();
+    const setup = createPolicyAgentSetup(f.options);
+    const owned = { id: "bridge-owned", ctx: f.root };
+    owned.ctx = createScope(f.root, owned).ctx.extend({ agent: owned });
+    setup(owned.ctx);
+    const other = { id: "bridge-owned", ctx: f.root };
+    other.ctx = createScope(f.root, other).ctx.extend({ agent: other });
+    expect(() => setup(other.ctx)).toThrow("POLICY_BRIDGE_AGENT_MISMATCH");
+  });
+  it("denies missing approval service even if an outer layer returns allow", async () => {
+    const f = runtimeFixture();
+    f.root.set("approval", undefined);
+    f.agent.ctx.on(
+      "tools/pre-execute",
+      async (_exec, next) => {
+        await next();
+        return { kind: "allow" as const };
+      },
+      { prepend: true },
+    );
+    expect((await f.execute()).isError).toBe(true);
+    expect(f.bodies()).toBe(0);
+  });
+
+  it("does not install policy on unrelated or agentless executions", async () => {
+    const f = runtimeFixture();
+    const action = makeAction(makeFixture(), { environmentRead: "arbitrary" });
+    f.root.tools.register({
+      name: "read_file",
+      description: "scope probe",
+      parameters: { type: "object", properties: {} },
+      output: { schema: { type: "number" }, render: () => [] },
+      async execute() {
+        return 1;
+      },
+    });
+    expect(
+      (
+        await f.root.tools.execute({
+          name: "read_file",
+          arguments: { action },
+          callId: "agentless" as never,
+          signal: new AbortController().signal,
+        })
+      ).isError,
+    ).toBe(false);
+    const other = { id: "another" };
+    expect(
+      (
+        await f.root.tools.execute({
+          name: "read_file",
+          arguments: { action },
+          agent: other as never,
+          callId: "another" as never,
+          signal: new AbortController().signal,
+        })
+      ).isError,
+    ).toBe(false);
+  });
+  it("F1 audits a grant before executing and consumes proof once", async () => {
+    const f = runtimeFixture();
+    let captured: ToolExecution | undefined;
+    f.agent.ctx.on(
+      "tools/pre-execute",
+      async (exec, next) => {
+        captured = exec;
+        return next();
+      },
+      { prepend: true },
+    );
+    expect((await f.execute()).isError).toBe(false);
+    expect(f.bodies()).toBe(1);
+    expect(f.events.map((event) => event.type)).toEqual([
+      "turn/start",
+      "approval/asked",
+      "approval/decided",
+    ]);
+    expect(
+      (
+        f.root.tools as unknown as {
+          guardReason(exec: ToolExecution): string | undefined;
+        }
+      ).guardReason(captured as ToolExecution),
+    ).toMatch(/APPROVAL|PROOF/u);
+  });
+
+  it("F1 denies a later prepended allow without an approval", async () => {
+    const f = runtimeFixture();
+    f.agent.ctx.on(
+      "tools/pre-execute",
+      async () => ({ kind: "allow" as const }),
+      { prepend: true },
+    );
+    expect((await f.execute()).isError).toBe(true);
+    expect(f.bodies()).toBe(0);
+    expect(f.events).toHaveLength(1);
+  });
+
+  it.each(["rejected", "unavailable", "cancelled"] as const)(
+    "F1 outer allow cannot rewrite %s",
+    async (outcome) => {
+      const f = runtimeFixture(outcome);
+      f.agent.ctx.on(
+        "tools/pre-execute",
+        async (_exec, next) => {
+          await next();
+          return { kind: "allow" as const };
+        },
+        { prepend: true },
+      );
+      expect((await f.execute()).isError).toBe(true);
+      expect(f.bodies()).toBe(0);
+    },
+  );
+
+  it("F1 denies changed fingerprints after a granted request", async () => {
+    const f = runtimeFixture();
+    f.agent.ctx.on(
+      "tools/pre-execute",
+      async (_exec, next) => {
+        await next();
+        f.changeAction();
+        return { kind: "allow" as const };
+      },
+      { prepend: true },
+    );
+    expect((await f.execute()).isError).toBe(true);
+    expect(f.bodies()).toBe(0);
+  });
+
+  it("F1 abort cannot produce usable approval proof", async () => {
+    const f = runtimeFixture();
+    const abort = new AbortController();
+    f.agent.ctx.on(
+      "approval/request",
+      async () => {
+        abort.abort();
+        return "allowed-once" as const;
+      },
+      { prepend: true },
+    );
+    expect((await f.execute(abort.signal)).isError).toBe(true);
+    expect(f.bodies()).toBe(0);
+  });
+
+  it("F8 rejects an untagged self-reference without installing a global guard", () => {
+    const fixture = makeFixture();
+    const root = new Context();
+    root.provide("systemPrompt", {
+      tools() {},
+      context() {},
+      getContextOrder() {
+        return 0;
+      },
+    });
+    new ToolRuntime(root);
+    const agent = { ctx: root, id: "owned" };
+    agent.ctx = root.extend({ agent });
+    expect(() =>
+      registerPolicyGuard(agent.ctx, {
+        repositories: [fixture.repository],
+        resolveAction: () => undefined,
+      }),
+    ).toThrow();
+    expect(
+      (
+        root.tools as unknown as {
+          guardReason(exec: object): string | undefined;
+        }
+      ).guardReason({ name: "read_file" }),
+    ).toBeUndefined();
+  });
+
+  it("F8 binds the setup capability to the specified bridge agent", () => {
+    const f = runtimeFixture();
+    const stranger = { id: "unrelated", ctx: f.root };
+    stranger.ctx = createScope(f.root, stranger).ctx.extend({
+      agent: stranger,
+    });
+    expect(() => createPolicyAgentSetup(f.options)(stranger.ctx)).toThrow();
+  });
+});
+
 const policyOptions = (
   fixture: ReturnType<typeof makeFixture>,
 ): ActionPolicyOptions => ({ repositories: [fixture.repository] });
 
-type TestExecution = Readonly<{ name: string; arguments: unknown }>;
+type TestExecution = Readonly<{
+  name: string;
+  arguments: unknown;
+  agent?: object;
+  signal?: AbortSignal;
+  callId?: string;
+}>;
 type TestGuard = (execution: TestExecution) => string | undefined;
 
+let testAgent: { ctx: Context; id: string } | undefined;
 const makeAgentScope = () => {
   const root = new Context();
+  root.provide("approval", {
+    async request() {
+      return "allowed-once";
+    },
+  });
   const guards: TestGuard[] = [];
-  const agent = {} as { ctx: Context };
-  const agentContext = root.extend({
+  const agent = { ctx: root, id: "test-owned" };
+  const agentContext = createScope(root, agent).ctx.extend({
     agent,
     tools: {
       guard(guard: TestGuard) {
@@ -99,13 +664,32 @@ const makeAgentScope = () => {
     },
   });
   agent.ctx = agentContext;
+  testAgent = agent;
   return { agentContext, guards, root };
+};
+
+const installPolicy = (
+  ctx: Context,
+  options: PolicyGuardRegistrationOptions,
+) => {
+  const setup = createPolicyAgentSetup({
+    ...options,
+    agentId: String(ctx.agent?.id ?? "test-owned"),
+  });
+  setup(ctx);
+  return setup.dispose;
 };
 
 const makeExecution = (
   action: CanonicalAction,
   name = action.toolName,
-): TestExecution => ({ name, arguments: { action } });
+): TestExecution => ({
+  name,
+  arguments: { action },
+  agent: testAgent,
+  signal: new AbortController().signal,
+  callId: "fixture",
+});
 
 const trustedPolicyOptions = (
   fixture: ReturnType<typeof makeFixture>,
@@ -173,10 +757,7 @@ describe("local repository policy boundary", () => {
     const fixture = makeFixture();
     const trustedActions = new WeakMap<object, TrustedPolicyAction>();
     const { agentContext, guards } = makeAgentScope();
-    registerPolicyGuard(
-      agentContext,
-      trustedPolicyOptions(fixture, trustedActions),
-    );
+    installPolicy(agentContext, trustedPolicyOptions(fixture, trustedActions));
     const attacker = join(fixture.outsidePath, "rg");
     writeFileSync(attacker, "attacker fixture\n", { mode: 0o755 });
     vi.stubEnv("PATH", fixture.outsidePath);
@@ -270,11 +851,16 @@ describe("local repository policy boundary", () => {
     (argument) => {
       const fixture = makeFixture();
       const result = canonicalizeAction(
-        makeAction(fixture, { argv: [argument] }),
+        makeAction(fixture, {
+          toolName: "build",
+          executable: join(fixture.executableDirectory, "pnpm"),
+          argv: ["build", argument],
+        }),
         policyOptions(fixture),
       );
       expect(result.violations).toEqual([]);
       expect(result.action.argv).toEqual([
+        "build",
         argument.replace(/\.$/u, fixture.repository.canonicalPath),
       ]);
     },
@@ -309,7 +895,7 @@ describe("local repository policy boundary", () => {
       trustedExecutables: { rg: trusted },
     };
     const { agentContext, guards } = makeAgentScope();
-    registerPolicyGuard(agentContext, options);
+    installPolicy(agentContext, options);
     const repositoryId = fixture.repository.id;
     fixture.repository.canonicalPath = realpathSync(fixture.outsidePath);
     options.trustedExecutables.rg = realpathSync(attacker);
@@ -335,12 +921,17 @@ describe("local repository policy boundary", () => {
     };
     trustedActions.set(execution, injected);
     options.resolveAction = () => undefined;
-    expect(guards[0]?.(execution)).toBeUndefined();
     await expect(
-      agentContext.waterfall("tools/pre-execute", execution, async () => ({
-        kind: "allow" as const,
-      })),
+      agentContext.waterfall(
+        scopeTarget({}, agentContext.agent),
+        "tools/pre-execute",
+        execution,
+        async () => ({
+          kind: "allow" as const,
+        }),
+      ),
     ).resolves.toMatchObject({ kind: "allow" });
+    expect(guards[0]?.(execution)).toBeUndefined();
     trustedActions.set(execution, {
       action: { ...action, executable: attacker },
       provenance: "local_tool",
@@ -438,7 +1029,7 @@ describe("local repository policy boundary", () => {
     const fixture = makeFixture();
     const { agentContext, guards } = makeAgentScope();
     const trustedActions = new WeakMap<object, TrustedPolicyAction>();
-    const dispose = registerPolicyGuard(
+    const dispose = installPolicy(
       agentContext,
       trustedPolicyOptions(fixture, trustedActions),
     );
@@ -456,11 +1047,12 @@ describe("local repository policy boundary", () => {
     trustExecution(trustedActions, approvalExecution, approvalAction, fixture);
     await expect(
       agentContext.waterfall(
+        scopeTarget({}, agentContext.agent),
         "tools/pre-execute",
         approvalExecution,
         async () => ({ kind: "allow" as const }),
       ),
-    ).resolves.toMatchObject({ kind: "ask" });
+    ).resolves.toMatchObject({ kind: "allow" });
 
     dispose();
   });
@@ -474,7 +1066,7 @@ describe("local repository policy boundary", () => {
       return { kind: "allow" as const };
     });
     const trustedActions = new WeakMap<object, TrustedPolicyAction>();
-    const disposePolicy = registerPolicyGuard(
+    const disposePolicy = installPolicy(
       agentContext,
       trustedPolicyOptions(fixture, trustedActions),
     );
@@ -486,12 +1078,13 @@ describe("local repository policy boundary", () => {
     trustExecution(trustedActions, execution, action, fixture);
 
     const result = await agentContext.waterfall(
+      scopeTarget({}, agentContext.agent),
       "tools/pre-execute",
       execution,
       async () => ({ kind: "allow" as const }),
     );
 
-    expect(result).toMatchObject({ kind: "ask" });
+    expect(result).toMatchObject({ kind: "allow" });
     expect(earlierAllowCalls).toBe(0);
     disposePolicy();
     disposeEarlier();
@@ -503,7 +1096,7 @@ describe("local repository policy boundary", () => {
     const trustedActions = new WeakMap<object, TrustedPolicyAction>();
 
     expect(() =>
-      registerPolicyGuard(root, trustedPolicyOptions(fixture, trustedActions)),
+      installPolicy(root, trustedPolicyOptions(fixture, trustedActions)),
     ).toThrowError("POLICY_AGENT_SCOPE_REQUIRED");
   });
 
@@ -523,9 +1116,10 @@ describe("local repository policy boundary", () => {
         ) => (agentContext: Context) => void;
       }
     ).createPolicyAgentSetup;
-    const setup = createPolicyAgentSetup(
-      trustedPolicyOptions(fixture, trustedActions),
-    );
+    const setup = createPolicyAgentSetup({
+      ...trustedPolicyOptions(fixture, trustedActions),
+      agentId: "test-owned",
+    });
     setup(agentContext);
 
     expect(guards).toHaveLength(1);
@@ -538,9 +1132,9 @@ describe("local repository policy boundary", () => {
   ])("denies %s without a trusted local resolver", (_label, overrides) => {
     const fixture = makeFixture();
     const { agentContext, guards } = makeAgentScope();
-    registerPolicyGuard(agentContext, policyOptions(fixture) as never);
+    installPolicy(agentContext, policyOptions(fixture) as never);
     const action = { ...makeAction(fixture), ...overrides };
-    const execution = { name: action.toolName, arguments: { action } };
+    const execution = makeExecution(action as CanonicalAction);
 
     expect(guards[0]?.(execution)).toBe("POLICY_DENIED:UNTRUSTED_ACTION");
   });
@@ -549,27 +1143,19 @@ describe("local repository policy boundary", () => {
     const fixture = makeFixture();
     const { agentContext, guards } = makeAgentScope();
     const trustedActions = new WeakMap<object, TrustedPolicyAction>();
-    registerPolicyGuard(
-      agentContext,
-      trustedPolicyOptions(fixture, trustedActions),
-    );
+    installPolicy(agentContext, trustedPolicyOptions(fixture, trustedActions));
     const action = makeAction(fixture);
     const execution = makeExecution(action, "shell");
     trustExecution(trustedActions, execution, action, fixture);
 
-    expect(guards[0]?.(execution)).toBe(
-      "POLICY_DENIED:UNTRUSTED_TOOL_IDENTITY",
-    );
+    expect(guards[0]?.(execution)).toBe("POLICY_DENIED:UNTRUSTED_ACTION");
   });
 
   it("resolves a trusted bare executable before automatic authorization", () => {
     const fixture = makeFixture();
     const { agentContext, guards } = makeAgentScope();
     const trustedActions = new WeakMap<object, TrustedPolicyAction>();
-    registerPolicyGuard(
-      agentContext,
-      trustedPolicyOptions(fixture, trustedActions),
-    );
+    installPolicy(agentContext, trustedPolicyOptions(fixture, trustedActions));
     rmSync(join(fixture.executableDirectory, "rg"));
     symlinkSync(
       join(fixture.executableDirectory, "rm"),
@@ -597,7 +1183,7 @@ describe("local repository policy boundary", () => {
     mkdirSync(secondDirectory);
     const { agentContext, guards } = makeAgentScope();
     const trustedActions = new WeakMap<object, TrustedPolicyAction>();
-    const dispose = registerPolicyGuard(
+    const dispose = installPolicy(
       agentContext,
       trustedPolicyOptions(fixture, trustedActions),
     );
@@ -608,10 +1194,15 @@ describe("local repository policy boundary", () => {
     const execution = makeExecution(action);
     trustExecution(trustedActions, execution, action, fixture);
     await expect(
-      agentContext.waterfall("tools/pre-execute", execution, async () => ({
-        kind: "allow" as const,
-      })),
-    ).resolves.toMatchObject({ kind: "ask" });
+      agentContext.waterfall(
+        scopeTarget({}, agentContext.agent),
+        "tools/pre-execute",
+        execution,
+        async () => ({
+          kind: "allow" as const,
+        }),
+      ),
+    ).resolves.toMatchObject({ kind: "allow" });
 
     renameSync(firstDirectory, join(fixture.directory, "first-original"));
     symlinkSync(secondDirectory, firstDirectory, "dir");
@@ -630,7 +1221,7 @@ describe("local repository policy boundary", () => {
     symlinkSync(firstTarget, leaf);
     const { agentContext, guards } = makeAgentScope();
     const trustedActions = new WeakMap<object, TrustedPolicyAction>();
-    const dispose = registerPolicyGuard(
+    const dispose = installPolicy(
       agentContext,
       trustedPolicyOptions(fixture, trustedActions),
     );
@@ -640,9 +1231,14 @@ describe("local repository policy boundary", () => {
     });
     const execution = makeExecution(action);
     trustExecution(trustedActions, execution, action, fixture);
-    await agentContext.waterfall("tools/pre-execute", execution, async () => ({
-      kind: "allow" as const,
-    }));
+    await agentContext.waterfall(
+      scopeTarget({}, agentContext.agent),
+      "tools/pre-execute",
+      execution,
+      async () => ({
+        kind: "allow" as const,
+      }),
+    );
 
     rmSync(leaf);
     symlinkSync(secondTarget, leaf);

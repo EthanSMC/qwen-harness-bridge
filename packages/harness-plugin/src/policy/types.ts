@@ -39,7 +39,9 @@ export type PolicyPathViolation =
   | "PATH_UNAVAILABLE"
   | "ROOT_NOT_CANONICAL"
   | "UNKNOWN_REPOSITORY"
-  | "UNSTRUCTURED_ACTION";
+  | "UNSTRUCTURED_ACTION"
+  | "UNSUPPORTED_ARGUMENTS"
+  | "PROTECTED_RESOURCE";
 
 export type CanonicalActionResult = Readonly<{
   action: CanonicalAction;
