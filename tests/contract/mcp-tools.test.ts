@@ -506,16 +506,52 @@ describe("MCP public tool contract", () => {
     }
   });
 
-  it("keeps submit_task below the two-second service budget", async () => {
-    const connection = await connectedClient(fakeCoordinator());
+  it("emits the submit_task latency evidence contract", async () => {
+    const budgetMs = 2000;
+    const sampleCount = 20;
+    const coordinator = fakeCoordinator();
+    const connection = await connectedClient(coordinator);
     try {
-      const started = performance.now();
-      const result = await connection.client.callTool({
-        name: "submit_task",
-        arguments: VALID_SUBMIT,
-      });
-      expect(performance.now() - started).toBeLessThan(2000);
-      expect(result.structuredContent).toMatchObject({ status: "queued" });
+      const samplesMs: number[] = [];
+      for (let index = 0; index < sampleCount; index += 1) {
+        const started = performance.now();
+        const result = await connection.client.callTool({
+          name: "submit_task",
+          arguments: VALID_SUBMIT,
+        });
+        const elapsedMs = performance.now() - started;
+        expect(result.structuredContent).toMatchObject({ status: "queued" });
+        samplesMs.push(Number(elapsedMs.toFixed(3)));
+      }
+
+      const sortedSamplesMs = [...samplesMs].sort(
+        (left, right) => left - right,
+      );
+      const nearestRank = (percentile: number): number =>
+        sortedSamplesMs[Math.ceil(percentile * sampleCount) - 1];
+      const evidence = {
+        measurement: "in_memory_mcp_call_tool" as const,
+        sample_count: sortedSamplesMs.length,
+        samples_ms: sortedSamplesMs,
+        p50_ms: nearestRank(0.5),
+        p95_ms: nearestRank(0.95),
+        p99_ms: nearestRank(0.99),
+        max_ms: sortedSamplesMs[sortedSamplesMs.length - 1],
+        budget_ms: budgetMs,
+      };
+
+      expect(evidence.sample_count).toBe(sampleCount);
+      expect(evidence.samples_ms).toHaveLength(sampleCount);
+      expect(
+        evidence.samples_ms.every(
+          (sample) => Number.isFinite(sample) && sample >= 0,
+        ),
+      ).toBe(true);
+      expect(evidence.p99_ms).toBeLessThan(budgetMs);
+      expect(evidence.max_ms).toBeLessThan(budgetMs);
+      console.log(
+        `QHB_MCP_SUBMIT_LATENCY_EVIDENCE=${JSON.stringify(evidence)}`,
+      );
     } finally {
       await closeConnection(connection);
     }
