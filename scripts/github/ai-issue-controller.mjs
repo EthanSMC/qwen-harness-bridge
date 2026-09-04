@@ -14,6 +14,7 @@ import {
   parseLifecycleCommand,
   parseReceipts,
   planLifecycleCommand,
+  RECEIPT_ACTIONS,
   receiptBody,
   STATUS_LABELS,
   stripMarkdownCode,
@@ -603,10 +604,17 @@ const recoverPendingIntent = async ({
     requestedEventId,
   );
   const observedState = observedStatusOf(loaded.issue);
+  const currentClaim = currentClaimFromReceipts(loaded.receipts);
+  const matchesCurrentClaim = (candidate) =>
+    candidate.command === "claim"
+      ? currentClaim === null ||
+        currentClaim?.claimId === candidate.receipt.claimId
+      : candidate.receipt.claimId === (currentClaim?.claimId ?? null);
   if (
     requestedPlan &&
     (!expectedActions.includes(requestedPlan.command) ||
-      ![requestedPlan.from, requestedPlan.to].includes(observedState))
+      ![requestedPlan.from, requestedPlan.to].includes(observedState) ||
+      !matchesCurrentClaim(requestedPlan))
   ) {
     throw new LifecycleError(
       "STATE_MISMATCH",
@@ -621,7 +629,8 @@ const recoverPendingIntent = async ({
       (candidate) =>
         candidate &&
         expectedActions.includes(candidate.command) &&
-        [candidate.from, candidate.to].includes(observedState),
+        [candidate.from, candidate.to].includes(observedState) &&
+        matchesCurrentClaim(candidate),
     );
   if (candidatePlans.length > 1) {
     throw new LifecycleError(
@@ -859,7 +868,7 @@ export const handleIssueComment = async ({
       issueNumber,
       loaded,
       eventId: commentId,
-      expectedActions: [command.name],
+      expectedActions: RECEIPT_ACTIONS,
     });
     if (recovered) return recovered;
   }

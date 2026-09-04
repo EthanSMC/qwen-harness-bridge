@@ -1129,6 +1129,43 @@ test("scheduled reconciliation recovers interrupted close and expiry receipts", 
   assert.equal(expiredFake.workflowReceipts().at(-1).action, "expire");
 });
 
+test("a new claimant cannot be mutated by an unfinished prior claim intent", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  fake.failNextReceiptPost = true;
+  await assert.rejects(
+    () =>
+      reconcileExpiredClaims(
+        context(
+          fake,
+          {},
+          {
+            eventId: 950,
+            now: "2026-09-05T12:00:00.000Z",
+          },
+        ),
+      ),
+    /expired claim|receipt write interruption/i,
+  );
+  const bobEvent = fake.command(902, "bob", "/ai-claim\nagent: codex");
+  const bobContext = context(fake, bobEvent, {
+    randomUUID: () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  });
+  const recovered = await handleIssueComment(bobContext);
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.plan.command, "expire");
+
+  const claimed = await handleIssueComment(bobContext);
+  assert.equal(claimed.plan.command, "claim");
+  assert.equal(claimed.plan.receipt.actor, "bob");
+  await reconcileRepositoryState(context(fake, {}, { defaultBranch: "main" }));
+  assert.ok(
+    fake.issue().labels.some(({ name }) => name === "status:in-progress"),
+  );
+  assert.deepEqual(fake.issue().assignees, [{ login: "bob" }]);
+  assert.equal(fake.workflowReceipts().at(-1).actor, "bob");
+});
+
 test("a review lock cannot transfer to a second pull request", async () => {
   const fake = new FakeGitHub();
   await claim(fake);
