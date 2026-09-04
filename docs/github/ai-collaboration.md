@@ -63,7 +63,7 @@ Keep public progress bounded and useful:
 summary: claim parser and state tests pass; controller integration remains
 ```
 
-The summary is a single line of at most 240 UTF-8 bytes. It renews the lease for 24 hours. Branch pushes do not renew the lease implicitly.
+The summary is a single line of at most 240 UTF-8 bytes. It renews the lease for 24 hours in either `status:in-progress` or `status:review` without changing the lifecycle state. Branch pushes do not renew the lease implicitly. Review work is not automatically released when a lease expires, but the expired lease blocks merge until the owner renews it.
 
 ## Block, resume, release, and handoff
 
@@ -110,6 +110,8 @@ Opening a qualifying pull request moves the Issue to `status:review`. The review
 
 Protected `main` is the only merge target. Before merge, the controller independently verifies the current checks, review state, Issue owner, claim receipt, branch, and lifecycle state.
 
+Rollout begins in `report` mode, where the same read-only PR validator reports lifecycle gaps without weakening the existing review gate. `enforce` mode is valid only after the migration registry contains a full activation commit reachable from `main` and contains no remaining migration entries.
+
 After merge, verify all of these outcomes:
 
 1. the primary pull request is merged into `main`;
@@ -144,4 +146,3 @@ The workflow fails closed with one safe next action. Common codes are:
 - `LEASE_EXPIRED`: claim again if the Issue returned to ready.
 - `STATE_MISMATCH`: stop and ask a maintainer to repair labels/assignees.
 - `GITHUB_STATE_UNAVAILABLE`: retry after GitHub state can be verified.
-

@@ -28,6 +28,7 @@ const governance = [
 const aiGovernance = [
   "AGENTS.md",
   "docs/github/ai-collaboration.md",
+  "docs/github/ai-lifecycle-migrations.json",
   "docs/superpowers/specs/2026-09-04-ai-issue-collaboration-design.md",
   "docs/superpowers/plans/2026-09-04-ai-issue-collaboration.md",
 ];
@@ -102,6 +103,20 @@ for (const command of [
     new RegExp(command.replace("/", "\\/")),
     command,
   );
+}
+
+const lifecycleMigrations = JSON.parse(
+  contents.get("docs/github/ai-lifecycle-migrations.json"),
+);
+if (
+  lifecycleMigrations.schema_version !== 1 ||
+  !Array.isArray(lifecycleMigrations.entries) ||
+  !(
+    lifecycleMigrations.activation_commit === null ||
+    /^[0-9a-f]{40}$/u.test(lifecycleMigrations.activation_commit)
+  )
+) {
+  throw new Error("AI lifecycle migration registry has an invalid schema");
 }
 
 for (const template of [
@@ -345,10 +360,15 @@ for (const [pattern, message] of [
     /node scripts\/github\/verify-pr-review-evidence\.mjs/,
     "the actual pull-request body validator command",
   ],
+  [
+    /node scripts\/github\/verify-ai-lifecycle\.mjs/,
+    "the live PR-to-claim lifecycle validator command",
+  ],
   [/node --test/, "the repository governance node:test command"],
   [/ai-issue-policy\.test\.mjs/, "the AI lifecycle policy tests"],
   [/github-api\.test\.mjs/, "the strict GitHub API tests"],
   [/ai-issue-controller\.test\.mjs/, "the lifecycle controller tests"],
+  [/verify-ai-lifecycle\.test\.mjs/, "the PR-to-claim lifecycle tests"],
   [/verify-pr-review-evidence\.test\.mjs/, "the review evidence tests"],
   [/verify-pr-review-state\.test\.mjs/, "the live review-state tests"],
   [/sync-management\.test\.mjs/, "the management synchronization tests"],

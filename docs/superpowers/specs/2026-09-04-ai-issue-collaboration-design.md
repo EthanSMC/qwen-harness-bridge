@@ -184,7 +184,7 @@ summary: protocol schema implemented; integration tests remain
 
 The summary is required, is limited to 240 UTF-8 bytes, and must contain no private execution material. The workflow verifies ownership and extends the lease from GitHub server time.
 
-A scheduled hourly reconciliation releases an expired `status:in-progress` claim by removing the assignee, restoring `status:ready` when readiness still passes or `status:waiting` otherwise, and writing a stale-release receipt. It does not automatically release `status:review` or `status:blocked`; those states require an explicit resolution because a pull request or external dependency may still exist.
+A scheduled hourly reconciliation releases an expired `status:in-progress` claim by removing the assignee, restoring `status:ready` when readiness still passes or `status:waiting` otherwise, and writing a stale-release receipt. It does not automatically release `status:review` or `status:blocked`; those states require an explicit resolution because a pull request or external dependency may still exist. The owner may heartbeat `status:review` without changing its state; an expired review lease blocks merge until renewed.
 
 ## 8. Local execution contract
 

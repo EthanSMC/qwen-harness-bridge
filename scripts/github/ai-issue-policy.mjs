@@ -82,7 +82,6 @@ const ERROR_CODES = new Set([
 
 const SUCCESS_TRANSITIONS = Object.freeze({
   claim: ["ready", "in-progress"],
-  heartbeat: ["in-progress", "in-progress"],
   block: ["in-progress", "blocked"],
   resume: ["blocked", "in-progress"],
   "pr-open": ["in-progress", "review"],
@@ -549,8 +548,11 @@ export const planLifecycleCommand = ({
 
   if (action === "heartbeat") {
     if (!isOwner) fail("NOT_OWNER", "Only the owner can renew a claim.");
-    if (state !== "in-progress") {
-      fail("INVALID_TRANSITION", "Only in-progress work accepts a heartbeat.");
+    if (!["in-progress", "review"].includes(state)) {
+      fail(
+        "INVALID_TRANSITION",
+        "Only in-progress or review work accepts a heartbeat.",
+      );
     }
     if (isExpired(currentClaim.leaseExpiresAt, now)) {
       fail("LEASE_EXPIRED", "The claim lease expired before this heartbeat.");
@@ -821,9 +823,12 @@ const parseReceiptBody = (body) => {
   } else {
     const transition = SUCCESS_TRANSITIONS[receipt.action];
     if (
-      !transition ||
-      receipt.from !== transition[0] ||
-      receipt.to !== transition[1] ||
+      (receipt.action === "heartbeat"
+        ? !["in-progress", "review"].includes(receipt.from) ||
+          receipt.to !== receipt.from
+        : !transition ||
+          receipt.from !== transition[0] ||
+          receipt.to !== transition[1]) ||
       receipt.leaseExpiresAt === null
     ) {
       fail("STATE_MISMATCH", "A lifecycle receipt has an invalid transition.");

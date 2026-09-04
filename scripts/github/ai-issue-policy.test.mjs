@@ -620,6 +620,29 @@ test("renews only the current owner's active claim", () => {
   );
 });
 
+test("renews a review-state claim so an expired lease cannot merge", () => {
+  const claim = plan().receipt;
+  const review = {
+    ...claim,
+    eventId: 902,
+    action: "pr-open",
+    from: "in-progress",
+    to: "review",
+  };
+  const heartbeat = plan({
+    command: parseLifecycleCommand(
+      "/ai-heartbeat\nsummary: final review is still in progress",
+    ),
+    issue: issue({ labels: ["status:review"], assignees: ["alice"] }),
+    receipts: [claim, review],
+    eventId: 903,
+    now: "2026-09-05T00:00:00.000Z",
+  });
+  assert.equal(heartbeat.from, "review");
+  assert.equal(heartbeat.to, "review");
+  assert.equal(heartbeat.leaseExpiresAt, "2026-09-06T00:00:00.000Z");
+});
+
 test("plans owner block and resume with the same claim generation", () => {
   const claim = plan().receipt;
   const activeIssue = issue({

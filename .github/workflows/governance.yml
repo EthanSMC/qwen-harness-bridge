@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: read
   checks: read
   actions: read
@@ -38,6 +39,7 @@ jobs:
           scripts/github/ai-issue-policy.test.mjs
           scripts/github/github-api.test.mjs
           scripts/github/ai-issue-controller.test.mjs
+          scripts/github/verify-ai-lifecycle.test.mjs
           scripts/github/verify-pr-review-evidence.test.mjs
           scripts/github/verify-pr-review-state.test.mjs
           scripts/github/sync-management.test.mjs
@@ -63,3 +65,12 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_STATIC_RESULT: ${{ needs.static.result }}
         run: node scripts/github/verify-pr-review-evidence.mjs
+      - name: Verify live AI Issue lifecycle
+        if: github.event_name == 'pull_request'
+        env:
+          AI_LIFECYCLE_MODE: ${{ vars.AI_LIFECYCLE_MODE || 'report' }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_STATIC_RESULT: ${{ needs.static.result }}
+        run: node scripts/github/verify-ai-lifecycle.mjs

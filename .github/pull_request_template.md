@@ -12,6 +12,7 @@
 - Spec section:
 - Implementation plan/task:
 
+<!-- Claim receipt must be the exact workflow-authored success comment for this Issue and claim generation. Agent class is one lowercase public slug, not a private agent/session identifier. -->
 <!-- Do not include private agent/thread URLs, prompts, raw logs, source bodies, credentials, private paths, or local absolute paths. -->
 
 ## Review evidence

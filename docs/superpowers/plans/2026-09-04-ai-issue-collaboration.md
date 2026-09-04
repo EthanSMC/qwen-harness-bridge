@@ -590,7 +590,7 @@ git commit -m "ci(governance): run trusted AI issue lifecycle"
 - Consumes: pull-request event, live PR, primary Issue, verified workflow comments, current labels/assignee, migration registry, and current enforcement mode.
 - Produces: `extractLifecycleFields(body)`, `validatePullRequestLifecycleState(input)`, and a zero/nonzero CLI gate.
 
-- [ ] **Step 1: Write PR-body field tests against the real template**
+- [x] **Step 1: Write PR-body field tests against the real template**
 
 ```js
 test("parses one primary Issue and one concrete claim receipt", () => {
@@ -608,24 +608,24 @@ test("rejects multiple closing Issues and private agent references", () => {
 });
 ```
 
-- [ ] **Step 2: Run the verifier tests and observe failure**
+- [x] **Step 2: Run the verifier tests and observe failure**
 
 Run: `node --test scripts/github/verify-ai-lifecycle.test.mjs`  
 Expected: FAIL because the verifier does not exist.
 
-- [ ] **Step 3: Implement body and branch validation**
+- [x] **Step 3: Implement body and branch validation**
 
 Parse exactly one `Closes #N` line outside fenced code, exactly one value for every claim field, and branch names matching `^(feat|fix|security|docs)/<N>-[a-z0-9-]+$`. Require normalized PR author, Issue assignee, accountable owner, and claim-receipt actor to match.
 
-- [ ] **Step 4: Write live-state gate tests**
+- [x] **Step 4: Write live-state gate tests**
 
 Cover a valid review-state Issue; missing/deleted receipt; receipt by the wrong workflow actor; stale/expired claim; wrong assignee; waiting/ready/blocked/done label; multiple status labels; open dependency; PR head after last review; ambiguous closing PR; GitHub timeout; pagination exhaustion; and report/enforce modes.
 
-- [ ] **Step 5: Implement fail-closed live validation**
+- [x] **Step 5: Implement fail-closed live validation**
 
 Use the shared API client to fetch the current PR, Issue, comments, dependencies, closing PRs, and repository Actions bot identity. In enforce mode require `status:review`, one assignee matching the PR author, a current successful claim receipt URL from the PR body, and no contradictory release/stale receipt after it. Return structured evidence to the caller without mutating GitHub.
 
-- [ ] **Step 6: Add an explicit migration registry**
+- [x] **Step 6: Add an explicit migration registry**
 
 Use this schema with bounded entries:
 
@@ -647,11 +647,11 @@ Use this schema with bounded entries:
 
 The validator accepts a migration only in report/pre-activation mode, only for the exact PR/Issue pair, and only before expiry. Strict activation requires `activation_commit` to be a full 40-character commit on `main` and forbids every remaining migration entry.
 
-- [ ] **Step 7: Integrate the read-only validator into governance**
+- [x] **Step 7: Integrate the read-only validator into governance**
 
 Add `issues: read` to governance permissions. Run the lifecycle validator after existing review validation with the same immutable event file, token, repository, run ID, and static result. Keep the job read-only.
 
-- [ ] **Step 8: Run the complete governance suite and commit**
+- [x] **Step 8: Run the complete governance suite and commit**
 
 Run:
 
