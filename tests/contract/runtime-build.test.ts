@@ -141,7 +141,6 @@ const buildEnvironment = (): NodeJS.ProcessEnv => {
 };
 
 const FRESH_BUILD_COMMAND_BUDGET_MS = 90_000;
-const FRESH_BUILD_TEST_TIMEOUT_MS = 120_000;
 type FreshBuildCommandOptions = Omit<
   ExecFileSyncOptions,
   "killSignal" | "timeout"
@@ -673,202 +672,198 @@ describe("release runtime build contract", () => {
     expect(performance.now() - startedAt).toBeLessThan(1_000);
   });
 
-  it(
-    "freshly builds non-empty executable artifacts and exact migrations",
-    () => {
-      const buildRoot = copyWorkingTree();
-      const built = (path: string): string => join(buildRoot, path);
-      const readBuilt = (path: string): string =>
-        readFileSync(built(path), "utf8");
-      try {
-        for (const path of [
-          "packages/protocol/dist",
-          "apps/control-plane/dist",
-        ]) {
-          expect(existsSync(built(path))).toBe(false);
-        }
-        const environment = buildEnvironment();
-        const runFreshBuildCommand = createFreshBuildCommandRunner(
-          FRESH_BUILD_COMMAND_BUDGET_MS,
-        );
-        runFreshBuildCommand(
-          "pnpm",
-          ["install", "--offline", "--frozen-lockfile", "--ignore-scripts"],
-          {
-            cwd: buildRoot,
-            env: environment,
-            stdio: "pipe",
-          },
-        );
-        runFreshBuildCommand("pnpm", ["build"], {
+  it("freshly builds non-empty executable artifacts and exact migrations", () => {
+    const buildRoot = copyWorkingTree();
+    const built = (path: string): string => join(buildRoot, path);
+    const readBuilt = (path: string): string =>
+      readFileSync(built(path), "utf8");
+    try {
+      for (const path of [
+        "packages/protocol/dist",
+        "apps/control-plane/dist",
+      ]) {
+        expect(existsSync(built(path))).toBe(false);
+      }
+      const environment = buildEnvironment();
+      const runFreshBuildCommand = createFreshBuildCommandRunner(
+        FRESH_BUILD_COMMAND_BUDGET_MS,
+      );
+      runFreshBuildCommand(
+        "pnpm",
+        ["install", "--offline", "--frozen-lockfile", "--ignore-scripts"],
+        {
           cwd: buildRoot,
           env: environment,
           stdio: "pipe",
-        });
+        },
+      );
+      runFreshBuildCommand("pnpm", ["build"], {
+        cwd: buildRoot,
+        env: environment,
+        stdio: "pipe",
+      });
 
-        const javascript = [
-          "packages/protocol/dist/index.js",
-          "apps/control-plane/dist/main.js",
-          "apps/control-plane/dist/db/migrate.js",
-        ];
-        const assets = [
-          ...javascript,
-          "packages/protocol/dist/index.d.ts",
-          "apps/control-plane/dist/db/migrations/meta/_journal.json",
-          "apps/control-plane/dist/db/migrations/0002_result_acknowledgement.sql",
-        ];
-        for (const path of assets) {
-          expect(existsSync(built(path)), path).toBe(true);
-          expect(
-            statSync(built(path)).size,
-            `${path} must not be empty`,
-          ).toBeGreaterThan(0);
-        }
-        for (const path of javascript) {
-          runFreshBuildCommand(process.execPath, ["--check", built(path)], {
-            stdio: "pipe",
-          });
-        }
-        const compiledTests = String(
-          runFreshBuildCommand(
-            "find",
-            [
-              built("packages/protocol/dist"),
-              built("apps/control-plane/dist"),
-              "-type",
-              "f",
-              "(",
-              "-name",
-              "*.test.js",
-              "-o",
-              "-name",
-              "*.test.d.ts",
-              ")",
-            ],
-            { encoding: "utf8", stdio: "pipe" },
-          ),
-        ).trim();
-        expect(compiledTests).toBe("");
-        expect(readBuilt("packages/protocol/dist/index.d.ts")).toMatch(
-          /\bexport\b/,
-        );
-        const journal = JSON.parse(
-          readBuilt("apps/control-plane/dist/db/migrations/meta/_journal.json"),
-        ) as { entries?: Array<{ tag?: string; when?: number }> };
-        expect(journal.entries?.at(-1)).toMatchObject({
-          tag: "0002_result_acknowledgement",
-          when: 1788244364352,
-        });
+      const javascript = [
+        "packages/protocol/dist/index.js",
+        "apps/control-plane/dist/main.js",
+        "apps/control-plane/dist/db/migrate.js",
+      ];
+      const assets = [
+        ...javascript,
+        "packages/protocol/dist/index.d.ts",
+        "apps/control-plane/dist/db/migrations/meta/_journal.json",
+        "apps/control-plane/dist/db/migrations/0002_result_acknowledgement.sql",
+      ];
+      for (const path of assets) {
+        expect(existsSync(built(path)), path).toBe(true);
         expect(
-          createHash("sha256")
-            .update(
-              readBuilt(
-                "apps/control-plane/dist/db/migrations/0002_result_acknowledgement.sql",
-              ),
-            )
-            .digest("hex"),
-        ).toBe(
-          "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
-        );
-
-        const protocol = JSON.parse(
-          readBuilt("packages/protocol/package.json"),
-        ) as {
-          exports?: { "."?: { types?: string; default?: string } };
-          scripts?: { build?: string };
-        };
-        const controlPlane = JSON.parse(
-          readBuilt("apps/control-plane/package.json"),
-        ) as {
-          scripts?: { build?: string; migrate?: string; start?: string };
-        };
-        expect(protocol.scripts?.build).toMatch(/\btsc\b/);
-        expect(protocol.exports?.["."]?.types).toBe("./dist/index.d.ts");
-        expect(protocol.exports?.["."]?.default).toBe("./dist/index.js");
-        expect(controlPlane.scripts?.build).toMatch(/\btsc\b/);
-        expect(controlPlane.scripts?.build).toMatch(/migration/i);
-        expect(controlPlane.scripts?.migrate).toMatch(/dist\/db\/migrate\.js/);
-        expect(controlPlane.scripts?.start).toMatch(/dist\/main\.js/);
-
-        const runtimeRoot = join(buildRoot, "runtime");
-        runFreshBuildCommand(
-          "pnpm",
-          [
-            "--filter",
-            "@qhb/control-plane",
-            "deploy",
-            "--offline",
-            "--prod",
-            "--legacy",
-            runtimeRoot,
-          ],
-          { cwd: buildRoot, env: environment, stdio: "pipe" },
-        );
-        runFreshBuildCommand(
-          process.execPath,
-          ["scripts/runtime/prune-production-dependencies.mjs", runtimeRoot],
-          { cwd: buildRoot, env: environment, stdio: "pipe" },
-        );
-        for (const path of [
-          "dist/main.js",
-          "dist/db/migrate.js",
-          "node_modules/fastify",
-          "node_modules/drizzle-orm",
-          "node_modules/postgres",
-          "node_modules/zod",
-          "node_modules/@qhb/protocol",
-        ]) {
-          expect(existsSync(join(runtimeRoot, path)), path).toBe(true);
-        }
-        expect(existsSync(join(runtimeRoot, "src"))).toBe(false);
-        expect(existsSync(join(runtimeRoot, "tests"))).toBe(false);
-        const forbiddenDependencyTests = readdirSync(
-          join(runtimeRoot, "node_modules"),
-          { recursive: true, withFileTypes: true },
-        )
-          .filter((entry) => {
-            const name = entry.name.toLowerCase();
-            return entry.isDirectory()
-              ? ["test", "tests", "__tests__"].includes(name)
-              : /\.(?:test|spec)\.[^/]+(?:\.map)?$/u.test(name);
-          })
-          .map((entry) => entry.name)
-          .sort();
-        expect(forbiddenDependencyTests).toEqual([]);
-        runFreshBuildCommand(
-          process.execPath,
-          [
-            "--input-type=module",
-            "-e",
-            "for (const name of ['fastify', 'drizzle-orm', 'postgres', 'zod', '@qhb/protocol']) await import.meta.resolve(name)",
-          ],
-          {
-            cwd: runtimeRoot,
-            env: {
-              ...environment,
-              DATABASE_URL: "postgresql://qhb:qhb@127.0.0.1:1/qhb",
-            },
-            stdio: "pipe",
-          },
-        );
-        runFreshBuildCommand(
-          process.execPath,
-          ["--input-type=module", "-e", "await import('./dist/main.js')"],
-          {
-            cwd: runtimeRoot,
-            env: {
-              ...environment,
-              DATABASE_URL: "postgresql://qhb:qhb@127.0.0.1:1/qhb",
-            },
-            stdio: "pipe",
-          },
-        );
-      } finally {
-        rmSync(buildRoot, { recursive: true, force: true });
+          statSync(built(path)).size,
+          `${path} must not be empty`,
+        ).toBeGreaterThan(0);
       }
-    },
-    FRESH_BUILD_TEST_TIMEOUT_MS,
-  );
+      for (const path of javascript) {
+        runFreshBuildCommand(process.execPath, ["--check", built(path)], {
+          stdio: "pipe",
+        });
+      }
+      const compiledTests = String(
+        runFreshBuildCommand(
+          "find",
+          [
+            built("packages/protocol/dist"),
+            built("apps/control-plane/dist"),
+            "-type",
+            "f",
+            "(",
+            "-name",
+            "*.test.js",
+            "-o",
+            "-name",
+            "*.test.d.ts",
+            ")",
+          ],
+          { encoding: "utf8", stdio: "pipe" },
+        ),
+      ).trim();
+      expect(compiledTests).toBe("");
+      expect(readBuilt("packages/protocol/dist/index.d.ts")).toMatch(
+        /\bexport\b/,
+      );
+      const journal = JSON.parse(
+        readBuilt("apps/control-plane/dist/db/migrations/meta/_journal.json"),
+      ) as { entries?: Array<{ tag?: string; when?: number }> };
+      expect(journal.entries?.at(-1)).toMatchObject({
+        tag: "0002_result_acknowledgement",
+        when: 1788244364352,
+      });
+      expect(
+        createHash("sha256")
+          .update(
+            readBuilt(
+              "apps/control-plane/dist/db/migrations/0002_result_acknowledgement.sql",
+            ),
+          )
+          .digest("hex"),
+      ).toBe(
+        "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
+      );
+
+      const protocol = JSON.parse(
+        readBuilt("packages/protocol/package.json"),
+      ) as {
+        exports?: { "."?: { types?: string; default?: string } };
+        scripts?: { build?: string };
+      };
+      const controlPlane = JSON.parse(
+        readBuilt("apps/control-plane/package.json"),
+      ) as {
+        scripts?: { build?: string; migrate?: string; start?: string };
+      };
+      expect(protocol.scripts?.build).toMatch(/\btsc\b/);
+      expect(protocol.exports?.["."]?.types).toBe("./dist/index.d.ts");
+      expect(protocol.exports?.["."]?.default).toBe("./dist/index.js");
+      expect(controlPlane.scripts?.build).toMatch(/\btsc\b/);
+      expect(controlPlane.scripts?.build).toMatch(/migration/i);
+      expect(controlPlane.scripts?.migrate).toMatch(/dist\/db\/migrate\.js/);
+      expect(controlPlane.scripts?.start).toMatch(/dist\/main\.js/);
+
+      const runtimeRoot = join(buildRoot, "runtime");
+      runFreshBuildCommand(
+        "pnpm",
+        [
+          "--filter",
+          "@qhb/control-plane",
+          "deploy",
+          "--offline",
+          "--prod",
+          "--legacy",
+          runtimeRoot,
+        ],
+        { cwd: buildRoot, env: environment, stdio: "pipe" },
+      );
+      runFreshBuildCommand(
+        process.execPath,
+        ["scripts/runtime/prune-production-dependencies.mjs", runtimeRoot],
+        { cwd: buildRoot, env: environment, stdio: "pipe" },
+      );
+      for (const path of [
+        "dist/main.js",
+        "dist/db/migrate.js",
+        "node_modules/fastify",
+        "node_modules/drizzle-orm",
+        "node_modules/postgres",
+        "node_modules/zod",
+        "node_modules/@qhb/protocol",
+      ]) {
+        expect(existsSync(join(runtimeRoot, path)), path).toBe(true);
+      }
+      expect(existsSync(join(runtimeRoot, "src"))).toBe(false);
+      expect(existsSync(join(runtimeRoot, "tests"))).toBe(false);
+      const forbiddenDependencyTests = readdirSync(
+        join(runtimeRoot, "node_modules"),
+        { recursive: true, withFileTypes: true },
+      )
+        .filter((entry) => {
+          const name = entry.name.toLowerCase();
+          return entry.isDirectory()
+            ? ["test", "tests", "__tests__"].includes(name)
+            : /\.(?:test|spec)\.[^/]+(?:\.map)?$/u.test(name);
+        })
+        .map((entry) => entry.name)
+        .sort();
+      expect(forbiddenDependencyTests).toEqual([]);
+      runFreshBuildCommand(
+        process.execPath,
+        [
+          "--input-type=module",
+          "-e",
+          "for (const name of ['fastify', 'drizzle-orm', 'postgres', 'zod', '@qhb/protocol']) await import.meta.resolve(name)",
+        ],
+        {
+          cwd: runtimeRoot,
+          env: {
+            ...environment,
+            DATABASE_URL: "postgresql://qhb:qhb@127.0.0.1:1/qhb",
+          },
+          stdio: "pipe",
+        },
+      );
+      runFreshBuildCommand(
+        process.execPath,
+        ["--input-type=module", "-e", "await import('./dist/main.js')"],
+        {
+          cwd: runtimeRoot,
+          env: {
+            ...environment,
+            DATABASE_URL: "postgresql://qhb:qhb@127.0.0.1:1/qhb",
+          },
+          stdio: "pipe",
+        },
+      );
+    } finally {
+      rmSync(buildRoot, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it("accepts base CA certificates while rejecting application secrets and tests", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-image-audit-"));
