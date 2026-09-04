@@ -835,7 +835,7 @@ Make a harmless documentation change in the disposable PR. Obtain the applicable
 
 Set `activation_commit` to the exact 40-character protected-main commit containing the trusted workflow, set `mutation_acceptance` to `null`, and set `entries` to `[]`. Update repository status with acceptance Issue/PR/workflow URLs and GitHub-derived timestamps. Merge this registry change while validation is still report-only, verify reachability, and then set both repository variables to `enforce`.
 
-- [ ] **Step 6: Commit and open the activation PR through mutation acceptance**
+- [x] **Step 6: Commit and open the activation PR through mutation acceptance**
 
 The activation Issue itself must be claimed through `/ai-claim`, use a new `docs/<issue>-activate-ai-lifecycle` branch/worktree, and create a PR with complete lifecycle evidence while validation remains report-only. After it merges and both variables enter enforce, use the reopened disposable Issue for one fresh claim and final documentation smoke PR whose lifecycle evidence passes strict validation and closes the fixture. This proves that the system can govern work before and after its own activation without a circular gate.
 

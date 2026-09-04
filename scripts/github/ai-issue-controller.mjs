@@ -75,6 +75,14 @@ const assigneesOf = (issue) =>
 const managedTypeCount = (issue) =>
   labelsOf(issue).filter((label) => MANAGED_TYPE_LABELS.includes(label)).length;
 
+const managedStatusCount = (issue) =>
+  labelsOf(issue).filter((label) => STATUS_LABELS.includes(label)).length;
+
+const isClosedPreLifecycleHistory = (issue) =>
+  issue.state === "closed" &&
+  managedTypeCount(issue) === 1 &&
+  managedStatusCount(issue) === 0;
+
 const assertManagedIssue = (issue) => {
   const count = managedTypeCount(issue);
   if (count !== 1) {
@@ -1762,8 +1770,15 @@ export const reconcileRepositoryState = async ({
       "repository pull requests",
     ),
   ]);
-  const issues = listedIssues.filter(
+  const managedIssues = listedIssues.filter(
     (issue) => !issue.pull_request && managedTypeCount(issue) > 0,
+  );
+  const historicalSkipped = managedIssues
+    .filter(isClosedPreLifecycleHistory)
+    .map(({ number }) => requirePositiveInteger(number, "Issue number"))
+    .sort((left, right) => left - right);
+  const issues = managedIssues.filter(
+    (issue) => !isClosedPreLifecycleHistory(issue),
   );
   const openPullRequests = listedPullRequests.filter(
     (pullRequest) => pullRequest.state === "open",
@@ -1782,7 +1797,7 @@ export const reconcileRepositoryState = async ({
       throw error;
     }
   });
-  if (issues.length + pullRequests.length > maxObjects) {
+  if (managedIssues.length + pullRequests.length > maxObjects) {
     throw new Error(
       `AI lifecycle reconciliation exceeds the ${maxObjects}-object cap`,
     );
@@ -1852,7 +1867,12 @@ export const reconcileRepositoryState = async ({
       `${failures.length} repository lifecycle object(s) failed after reconciliation continued`,
     );
   }
-  return { status: mode, processed: results.length, results };
+  return {
+    status: mode,
+    processed: results.length,
+    historicalSkipped,
+    results,
+  };
 };
 
 export const runReconciliationPhases = async (phases) => {

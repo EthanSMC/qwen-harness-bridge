@@ -128,6 +128,8 @@ After merge, verify all of these outcomes:
 
 Reopening a completed Issue removes `status:done`, leaves it unassigned, and recalculates `status:ready` or `status:waiting`. A new claim is required.
 
+Closed Issues that predate lifecycle activation and have no lifecycle label remain read-only historical records; scheduled repository reconciliation reports their numbers and skips them without synthesizing claims or terminal receipts. This exception applies only when there are zero lifecycle labels. Any closed Issue that entered the lifecycle remains subject to the full state, assignee, claim, pull-request, and terminal-evidence checks.
+
 ## Release closure
 
 A milestone Release requires every milestone Issue closed with valid terminal evidence, no open milestone pull request, current acceptance results, successful security/compatibility/migration/rollback gates, synchronized changelog and versions, an available rollback-compatible artifact, and a tag/Release created from the verified protected-branch commit.

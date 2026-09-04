@@ -478,6 +478,62 @@ test("scheduled live-state reconciliation recovers a dropped PR event", async ()
   assert.equal(fake.workflowReceipts().at(-1).action, "pr-open");
 });
 
+test("repository reconciliation isolates pre-lifecycle closed history", async () => {
+  const historical = new FakeGitHub();
+  const historicalIssue = historical.issues.get(46);
+  historicalIssue.state = "closed";
+  historicalIssue.state_reason = "completed";
+  historicalIssue.closed_at = "2026-09-03T12:00:00.000Z";
+  historicalIssue.labels = [{ name: "type:docs" }];
+  historicalIssue.assignees = [{ login: "legacy-owner" }];
+
+  const result = await reconcileRepositoryState({
+    github: historical.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+  });
+  assert.deepEqual(result, {
+    status: "enforce",
+    processed: 0,
+    historicalSkipped: [46],
+    results: [],
+  });
+  assert.deepEqual(historical.mutations, []);
+
+  for (const { labels, message } of [
+    {
+      labels: [{ name: "type:docs" }, { name: "status:ready" }],
+      message: /Only claimed review work can reconcile to done/i,
+    },
+    {
+      labels: [{ name: "type:docs" }, { name: "type:bug" }],
+      message: /exactly one managed type label/i,
+    },
+  ]) {
+    const malformedManaged = new FakeGitHub();
+    const malformedIssue = malformedManaged.issues.get(46);
+    malformedIssue.state = "closed";
+    malformedIssue.state_reason = "completed";
+    malformedIssue.closed_at = "2026-09-03T12:00:00.000Z";
+    malformedIssue.labels = labels;
+    await assert.rejects(
+      () =>
+        reconcileRepositoryState({
+          github: malformedManaged.client,
+          repository: REPOSITORY,
+          defaultBranch: "main",
+          mode: "enforce",
+          now: NOW,
+        }),
+      (error) =>
+        error instanceof AggregateError &&
+        error.errors.some((failure) => message.test(failure.message)),
+    );
+  }
+});
+
 test("reconciliation phases continue after an earlier phase fails", async () => {
   const calls = [];
   await assert.rejects(
