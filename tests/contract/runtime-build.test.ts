@@ -1,4 +1,8 @@
-import { type ExecFileSyncOptions, execFileSync } from "node:child_process";
+import {
+  type ExecFileSyncOptions,
+  execFileSync,
+  spawnSync,
+} from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   cpSync,
@@ -1515,6 +1519,7 @@ describe("release runtime build contract", () => {
     expect(healthy).toMatch(
       /grep[^\n]*(?:owner|job|repository|prompt|path|https\?:\/\/|url|secret|error:)[\s\S]*then[\s\S]*exit\s+1/i,
     );
+
     expectBoundedPolling(healthy);
 
     expect(databaseLoss).toContain("set -euo pipefail");
@@ -1702,5 +1707,84 @@ describe("release runtime build contract", () => {
     expect(runbook).toMatch(
       /sudo\s+install[^\n]*-o\s+1000[^\n]*-g\s+1000[^\n]*-m\s+0400[^\n]*QHB_TLS_KEY/i,
     );
+  });
+
+  it("keeps the fixed repository error enum out of privacy matches", () => {
+    const workflow = read(".github/workflows/runtime.yml");
+    const runtimeJob = yamlMappingBlock(workflow, "jobs", "runtime");
+    const healthy = workflowStep(runtimeJob, "Verify healthy runtime");
+    const databaseLoss = workflowStep(
+      runtimeJob,
+      "Verify database failure separation",
+    );
+    const privacyCommand = healthy.match(
+      /if\s+grep\s+-E\s+-i\s+'([^']+)'\s+"\$RUNTIME_HEALTH_METRICS_BODY_FILE";\s+then\s+exit\s+1;\s+fi/,
+    );
+    const databasePrivacyCommand = databaseLoss.match(
+      /if\s+grep\s+-E\s+-i\s+'([^']+)'\s+"\$readiness_body_file";\s+then\s+exit\s+1;\s+fi/,
+    );
+    expect(privacyCommand).not.toBeNull();
+    expect(databasePrivacyCommand).not.toBeNull();
+    const privacyPattern = privacyCommand?.[1] ?? "";
+    const databasePrivacyPattern = databasePrivacyCommand?.[1] ?? "";
+    expect(privacyPattern).toContain("repository");
+    expect(databasePrivacyPattern).toBe(privacyPattern);
+
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-runtime-privacy-"));
+    const fixtureFile = join(fixtureRoot, "metrics.txt");
+    const matchesPrivacyPattern = (body: string): boolean => {
+      writeFileSync(fixtureFile, `${body}\n`);
+      const result = spawnSync(
+        "grep",
+        ["-E", "-i", privacyPattern, fixtureFile],
+        { encoding: "utf8" },
+      );
+      expect(result.error).toBeUndefined();
+      expect(result.signal).toBeNull();
+      expect(result.status).toBeOneOf([0, 1]);
+      return result.status === 0;
+    };
+
+    try {
+      for (const fixedEnum of [
+        "REPOSITORY_NOT_ALLOWED",
+        "repository_not_allowed",
+      ]) {
+        expect(
+          matchesPrivacyPattern(
+            `qhb_errors_total{error_code="${fixedEnum}"} 0`,
+          ),
+          `${fixedEnum} is a fixed public error enum, not a leak`,
+        ).toBe(false);
+      }
+
+      for (const sensitiveSample of [
+        "repository",
+        'repository_id="repo-123"',
+        'repository_name="repo-123"',
+        'repositoryName="repo-123"',
+        'repository-name="repo-123"',
+        'repository.name="repo-123"',
+        'repository="repo-123"',
+        "https://github.com/example/repository/path",
+        "path=/srv/repository/config",
+        'owner_id="owner-123"',
+        'job_id="job-123"',
+        'prompt="show private data"',
+        "url=https://example.test/private",
+        'secret="sensitive-value"',
+        "error: repository unavailable",
+        "stack trace: Error at handler",
+        "ECONNREFUSED 127.0.0.1:5432",
+        "SQLSTATE=08006",
+      ]) {
+        expect(
+          matchesPrivacyPattern(sensitiveSample),
+          `privacy pattern must match sensitive sample: ${sensitiveSample}`,
+        ).toBe(true);
+      }
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   });
 });
