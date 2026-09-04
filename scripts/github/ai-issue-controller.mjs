@@ -501,6 +501,92 @@ const verifyCompletedIssueEvidence = async ({
   return { claim, pullRequest, terminalReceipt };
 };
 
+const verifyClosedUnmergedPullRequestEvidence = ({
+  pullRequest,
+  issueNumber,
+  repository,
+  defaultBranch,
+  receipts,
+}) => {
+  if (pullRequest.state !== "closed" || pullRequest.merged === true) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Historical pull request evidence must be closed without a merge.",
+    );
+  }
+  const successfulReceipts = receipts.filter(
+    ({ result }) => result === "success",
+  );
+  const prCloseIndex = successfulReceipts.findLastIndex(
+    ({ action, pullRequestNumber }) =>
+      action === "pr-close" && pullRequestNumber === pullRequest.number,
+  );
+  const prCloseReceipt = successfulReceipts[prCloseIndex];
+  const prOpenReceipt = successfulReceipts
+    .slice(0, prCloseIndex)
+    .findLast(
+      ({ action, claimId, pullRequestNumber }) =>
+        action === "pr-open" &&
+        claimId === prCloseReceipt?.claimId &&
+        pullRequestNumber === pullRequest.number,
+    );
+  const claimReceipt = successfulReceipts.find(
+    ({ action, claimId }) =>
+      action === "claim" && claimId === prCloseReceipt?.claimId,
+  );
+  const released = successfulReceipts
+    .slice(prCloseIndex + 1)
+    .some(
+      ({ action, claimId }) =>
+        ["release", "expire"].includes(action) &&
+        claimId === prCloseReceipt?.claimId,
+    );
+  if (!prCloseReceipt || !prOpenReceipt || !claimReceipt || !released) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Closed unmerged pull request history requires a released claim-bound review cycle.",
+    );
+  }
+  const leaseReceipt = successfulReceipts
+    .slice(0, successfulReceipts.indexOf(prOpenReceipt))
+    .findLast(
+      ({ claimId, leaseExpiresAt }) =>
+        claimId === claimReceipt.claimId && leaseExpiresAt !== null,
+    );
+  const claim = {
+    claimId: claimReceipt.claimId,
+    owner: claimReceipt.actor,
+    agent: claimReceipt.agent,
+    leaseExpiresAt: leaseReceipt?.leaseExpiresAt ?? claimReceipt.leaseExpiresAt,
+    pullRequestNumber: pullRequest.number,
+    claimCommentId: claimReceipt.commentId,
+    claimedAt: claimReceipt.createdAt,
+  };
+  if (
+    primaryIssueNumber(pullRequest.body) !== issueNumber ||
+    claimReceiptCommentId({
+      body: pullRequest.body,
+      repository,
+      issueNumber,
+    }) !== claim.claimCommentId ||
+    pullRequest.user?.login !== claim.owner ||
+    pullRequest.base?.ref !== defaultBranch ||
+    pullRequest.base?.repo?.full_name?.toLowerCase() !==
+      repository.toLowerCase()
+  ) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Closed unmerged pull request history does not match its claim binding.",
+    );
+  }
+  requireReviewAdmissionChronology({
+    claim,
+    pullRequest,
+    eventAction: "opened",
+  });
+  return { claim, prCloseReceipt, prOpenReceipt };
+};
+
 const commentsFor = (github, issueNumber) =>
   github.getAll(`/issues/${issueNumber}/comments`, "Issue comments");
 
@@ -1261,7 +1347,6 @@ export const handlePullRequest = async ({
   }
   const observedState = statusOf(loaded.issue);
   if (
-    pullRequest.merged === true &&
     observedState === "done" &&
     loaded.issue.state === "closed" &&
     loaded.issue.state_reason === "completed" &&
@@ -1274,17 +1359,29 @@ export const handlePullRequest = async ({
       defaultBranch,
       loaded,
     });
-    if (verified.pullRequest.number !== pullRequest.number) {
-      await verifyCompletedIssueEvidence({
-        github,
+    if (pullRequest.merged === true) {
+      if (verified.pullRequest.number !== pullRequest.number) {
+        await verifyCompletedIssueEvidence({
+          github,
+          issueNumber,
+          repository,
+          defaultBranch,
+          loaded,
+          pullRequestNumber: pullRequest.number,
+        });
+      }
+      return { status: "unchanged" };
+    }
+    if (pullRequest.state === "closed") {
+      verifyClosedUnmergedPullRequestEvidence({
+        pullRequest,
         issueNumber,
         repository,
         defaultBranch,
-        loaded,
-        pullRequestNumber: pullRequest.number,
+        receipts: loaded.receipts,
       });
+      return { status: "unchanged" };
     }
-    return { status: "unchanged" };
   }
   const { state, assignee } = assertIssueInvariant(
     pullRequest.merged ? { ...loaded.issue, state: "open" } : loaded.issue,

@@ -1814,6 +1814,112 @@ test("merged pull event is idempotent when Issue close reconciliation won", asyn
   assert.ok(fake.issue().labels.some(({ name }) => name === "status:done"));
 });
 
+test("repository reconciliation verifies a released prior unmerged pull request generation", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const firstPull = fake.pull();
+  await handlePullRequest(
+    context(fake, fake.pullEvent(firstPull, "opened"), { eventId: 910 }),
+  );
+  const closedFirstPull = fake.pulls.get(51);
+  closedFirstPull.state = "closed";
+  closedFirstPull.updated_at = NOW;
+  await handlePullRequest(
+    context(fake, fake.pullEvent(closedFirstPull, "closed"), { eventId: 911 }),
+  );
+  await handleIssueComment(
+    context(
+      fake,
+      fake.command(912, "alice", "/ai-release\nreason: handoff requested"),
+    ),
+  );
+  await handleIssueComment(
+    context(fake, fake.command(913, "bob", "/ai-claim\nagent: codex"), {
+      randomUUID: () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    }),
+  );
+  const finalPull = fake.pull({ number: 52, user: "bob" });
+  await handlePullRequest(
+    context(fake, fake.pullEvent(finalPull, "opened"), { eventId: 914 }),
+  );
+  const mergedFinalPull = fake.pulls.get(52);
+  mergedFinalPull.state = "closed";
+  mergedFinalPull.merged = true;
+  mergedFinalPull.merged_at = NOW;
+  mergedFinalPull.updated_at = NOW;
+  mergedFinalPull.merge_commit_sha = "abc1234";
+  const governedIssue = fake.issues.get(46);
+  governedIssue.state = "closed";
+  governedIssue.state_reason = "completed";
+  governedIssue.closed_at = NOW;
+  await handlePullRequest(
+    context(fake, fake.pullEvent(mergedFinalPull, "closed"), { eventId: 915 }),
+  );
+
+  const result = await reconcileRepositoryState({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+  });
+  assert.equal(result.processed, 3);
+  assert.deepEqual(result.historicalSkipped, []);
+  assert.ok(result.results.every(({ status }) => status === "unchanged"));
+
+  const validComments = structuredClone(fake.comments.get(46));
+  const validFirstPullBody = closedFirstPull.body;
+  const assertReconciliationFailure = async (message) =>
+    assert.rejects(
+      () =>
+        reconcileRepositoryState({
+          github: fake.client,
+          repository: REPOSITORY,
+          defaultBranch: "main",
+          mode: "enforce",
+          now: NOW,
+        }),
+      (error) =>
+        error instanceof AggregateError &&
+        error.errors.some((failure) => message.test(failure.message)),
+    );
+
+  closedFirstPull.body = closedFirstPull.body.replace(
+    /issuecomment-[1-9]\d*/u,
+    "issuecomment-999",
+  );
+  await assertReconciliationFailure(/does not match its claim binding/i);
+  closedFirstPull.body = validFirstPullBody;
+
+  fake.comments.set(
+    46,
+    validComments.filter(({ body }) => !body.includes("\naction=pr-close\n")),
+  );
+  await assertReconciliationFailure(/receipt|claim|transition/i);
+
+  fake.comments.set(
+    46,
+    validComments.filter(({ body }) => !body.includes("\naction=release\n")),
+  );
+  await assertReconciliationFailure(/released claim-bound review cycle/i);
+
+  fake.comments.set(
+    46,
+    validComments.map((comment) =>
+      comment.body.includes("\naction=pr-close\n")
+        ? {
+            ...comment,
+            body: comment.body.replace(
+              "\npull-request=51\n",
+              "\npull-request=52\n",
+            ),
+          }
+        : comment,
+    ),
+  );
+  await assertReconciliationFailure(/pull request receipt|claim generation/i);
+});
+
 test("reopened completed Issue returns to ready with a fresh generation required", async () => {
   const fake = new FakeGitHub();
   await claim(fake);
