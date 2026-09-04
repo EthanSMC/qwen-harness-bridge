@@ -1,5 +1,5 @@
-import { lstat, readdir, realpath, rm } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { lstat, readdir, realpath, rm, stat } from "node:fs/promises";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const [runtimeRootArgument] = process.argv.slice(2);
 
@@ -34,13 +34,81 @@ if (
 
 const testDirectoryNames = new Set(["test", "tests", "__tests__"]);
 const testFilePattern = /\.(?:test|spec)\.[^/]+(?:\.map)?$/i;
+const visitedDirectories = new Set();
+
+const assertInsideNodeModules = (candidate, description) => {
+  const candidateRelativePath = relative(canonicalNodeModulesRoot, candidate);
+
+  if (
+    candidateRelativePath === ".." ||
+    candidateRelativePath.startsWith(`..${sep}`) ||
+    isAbsolute(candidateRelativePath)
+  ) {
+    throw new Error(
+      `Refusing to prune ${description} outside the deployed node_modules: ${candidate}`,
+    );
+  }
+};
 
 const prune = async (directory) => {
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
+  assertInsideNodeModules(directory, "directory");
+
+  if (visitedDirectories.has(directory)) return;
+  visitedDirectories.add(directory);
+
+  for (const entry of await readdir(directory, {
+    withFileTypes: true,
+  })) {
     const entryPath = join(directory, entry.name);
     const entryMetadata = await lstat(entryPath);
 
-    if (entryMetadata.isSymbolicLink()) continue;
+    if (entryMetadata.isSymbolicLink()) {
+      let canonicalTarget;
+      try {
+        canonicalTarget = await realpath(entryPath);
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          "code" in error &&
+          error.code === "ENOENT"
+        ) {
+          await rm(entryPath, { force: true });
+          continue;
+        }
+        throw error;
+      }
+      assertInsideNodeModules(canonicalTarget, `symbolic link ${entryPath}`);
+
+      if (
+        testDirectoryNames.has(entry.name.toLowerCase()) ||
+        testFilePattern.test(entry.name)
+      ) {
+        await rm(entryPath, { force: true });
+        continue;
+      }
+
+      const targetMetadata = await stat(canonicalTarget);
+      if (targetMetadata.isDirectory()) {
+        if (testDirectoryNames.has(basename(canonicalTarget).toLowerCase())) {
+          await rm(canonicalTarget, { force: true, recursive: true });
+          await rm(entryPath, { force: true });
+          continue;
+        }
+        await prune(canonicalTarget);
+        continue;
+      }
+
+      if (targetMetadata.isFile()) {
+        if (testFilePattern.test(basename(canonicalTarget))) {
+          await rm(canonicalTarget, { force: true });
+          await rm(entryPath, { force: true });
+        }
+        continue;
+      }
+
+      throw new Error(`Unsupported symbolic link target: ${entryPath}`);
+    }
+
     if (entryMetadata.isDirectory()) {
       if (testDirectoryNames.has(entry.name.toLowerCase())) {
         await rm(entryPath, { force: true, recursive: true });

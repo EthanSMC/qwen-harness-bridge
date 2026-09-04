@@ -9,6 +9,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -262,6 +263,84 @@ const normalizedWorkflowCommands = (workflow: string): string[] =>
   workflow.replace(/\\\r?\n\s*/g, " ").match(/\bdocker compose\b[^\n]*/g) ?? [];
 
 describe("release runtime build contract", () => {
+  it("prunes forbidden links through an in-root pnpm-style package symlink", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-prune-links-"));
+    const runtimeRoot = join(fixtureRoot, "runtime");
+    const nodeModulesRoot = join(runtimeRoot, "node_modules");
+    const packageRoot = join(
+      nodeModulesRoot,
+      ".pnpm/example@1.0.0/node_modules/example",
+    );
+    try {
+      mkdirSync(join(packageRoot, "fixtures"), { recursive: true });
+      writeFileSync(
+        join(packageRoot, "package.json"),
+        JSON.stringify({ name: "example", version: "1.0.0", main: "index.js" }),
+      );
+      writeFileSync(join(packageRoot, "index.js"), "export const value = 1;\n");
+      writeFileSync(
+        join(packageRoot, "fixtures/probe.js"),
+        "export const fixture = true;\n",
+      );
+      symlinkSync("fixtures", join(packageRoot, "tests"), "dir");
+      symlinkSync(".", join(packageRoot, "self"), "dir");
+      symlinkSync(
+        ".pnpm/example@1.0.0/node_modules/example",
+        join(nodeModulesRoot, "example"),
+        "dir",
+      );
+
+      execFileSync(
+        process.execPath,
+        [
+          absolute("scripts/runtime/prune-production-dependencies.mjs"),
+          runtimeRoot,
+        ],
+        { stdio: "pipe" },
+      );
+
+      expect(existsSync(join(nodeModulesRoot, "example/index.js"))).toBe(true);
+      expect(existsSync(join(nodeModulesRoot, "example/self"))).toBe(true);
+      expect(existsSync(join(nodeModulesRoot, "example/tests"))).toBe(false);
+      expect(existsSync(join(packageRoot, "fixtures/probe.js"))).toBe(true);
+    } finally {
+      rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
+  it("rejects a dependency symlink that escapes the deployed node_modules", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-prune-escape-"));
+    const runtimeRoot = join(fixtureRoot, "runtime");
+    const nodeModulesRoot = join(runtimeRoot, "node_modules");
+    const outsidePackage = join(fixtureRoot, "outside-package");
+    try {
+      mkdirSync(nodeModulesRoot, { recursive: true });
+      mkdirSync(outsidePackage, { recursive: true });
+      writeFileSync(join(outsidePackage, "outside.spec.js"), "do not mutate\n");
+      symlinkSync(
+        outsidePackage,
+        join(nodeModulesRoot, "escaped-package"),
+        "dir",
+      );
+
+      expect(() =>
+        execFileSync(
+          process.execPath,
+          [
+            absolute("scripts/runtime/prune-production-dependencies.mjs"),
+            runtimeRoot,
+          ],
+          { stdio: "pipe" },
+        ),
+      ).toThrow();
+      expect(
+        readFileSync(join(outsidePackage, "outside.spec.js"), "utf8"),
+      ).toBe("do not mutate\n");
+    } finally {
+      rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
   it("freshly builds non-empty executable artifacts and exact migrations", () => {
     const buildRoot = copyWorkingTree();
     const built = (path: string): string => join(buildRoot, path);
