@@ -50,6 +50,10 @@ export type ConnectorClientOptions = Readonly<{
 
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const MESSAGE_TTL_MS = 60_000;
+const DURABLE_RECEIPTS = "durable-receipts-v1";
+const MAX_UNCONFIRMED_FRAMES = 32;
+const MAX_UNCONFIRMED_BYTES = 128 * 1024;
+const RECEIPT_TIMEOUT_MS = 30_000;
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 const SOCKET_CLOSE_TIMEOUT_MS = 1_000;
 const ABORTED = Symbol("CONNECTOR_ABORTED");
@@ -149,6 +153,10 @@ export class DurableConnectorClient implements ConnectorClient {
   readonly #handlers = new Set<(command: ServerEnvelope) => Promise<void>>();
   readonly #outboundBySequence = new Map<number, StoredOutboundEvent>();
   readonly #sentOnConnection = new Set<number>();
+  readonly #unconfirmed = new Map<number, number>();
+  #lastReceiptProgress = 0;
+  #receiptTimer: ReturnType<typeof setInterval> | undefined;
+  #fatalError: Error | undefined;
   #clientSequence = 0;
   #serverCursor: SequenceCursor;
   #socket: WebSocket | undefined;
@@ -161,7 +169,6 @@ export class DurableConnectorClient implements ConnectorClient {
   #resolveWelcome: (() => void) | undefined;
   #helloMessage: PendingMessage | undefined;
   #welcomeReceived = false;
-  #retireSessionOnStop = false;
   #started = false;
   #stopping = false;
   #nextSession: { token: string; expiresAt: string } | undefined;
@@ -181,6 +188,8 @@ export class DurableConnectorClient implements ConnectorClient {
     for (const event of pending) {
       this.#rememberPending(event);
     }
+    const anchor = options.store.activeHello();
+    if (anchor !== undefined) this.#rememberPending(anchor);
   }
 
   start(signal: AbortSignal): Promise<void> {
@@ -221,8 +230,6 @@ export class DurableConnectorClient implements ConnectorClient {
 
   async #run(signal: AbortSignal): Promise<void> {
     const onAbort = (): void => {
-      this.#retireSessionOnStop =
-        this.#welcomeReceived && this.#socket?.readyState === WebSocket.OPEN;
       this.#stopping = true;
       this.#clearTimers();
       this.#closeSocket();
@@ -236,6 +243,7 @@ export class DurableConnectorClient implements ConnectorClient {
           const welcomed = await this.#connectOnce(signal);
           if (welcomed) attempt = 0;
         } catch {
+          if (this.#fatalError !== undefined) throw this.#fatalError;
           if (signal.aborted) break;
         }
         if (signal.aborted) break;
@@ -251,7 +259,6 @@ export class DurableConnectorClient implements ConnectorClient {
       this.#clearTimers();
       this.#closeSocket();
       this.#nextSession = undefined;
-      this.#retireSessionIfSafe();
       this.#stopping = true;
     }
   }
@@ -291,6 +298,7 @@ export class DurableConnectorClient implements ConnectorClient {
     });
     this.#socket = socket;
     this.#sentOnConnection.clear();
+    this.#unconfirmed.clear();
     this.#welcomeReceived = false;
     this.#welcomeWaiter = new Promise<void>((resolve) => {
       this.#resolveWelcome = resolve;
@@ -331,8 +339,10 @@ export class DurableConnectorClient implements ConnectorClient {
     });
     try {
       await closePromise;
+      if (this.#fatalError !== undefined) throw this.#fatalError;
       return this.#welcomeReceived;
     } catch (error) {
+      if (this.#fatalError !== undefined) throw this.#fatalError;
       if (this.#welcomeReceived) return true;
       throw error;
     } finally {
@@ -340,6 +350,8 @@ export class DurableConnectorClient implements ConnectorClient {
       this.#welcomeWaiter = undefined;
       this.#resolveWelcome = undefined;
       this.#clearHeartbeat();
+      if (this.#receiptTimer !== undefined) clearInterval(this.#receiptTimer);
+      this.#receiptTimer = undefined;
     }
   }
 
@@ -350,14 +362,32 @@ export class DurableConnectorClient implements ConnectorClient {
       throw new Error("CONNECTOR_HELLO_MISSING");
     }
     this.#helloMessage = hello;
-    this.#sendJson(socket, hello.message);
+    this.#sendRenewed(socket, hello);
+    this.#lastReceiptProgress = this.#now().getTime();
+    this.#receiptTimer = setInterval(() => {
+      if (
+        (!this.#welcomeReceived || this.#unconfirmed.size > 0) &&
+        this.#now().getTime() - this.#lastReceiptProgress >= RECEIPT_TIMEOUT_MS
+      )
+        this.#closeSocket(socket);
+    }, 1_000);
     await this.#welcomeWaiter;
-    if (signal.aborted || this.#socket !== socket) return;
+    if (signal.aborted || this.#socket !== socket || !this.#welcomeReceived)
+      return;
     await this.#sendPending(socket);
   }
 
   #prepareHello(): void {
-    if (this.#helloMessage !== undefined) return;
+    if (this.#helloMessage !== undefined) {
+      const message = this.#helloMessage.message;
+      if (
+        message.type !== "connector.hello" ||
+        !message.payload.capabilities?.includes(DURABLE_RECEIPTS)
+      )
+        throw new Error("CONNECTOR_INCOMPATIBLE_STATE");
+      if (this.#options.store.provenClientSequence() !== this.#clientSequence)
+        return;
+    }
     const lastClientSequence = this.#clientSequence;
     this.#helloMessage = this.#persistMessage((sequence) =>
       buildConnectorHello({
@@ -371,7 +401,12 @@ export class DurableConnectorClient implements ConnectorClient {
         now: this.#now(),
         connectorVersion:
           this.#options.connectorVersion ?? "qhb-harness-plugin/1.0",
-        capabilities: this.#options.capabilities ?? ["harness", "replay"],
+        capabilities: [
+          ...new Set([
+            ...(this.#options.capabilities ?? ["harness", "replay"]),
+            DURABLE_RECEIPTS,
+          ]),
+        ],
       }),
     );
   }
@@ -393,6 +428,12 @@ export class DurableConnectorClient implements ConnectorClient {
       return;
     }
     if (message.type === "connector.welcome" && !this.#validWelcome(message)) {
+      if (!message.payload.capabilities?.includes(DURABLE_RECEIPTS))
+        this.#fatalError = new Error("CONNECTOR_INCOMPATIBLE_PEER");
+      this.#closeSocket(socket);
+      return;
+    }
+    if (message.type === "ack" && !this.#validReceipt(message)) {
       this.#closeSocket(socket);
       return;
     }
@@ -465,10 +506,12 @@ export class DurableConnectorClient implements ConnectorClient {
 
     if (message.type === "connector.welcome") {
       this.#welcomeReceived = true;
+      const hello = this.#helloMessage?.message;
+      if (hello === undefined) throw new Error("CONNECTOR_HELLO_MISSING");
+      this.#acknowledgeOutbound(hello.sequence, hello.correlation_id);
       this.#startHeartbeat(socket, signal);
-      // Keep the accepted hello pending as the durable replay anchor. A later
-      // connection can resend that exact hello before replaying any uncertain
-      // post-welcome client sequences.
+      // The hello remains pinned separately after its receipt retires the row
+      // from the pending queue. Reconnect retains its immutable identity.
       await this.#recoverPendingInbound(socket);
       if (existing?.delivered === true) {
         await this.#completeInbound(message, true);
@@ -509,11 +552,41 @@ export class DurableConnectorClient implements ConnectorClient {
     const restoresWelcome =
       previous.type === "protocol.error" &&
       previous.payload.code === "MESSAGE_EXPIRED" &&
-      replacement.type === "connector.welcome";
+      replacement.type === "connector.welcome" &&
+      this.#validWelcome(replacement);
+    const restoresAck =
+      previous.type === "protocol.error" &&
+      previous.payload.code === "MESSAGE_EXPIRED" &&
+      replacement.type === "ack" &&
+      this.#validReceipt(replacement);
+    const restoresRejection =
+      previous.type === "protocol.error" &&
+      previous.payload.code === "MESSAGE_EXPIRED" &&
+      replacement.type === "protocol.error" &&
+      this.#pendingMessages().some(
+        ({ message }) =>
+          message.correlation_id === replacement.correlation_id &&
+          ((message.type === "job.claim" &&
+            replacement.payload.code === "CLAIM_REJECTED" &&
+            [
+              "The business deadline has expired.",
+              "The offered job was cancelled before it was claimed.",
+            ].includes(replacement.payload.message)) ||
+            (["job.event", "approval.requested", "job.cancelled"].includes(
+              message.type,
+            ) &&
+              replacement.payload.code === "EVENT_REJECTED" &&
+              replacement.payload.message ===
+                "The business deadline has expired.")),
+      );
     return (
-      (previousExpired && (sameSemanticEnvelope || isExpiryTombstone)) ||
+      (previousExpired &&
+        ((sameSemanticEnvelope && !isCommand(replacement)) ||
+          isExpiryTombstone)) ||
       isInactiveOfferTombstone ||
-      restoresWelcome
+      restoresWelcome ||
+      restoresAck ||
+      restoresRejection
     );
   }
 
@@ -523,6 +596,7 @@ export class DurableConnectorClient implements ConnectorClient {
     const hello = this.#helloMessage?.message;
     return (
       hello?.type === "connector.hello" &&
+      message.payload.capabilities?.includes(DURABLE_RECEIPTS) === true &&
       message.correlation_id === hello.correlation_id &&
       message.payload.connector_id === this.#options.connectorId &&
       message.payload.server_sequence === message.sequence &&
@@ -540,7 +614,7 @@ export class DurableConnectorClient implements ConnectorClient {
         throw new Error("CONNECTOR_STORED_INBOUND_INVALID");
       }
       if (Date.parse(message.expires_at) <= this.#now().getTime()) {
-        this.#options.store.markInboundDelivered(message.message_id);
+        this.#options.store.markInboundExpired(message.message_id);
         continue;
       }
       await this.#completeInbound(message, false);
@@ -578,10 +652,22 @@ export class DurableConnectorClient implements ConnectorClient {
         );
       }
       if (isCommand(message)) {
-        for (const handler of [...this.#handlers]) await handler(message);
+        if (Date.parse(message.expires_at) <= this.#now().getTime()) {
+          this.#options.store.markInboundExpired(message.message_id);
+          this.#enqueueAck(message.sequence);
+          return;
+        }
+        for (const handler of [...this.#handlers]) {
+          if (Date.parse(message.expires_at) <= this.#now().getTime()) {
+            this.#options.store.markInboundExpired(message.message_id);
+            this.#enqueueAck(message.sequence);
+            return;
+          }
+          await handler(message);
+        }
       }
     }
-    this.#enqueueAck(message.sequence);
+    if (message.type !== "ack") this.#enqueueAck(message.sequence);
     if (!delivered) {
       // ACK persistence precedes this marker. A crash after handler success but
       // before the marker can redeliver, giving commands at-least-once rather
@@ -592,21 +678,44 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   #acknowledgeOutbound(sequence: number, correlationId: string): void {
-    const stored = this.#outboundBySequence.get(sequence);
-    if (stored === undefined) return;
-    try {
-      const message = ConnectorClientMessageSchema.parse(
-        JSON.parse(stored.payload),
-      );
-      if (message.correlation_id !== correlationId) return;
-    } catch {
-      return;
+    this.#options.store.acknowledgeThrough(sequence, correlationId);
+    const prefix = this.#options.store.provenClientSequence();
+    for (const candidate of this.#outboundBySequence.keys()) {
+      if (candidate <= prefix) this.#outboundBySequence.delete(candidate);
     }
-    this.#options.store.acknowledgeEvent(stored.messageId);
-    this.#outboundBySequence.delete(sequence);
+    for (const candidate of this.#unconfirmed.keys()) {
+      if (candidate <= prefix) {
+        this.#unconfirmed.delete(candidate);
+        this.#lastReceiptProgress = this.#now().getTime();
+      }
+    }
+    this.#scheduleSendPump();
+  }
+
+  #validReceipt(
+    message: Extract<ConnectorServerMessage, { type: "ack" }>,
+  ): boolean {
+    const stored = this.#options.store.outboundEvent(message.payload.sequence);
+    if (stored === undefined) return false;
+    const parsed = ConnectorClientMessageSchema.safeParse(
+      JSON.parse(stored.payload),
+    );
+    return (
+      parsed.success &&
+      parsed.data.sequence === stored.sequence &&
+      parsed.data.message_id === stored.messageId &&
+      parsed.data.correlation_id === message.correlation_id
+    );
   }
 
   #enqueueAck(sequence: number): void {
+    if (
+      this.#pendingMessages().some(
+        ({ message }) =>
+          message.type === "ack" && message.payload.sequence === sequence,
+      )
+    )
+      return;
     this.#persistMessage((nextSequence) =>
       messageEnvelope(
         "ack",
@@ -644,11 +753,14 @@ export class DurableConnectorClient implements ConnectorClient {
     const message = build(sequence);
     const serialized = JSON.stringify(message);
     try {
-      this.#options.store.enqueueEvent({
-        messageId: message.message_id,
-        sequence,
-        payload: serialized,
-      });
+      this.#options.store.enqueueEvent(
+        {
+          messageId: message.message_id,
+          sequence,
+          payload: serialized,
+        },
+        message.type === "connector.hello",
+      );
     } catch (error) {
       if (error instanceof StoreSequenceError) {
         // One client process exclusively owns a Connector store. A conflict
@@ -675,6 +787,22 @@ export class DurableConnectorClient implements ConnectorClient {
     socket.send(JSON.stringify(message));
   }
 
+  #sendRenewed(socket: WebSocket, pending: PendingMessage): void {
+    const stored = this.#options.store.renewDelivery(
+      pending.stored.sequence,
+      new Date(this.#now().getTime() + MESSAGE_TTL_MS).toISOString(),
+    );
+    const message = ConnectorClientMessageSchema.parse(
+      JSON.parse(stored.payload),
+    );
+    if (this.#unconfirmed.size === 0)
+      this.#lastReceiptProgress = this.#now().getTime();
+    this.#outboundBySequence.set(stored.sequence, stored);
+    this.#unconfirmed.set(stored.sequence, Buffer.byteLength(stored.payload));
+    this.#sentOnConnection.add(stored.sequence);
+    this.#sendJson(socket, message);
+  }
+
   #rememberPending(event: StoredOutboundEvent): void {
     try {
       const message = ConnectorClientMessageSchema.parse(
@@ -684,18 +812,14 @@ export class DurableConnectorClient implements ConnectorClient {
         message.message_id !== event.messageId ||
         message.sequence !== event.sequence
       ) {
-        return;
+        throw new Error("CONNECTOR_STORED_OUTBOUND_INVALID");
       }
       this.#outboundBySequence.set(event.sequence, event);
-      if (
-        message.type === "connector.hello" &&
-        this.#helloMessage === undefined
-      ) {
+      if (message.type === "connector.hello") {
         this.#helloMessage = { stored: event, message };
       }
     } catch {
-      // The store only contains locally-created payloads. Ignore an invalid
-      // legacy row here; it cannot be safely sent to the control plane.
+      throw new Error("CONNECTOR_STORED_OUTBOUND_INVALID");
     }
   }
 
@@ -709,11 +833,11 @@ export class DurableConnectorClient implements ConnectorClient {
           message.message_id !== stored.messageId ||
           message.sequence !== stored.sequence
         ) {
-          return [];
+          throw new Error("CONNECTOR_STORED_OUTBOUND_INVALID");
         }
         return [{ stored, message }];
       } catch {
-        return [];
+        throw new Error("CONNECTOR_STORED_OUTBOUND_INVALID");
       }
     });
   }
@@ -723,11 +847,27 @@ export class DurableConnectorClient implements ConnectorClient {
       for (const pending of this.#pendingMessages()) {
         if (pending.message.type === "connector.hello") continue;
         if (this.#sentOnConnection.has(pending.stored.sequence)) continue;
+        if (
+          this.#unconfirmed.size >= MAX_UNCONFIRMED_FRAMES ||
+          [...this.#unconfirmed.values()].reduce(
+            (sum, bytes) => sum + bytes,
+            0,
+          ) +
+            Buffer.byteLength(
+              JSON.stringify({
+                ...pending.message,
+                expires_at: new Date(
+                  this.#now().getTime() + MESSAGE_TTL_MS,
+                ).toISOString(),
+              }),
+            ) >
+            MAX_UNCONFIRMED_BYTES
+        )
+          return;
         if (this.#socket !== socket || socket.readyState !== WebSocket.OPEN)
           return;
         this.#outboundBySequence.set(pending.stored.sequence, pending.stored);
-        this.#sendJson(socket, pending.message);
-        this.#sentOnConnection.add(pending.stored.sequence);
+        this.#sendRenewed(socket, pending);
       }
     });
     this.#sendPump = operation.catch(() => undefined);
@@ -753,31 +893,6 @@ export class DurableConnectorClient implements ConnectorClient {
       }
       this.#enqueueHeartbeat();
     }, HEARTBEAT_INTERVAL_MS);
-  }
-
-  #retireSessionIfSafe(): void {
-    if (!this.#retireSessionOnStop) return;
-    if (this.#options.store.pendingInboundMessages().length > 0) return;
-    const stored = this.#options.store.pendingEvents(0);
-    const pending = this.#pendingMessages();
-    if (stored.length !== pending.length) return;
-    for (const item of pending) {
-      if (item.message.type === "connector.hello") continue;
-      if (
-        (item.message.type !== "ack" &&
-          item.message.type !== "connector.heartbeat") ||
-        !this.#sentOnConnection.has(item.stored.sequence)
-      ) {
-        return;
-      }
-    }
-    for (const item of pending) {
-      this.#options.store.acknowledgeEvent(item.stored.messageId);
-      this.#outboundBySequence.delete(item.stored.sequence);
-    }
-    // A graceful close after every one-way control frame was put on this
-    // connection permits the next process to advance to a fresh hello/cursor.
-    this.#helloMessage = undefined;
   }
 
   #scheduleTokenRefresh(expiresAt: string, signal: AbortSignal): void {
@@ -885,6 +1000,8 @@ export class DurableConnectorClient implements ConnectorClient {
 
   #clearTimers(): void {
     this.#clearHeartbeat();
+    if (this.#receiptTimer !== undefined) clearInterval(this.#receiptTimer);
+    this.#receiptTimer = undefined;
     if (this.#refreshTimer !== undefined) clearTimeout(this.#refreshTimer);
     this.#refreshTimer = undefined;
   }

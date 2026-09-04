@@ -48,6 +48,45 @@ afterEach(() => {
 });
 
 describe("SQLite Harness plugin store", () => {
+  it("persists a proven prefix separately from its pinned reconnect hello", () => {
+    const path = makeDatabasePath();
+    const store = new SqlitePluginStore(path);
+    const hello = {
+      ...event(1),
+      payload: JSON.stringify({
+        sequence: 1,
+        type: "connector.hello",
+        correlation_id: "hello",
+      }),
+    };
+    store.enqueueEvent(hello, true);
+    store.enqueueEvent({
+      ...event(2),
+      payload: JSON.stringify({ sequence: 2, correlation_id: "event" }),
+    });
+    expect(() => store.acknowledgeThrough(2, "wrong")).toThrow();
+    expect(store.provenClientSequence()).toBe(0);
+    store.acknowledgeThrough(2, "event");
+    expect(store.pendingEvents(0)).toEqual([]);
+    expect(store.activeHello()?.messageId).toBe(hello.messageId);
+    store.close();
+    const reopened = new SqlitePluginStore(path);
+    expect(reopened.provenClientSequence()).toBe(2);
+    expect(reopened.activeHello()?.messageId).toBe(hello.messageId);
+    reopened.enqueueEvent(
+      {
+        ...event(3),
+        payload: JSON.stringify({
+          sequence: 3,
+          type: "connector.hello",
+          correlation_id: "next",
+        }),
+      },
+      true,
+    );
+    expect(reopened.activeHello()?.sequence).toBe(3);
+    reopened.close();
+  });
   it("creates an atomic WAL schema with the expected durable tables", () => {
     const databasePath = makeDatabasePath();
     const store = new SqlitePluginStore(databasePath);

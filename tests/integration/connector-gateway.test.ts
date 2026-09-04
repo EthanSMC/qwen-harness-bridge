@@ -1,9 +1,13 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import * as https from "node:https";
 import { type AddressInfo, Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type Duplex, PassThrough } from "node:stream";
 import { connect as connectTls } from "node:tls";
+import { ConnectorClientMessageSchema } from "@qhb/protocol";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hashConnectorCredential } from "../../apps/control-plane/src/connector/auth.js";
 import { createConnectorGateway } from "../../apps/control-plane/src/connector/gateway.js";
@@ -12,6 +16,13 @@ import { createConnectorSessionService } from "../../apps/control-plane/src/conn
 import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js";
 import { Aes256GcmEncryptor } from "../../apps/control-plane/src/domain/job-coordinator.js";
 import { createApp } from "../../apps/control-plane/src/http/app.js";
+import WebSocket from "../../packages/harness-plugin/node_modules/ws/index.js";
+import { SqlitePluginStore } from "../../packages/harness-plugin/src/store/plugin-store.js";
+import {
+  buildConnectorHello,
+  type ConnectorClientOptions,
+  createConnectorClient,
+} from "../../packages/harness-plugin/src/transport/connector-client.js";
 import {
   type ConnectorCredentials,
   FakeConnector,
@@ -455,11 +466,417 @@ beforeAll(async () => {
   await db.start();
 });
 
+const harnessClient = (
+  app: Awaited<ReturnType<typeof startApp>>,
+  credentials: ConnectorCredentials,
+  store: SqlitePluginStore,
+  options: Partial<ConnectorClientOptions> = {},
+) => {
+  const address = app.server.address() as AddressInfo;
+  return createConnectorClient({
+    connectorId: credentials.connector_id,
+    controlPlaneUrl: `wss://127.0.0.1:${address.port}/connector/v1`,
+    store,
+    bootstrapCredentialProvider: async () => credentials.credential_secret,
+    sessionTokenClient: {
+      exchange: async () => {
+        const session = await FakeConnector.exchangeSession(app, credentials);
+        return {
+          token: session.token,
+          expiresAt: new Date(Date.now() + 900_000).toISOString(),
+        };
+      },
+    },
+    webSocketFactory: (url, config) =>
+      new WebSocket(url, { ...config, ca: LOCALHOST_TLS.cert }),
+    reconnectDelay: () => 10_000,
+    ...options,
+  });
+};
+
 afterAll(async () => {
   await db.stop();
 });
 
 describe("Connector gateway authentication and handshake", () => {
+  it("retains a client ACK aborted after socket send before PostgreSQL receipt and recovers after restart", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const directory = mkdtempSync(join(tmpdir(), "qhb-receipt-abort-"));
+    const path = join(directory, "state.sqlite");
+    let store = new SqlitePluginStore(path);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let waiting = false;
+    const original = PostgresConnectorStore.prototype.acceptClientMessage;
+    const spy = vi
+      .spyOn(PostgresConnectorStore.prototype, "acceptClientMessage")
+      .mockImplementation(async function (identity, message, now) {
+        if (
+          identity.connectorId === credentials.connector_id &&
+          message.type === "ack" &&
+          !waiting
+        ) {
+          waiting = true;
+          await gate;
+        }
+        return original.call(this, identity, message, now);
+      });
+    const controller = new AbortController();
+    const running = harnessClient(app, credentials, store).start(
+      controller.signal,
+    );
+    try {
+      await vi.waitFor(() => expect(waiting).toBe(true));
+      controller.abort();
+      await running;
+      expect(store.pendingEvents(0).map((row) => row.sequence)).toEqual([2]);
+      expect(store.provenClientSequence()).toBe(1);
+      expect(
+        (
+          await db.query(
+            "SELECT last_client_sequence FROM connectors WHERE id = $1",
+            [credentials.connector_id],
+          )
+        ).rows[0]?.last_client_sequence,
+      ).toBe("1");
+      release();
+      await vi.waitFor(async () =>
+        expect(
+          (
+            await db.query(
+              "SELECT last_client_sequence FROM connectors WHERE id = $1",
+              [credentials.connector_id],
+            )
+          ).rows[0]?.last_client_sequence,
+        ).toBe("2"),
+      );
+      spy.mockRestore();
+      store.close();
+      store = new SqlitePluginStore(path);
+      const resumed = new AbortController();
+      const resumedRun = harnessClient(app, credentials, store).start(
+        resumed.signal,
+      );
+      try {
+        await vi.waitFor(() =>
+          expect(store.provenClientSequence()).toBeGreaterThanOrEqual(2),
+        );
+      } finally {
+        resumed.abort();
+        await resumedRun;
+      }
+      expect(store.activeHello()?.sequence).toBe(1);
+    } finally {
+      release();
+      controller.abort();
+      await running;
+      spy.mockRestore();
+      store.close();
+      await app.close();
+    }
+  });
+
+  it("restores a lost product ACK from a real replay tombstone after durable restart", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const directory = mkdtempSync(join(tmpdir(), "qhb-ack-restore-"));
+    const path = join(directory, "state.sqlite");
+    let store = new SqlitePluginStore(path);
+    const repositoryId = `restore-${crypto.randomUUID()}`;
+    await db.query(
+      "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, enabled) VALUES ($1, $2, 'Restore fixture', '/redacted', false)",
+      [repositoryId, OWNER_ID],
+    );
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      clientRequestId: crypto.randomUUID(),
+      repositoryId,
+      requestCiphertext: "fixture",
+      requestDigest: "fixture",
+    });
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1 WHERE id = $2",
+      [credentials.connector_id, job.jobId],
+    );
+    let lostSequence = 0;
+    const correlation = crypto.randomUUID();
+    const first = harnessClient(app, credentials, store, {
+      webSocketFactory: (url, options) => {
+        const socket = new WebSocket(url, {
+          ...options,
+          ca: LOCALHOST_TLS.cert,
+        });
+        const emit = socket.emit.bind(socket);
+        socket.emit = ((event: string | symbol, ...args: unknown[]) => {
+          if (event === "message") {
+            const message = JSON.parse(String(args[0]));
+            if (
+              message.type === "ack" &&
+              message.correlation_id === correlation
+            ) {
+              lostSequence = message.sequence;
+              socket.close();
+              return true;
+            }
+          }
+          return emit(event, ...args);
+        }) as typeof socket.emit;
+        return socket;
+      },
+    });
+    const controller = new AbortController();
+    const running = first.start(controller.signal);
+    try {
+      await vi.waitFor(() =>
+        expect(store.provenClientSequence()).toBeGreaterThanOrEqual(2),
+      );
+      await first.publish(
+        "job.event",
+        {
+          job_id: job.jobId,
+          attempt: 1,
+          event_type: "progress",
+          payload: { stage: "testing" },
+          source: "harness",
+        },
+        correlation,
+      );
+      await vi.waitFor(() => expect(lostSequence).toBeGreaterThan(0));
+      controller.abort();
+      await running;
+      const pending = store
+        .pendingEvents(0)
+        .find((row) => JSON.parse(row.payload).correlation_id === correlation);
+      if (pending === undefined)
+        throw new Error("fixture pending product missing");
+      await db.query(
+        "UPDATE connector_messages SET expires_at = clock_timestamp() - interval '1 second' WHERE connector_id = $1 AND direction = 'server' AND sequence = $2",
+        [credentials.connector_id, lostSequence],
+      );
+      store.close();
+      store = new SqlitePluginStore(path);
+      const observed: string[] = [];
+      const resumed = new AbortController();
+      const resumedRun = harnessClient(app, credentials, store, {
+        webSocketFactory: (url, options) => {
+          const socket = new WebSocket(url, {
+            ...options,
+            ca: LOCALHOST_TLS.cert,
+          });
+          socket.on("message", (data) => {
+            const message = JSON.parse(String(data));
+            if (message.sequence === lostSequence) observed.push(message.type);
+          });
+          return socket;
+        },
+      }).start(resumed.signal);
+      try {
+        await vi.waitFor(
+          () =>
+            expect(store.provenClientSequence()).toBeGreaterThanOrEqual(
+              pending.sequence,
+            ),
+          { timeout: 5_000 },
+        );
+      } finally {
+        resumed.abort();
+        await resumedRun;
+      }
+      expect(observed).toEqual(["protocol.error", "ack"]);
+      expect(store.inboundMessageBySequence(lostSequence)?.delivered).toBe(
+        true,
+      );
+      expect(
+        JSON.parse(store.inboundMessageBySequence(lostSequence)?.body ?? "{}")
+          .type,
+      ).toBe("ack");
+      expect(
+        (
+          await db.query(
+            "SELECT id FROM job_events WHERE job_id = $1 AND source = 'harness'",
+            [job.jobId],
+          )
+        ).rows,
+      ).toHaveLength(1);
+    } finally {
+      controller.abort();
+      await running;
+      store.close();
+      await app.close();
+    }
+  }, 15_000);
+  it("drains 130 expired unreceived ACKs through both durable endpoints without overflowing admission", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const directory = mkdtempSync(join(tmpdir(), "qhb-durable-endpoints-"));
+    const local = new SqlitePluginStore(join(directory, "state.sqlite"));
+    const old = new Date(Date.now() - 120_000);
+    const hello = buildConnectorHello({
+      connectorId: credentials.connector_id,
+      sequence: 1,
+      lastServerSequence: 0,
+      correlationId: crypto.randomUUID(),
+      now: old,
+      capabilities: ["durable-receipts-v1"],
+    });
+    local.enqueueEvent(
+      {
+        messageId: hello.message_id,
+        sequence: 1,
+        payload: JSON.stringify(hello),
+      },
+      true,
+    );
+    for (let sequence = 2; sequence <= 131; sequence++) {
+      const ack = ConnectorClientMessageSchema.parse({
+        ...hello,
+        type: "ack",
+        sequence,
+        message_id: crypto.randomUUID(),
+        correlation_id: crypto.randomUUID(),
+        payload: { sequence: 1 },
+      });
+      local.enqueueEvent({
+        messageId: ack.message_id,
+        sequence,
+        payload: JSON.stringify(ack),
+      });
+    }
+    const repositoryId = `expired-${crypto.randomUUID()}`;
+    await db.query(
+      "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, enabled) VALUES ($1, $2, 'Expired fixture', '/redacted', false)",
+      [repositoryId, OWNER_ID],
+    );
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      clientRequestId: crypto.randomUUID(),
+      repositoryId,
+      requestCiphertext: "fixture",
+      requestDigest: "fixture",
+    });
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1, expires_at = clock_timestamp() - interval '1 minute' WHERE id = $2",
+      [credentials.connector_id, job.jobId],
+    );
+    const product = ConnectorClientMessageSchema.parse({
+      ...hello,
+      sequence: 132,
+      message_id: crypto.randomUUID(),
+      correlation_id: crypto.randomUUID(),
+      type: "job.event",
+      payload: {
+        job_id: job.jobId,
+        attempt: 1,
+        event_type: "progress",
+        payload: { stage: "testing" },
+        source: "harness",
+      },
+    });
+    const heartbeat = ConnectorClientMessageSchema.parse({
+      ...hello,
+      sequence: 133,
+      message_id: crypto.randomUUID(),
+      correlation_id: crypto.randomUUID(),
+      type: "connector.heartbeat",
+      payload: {},
+    });
+    for (const message of [product, heartbeat])
+      local.enqueueEvent({
+        messageId: message.message_id,
+        sequence: message.sequence,
+        payload: JSON.stringify(message),
+      });
+    const address = app.server.address() as AddressInfo;
+    const closes: number[] = [];
+    const wires: Record<string, unknown>[] = [];
+    const client = createConnectorClient({
+      connectorId: credentials.connector_id,
+      controlPlaneUrl: `wss://127.0.0.1:${address.port}/connector/v1`,
+      store: local,
+      bootstrapCredentialProvider: async () => credentials.credential_secret,
+      sessionTokenClient: {
+        exchange: async () => {
+          const session = await FakeConnector.exchangeSession(app, credentials);
+          return {
+            token: session.token,
+            expiresAt: new Date(Date.now() + 900_000).toISOString(),
+          };
+        },
+      },
+      webSocketFactory: (url, options) => {
+        const socket = new WebSocket(url, {
+          ...options,
+          ca: LOCALHOST_TLS.cert,
+        });
+        const send = socket.send.bind(socket);
+        socket.send = ((data: string) => {
+          wires.push(JSON.parse(data));
+          send(data);
+        }) as typeof socket.send;
+        socket.on("close", (code: number) => closes.push(code));
+        return socket;
+      },
+      reconnectDelay: () => 10,
+    });
+    const controller = new AbortController();
+    const running = client.start(controller.signal);
+    try {
+      await vi.waitFor(
+        () => expect(local.provenClientSequence()).toBeGreaterThanOrEqual(133),
+        { timeout: 10_000 },
+      );
+      expect(closes).not.toContain(1013);
+      expect(wires.filter((m) => m.type === "connector.hello")).toHaveLength(1);
+      expect(wires[0]).toMatchObject({
+        message_id: hello.message_id,
+        sequence: 1,
+        sent_at: hello.sent_at,
+      });
+      expect(Date.parse(String(wires[0]?.expires_at))).toBeGreaterThan(
+        Date.parse(hello.expires_at),
+      );
+      const receipts = await db.query<{ count: string }>(
+        "SELECT count(*) FROM connector_messages WHERE connector_id = $1 AND direction = 'client'",
+        [credentials.connector_id],
+      );
+      expect(Number(receipts.rows[0]?.count)).toBeGreaterThanOrEqual(131);
+      const outcomes = await db.query(
+        "SELECT type, payload FROM connector_messages WHERE connector_id = $1 AND direction = 'server' AND correlation_id = $2 ORDER BY sequence",
+        [credentials.connector_id, product.correlation_id],
+      );
+      expect(outcomes.rows).toMatchObject([
+        { type: "protocol.error", payload: { code: "EVENT_REJECTED" } },
+        { type: "ack", payload: { sequence: 132 } },
+      ]);
+      expect(
+        (
+          await db.query(
+            "SELECT id FROM job_events WHERE job_id = $1 AND source = 'harness'",
+            [job.jobId],
+          )
+        ).rows,
+      ).toHaveLength(0);
+      expect(
+        (
+          await db.query("SELECT status, revision FROM jobs WHERE id = $1", [
+            job.jobId,
+          ])
+        ).rows[0],
+      ).toMatchObject({ status: "running", revision: 0 });
+    } finally {
+      controller.abort();
+      await running;
+      local.close();
+      await app.close();
+    }
+    const reopened = new SqlitePluginStore(join(directory, "state.sqlite"));
+    expect(reopened.provenClientSequence()).toBeGreaterThanOrEqual(131);
+    expect(reopened.activeHello()?.messageId).toBe(hello.message_id);
+    reopened.close();
+  }, 15_000);
   it("contains synchronous Upgrade construction failures without an unhandled rejection", async () => {
     const server = https.createServer(LOCALHOST_TLS);
     const signingKey = "gateway-upgrade-failure-signing-key-fixture";

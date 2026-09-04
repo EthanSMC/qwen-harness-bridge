@@ -502,6 +502,7 @@ export const JobCancelledPayloadSchema = z
 export const ConnectorWelcomePayloadSchema = z
   .object({
     connector_id: ConnectorIdSchema,
+    capabilities: z.array(CapabilitySchema).max(32).optional(),
     server_sequence: NonNegativeIntegerSchema,
     replay_from: NonNegativeIntegerSchema,
   })

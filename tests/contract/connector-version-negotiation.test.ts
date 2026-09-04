@@ -6,6 +6,30 @@ import { describe, expect, it } from "vitest";
 import { buildConnectorHello } from "../../packages/harness-plugin/src/transport/connector-client.js";
 
 describe("connector protocol version negotiation", () => {
+  it("accepts an explicit bounded durable-receipts welcome echo", () => {
+    const message = {
+      protocol_version: "1.0",
+      message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      sequence: 1,
+      sent_at: "2026-09-05T00:00:00.000Z",
+      expires_at: "2026-09-05T00:01:00.000Z",
+      correlation_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      type: "connector.welcome",
+      payload: {
+        connector_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        server_sequence: 1,
+        replay_from: 1,
+        capabilities: ["durable-receipts-v1"],
+      },
+    };
+    expect(ConnectorServerMessageSchema.parse(message)).toEqual(message);
+    expect(
+      ConnectorServerMessageSchema.safeParse({
+        ...message,
+        payload: { ...message.payload, capabilities: Array(33).fill("x") },
+      }).success,
+    ).toBe(false);
+  });
   it("builds a protocol 1.0 hello accepted by the shared client schema", () => {
     const hello = buildConnectorHello({
       connectorId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",

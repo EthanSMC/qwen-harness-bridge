@@ -23,6 +23,7 @@ import {
 } from "../store/plugin-store.js";
 import { reconnectDelayMs } from "./backoff.js";
 import {
+  buildConnectorHello,
   type ConnectorClient,
   type ConnectorClientOptions,
   createConnectorClient,
@@ -38,6 +39,12 @@ const BOOTSTRAP_CREDENTIAL = "bootstrap-credential-fixture";
 const JOB_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 type JsonRecord = Record<string, unknown>;
+
+const required = <T>(value: T | undefined | null): T => {
+  if (value === undefined || value === null)
+    throw new Error("fixture value missing");
+  return value;
+};
 
 const isoAfter = (milliseconds: number): string =>
   new Date(Date.now() + milliseconds).toISOString();
@@ -57,7 +64,10 @@ const envelope = (
     expires_at: new Date(sentAt.getTime() + 60_000).toISOString(),
     correlation_id: correlationId,
     type,
-    payload,
+    payload:
+      type === "connector.welcome"
+        ? { capabilities: ["durable-receipts-v1"], ...(payload as JsonRecord) }
+        : payload,
   });
 
 const readBody = async (request: IncomingMessage): Promise<JsonRecord> => {
@@ -136,6 +146,7 @@ const startFixture = async (): Promise<Fixture> => {
           sequence,
           {
             connector_id: CONNECTOR_ID,
+            capabilities: ["durable-receipts-v1"],
             server_sequence: sequence,
             replay_from:
               ((hello.payload as JsonRecord).last_server_sequence as number) +
@@ -288,6 +299,387 @@ describe("authenticated connector transport", () => {
     for (const item of stores.splice(0)) item.store.close();
     for (const fixture of fixtures.splice(0)) await fixture.close();
     vi.useRealTimers();
+  });
+
+  it("fails a missing welcome echo before commands or post-hello traffic", async () => {
+    const fixture = await startFixture();
+    fixture.autoWelcome = false;
+    fixtures.push(fixture);
+    const item = makeStore();
+    stores.push(item);
+    const client = makeClient(fixture, item.store);
+    const handler = vi.fn(async () => undefined);
+    client.onCommand(handler);
+    const controller = new AbortController();
+    const result = client
+      .start(controller.signal)
+      .catch((error: Error) => error);
+    try {
+      await waitFor(() => fixture.clientMessages.length === 1);
+      const socket = required([...fixture.sockets][0]);
+      fixture.send(
+        socket,
+        envelope("job.offer", 1, {
+          job_id: JOB_ID,
+          attempt: 1,
+          lease_id: randomUUID(),
+          repository_id: "repo",
+          request: "Run tests",
+        }),
+      );
+      const legacy = envelope(
+        "connector.welcome",
+        2,
+        { connector_id: CONNECTOR_ID, server_sequence: 2, replay_from: 1 },
+        required(fixture.clientMessages[0]).correlation_id as ReturnType<
+          typeof randomUUID
+        >,
+      );
+      if (legacy.type !== "connector.welcome")
+        throw new Error("fixture welcome missing");
+      delete legacy.payload.capabilities;
+      fixture.send(socket, legacy);
+      expect(await result).toMatchObject({
+        message: "CONNECTOR_INCOMPATIBLE_PEER",
+      });
+      expect(handler).not.toHaveBeenCalled();
+      expect(fixture.clientMessages).toHaveLength(1);
+    } finally {
+      controller.abort();
+      await result;
+    }
+  });
+
+  it("restores a correlated business rejection before its receipt ACK", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const item = makeStore();
+    stores.push(item);
+    const client = makeClient(fixture, item.store);
+    const controller = new AbortController();
+    const running = client.start(controller.signal);
+    const correlation = randomUUID();
+    try {
+      await waitFor(() => fixture.clientMessages.some((m) => m.type === "ack"));
+      await client.publish("job.event", jobEventPayload(), correlation);
+      await waitFor(() =>
+        fixture.clientMessages.some((m) => m.correlation_id === correlation),
+      );
+      const product = required(
+        fixture.clientMessages.find((m) => m.correlation_id === correlation),
+      );
+      const socket = required([...fixture.sockets][0]);
+      const tombstone = envelope(
+        "protocol.error",
+        2,
+        {
+          code: "MESSAGE_EXPIRED",
+          message: "A Connector message expired before delivery.",
+        },
+        correlation,
+      );
+      fixture.send(socket, tombstone);
+      await waitFor(
+        () =>
+          item.store.inboundMessage(tombstone.message_id)?.delivered === true,
+      );
+      const restored = envelope(
+        "protocol.error",
+        2,
+        {
+          code: "EVENT_REJECTED",
+          message: "The business deadline has expired.",
+        },
+        correlation,
+      );
+      fixture.send(socket, restored);
+      expect(
+        await becomesTrue(
+          () =>
+            item.store.inboundMessage(restored.message_id)?.delivered === true,
+        ),
+      ).toBe(true);
+      fixture.send(
+        socket,
+        envelope("ack", 3, { sequence: product.sequence }, correlation),
+      );
+      await waitFor(
+        () => item.store.provenClientSequence() === product.sequence,
+      );
+    } finally {
+      controller.abort();
+      await running;
+    }
+  });
+
+  it("preserves an incompatible pending legacy hello without allocating or rewriting", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const item = makeStore();
+    stores.push(item);
+    const hello = buildConnectorHello({
+      connectorId: CONNECTOR_ID,
+      sequence: 1,
+      lastServerSequence: 0,
+      correlationId: randomUUID(),
+      now: new Date(),
+    });
+    item.store.enqueueEvent(
+      {
+        messageId: hello.message_id,
+        sequence: 1,
+        payload: JSON.stringify(hello),
+      },
+      true,
+    );
+    const client = makeClient(fixture, item.store);
+    expect(() => client.start(new AbortController().signal)).toThrow(
+      "CONNECTOR_INCOMPATIBLE_STATE",
+    );
+    expect(item.store.maxOutboundSequence()).toBe(1);
+    expect(item.store.activeHello()?.payload).toBe(JSON.stringify(hello));
+  });
+
+  it.each([false, true])(
+    "reconnects on missing application receipt progress (welcome=%s) without retiring uncertain frames",
+    async (autoWelcome) => {
+      const fixture = await startFixture();
+      fixture.autoWelcome = autoWelcome;
+      fixtures.push(fixture);
+      const item = makeStore();
+      stores.push(item);
+      let time = Date.now();
+      const client = makeClient(fixture, item.store, {
+        now: () => new Date(time),
+        reconnectDelay: () => 10_000,
+      });
+      const controller = new AbortController();
+      const running = client.start(controller.signal);
+      try {
+        await waitFor(
+          () => fixture.clientMessages.length === (autoWelcome ? 2 : 1),
+        );
+        const sequence = item.store.maxOutboundSequence();
+        time += 30_001;
+        await waitFor(() => fixture.sockets.size === 0);
+        expect(item.store.maxOutboundSequence()).toBe(sequence);
+        expect(item.store.pendingEvents(0)).toHaveLength(1);
+        expect(item.store.provenClientSequence()).toBe(autoWelcome ? 1 : 0);
+      } finally {
+        controller.abort();
+        await running;
+      }
+    },
+  );
+
+  it("bounds unconfirmed bytes independently of its frame limit", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const item = makeStore();
+    stores.push(item);
+    const client = makeClient(fixture, item.store);
+    const controller = new AbortController();
+    const running = client.start(controller.signal);
+    try {
+      await waitFor(() =>
+        fixture.clientMessages.some((message) => message.type === "ack"),
+      );
+      const payload = Object.fromEntries(
+        Array.from({ length: 30 }, (_, i) => [`item${i}`, "a".repeat(450)]),
+      );
+      for (let i = 0; i < 12; i++)
+        await client.publish(
+          "job.event",
+          { ...jobEventPayload(), payload },
+          randomUUID(),
+        );
+      await waitFor(() => fixture.clientMessages.length >= 10);
+      const sent = fixture.clientMessages.filter(
+        (message) => message.type !== "connector.hello",
+      );
+      const bytes = sent.reduce(
+        (sum, message) => sum + Buffer.byteLength(JSON.stringify(message)),
+        0,
+      );
+      expect(sent.length).toBeLessThan(32);
+      expect(bytes).toBeLessThanOrEqual(128 * 1024);
+      expect(
+        bytes + Buffer.byteLength(JSON.stringify(sent.at(-1))),
+      ).toBeGreaterThan(128 * 1024);
+    } finally {
+      controller.abort();
+      await running;
+    }
+  });
+
+  it("records expired disposition when SQLite receipt crosses the command deadline", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const item = makeStore();
+    stores.push(item);
+    let time = Date.now();
+    const original = item.store.recordInbound.bind(item.store);
+    vi.spyOn(item.store, "recordInbound").mockImplementation(
+      (id, sequence, body) => {
+        const result = original(id, sequence, body);
+        if (JSON.parse(body).type === "job.offer") time += 61_000;
+        return result;
+      },
+    );
+    const client = makeClient(fixture, item.store, {
+      now: () => new Date(time),
+    });
+    const handler = vi.fn(async () => undefined);
+    client.onCommand(handler);
+    const controller = new AbortController();
+    const running = client.start(controller.signal);
+    try {
+      await waitFor(() =>
+        fixture.clientMessages.some((message) => message.type === "ack"),
+      );
+      const command = envelope("job.offer", fixture.nextServerSequence++, {
+        job_id: JOB_ID,
+        attempt: 1,
+        lease_id: randomUUID(),
+        repository_id: "repo",
+        request: "Run tests",
+      });
+      fixture.send(required([...fixture.sockets][0]), command);
+      await waitFor(
+        () => item.store.inboundMessage(command.message_id)?.delivered === true,
+      );
+      expect(handler).not.toHaveBeenCalled();
+      const database = new Database(join(item.directory, "state.sqlite"), {
+        readonly: true,
+      });
+      try {
+        expect(
+          database
+            .prepare("SELECT value FROM metadata WHERE key = ?")
+            .get(`inbound-disposition:${command.message_id}`),
+        ).toEqual({ value: "expired" });
+      } finally {
+        database.close();
+      }
+    } finally {
+      controller.abort();
+      await running;
+    }
+  });
+
+  it("renews a delayed first hello without changing its identity and retains unproven ACKs on abort", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const item = makeStore();
+    stores.push(item);
+    const credentials = deferred<string>();
+    let time = Date.now() - 120_000;
+    const client = makeClient(fixture, item.store, {
+      now: () => new Date(time),
+      bootstrapCredentialProvider: () => credentials.promise,
+    });
+    const controller = new AbortController();
+    const running = client.start(controller.signal);
+    const original = JSON.parse(
+      required(item.store.pendingEvents(0)[0]).payload,
+    );
+    time = Date.now();
+    credentials.resolve(BOOTSTRAP_CREDENTIAL);
+    try {
+      await waitFor(() => fixture.clientMessages.some((m) => m.type === "ack"));
+      const hello = required(fixture.clientMessages[0]);
+      expect(hello).toEqual({
+        ...original,
+        expires_at: new Date(time + 60_000).toISOString(),
+      });
+    } finally {
+      controller.abort();
+      await running;
+    }
+    expect(
+      item.store
+        .pendingEvents(0)
+        .some((row) => JSON.parse(row.payload).type === "ack"),
+    ).toBe(true);
+    expect(item.store.activeHello()?.messageId).toBe(original.message_id);
+  });
+
+  it("bounds unconfirmed traffic at 32 frames and does not ACK server ACKs", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const item = makeStore();
+    stores.push(item);
+    const client = makeClient(fixture, item.store);
+    const controller = new AbortController();
+    const running = client.start(controller.signal);
+    try {
+      await waitFor(() => fixture.clientMessages.some((m) => m.type === "ack"));
+      for (let i = 0; i < 130; i++)
+        await client.publish("job.event", jobEventPayload(), randomUUID());
+      await waitFor(() => fixture.clientMessages.length >= 33);
+      expect(
+        fixture.clientMessages.filter((m) => m.type !== "connector.hello"),
+      ).toHaveLength(32);
+      const last = required(fixture.clientMessages.at(-1));
+      const beforeAcks = fixture.clientMessages.filter(
+        (m) => m.type === "ack",
+      ).length;
+      fixture.send(
+        required([...fixture.sockets][0]),
+        envelope(
+          "ack",
+          fixture.nextServerSequence++,
+          { sequence: last.sequence },
+          last.correlation_id as ReturnType<typeof randomUUID>,
+        ),
+      );
+      await waitFor(() => fixture.clientMessages.length > 33);
+      expect(
+        fixture.clientMessages.filter((m) => m.type === "ack"),
+      ).toHaveLength(beforeAcks);
+      expect(item.store.provenClientSequence()).toBe(last.sequence);
+    } finally {
+      controller.abort();
+      await running;
+    }
+  });
+
+  it("rechecks expiry after receipt and before each handler", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const item = makeStore();
+    stores.push(item);
+    let time = Date.now();
+    const client = makeClient(fixture, item.store, {
+      now: () => new Date(time),
+    });
+    const first = vi.fn(async () => {
+      time += 61_000;
+    });
+    const second = vi.fn(async () => undefined);
+    client.onCommand(first);
+    client.onCommand(second);
+    const controller = new AbortController();
+    const running = client.start(controller.signal);
+    try {
+      await waitFor(() => fixture.clientMessages.some((m) => m.type === "ack"));
+      const command = envelope("job.offer", fixture.nextServerSequence++, {
+        job_id: JOB_ID,
+        attempt: 1,
+        lease_id: randomUUID(),
+        repository_id: "repo",
+        request: "Run tests",
+      });
+      fixture.send(required([...fixture.sockets][0]), command);
+      await waitFor(
+        () => item.store.inboundMessage(command.message_id)?.delivered === true,
+      );
+      expect(first).toHaveBeenCalledTimes(1);
+      expect(second).not.toHaveBeenCalled();
+    } finally {
+      controller.abort();
+      await running;
+    }
   });
 
   it("exchanges the bootstrap credential over HTTPS and negotiates protocol 1.0 over WSS", async () => {
@@ -456,17 +848,13 @@ describe("authenticated connector transport", () => {
     });
     const replayStart = fixture.clientMessages.indexOf(secondHello) + 1;
     fixture.send(secondSocket, welcome);
-    await waitFor(() => fixture.clientMessages.length >= replayStart + 3);
-    const replayed = fixture.clientMessages.slice(replayStart, replayStart + 3);
+    await waitFor(() => fixture.clientMessages.length >= replayStart + 2);
+    const replayed = fixture.clientMessages.slice(replayStart, replayStart + 2);
 
     secondController.abort();
     await secondRunning;
-    expect(replayed.map(({ type }) => type)).toEqual([
-      "job.event",
-      "ack",
-      "ack",
-    ]);
-    expect(replayed.map(({ sequence }) => sequence)).toEqual([2, 3, 4]);
+    expect(replayed.map(({ type }) => type)).toEqual(["job.event", "ack"]);
+    expect(replayed.map(({ sequence }) => sequence)).toEqual([2, 3]);
   });
 
   it("reconnects after hello expiry with a refreshed same-sequence welcome", async () => {
@@ -525,7 +913,7 @@ describe("authenticated connector transport", () => {
       message_id: firstHello.message_id,
       sequence: firstHello.sequence,
     });
-    expect(Date.parse(String(replayedHello.expires_at))).toBeLessThan(
+    expect(Date.parse(String(replayedHello.expires_at))).toBeGreaterThan(
       clock.getTime(),
     );
     const refreshedWelcome = envelope(
@@ -550,7 +938,7 @@ describe("authenticated connector transport", () => {
     expect(originalAfterReplacement).toBeUndefined();
   });
 
-  it("processes a same-sequence command tombstone once and re-ACKs its duplicate", async () => {
+  it("processes a same-sequence command tombstone once and coalesces its pending ACK", async () => {
     const fixture = await startFixture();
     fixtures.push(fixture);
     const { store, directory } = makeStore();
@@ -602,7 +990,7 @@ describe("authenticated connector transport", () => {
           (message) =>
             message.type === "ack" &&
             (message.payload as JsonRecord).sequence === command.sequence,
-        ).length === 3,
+        ).length === 1,
     );
 
     controller.abort();
@@ -697,7 +1085,7 @@ describe("authenticated connector transport", () => {
     await running;
   });
 
-  it("durably receives a command before ACK, suppresses duplicates, and re-ACKs them", async () => {
+  it("durably receives a command before ACK, suppresses duplicates, and coalesces unconfirmed ACKs", async () => {
     const fixture = await startFixture();
     fixtures.push(fixture);
     const { store, directory } = makeStore();
@@ -753,7 +1141,7 @@ describe("authenticated connector transport", () => {
           (message) =>
             message.type === "ack" &&
             (message.payload as JsonRecord).sequence === command.sequence,
-        ).length === 2,
+        ).length === 1,
     );
     expect(handlerCalls).toBe(1);
 
@@ -894,13 +1282,20 @@ describe("authenticated connector transport", () => {
       pendingInboundMessages: () => baseStore.pendingInboundMessages(),
       markInboundDelivered: (messageId) =>
         baseStore.markInboundDelivered(messageId),
+      markInboundExpired: (messageId) =>
+        baseStore.markInboundExpired(messageId),
+      activeHello: () => baseStore.activeHello(),
+      outboundEvent: (sequence) => baseStore.outboundEvent(sequence),
+      renewDelivery: (...args) => baseStore.renewDelivery(...args),
+      provenClientSequence: () => baseStore.provenClientSequence(),
+      acknowledgeThrough: (...args) => baseStore.acknowledgeThrough(...args),
       mapJob: (input) => baseStore.mapJob(input),
       findJob: (jobId) => baseStore.findJob(jobId),
       listNonterminalJobs: () => baseStore.listNonterminalJobs(),
-      enqueueEvent: (event) => {
+      enqueueEvent: (event, pinHello) => {
         const message = JSON.parse(event.payload) as JsonRecord;
         operations.push(`enqueueEvent:${String(message.type)}`);
-        baseStore.enqueueEvent(event);
+        baseStore.enqueueEvent(event, pinHello);
       },
       pendingEvents: (afterSequence) => baseStore.pendingEvents(afterSequence),
       acknowledgeEvent: (messageId) => baseStore.acknowledgeEvent(messageId),
@@ -1139,6 +1534,12 @@ describe("authenticated connector transport", () => {
     );
     firstController.abort();
     await firstRunning;
+    const pendingAck = required(store.pendingEvents(0)[0]);
+    expect(JSON.parse(pendingAck.payload).type).toBe("ack");
+    store.acknowledgeThrough(
+      pendingAck.sequence,
+      JSON.parse(pendingAck.payload).correlation_id,
+    );
     expect(store.pendingEvents(0)).toHaveLength(0);
 
     const secondController = new AbortController();
@@ -1392,7 +1793,7 @@ describe("authenticated connector transport", () => {
             (message) =>
               message.type === "ack" &&
               (message.payload as JsonRecord).sequence === command.sequence,
-          ).length === 2,
+          ).length === 1,
       );
     }
     const deliveryState = reopened.inboundMessage(command.message_id);
