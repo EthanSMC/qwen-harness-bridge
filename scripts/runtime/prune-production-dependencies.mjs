@@ -1,4 +1,4 @@
-import { lstat, readdir, realpath, rm, stat } from "node:fs/promises";
+import { lstat, readdir, readFile, realpath, rm, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 const [runtimeRootArgument] = process.argv.slice(2);
@@ -51,9 +51,43 @@ const isContainedBy = (root, candidate) => {
   );
 };
 
-const isPnpmWorkspaceLink = (candidate) =>
+const isPnpmWorkspaceLinkCandidate = (candidate) =>
   candidate !== pnpmWorkspaceNodeModulesRoot &&
   isContainedBy(pnpmWorkspaceNodeModulesRoot, candidate);
+
+let pnpmWorkspaceSelfLink;
+const loadPnpmWorkspaceSelfLink = async () => {
+  if (pnpmWorkspaceSelfLink !== undefined) return pnpmWorkspaceSelfLink;
+
+  const packageJson = JSON.parse(
+    await readFile(join(canonicalRoot, "package.json"), "utf8"),
+  );
+  const packageName = packageJson?.name;
+  const packageNameSegments =
+    typeof packageName === "string" ? packageName.split("/") : [];
+  const hasValidShape = packageName?.startsWith("@")
+    ? packageNameSegments.length === 2 &&
+      packageNameSegments[0]?.length > 1 &&
+      packageNameSegments[1]?.length > 0
+    : packageNameSegments.length === 1 && packageNameSegments[0]?.length > 0;
+  const hasSafeSegments = packageNameSegments.every(
+    (segment) =>
+      segment !== "." &&
+      segment !== ".." &&
+      !segment.includes("\\") &&
+      !segment.includes("\0"),
+  );
+
+  if (!hasValidShape || !hasSafeSegments) {
+    throw new Error("runtime package.json must contain a valid package name");
+  }
+
+  pnpmWorkspaceSelfLink = join(
+    pnpmWorkspaceNodeModulesRoot,
+    ...packageNameSegments,
+  );
+  return pnpmWorkspaceSelfLink;
+};
 
 const assertInsideNodeModules = (candidate, description) => {
   if (!isContainedBy(canonicalNodeModulesRoot, candidate)) {
@@ -92,7 +126,8 @@ const prune = async (directory) => {
       }
       if (
         !isContainedBy(canonicalNodeModulesRoot, canonicalTarget) &&
-        isPnpmWorkspaceLink(entryPath)
+        isPnpmWorkspaceLinkCandidate(entryPath) &&
+        entryPath === (await loadPnpmWorkspaceSelfLink())
       ) {
         await rm(entryPath, { force: true });
         continue;
