@@ -1651,6 +1651,16 @@ test("main drains commands but never treats a pull-request comment target as an 
       method: options.method,
       path: `${requestUrl.pathname}${requestUrl.search}`,
     });
+    if (
+      requestUrl.pathname.includes(
+        "/compare/b06aceb805f03dc809b37b80cb45a240bb5be66d...main",
+      )
+    ) {
+      return new Response(JSON.stringify({ status: "ahead" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     if (requestUrl.pathname.endsWith("/issues/comments")) {
       return new Response("[]", {
         status: 200,

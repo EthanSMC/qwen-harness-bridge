@@ -790,15 +790,15 @@ git add CHANGELOG.md docs/github/repository-status.md
 git commit -m "docs(governance): record AI lifecycle verification"
 ```
 
-- [ ] **Step 5: Push and create the bootstrap pull request**
+- [x] **Step 5: Push and create the bootstrap pull request**
 
 Push `docs/46-ai-issue-lifecycle`. Create one PR with `Closes #46`, exact base/head commit range, current checks URL, test results, risk/rollback, existing review-mode evidence, and an explicit pre-activation migration statement. Do not claim strict lifecycle enforcement is active yet.
 
-- [ ] **Step 6: Obtain independent final review and current-head CI**
+- [x] **Step 6: Obtain independent final review and current-head CI**
 
 Use a reviewer distinct from every implementation agent. Review the complete `origin/main..HEAD` range, fix every finding, rerun the full matrix, then obtain a fresh final PASS. Update the PR body with the exact final commit range and current checks URL. Query GitHub checks independently before merge.
 
-- [ ] **Step 7: Merge and verify bootstrap closure**
+- [x] **Step 7: Merge and verify bootstrap closure**
 
 Merge only when protected-branch requirements pass. Verify PR merged, Issue #46 closed as completed, merge commit reachable from `origin/main`, report-mode workflow installed, and migration registry/status evidence present.
 
@@ -815,21 +815,21 @@ Merge only when protected-branch requirements pass. Verify PR merged, Issue #46 
 - Consumes: report-mode implementation merged from Task 8.
 - Produces: a child activation Issue, disposable live acceptance Issue/PR, strict mutation and validation modes, activation commit, and end-to-end public evidence.
 
-- [ ] **Step 1: Create and classify the activation Issue**
+- [x] **Step 1: Create and classify the activation Issue**
 
 Create a child Issue titled `[Governance] Activate and prove AI Issue lifecycle`, with `Blocked by #46`, the ten live acceptance cases from Spec section 16.3, exact rollback (set both lifecycle mode variables to `report`), and no private data. After #46 closes, run synchronization and verify it becomes `status:ready`.
 
-- [ ] **Step 2: Enable command mutations for the acceptance repository**
+- [x] **Step 2: Enable command mutations for the acceptance repository**
 
 Keep `AI_LIFECYCLE_VALIDATION_MODE=report` and set only `AI_LIFECYCLE_MUTATION_MODE=enforce` while the committed `mutation_acceptance` window remains unexpired. Immediately verify the workflow still uses protected `main`; if the first enforce run fails unexpectedly, set the mutation variable back to `report` before any manual state edit.
 
-- [ ] **Step 3: Execute the live command lifecycle**
+- [x] **Step 3: Execute the live command lifecycle**
 
 On a disposable documentation-only Issue, exercise in order: first claim success, competing claim rejection, heartbeat, block, resume, release, fresh claim, and qualifying pull request transition to review. Capture only public GitHub URLs and bounded receipts.
 
 - [ ] **Step 4: Complete independent review, CI, merge, close, and reopen**
 
-Make a harmless documentation change in the disposable PR. Obtain the applicable independent review gate and current-head checks, merge it, verify automatic Issue closure and `status:done`, reopen it, verify unassigned waiting/ready reconciliation, then close it as completed with an explicit acceptance note.
+Make a harmless documentation change in the disposable PR. Obtain the applicable independent review gate and current-head checks, merge it, verify automatic Issue closure and `status:done`, then reopen it and verify unassigned waiting/ready reconciliation. Preserve that valid ready state for the post-activation fresh claim and strict smoke PR in Step 6; its second verified merge closes the fixture, after which add an explicit acceptance note.
 
 - [ ] **Step 5: Remove bootstrap migrations and set activation commit**
 
@@ -837,7 +837,7 @@ Set `activation_commit` to the exact 40-character protected-main commit containi
 
 - [ ] **Step 6: Commit and open the activation PR through mutation acceptance**
 
-The activation Issue itself must be claimed through `/ai-claim`, use a new `docs/<issue>-activate-ai-lifecycle` branch/worktree, and create a PR with complete lifecycle evidence while validation remains report-only. After it merges and both variables enter enforce, create one final disposable documentation smoke PR whose lifecycle evidence passes strict validation. This proves that the system can govern work before and after its own activation without a circular gate.
+The activation Issue itself must be claimed through `/ai-claim`, use a new `docs/<issue>-activate-ai-lifecycle` branch/worktree, and create a PR with complete lifecycle evidence while validation remains report-only. After it merges and both variables enter enforce, use the reopened disposable Issue for one fresh claim and final documentation smoke PR whose lifecycle evidence passes strict validation and closes the fixture. This proves that the system can govern work before and after its own activation without a circular gate.
 
 - [ ] **Step 7: Verify final closure and repository-wide invariants**
 
