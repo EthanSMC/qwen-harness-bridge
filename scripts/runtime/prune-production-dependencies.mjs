@@ -35,15 +35,28 @@ if (
 const testDirectoryNames = new Set(["test", "tests", "__tests__"]);
 const testFilePattern = /\.(?:test|spec)\.[^/]+(?:\.map)?$/i;
 const visitedDirectories = new Set();
+const pnpmWorkspaceNodeModulesRoot = join(
+  canonicalNodeModulesRoot,
+  ".pnpm",
+  "node_modules",
+);
+
+const isContainedBy = (root, candidate) => {
+  const candidateRelativePath = relative(root, candidate);
+  return (
+    candidateRelativePath === "" ||
+    (candidateRelativePath !== ".." &&
+      !candidateRelativePath.startsWith(`..${sep}`) &&
+      !isAbsolute(candidateRelativePath))
+  );
+};
+
+const isPnpmWorkspaceLink = (candidate) =>
+  candidate !== pnpmWorkspaceNodeModulesRoot &&
+  isContainedBy(pnpmWorkspaceNodeModulesRoot, candidate);
 
 const assertInsideNodeModules = (candidate, description) => {
-  const candidateRelativePath = relative(canonicalNodeModulesRoot, candidate);
-
-  if (
-    candidateRelativePath === ".." ||
-    candidateRelativePath.startsWith(`..${sep}`) ||
-    isAbsolute(candidateRelativePath)
-  ) {
+  if (!isContainedBy(canonicalNodeModulesRoot, candidate)) {
     throw new Error(
       `Refusing to prune ${description} outside the deployed node_modules: ${candidate}`,
     );
@@ -76,6 +89,13 @@ const prune = async (directory) => {
           continue;
         }
         throw error;
+      }
+      if (
+        !isContainedBy(canonicalNodeModulesRoot, canonicalTarget) &&
+        isPnpmWorkspaceLink(entryPath)
+      ) {
+        await rm(entryPath, { force: true });
+        continue;
       }
       assertInsideNodeModules(canonicalTarget, `symbolic link ${entryPath}`);
 

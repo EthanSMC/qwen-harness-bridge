@@ -308,6 +308,43 @@ describe("release runtime build contract", () => {
     }
   });
 
+  it("unlinks an external pnpm workspace link without traversing its target", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-prune-workspace-"));
+    const buildRoot = join(fixtureRoot, "buildRoot");
+    const runtimeRoot = join(buildRoot, "runtime");
+    const workspacePackage = join(buildRoot, "apps/control-plane");
+    const workspaceLink = join(
+      runtimeRoot,
+      "node_modules/.pnpm/node_modules/@qhb/control-plane",
+    );
+    try {
+      mkdirSync(join(workspacePackage, "tests"), { recursive: true });
+      writeFileSync(
+        join(workspacePackage, "tests/secret.spec.js"),
+        "must remain outside the deployed runtime\n",
+      );
+      mkdirSync(dirname(workspaceLink), { recursive: true });
+      symlinkSync("../../../../../apps/control-plane", workspaceLink, "dir");
+
+      expect(() =>
+        execFileSync(
+          process.execPath,
+          [
+            absolute("scripts/runtime/prune-production-dependencies.mjs"),
+            runtimeRoot,
+          ],
+          { stdio: "pipe" },
+        ),
+      ).not.toThrow();
+      expect(existsSync(workspaceLink)).toBe(false);
+      expect(
+        readFileSync(join(workspacePackage, "tests/secret.spec.js"), "utf8"),
+      ).toBe("must remain outside the deployed runtime\n");
+    } finally {
+      rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
   it("rejects a dependency symlink that escapes the deployed node_modules", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-prune-escape-"));
     const runtimeRoot = join(fixtureRoot, "runtime");
