@@ -63,7 +63,7 @@ const validateResponseIds = (value, seen = new Set(), contextKey = null) => {
     }
   }
   if (Array.isArray(value)) {
-    for (const item of value) validateResponseIds(item, seen, contextKey);
+    for (const item of value) validateResponseIds(item, seen);
     return;
   }
   for (const [key, child] of Object.entries(value)) {

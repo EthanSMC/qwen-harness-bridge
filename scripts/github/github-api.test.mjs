@@ -57,6 +57,10 @@ test("accepts Git object IDs without weakening numeric object ID checks", async 
     () => clientFor({ id: oid }).get("/issues/46"),
     /id.*positive|positive.*id/i,
   );
+  await assert.rejects(
+    () => clientFor({ head_commit: [{ id: oid }] }).get("/run"),
+    /id.*positive|positive.*id/i,
+  );
 });
 
 test("uses the GitHub response Date as the server clock", async () => {
