@@ -4,8 +4,9 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  type OutboundEventInput,
   SqlitePluginStore,
-  type StoredOutboundEvent,
+  StoreInboundConflictError,
   StoreSequenceError,
 } from "./plugin-store.js";
 
@@ -20,12 +21,22 @@ const makeDatabasePath = () => {
 const event = (
   sequence: number,
   messageId = `event-${sequence}`,
-): StoredOutboundEvent => ({
+): OutboundEventInput => ({
   messageId,
   sequence,
   payload: JSON.stringify({ sequence }),
-  attempts: 0,
 });
+
+const captureStoreError = (
+  operation: () => void,
+): Error & { code?: string } => {
+  try {
+    operation();
+  } catch (error) {
+    return error as Error & { code?: string };
+  }
+  throw new Error("Expected store operation to fail");
+};
 
 afterEach(() => {
   while (temporaryDirectories.length > 0) {
@@ -61,26 +72,102 @@ describe("SQLite Harness plugin store", () => {
     database.close();
   });
 
-  it("rejects an unknown future schema version without applying a partial migration", () => {
+  it.each([-1, 2, 99])(
+    "rejects unsupported schema version %s without applying a partial migration",
+    (version) => {
+      const databasePath = makeDatabasePath();
+      const database = new Database(databasePath);
+      database.pragma(`user_version = ${version}`);
+      database.close();
+
+      expect(() => new SqlitePluginStore(databasePath)).toThrow(
+        "STORE_SCHEMA_VERSION_UNSUPPORTED",
+      );
+
+      const reopened = new Database(databasePath, { readonly: true });
+      expect(reopened.pragma("user_version", { simple: true })).toBe(version);
+      expect(
+        reopened
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'inbound_messages'",
+          )
+          .get(),
+      ).toBeUndefined();
+      reopened.close();
+    },
+  );
+
+  it("rolls back a malformed version-zero schema instead of blessing it", () => {
     const databasePath = makeDatabasePath();
     const database = new Database(databasePath);
-    database.pragma("user_version = 99");
+    database.exec(
+      "CREATE TABLE inbound_messages (message_id TEXT PRIMARY KEY NOT NULL)",
+    );
     database.close();
 
     expect(() => new SqlitePluginStore(databasePath)).toThrow(
-      "STORE_SCHEMA_VERSION_UNSUPPORTED",
+      "STORE_SCHEMA_INCOMPATIBLE",
     );
 
     const reopened = new Database(databasePath, { readonly: true });
-    expect(reopened.pragma("user_version", { simple: true })).toBe(99);
+    expect(reopened.pragma("user_version", { simple: true })).toBe(0);
     expect(
       reopened
         .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'inbound_messages'",
+          "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
         )
-        .get(),
-    ).toBeUndefined();
+        .all()
+        .map((row) => (row as { name: string }).name),
+    ).toEqual(["inbound_messages"]);
+    expect(reopened.pragma("table_info(inbound_messages)")).toHaveLength(1);
     reopened.close();
+  });
+
+  it("rejects a malformed version-one schema instead of trusting user_version", () => {
+    const databasePath = makeDatabasePath();
+    const database = new Database(databasePath);
+    database.exec("CREATE TABLE metadata (key TEXT PRIMARY KEY NOT NULL)");
+    database.pragma("user_version = 1");
+    database.close();
+
+    expect(() => new SqlitePluginStore(databasePath)).toThrow(
+      "STORE_SCHEMA_INCOMPATIBLE",
+    );
+
+    const reopened = new Database(databasePath, { readonly: true });
+    expect(reopened.pragma("user_version", { simple: true })).toBe(1);
+    expect(
+      reopened
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+        )
+        .all()
+        .map((row) => (row as { name: string }).name),
+    ).toEqual(["metadata"]);
+    reopened.close();
+  });
+
+  it("rejects a version-one schema missing a required check constraint", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    store.close();
+
+    const database = new Database(databasePath);
+    database.exec(`
+      ALTER TABLE inbound_messages RENAME TO inbound_messages_old;
+      CREATE TABLE inbound_messages (
+        message_id TEXT PRIMARY KEY NOT NULL,
+        sequence INTEGER NOT NULL UNIQUE,
+        body TEXT NOT NULL,
+        received_at TEXT NOT NULL
+      );
+      DROP TABLE inbound_messages_old;
+    `);
+    database.close();
+
+    expect(() => new SqlitePluginStore(databasePath)).toThrow(
+      "STORE_SCHEMA_INCOMPATIBLE",
+    );
   });
 
   it("deduplicates inbound message IDs and persists the decision after reopen", () => {
@@ -94,6 +181,54 @@ describe("SQLite Harness plugin store", () => {
     const reopened = new SqlitePluginStore(databasePath);
     expect(reopened.recordInbound("message-1", 1, "body")).toBe("duplicate");
     reopened.close();
+  });
+
+  it("rejects reused inbound IDs unless sequence and body match exactly", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    store.recordInbound("message-private", 1, "body-private");
+
+    for (const [sequence, body] of [
+      [2, "body-private"],
+      [1, "body-changed-private"],
+    ] as const) {
+      const error = captureStoreError(() =>
+        store.recordInbound("message-private", sequence, body),
+      );
+      expect(error).toMatchObject({
+        name: "StoreInboundConflictError",
+        code: "STORE_INBOUND_CONFLICT",
+        message: "STORE_INBOUND_CONFLICT",
+      });
+      expect(error).toBeInstanceOf(StoreInboundConflictError);
+      expect(error.message).not.toMatch(
+        /message-private|body-private|body-changed-private/,
+      );
+    }
+
+    expect(store.recordInbound("message-private", 1, "body-private")).toBe(
+      "duplicate",
+    );
+    store.close();
+  });
+
+  it("rejects a different inbound message at an already recorded sequence", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    store.recordInbound("message-1", 1, "first-body");
+
+    const error = captureStoreError(() =>
+      store.recordInbound("message-2-private", 1, "second-body-private"),
+    );
+    expect(error).toMatchObject({
+      name: "StoreInboundConflictError",
+      code: "STORE_INBOUND_CONFLICT",
+      message: "STORE_INBOUND_CONFLICT",
+    });
+    expect(error).toBeInstanceOf(StoreInboundConflictError);
+    expect(error.message).not.toMatch(/message-2-private|second-body-private/);
+    expect(store.recordInbound("message-1", 1, "first-body")).toBe("duplicate");
+    store.close();
   });
 
   it("stores the latest job mapping and rejects conflicting unique identities", () => {
@@ -198,6 +333,29 @@ describe("SQLite Harness plugin store", () => {
     );
     reopened.close();
     expect(existsSync(databasePath)).toBe(true);
+  });
+
+  it("always initializes outbound delivery state instead of accepting forged state", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    const forgedInput = {
+      ...event(1, "event-forged"),
+      attempts: 41,
+      acknowledgedAt: "2026-09-04T00:00:00.000Z",
+    } as OutboundEventInput;
+
+    store.enqueueEvent(forgedInput);
+
+    expect(store.pendingEvents(0)).toEqual([
+      {
+        messageId: "event-forged",
+        sequence: 1,
+        payload: JSON.stringify({ sequence: 1 }),
+        attempts: 1,
+        acknowledgedAt: null,
+      },
+    ]);
+    store.close();
   });
 
   it("preserves mappings and unacknowledged events across a simulated process exit", () => {

@@ -6,6 +6,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -53,6 +54,7 @@ const makeConfig = (
   });
 
 afterEach(() => {
+  vi.useRealTimers();
   while (temporaryDirectories.length > 0) {
     rmSync(temporaryDirectories.pop() as string, {
       recursive: true,
@@ -71,6 +73,52 @@ describe("Harness plugin configuration", () => {
       ),
     ).toThrow(ConfigValidationError);
   });
+
+  it.each([
+    "wss://user@control.example.test/connector",
+    "wss://:password@control.example.test/connector",
+    "wss://user:password@control.example.test/connector",
+    "wss://control.example.test/connector?credential=private",
+    "wss://control.example.test/connector?",
+    "wss://control.example.test/connector#private",
+    "wss://control.example.test/connector#",
+  ])(
+    "rejects control-plane URL authority or suffix data generically",
+    (url) => {
+      const fixture = makeFixture();
+
+      expect(() =>
+        parsePluginConfig(makeConfig(fixture, { controlPlaneUrl: url })),
+      ).toThrowError("INVALID_PLUGIN_CONFIG");
+      expect(() =>
+        parsePluginConfig(makeConfig(fixture, { controlPlaneUrl: url })),
+      ).not.toThrowError(/user|password|credential|private/);
+    },
+  );
+
+  it("allows and preserves the intended wss control-plane path", () => {
+    const fixture = makeFixture();
+
+    expect(parsePluginConfig(makeConfig(fixture)).controlPlaneUrl).toBe(
+      "wss://control.example.test/connector",
+    );
+  });
+
+  it.each(["/private/repository", "Repo-one", "repo.one", "a", "a".repeat(51)])(
+    "rejects invalid repository ID %s before reflecting it",
+    (repositoryId) => {
+      const fixture = makeFixture();
+      const repository = JSON.parse(makeConfig(fixture)).repositories[0];
+      repository.id = repositoryId;
+
+      expect(() =>
+        parsePluginConfig(makeConfig(fixture, { repositories: [repository] })),
+      ).toThrowError("INVALID_PLUGIN_CONFIG");
+      expect(() =>
+        parsePluginConfig(makeConfig(fixture, { repositories: [repository] })),
+      ).not.toThrowError(repositoryId);
+    },
+  );
 
   it("rejects duplicate repository IDs without exposing configured paths", () => {
     const fixture = makeFixture();
@@ -205,6 +253,23 @@ describe("Harness plugin configuration", () => {
       parsePluginConfig(makeConfig(fixture, { databasePath })),
     ).not.toThrow();
   });
+
+  it.each(["existing", "dangling"])(
+    "rejects a %s final-component database symlink without exposing it",
+    (targetKind) => {
+      const fixture = makeFixture();
+      const targetPath = join(fixture.directory, "database-target.sqlite");
+      if (targetKind === "existing") writeFileSync(targetPath, "");
+      symlinkSync(targetPath, fixture.databasePath);
+
+      expect(() => parsePluginConfig(makeConfig(fixture))).toThrowError(
+        "DATABASE_PATH_NOT_CANONICAL",
+      );
+      expect(() => parsePluginConfig(makeConfig(fixture))).not.toThrowError(
+        fixture.databasePath,
+      );
+    },
+  );
 });
 
 const makeFakeSpawn = (options: {
@@ -218,7 +283,7 @@ const makeFakeSpawn = (options: {
     const child = new EventEmitter() as ChildProcessWithoutNullStreams;
     const stdout = new PassThrough();
     const stderr = new PassThrough();
-    Object.assign(child, { stdout, stderr });
+    Object.assign(child, { stdout, stderr, kill: vi.fn(() => true) });
     queueMicrotask(() => {
       if (options.stdout !== undefined) stdout.end(options.stdout);
       if (options.stderr !== undefined) stderr.end(options.stderr);
@@ -228,6 +293,21 @@ const makeFakeSpawn = (options: {
     return child;
   });
   return spawn;
+};
+
+const makeControlledSpawn = () => {
+  const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const kill = vi.fn(() => true);
+  Object.assign(child, { stdout, stderr, kill });
+  return {
+    child,
+    stdout,
+    stderr,
+    kill,
+    spawn: vi.fn(() => child),
+  };
 };
 
 describe("macOS Keychain credential reader", () => {
@@ -302,5 +382,95 @@ describe("macOS Keychain credential reader", () => {
     await expect(result).rejects.not.toThrow(
       /private stderr|private-service|private-account|private credential/,
     );
+  });
+
+  it("times out, terminates the child, and settles safely across kill races", async () => {
+    vi.useFakeTimers();
+    const controlled = makeControlledSpawn();
+    controlled.kill.mockImplementation(() => {
+      controlled.child.emit("error", new Error("private kill race"));
+      controlled.child.emit("close", null, "SIGTERM");
+      return true;
+    });
+    const reader = new MacOSKeychainCredentialReader(controlled.spawn, 10);
+    const result = reader.read("private-service", "private-account");
+    const rejection = expect(result).rejects.toEqual(
+      expect.objectContaining({ code: "CONNECTOR_CREDENTIAL_UNAVAILABLE" }),
+    );
+
+    await vi.advanceTimersByTimeAsync(10);
+    const killCountAfterTimeout = controlled.kill.mock.calls.length;
+    if (killCountAfterTimeout === 0) {
+      controlled.child.emit("close", 1, null);
+    }
+
+    await rejection;
+    expect(killCountAfterTimeout).toBe(1);
+    expect(controlled.kill).toHaveBeenCalledWith("SIGTERM");
+    expect(controlled.child.listenerCount("error")).toBe(0);
+    expect(controlled.child.listenerCount("close")).toBe(0);
+    expect(controlled.stdout.listenerCount("data")).toBe(0);
+    expect(controlled.stdout.listenerCount("error")).toBe(0);
+    expect(controlled.stderr.listenerCount("data")).toBe(0);
+    expect(controlled.stderr.listenerCount("error")).toBe(0);
+  });
+
+  it.each(["stdout", "stderr"] as const)(
+    "handles a private %s stream error and terminates the child",
+    async (streamName) => {
+      const controlled = makeControlledSpawn();
+      controlled.kill.mockImplementation(() => {
+        controlled.child.emit("error", new Error("private child race"));
+        controlled.child.emit("close", null, "SIGTERM");
+        return true;
+      });
+      const reader = new MacOSKeychainCredentialReader(controlled.spawn);
+      const result = reader.read("private-service", "private-account");
+
+      controlled[streamName].emit(
+        "error",
+        new Error(`private ${streamName} details`),
+      );
+
+      await expect(result).rejects.toEqual(
+        expect.objectContaining({ code: "CONNECTOR_CREDENTIAL_UNAVAILABLE" }),
+      );
+      await expect(result).rejects.not.toThrow(
+        /private|service|account|stdout|stderr/,
+      );
+      expect(controlled.kill).toHaveBeenCalledWith("SIGTERM");
+    },
+  );
+
+  it.each([
+    ["stdout", "x".repeat(16 * 1_024 + 1)],
+    ["stderr", "x".repeat(1_025)],
+  ] as const)(
+    "terminates the child when %s exceeds its memory bound",
+    async (streamName, content) => {
+      const controlled = makeControlledSpawn();
+      const reader = new MacOSKeychainCredentialReader(controlled.spawn);
+      const result = reader.read("private-service", "private-account");
+
+      controlled[streamName].end(content);
+      controlled.child.emit("close", 0, null);
+
+      await expect(result).rejects.toEqual(
+        expect.objectContaining({ code: "CONNECTOR_CREDENTIAL_UNAVAILABLE" }),
+      );
+      expect(controlled.kill).toHaveBeenCalledWith("SIGTERM");
+    },
+  );
+
+  it("rejects an unbounded internal timeout without exposing its value", () => {
+    const controlled = makeControlledSpawn();
+
+    expect(
+      () =>
+        new MacOSKeychainCredentialReader(
+          controlled.spawn,
+          Number.MAX_SAFE_INTEGER,
+        ),
+    ).toThrowError("CONNECTOR_CREDENTIAL_UNAVAILABLE");
   });
 });

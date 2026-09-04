@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS inbound_messages (
   message_id TEXT PRIMARY KEY NOT NULL,
-  sequence INTEGER NOT NULL CHECK (sequence >= 1),
+  sequence INTEGER NOT NULL UNIQUE CHECK (sequence >= 1),
   body TEXT NOT NULL,
   received_at TEXT NOT NULL
 );

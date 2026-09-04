@@ -20,6 +20,8 @@ export class CredentialUnavailableError extends Error {
 
 const MAX_STDERR_BYTES = 1_024;
 const MAX_CREDENTIAL_BYTES = 16 * 1_024;
+const DEFAULT_TIMEOUT_MS = 10_000;
+const MAX_TIMEOUT_MS = 30_000;
 
 export type SpawnImplementation = (
   command: string,
@@ -29,11 +31,21 @@ export type SpawnImplementation = (
 
 export class MacOSKeychainCredentialReader implements CredentialReader {
   readonly #spawn: SpawnImplementation;
+  readonly #timeoutMs: number;
 
   constructor(
     spawnImplementation: SpawnImplementation = spawn as SpawnImplementation,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
   ) {
+    if (
+      !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs < 1 ||
+      timeoutMs > MAX_TIMEOUT_MS
+    ) {
+      throw new CredentialUnavailableError();
+    }
     this.#spawn = spawnImplementation;
+    this.#timeoutMs = timeoutMs;
   }
 
   read(service: string, account: string): Promise<string> {
@@ -56,38 +68,77 @@ export class MacOSKeychainCredentialReader implements CredentialReader {
 
       const stdoutChunks: Buffer[] = [];
       let stdoutBytes = 0;
-      let stdoutOverflow = false;
       let stderrBytes = 0;
-      let stderrOverflow = false;
       let settled = false;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
 
-      child.stdout?.on("data", (chunk: Buffer | string) => {
+      function ignoreLateError(): void {
+        // The safe result has already settled; absorb teardown races.
+      }
+
+      const terminate = (): void => {
+        try {
+          child.kill("SIGTERM");
+        } catch {
+          // Preserve the safe credential error.
+        }
+      };
+
+      const cleanup = (): void => {
+        if (timeout !== undefined) clearTimeout(timeout);
+        child.stdout.removeListener("data", onStdoutData);
+        child.stderr.removeListener("data", onStderrData);
+        child.removeListener("close", onClose);
+        child.removeListener("error", onChildError);
+        child.stdout.removeListener("error", onStreamError);
+        child.stderr.removeListener("error", onStreamError);
+        child.removeListener("error", ignoreLateError);
+        child.stdout.removeListener("error", ignoreLateError);
+        child.stderr.removeListener("error", ignoreLateError);
+      };
+
+      const fail = (terminateChild: boolean): void => {
+        if (settled) return;
+        settled = true;
+        if (timeout !== undefined) clearTimeout(timeout);
+        child.stdout.removeListener("data", onStdoutData);
+        child.stderr.removeListener("data", onStderrData);
+        if (terminateChild) {
+          child.once("error", ignoreLateError);
+          child.stdout.once("error", ignoreLateError);
+          child.stderr.once("error", ignoreLateError);
+          terminate();
+        } else {
+          cleanup();
+        }
+        reject(new CredentialUnavailableError());
+      };
+
+      const onStdoutData = (chunk: Buffer | string): void => {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         stdoutBytes += buffer.byteLength;
         if (stdoutBytes <= MAX_CREDENTIAL_BYTES) {
           stdoutChunks.push(buffer);
         } else {
-          stdoutOverflow = true;
+          fail(true);
         }
-      });
-      child.stderr?.on("data", (chunk: Buffer | string) => {
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        stderrBytes += buffer.byteLength;
-        if (stderrBytes > MAX_STDERR_BYTES) stderrOverflow = true;
-        stderrBytes = Math.min(MAX_STDERR_BYTES, stderrBytes);
-      });
-
-      const fail = () => {
-        if (settled) return;
-        settled = true;
-        reject(new CredentialUnavailableError());
       };
 
-      child.once("error", fail);
-      child.once("close", (exitCode) => {
-        if (settled) return;
-        if (exitCode !== 0 || stdoutOverflow || stderrOverflow) {
-          fail();
+      const onStderrData = (chunk: Buffer | string): void => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        stderrBytes += buffer.byteLength;
+        if (stderrBytes > MAX_STDERR_BYTES) fail(true);
+      };
+
+      const onChildError = (): void => fail(true);
+      const onStreamError = (): void => fail(true);
+      const onClose = (exitCode: number | null): void => {
+        if (settled) {
+          cleanup();
+          return;
+        }
+        if (exitCode !== 0) {
+          fail(false);
           return;
         }
 
@@ -95,12 +146,21 @@ export class MacOSKeychainCredentialReader implements CredentialReader {
           .toString("utf8")
           .replace(/\r?\n$/, "");
         if (credential.length === 0) {
-          fail();
+          fail(false);
           return;
         }
         settled = true;
+        cleanup();
         resolve(credential);
-      });
+      };
+
+      child.stdout.on("data", onStdoutData);
+      child.stderr.on("data", onStderrData);
+      child.once("error", onChildError);
+      child.stdout.once("error", onStreamError);
+      child.stderr.once("error", onStreamError);
+      child.once("close", onClose);
+      timeout = setTimeout(() => fail(true), this.#timeoutMs);
     });
   }
 }

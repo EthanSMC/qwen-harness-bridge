@@ -14,12 +14,18 @@ export type LocalJobMapping = Readonly<{
   status: string;
 }>;
 
+export type OutboundEventInput = Readonly<{
+  messageId: string;
+  sequence: number;
+  payload: string;
+}>;
+
 export type StoredOutboundEvent = Readonly<{
   messageId: string;
   sequence: number;
   payload: string;
-  attempts?: number;
-  acknowledgedAt?: string | null;
+  attempts: number;
+  acknowledgedAt: string | null;
 }>;
 
 export interface PluginStore {
@@ -35,7 +41,7 @@ export interface PluginStore {
     status: string;
   }): void;
   findJob(jobId: string): LocalJobMapping | undefined;
-  enqueueEvent(event: StoredOutboundEvent): void;
+  enqueueEvent(event: OutboundEventInput): void;
   pendingEvents(afterSequence: number): StoredOutboundEvent[];
   acknowledgeEvent(messageId: string): void;
   close(): void;
@@ -47,6 +53,15 @@ export class StoreSequenceError extends Error {
   constructor() {
     super("STORE_SEQUENCE_NOT_MONOTONIC");
     this.name = "StoreSequenceError";
+  }
+}
+
+export class StoreInboundConflictError extends Error {
+  readonly code = "STORE_INBOUND_CONFLICT" as const;
+
+  constructor() {
+    super("STORE_INBOUND_CONFLICT");
+    this.name = "StoreInboundConflictError";
   }
 }
 
@@ -87,12 +102,137 @@ type JobRow = {
   status: string;
 };
 
+type InboundRow = {
+  message_id: string;
+  sequence: number;
+  body: string;
+};
+
 type EventRow = {
   message_id: string;
   sequence: number;
   payload_json: string;
   attempts: number;
   acknowledged_at: string | null;
+};
+
+type TableInfoRow = {
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+  pk: number;
+};
+
+type IndexListRow = {
+  name: string;
+  unique: number;
+};
+
+type IndexInfoRow = {
+  seqno: number;
+  name: string;
+};
+
+type TableDefinitionRow = {
+  sql: string | null;
+};
+
+const REQUIRED_SCHEMA = {
+  inbound_messages: {
+    columns: [
+      ["message_id", "TEXT", 1, null, 1],
+      ["sequence", "INTEGER", 1, null, 0],
+      ["body", "TEXT", 1, null, 0],
+      ["received_at", "TEXT", 1, null, 0],
+    ],
+    uniqueColumns: [["sequence"]],
+    requiredChecks: ["CHECK(SEQUENCE>=1)"],
+  },
+  job_mappings: {
+    columns: [
+      ["job_id", "TEXT", 1, null, 1],
+      ["attempt", "INTEGER", 1, null, 2],
+      ["session_id", "TEXT", 1, null, 0],
+      ["status", "TEXT", 1, null, 0],
+      ["updated_at", "TEXT", 1, null, 0],
+    ],
+    uniqueColumns: [["session_id"]],
+    requiredChecks: ["CHECK(ATTEMPT>=1)"],
+  },
+  outbound_events: {
+    columns: [
+      ["message_id", "TEXT", 1, null, 1],
+      ["sequence", "INTEGER", 1, null, 0],
+      ["payload_json", "TEXT", 1, null, 0],
+      ["attempts", "INTEGER", 1, "0", 0],
+      ["acknowledged_at", "TEXT", 0, null, 0],
+      ["created_at", "TEXT", 1, null, 0],
+    ],
+    uniqueColumns: [["sequence"]],
+    requiredChecks: ["CHECK(SEQUENCE>=1)", "CHECK(ATTEMPTS>=0)"],
+  },
+  metadata: {
+    columns: [
+      ["key", "TEXT", 1, null, 1],
+      ["value", "TEXT", 1, null, 0],
+    ],
+    uniqueColumns: [],
+    requiredChecks: [],
+  },
+} as const;
+
+const schemaMatches = (database: Database.Database): boolean => {
+  for (const [tableName, expected] of Object.entries(REQUIRED_SCHEMA)) {
+    const columns = database.pragma(
+      `table_info(${tableName})`,
+    ) as TableInfoRow[];
+    const actualColumns = columns.map((column) => [
+      column.name,
+      column.type.toUpperCase(),
+      column.notnull,
+      column.dflt_value,
+      column.pk,
+    ]);
+    if (JSON.stringify(actualColumns) !== JSON.stringify(expected.columns)) {
+      return false;
+    }
+
+    const definition = database
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+      )
+      .get(tableName) as TableDefinitionRow | undefined;
+    const normalizedDefinition = definition?.sql
+      ?.replace(/\s+/g, "")
+      .toUpperCase();
+    if (
+      normalizedDefinition === undefined ||
+      expected.requiredChecks.some(
+        (requiredCheck) => !normalizedDefinition.includes(requiredCheck),
+      )
+    ) {
+      return false;
+    }
+
+    const indexes = (
+      database.pragma(`index_list(${tableName})`) as IndexListRow[]
+    ).filter((index) => index.unique === 1);
+    for (const requiredColumns of expected.uniqueColumns) {
+      const hasRequiredIndex = indexes.some((index) => {
+        const indexColumns = (
+          database
+            .prepare(
+              "SELECT seqno, name FROM pragma_index_info(?) ORDER BY seqno",
+            )
+            .all(index.name) as IndexInfoRow[]
+        ).map(({ name }) => name);
+        return JSON.stringify(indexColumns) === JSON.stringify(requiredColumns);
+      });
+      if (!hasRequiredIndex) return false;
+    }
+  }
+  return true;
 };
 
 export class SqlitePluginStore implements PluginStore {
@@ -111,11 +251,19 @@ export class SqlitePluginStore implements PluginStore {
         const version = Number(
           this.database.pragma("user_version", { simple: true }),
         );
-        if (version > SCHEMA_VERSION) {
+        if (
+          !Number.isSafeInteger(version) ||
+          (version !== 0 && version !== SCHEMA_VERSION)
+        ) {
           throw new StoreError("STORE_SCHEMA_VERSION_UNSUPPORTED");
         }
         if (version === 0) {
           this.database.exec(SCHEMA_SQL);
+        }
+        if (!schemaMatches(this.database)) {
+          throw new StoreError("STORE_SCHEMA_INCOMPATIBLE");
+        }
+        if (version === 0) {
           this.database.pragma(`user_version = ${SCHEMA_VERSION}`);
         }
       });
@@ -141,14 +289,44 @@ export class SqlitePluginStore implements PluginStore {
     assertPositiveInteger(sequence, "STORE_SEQUENCE_INVALID");
     assertNonEmpty(body, "STORE_MESSAGE_BODY_REQUIRED");
 
-    const result = this.database
-      .prepare(
-        `INSERT OR IGNORE INTO inbound_messages
-          (message_id, sequence, body, received_at)
-         VALUES (?, ?, ?, ?)`,
-      )
-      .run(messageId, sequence, body, now());
-    return result.changes === 1 ? "new" : "duplicate";
+    const write = this.database.transaction((): "new" | "duplicate" => {
+      const byMessage = this.database
+        .prepare(
+          `SELECT message_id, sequence, body
+           FROM inbound_messages WHERE message_id = ?`,
+        )
+        .get(messageId) as InboundRow | undefined;
+      if (byMessage !== undefined) {
+        if (byMessage.sequence === sequence && byMessage.body === body) {
+          return "duplicate";
+        }
+        throw new StoreInboundConflictError();
+      }
+
+      const bySequence = this.database
+        .prepare(
+          `SELECT message_id, sequence, body
+           FROM inbound_messages WHERE sequence = ?`,
+        )
+        .get(sequence) as InboundRow | undefined;
+      if (bySequence !== undefined) throw new StoreInboundConflictError();
+
+      this.database
+        .prepare(
+          `INSERT INTO inbound_messages
+            (message_id, sequence, body, received_at)
+           VALUES (?, ?, ?, ?)`,
+        )
+        .run(messageId, sequence, body, now());
+      return "new";
+    });
+
+    try {
+      return write.immediate();
+    } catch (error) {
+      if (error instanceof StoreInboundConflictError) throw error;
+      throw new StoreError("STORE_INBOUND_WRITE_FAILED");
+    }
   }
 
   mapJob(input: {
@@ -226,7 +404,7 @@ export class SqlitePluginStore implements PluginStore {
     };
   }
 
-  enqueueEvent(event: StoredOutboundEvent): void {
+  enqueueEvent(event: OutboundEventInput): void {
     this.assertOpen();
     assertNonEmpty(event.messageId, "STORE_MESSAGE_ID_REQUIRED");
     assertPositiveInteger(event.sequence, "STORE_SEQUENCE_INVALID");
@@ -238,9 +416,6 @@ export class SqlitePluginStore implements PluginStore {
     } catch {
       throw new StoreError("STORE_PAYLOAD_INVALID");
     }
-    const attempts = event.attempts ?? 0;
-    assertNonNegativeInteger(attempts, "STORE_ATTEMPTS_INVALID");
-
     const write = this.database.transaction(() => {
       const byMessage = this.database
         .prepare(
@@ -271,14 +446,7 @@ export class SqlitePluginStore implements PluginStore {
             (message_id, sequence, payload_json, attempts, acknowledged_at, created_at)
            VALUES (?, ?, ?, ?, ?, ?)`,
         )
-        .run(
-          event.messageId,
-          event.sequence,
-          event.payload,
-          attempts,
-          event.acknowledgedAt ?? null,
-          now(),
-        );
+        .run(event.messageId, event.sequence, event.payload, 0, null, now());
     });
     write();
   }

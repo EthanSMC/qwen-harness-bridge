@@ -1,10 +1,11 @@
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join } from "node:path";
+import { RepositoryIdSchema } from "@qhb/protocol";
 import { z } from "zod";
 
 const repositorySchema = z
   .object({
-    id: z.string().trim().min(1),
+    id: z.string().trim().pipe(RepositoryIdSchema),
     displayName: z.string().trim().min(1),
     canonicalPath: z.string().trim().min(1),
     approvalTimeoutSeconds: z.number().int().min(60).max(1_800),
@@ -20,7 +21,16 @@ const pluginConfigSchema = z
       .refine((value) => {
         try {
           const url = new URL(value);
-          return url.protocol === "wss:" && url.hostname.length > 0;
+          return (
+            url.protocol === "wss:" &&
+            url.hostname.length > 0 &&
+            url.username.length === 0 &&
+            url.password.length === 0 &&
+            url.search.length === 0 &&
+            url.hash.length === 0 &&
+            !value.includes("?") &&
+            !value.includes("#")
+          );
         } catch {
           return false;
         }
@@ -134,7 +144,15 @@ const canonicalDatabasePath = (databasePath: string): string => {
   }
 
   const resolvedPath = join(parentPath, basename(databasePath));
-  if (!existsSync(databasePath)) return resolvedPath;
+  try {
+    if (lstatSync(databasePath).isSymbolicLink()) {
+      throw new ConfigValidationError("DATABASE_PATH_NOT_CANONICAL");
+    }
+  } catch (error) {
+    if (error instanceof ConfigValidationError) throw error;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return resolvedPath;
+    throw new ConfigValidationError("DATABASE_PATH_UNAVAILABLE");
+  }
 
   try {
     if (realpathSync.native(databasePath) !== databasePath) {
