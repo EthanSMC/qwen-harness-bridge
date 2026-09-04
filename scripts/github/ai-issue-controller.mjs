@@ -1263,72 +1263,85 @@ export const reconcileExpiredClaims = async ({
     "open pull requests",
   );
   const released = [];
+  const failures = [];
   for (const listedIssue of issues) {
-    const issueNumber = requirePositiveInteger(
-      listedIssue.number,
-      "Issue number",
-    );
-    const loaded = await loadIssueContext(
-      github,
-      issueNumber,
-      null,
-      openPullRequests,
-    );
-    if (mode === "enforce") {
-      const recovered = await recoverPendingIntent({
+    try {
+      const issueNumber = requirePositiveInteger(
+        listedIssue.number,
+        "Issue number",
+      );
+      const loaded = await loadIssueContext(
         github,
         issueNumber,
-        loaded,
-        eventId,
-        expectedActions: ["expire"],
-      });
-      if (recovered) {
-        released.push(issueNumber);
-        continue;
+        null,
+        openPullRequests,
+      );
+      if (mode === "enforce") {
+        const recovered = await recoverPendingIntent({
+          github,
+          issueNumber,
+          loaded,
+          eventId,
+          expectedActions: ["expire"],
+        });
+        if (recovered) {
+          released.push(issueNumber);
+          continue;
+        }
       }
+      const { state, assignee } = assertIssueInvariant(loaded.issue);
+      if (state !== "in-progress") continue;
+      const claim = currentClaimFromReceipts(loaded.receipts);
+      if (!claim || claim.owner !== assignee) {
+        throw new LifecycleError(
+          "STATE_MISMATCH",
+          `Issue #${issueNumber} has no matching active claim.`,
+        );
+      }
+      const expiresAt = Date.parse(claim.leaseExpiresAt);
+      const currentTime = Date.parse(now);
+      if (Number.isNaN(expiresAt) || Number.isNaN(currentTime)) {
+        throw new LifecycleError(
+          "STATE_MISMATCH",
+          "A claim lease timestamp is invalid.",
+        );
+      }
+      if (expiresAt > currentTime) continue;
+      const readiness = evaluateReadiness({
+        issue: loaded.issue,
+        dependencies: loaded.dependencies,
+        closingPullRequests: loaded.closingPullRequests,
+      });
+      if (
+        ["GITHUB_STATE_UNAVAILABLE", "CLOSING_PR_EXISTS"].includes(
+          readiness.code,
+        )
+      ) {
+        throw new LifecycleError(
+          readiness.code,
+          `Issue #${issueNumber} cannot expire safely.`,
+        );
+      }
+      const plan = systemPlan({
+        eventId,
+        claim,
+        action: "expire",
+        from: state,
+        to: readiness.ready ? "ready" : "waiting",
+      });
+      if (mode === "enforce") {
+        await applyPlan({ github, issueNumber, issue: loaded.issue, plan });
+      }
+      released.push(issueNumber);
+    } catch (error) {
+      failures.push(error);
     }
-    const { state, assignee } = assertIssueInvariant(loaded.issue);
-    if (state !== "in-progress") continue;
-    const claim = currentClaimFromReceipts(loaded.receipts);
-    if (!claim || claim.owner !== assignee) {
-      throw new LifecycleError(
-        "STATE_MISMATCH",
-        `Issue #${issueNumber} has no matching active claim.`,
-      );
-    }
-    const expiresAt = Date.parse(claim.leaseExpiresAt);
-    const currentTime = Date.parse(now);
-    if (Number.isNaN(expiresAt) || Number.isNaN(currentTime)) {
-      throw new LifecycleError(
-        "STATE_MISMATCH",
-        "A claim lease timestamp is invalid.",
-      );
-    }
-    if (expiresAt > currentTime) continue;
-    const readiness = evaluateReadiness({
-      issue: loaded.issue,
-      dependencies: loaded.dependencies,
-      closingPullRequests: loaded.closingPullRequests,
-    });
-    if (
-      ["GITHUB_STATE_UNAVAILABLE", "CLOSING_PR_EXISTS"].includes(readiness.code)
-    ) {
-      throw new LifecycleError(
-        readiness.code,
-        `Issue #${issueNumber} cannot expire safely.`,
-      );
-    }
-    const plan = systemPlan({
-      eventId,
-      claim,
-      action: "expire",
-      from: state,
-      to: readiness.ready ? "ready" : "waiting",
-    });
-    if (mode === "enforce") {
-      await applyPlan({ github, issueNumber, issue: loaded.issue, plan });
-    }
-    released.push(issueNumber);
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      `${failures.length} expired claim(s) failed after reconciliation continued`,
+    );
   }
   return { status: mode === "enforce" ? "applied" : "report", released };
 };
@@ -1552,6 +1565,29 @@ export const reconcileRepositoryState = async ({
   return { status: mode, processed: results.length, results };
 };
 
+export const runScheduledReconciliationPhases = async (phases) => {
+  const results = {};
+  const failures = [];
+  for (const { name, run } of phases) {
+    try {
+      results[name] = await run();
+    } catch (error) {
+      failures.push(
+        new Error(`${name}: ${error.message}`, {
+          cause: error,
+        }),
+      );
+    }
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures,
+      `${failures.length} scheduled lifecycle phase(s) failed after reconciliation continued`,
+    );
+  }
+  return results;
+};
+
 export const runLifecycleController = async (context) => {
   switch (context.eventName) {
     case "issue_comment":
@@ -1676,27 +1712,40 @@ export const main = async ({
     });
     result = { lifecycle, commandDrain };
   } else if (["schedule", "workflow_dispatch"].includes(eventName)) {
-    const repositoryState = await reconcileRepositoryState({
-      github,
-      repository,
-      defaultBranch,
-      mode,
-      now: authoritativeNow,
-    });
-    const commandDrain = await reconcileLifecycleCommands({
-      github,
-      repository,
-      defaultBranch,
-      mode,
-      now: authoritativeNow,
-    });
-    const lifecycle = await reconcileExpiredClaims({
-      github,
-      mode,
-      now: authoritativeNow,
-      eventId: requirePositiveInteger(runId, "GITHUB_RUN_ID"),
-    });
-    result = { repositoryState, commandDrain, lifecycle };
+    result = await runScheduledReconciliationPhases([
+      {
+        name: "repositoryState",
+        run: () =>
+          reconcileRepositoryState({
+            github,
+            repository,
+            defaultBranch,
+            mode,
+            now: authoritativeNow,
+          }),
+      },
+      {
+        name: "commandDrain",
+        run: () =>
+          reconcileLifecycleCommands({
+            github,
+            repository,
+            defaultBranch,
+            mode,
+            now: authoritativeNow,
+          }),
+      },
+      {
+        name: "lifecycle",
+        run: () =>
+          reconcileExpiredClaims({
+            github,
+            mode,
+            now: authoritativeNow,
+            eventId: requirePositiveInteger(runId, "GITHUB_RUN_ID"),
+          }),
+      },
+    ]);
   } else {
     result = await runLifecycleController({
       github,

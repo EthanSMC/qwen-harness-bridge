@@ -10,6 +10,7 @@ import {
   reconcileLifecycleCommands,
   reconcileRepositoryState,
   runLifecycleController,
+  runScheduledReconciliationPhases,
   stableSystemEventId,
 } from "./ai-issue-controller.mjs";
 import { parseReceipts } from "./ai-issue-policy.mjs";
@@ -382,6 +383,42 @@ test("scheduled live-state reconciliation recovers a dropped PR event", async ()
   assert.equal(fake.workflowReceipts().at(-1).action, "pr-open");
 });
 
+test("scheduled phases continue after an earlier phase fails", async () => {
+  const calls = [];
+  await assert.rejects(
+    runScheduledReconciliationPhases([
+      {
+        name: "repositoryState",
+        run: async () => {
+          calls.push("repositoryState");
+          throw new Error("malformed Issue");
+        },
+      },
+      {
+        name: "commandDrain",
+        run: async () => {
+          calls.push("commandDrain");
+          return { processed: 1 };
+        },
+      },
+      {
+        name: "lifecycle",
+        run: async () => {
+          calls.push("lifecycle");
+          return { released: [46] };
+        },
+      },
+    ]),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors.length, 1);
+      assert.match(error.errors[0].message, /^repositoryState:/u);
+      return true;
+    },
+  );
+  assert.deepEqual(calls, ["repositoryState", "commandDrain", "lifecycle"]);
+});
+
 test("two serialized claim events produce one accountable owner", async () => {
   const fake = new FakeGitHub();
   const first = await claim(fake, 901);
@@ -550,6 +587,40 @@ test("scheduled reconciliation releases an exactly expired claim", async () => {
     context(fake, {}, { now: "2026-09-05T12:00:00.000Z", eventId: 990 }),
   );
   assert.deepEqual(result, { status: "applied", released: [46] });
+  assert.ok(fake.issue().labels.some(({ name }) => name === "status:ready"));
+  assert.equal(fake.workflowReceipts().at(-1).action, "expire");
+});
+
+test("expired-claim reconciliation continues after a malformed Issue", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const valid = fake.issues.get(46);
+  fake.issues = new Map([
+    [
+      45,
+      {
+        id: 45,
+        number: 45,
+        state: "open",
+        state_reason: null,
+        body: issueBody(),
+        labels: [{ name: "type:docs" }, { name: "status:in-progress" }],
+        assignees: [{ login: "bob" }],
+      },
+    ],
+    [46, valid],
+  ]);
+  fake.comments.set(45, []);
+  await assert.rejects(
+    reconcileExpiredClaims(
+      context(fake, {}, { now: "2026-09-05T12:00:00.000Z", eventId: 990 }),
+    ),
+    (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.errors.length, 1);
+      return true;
+    },
+  );
   assert.ok(fake.issue().labels.some(({ name }) => name === "status:ready"));
   assert.equal(fake.workflowReceipts().at(-1).action, "expire");
 });
