@@ -466,6 +466,7 @@ const pendingIntentFor = (comments, receipts, eventId) => {
   const currentClaim = currentClaimFromReceipts(receipts);
   return {
     command: parsed.action,
+    intentCommentId: parsed.commentId,
     from: parsed.from,
     to: parsed.to,
     assignee: parsed.action === "claim" ? parsed.actor : null,
@@ -610,6 +611,37 @@ const recoverPendingIntent = async ({
       ? currentClaim === null ||
         currentClaim?.claimId === candidate.receipt.claimId
       : candidate.receipt.claimId === (currentClaim?.claimId ?? null);
+  const pendingPlans = pendingIntentEventIds(loaded.comments, loaded.receipts)
+    .map((candidateEventId) =>
+      pendingIntentFor(loaded.comments, loaded.receipts, candidateEventId),
+    )
+    .filter(Boolean);
+  const supersededPlans = pendingPlans
+    .filter((candidate) =>
+      loaded.receipts.some(
+        (receipt) =>
+          receipt.result === "success" &&
+          Number(receipt.commentId) > Number(candidate.intentCommentId),
+      ),
+    )
+    .sort(
+      (left, right) =>
+        Number(left.intentCommentId) - Number(right.intentCommentId),
+    );
+  if (supersededPlans.length > 0) {
+    const superseded = supersededPlans[0];
+    const receipt = failureReceipt({
+      eventId: superseded.receipt.eventId,
+      action: superseded.receipt.action,
+      actor: superseded.receipt.actor,
+      agent: superseded.receipt.agent,
+      state: observedState,
+      pullRequestNumber: superseded.receipt.pullRequestNumber,
+      code: "STATE_MISMATCH",
+    });
+    await postReceipt(github, issueNumber, receipt);
+    return { status: "superseded", code: receipt.code, receipt };
+  }
   if (
     requestedPlan &&
     (!expectedActions.includes(requestedPlan.command) ||
@@ -621,17 +653,13 @@ const recoverPendingIntent = async ({
       "The pending lifecycle intent does not match the current event or Issue state.",
     );
   }
-  const candidatePlans = pendingIntentEventIds(loaded.comments, loaded.receipts)
-    .map((candidateEventId) =>
-      pendingIntentFor(loaded.comments, loaded.receipts, candidateEventId),
-    )
-    .filter(
-      (candidate) =>
-        candidate &&
-        expectedActions.includes(candidate.command) &&
-        [candidate.from, candidate.to].includes(observedState) &&
-        matchesCurrentClaim(candidate),
-    );
+  const candidatePlans = pendingPlans.filter(
+    (candidate) =>
+      candidate &&
+      expectedActions.includes(candidate.command) &&
+      [candidate.from, candidate.to].includes(observedState) &&
+      matchesCurrentClaim(candidate),
+  );
   if (candidatePlans.length > 1) {
     throw new LifecycleError(
       "STATE_MISMATCH",
@@ -655,7 +683,15 @@ const recoverPendingIntent = async ({
   return { status: "applied", plan, issue, recovered: true };
 };
 
-const failureReceipt = ({ eventId, action, actor, agent, state, code }) => ({
+const failureReceipt = ({
+  eventId,
+  action,
+  actor,
+  agent,
+  state,
+  pullRequestNumber = null,
+  code,
+}) => ({
   version: 2,
   eventId,
   claimId: null,
@@ -666,7 +702,7 @@ const failureReceipt = ({ eventId, action, actor, agent, state, code }) => ({
   from: state,
   to: state,
   leaseExpiresAt: null,
-  pullRequestNumber: null,
+  pullRequestNumber,
   code,
 });
 
@@ -1057,7 +1093,7 @@ export const handlePullRequest = async ({
       issueNumber,
       loaded,
       eventId,
-      expectedActions: ["pr-open", "pr-close", "merge"],
+      expectedActions: RECEIPT_ACTIONS,
     });
     if (recovered) return recovered;
   }
@@ -1290,7 +1326,7 @@ export const handleIssueChange = async ({
       issueNumber,
       loaded,
       eventId,
-      expectedActions: ["close", "reopen", "initialize", "refresh", "expire"],
+      expectedActions: RECEIPT_ACTIONS,
     });
     if (recovered) return recovered;
   }
@@ -1494,7 +1530,7 @@ export const reconcileExpiredClaims = async ({
           issueNumber,
           loaded,
           eventId,
-          expectedActions: ["expire"],
+          expectedActions: RECEIPT_ACTIONS,
         });
         if (recovered) {
           released.push(issueNumber);

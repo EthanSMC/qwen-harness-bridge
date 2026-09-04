@@ -691,6 +691,64 @@ test("one claim generation cannot bind receipts from two pull requests", () => {
   );
 });
 
+test("rejects a claim receipt whose state does not follow the prior receipt", () => {
+  const claim = plan().receipt;
+  const blocked = {
+    ...claim,
+    eventId: 902,
+    action: "block",
+    from: "in-progress",
+    to: "blocked",
+  };
+  const staleHeartbeat = {
+    ...claim,
+    eventId: 903,
+    action: "heartbeat",
+    from: "in-progress",
+    to: "in-progress",
+    leaseExpiresAt: "2026-09-06T12:00:00.000Z",
+  };
+  expectCode(
+    () =>
+      parseReceipts(
+        [claim, blocked, staleHeartbeat].map((receipt, index) => ({
+          id: 50 + index,
+          body: receiptBody(receipt),
+          user: { login: "github-actions[bot]" },
+        })),
+      ),
+    "STATE_MISMATCH",
+  );
+});
+
+test("rejects a claim receipt that rolls an active lease backward", () => {
+  const claim = plan().receipt;
+  const renewed = {
+    ...claim,
+    eventId: 902,
+    action: "heartbeat",
+    from: "in-progress",
+    to: "in-progress",
+    leaseExpiresAt: "2026-09-07T12:00:00.000Z",
+  };
+  const staleHeartbeat = {
+    ...renewed,
+    eventId: 903,
+    leaseExpiresAt: "2026-09-06T12:00:00.000Z",
+  };
+  expectCode(
+    () =>
+      parseReceipts(
+        [claim, renewed, staleHeartbeat].map((receipt, index) => ({
+          id: 60 + index,
+          body: receiptBody(receipt),
+          user: { login: "github-actions[bot]" },
+        })),
+      ),
+    "STATE_MISMATCH",
+  );
+});
+
 test("treats an identical event receipt as idempotent", () => {
   const existing = plan().receipt;
   assert.deepEqual(plan({ receipts: [existing] }), {

@@ -993,6 +993,8 @@ export const parseReceipts = (
       claims.set(parsed.claimId, {
         owner: parsed.actor,
         agent: parsed.agent,
+        state: parsed.to,
+        leaseExpiresAt: parsed.leaseExpiresAt,
         pullRequestNumber: null,
         released: false,
       });
@@ -1001,6 +1003,28 @@ export const parseReceipts = (
         fail(
           "STATE_MISMATCH",
           "A receipt does not match an active claim generation.",
+        );
+      }
+      if (parsed.from !== claim.state) {
+        fail(
+          "STATE_MISMATCH",
+          "A receipt state does not follow its claim generation.",
+        );
+      }
+      if (
+        parsed.action === "block" &&
+        parsed.leaseExpiresAt !== claim.leaseExpiresAt
+      ) {
+        fail("STATE_MISMATCH", "A block receipt cannot change its lease.");
+      }
+      if (
+        ["heartbeat", "resume"].includes(parsed.action) &&
+        claim.leaseExpiresAt !== null &&
+        Date.parse(parsed.leaseExpiresAt) <= Date.parse(claim.leaseExpiresAt)
+      ) {
+        fail(
+          "STATE_MISMATCH",
+          "A receipt cannot roll an active claim lease backward.",
         );
       }
       if (
@@ -1032,6 +1056,8 @@ export const parseReceipts = (
           "A pull request receipt does not match its claim generation binding.",
         );
       }
+      claim.state = parsed.to;
+      claim.leaseExpiresAt = parsed.leaseExpiresAt;
       if (RECEIPT_END_ACTIONS.has(parsed.action)) claim.released = true;
     }
     events.set(parsed.eventId, identity);

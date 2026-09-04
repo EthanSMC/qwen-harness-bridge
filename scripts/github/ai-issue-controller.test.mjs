@@ -17,7 +17,7 @@ import {
   runReconciliationPhases,
   stableSystemEventId,
 } from "./ai-issue-controller.mjs";
-import { parseReceipts } from "./ai-issue-policy.mjs";
+import { currentClaimFromReceipts, parseReceipts } from "./ai-issue-policy.mjs";
 
 const REPOSITORY = "octo/example";
 const NOW = "2026-09-04T12:00:00.000Z";
@@ -94,11 +94,11 @@ class FakeGitHub {
     return parseReceipts(this.issueComments(number));
   }
 
-  command(id, actor, body, number = 46) {
+  command(id, actor, body, number = 46, createdAt = NOW) {
     const comment = {
       id,
       body,
-      created_at: NOW,
+      created_at: createdAt,
       issue_url: `https://api.github.com/repos/${REPOSITORY}/issues/${number}`,
       user: { login: actor },
     };
@@ -387,6 +387,8 @@ test("a bounded command drain processes the oldest batch instead of wedging", as
     902,
     "alice",
     "/ai-heartbeat\nsummary: implementation continues",
+    46,
+    "2026-09-04T13:00:00.000Z",
   );
   const first = await reconcileLifecycleCommands({
     github: fake.client,
@@ -638,9 +640,13 @@ test("owner blocks, resumes, and releases while maintainer recovery is allowed",
   );
   assert.ok(fake.issue().labels.some(({ name }) => name === "status:blocked"));
   await handleIssueComment(
-    context(fake, fake.command(903, "alice", "/ai-resume"), {
-      now: "2026-09-04T13:00:00.000Z",
-    }),
+    context(
+      fake,
+      fake.command(903, "alice", "/ai-resume", 46, "2026-09-04T13:00:00.000Z"),
+      {
+        now: "2026-09-04T13:00:00.000Z",
+      },
+    ),
   );
   assert.ok(
     fake.issue().labels.some(({ name }) => name === "status:in-progress"),
@@ -1164,6 +1170,116 @@ test("a new claimant cannot be mutated by an unfinished prior claim intent", asy
   );
   assert.deepEqual(fake.issue().assignees, [{ login: "bob" }]);
   assert.equal(fake.workflowReceipts().at(-1).actor, "bob");
+});
+
+test("a pending user intent completes before a later system transition", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const heartbeatEvent = fake.command(
+    902,
+    "alice",
+    "/ai-heartbeat\nsummary: implementation continues",
+  );
+  heartbeatEvent.comment.created_at = "2026-09-04T13:00:00.000Z";
+  fake.comments.get(46).find(({ id }) => id === 902).created_at =
+    heartbeatEvent.comment.created_at;
+  fake.failNextReceiptPost = true;
+  await assert.rejects(
+    () => handleIssueComment(context(fake, heartbeatEvent)),
+    /receipt write interruption/i,
+  );
+
+  const pull = fake.pull({ createdAt: "2026-09-04T13:30:00.000Z" });
+  const recovered = await handlePullRequest(
+    context(fake, fake.pullEvent(pull, "opened"), {
+      eventId: 910,
+      now: "2026-09-04T13:30:00.000Z",
+    }),
+  );
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.plan.command, "heartbeat");
+  assert.equal(fake.workflowReceipts().at(-1).eventId, 902);
+
+  const admitted = await handlePullRequest(
+    context(fake, fake.pullEvent(pull, "opened"), {
+      eventId: 910,
+      now: "2026-09-04T13:30:00.000Z",
+    }),
+  );
+  assert.equal(admitted.plan.command, "pr-open");
+});
+
+test("a later receipt supersedes an older unfinished intent without replay", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const oldHeartbeat = fake.command(
+    902,
+    "alice",
+    "/ai-heartbeat\nsummary: implementation continues",
+  );
+  oldHeartbeat.comment.created_at = "2026-09-04T13:00:00.000Z";
+  fake.comments.get(46).find(({ id }) => id === 902).created_at =
+    oldHeartbeat.comment.created_at;
+  fake.failNextReceiptPost = true;
+  await assert.rejects(
+    () => handleIssueComment(context(fake, oldHeartbeat)),
+    /receipt write interruption/i,
+  );
+  const oldIntent = fake.comments
+    .get(46)
+    .find(
+      ({ body }) =>
+        body.includes("<!-- qhb-ai-intent:v2") && body.includes("event-id=902"),
+    );
+  assert.ok(oldIntent, JSON.stringify(fake.issueComments()));
+  fake.comments.set(
+    46,
+    fake.comments.get(46).filter(({ id }) => id !== oldIntent.id),
+  );
+
+  const pull = fake.pull({ createdAt: "2026-09-04T13:30:00.000Z" });
+  await handlePullRequest(
+    context(fake, fake.pullEvent(pull, "opened"), { eventId: 910 }),
+  );
+  const closed = fake.pulls.get(51);
+  closed.state = "closed";
+  closed.updated_at = "2026-09-04T14:00:00.000Z";
+  await handlePullRequest(
+    context(fake, fake.pullEvent(closed, "closed"), {
+      eventId: 911,
+      now: "2026-09-04T14:00:00.000Z",
+    }),
+  );
+  const beforeLease = currentClaimFromReceipts(
+    fake.workflowReceipts(),
+  ).leaseExpiresAt;
+  fake.comments.get(46).push(oldIntent);
+
+  const newHeartbeat = fake.command(
+    903,
+    "alice",
+    "/ai-heartbeat\nsummary: final verification",
+  );
+  newHeartbeat.comment.created_at = "2026-09-04T15:00:00.000Z";
+  fake.comments.get(46).find(({ id }) => id === 903).created_at =
+    newHeartbeat.comment.created_at;
+  const superseded = await handleIssueComment(context(fake, newHeartbeat));
+  assert.deepEqual(
+    { status: superseded.status, code: superseded.code },
+    { status: "superseded", code: "STATE_MISMATCH" },
+  );
+  assert.equal(
+    currentClaimFromReceipts(fake.workflowReceipts()).leaseExpiresAt,
+    beforeLease,
+  );
+  const oldReceipt = fake
+    .workflowReceipts()
+    .find(({ eventId }) => eventId === 902);
+  assert.equal(oldReceipt.result, "failure");
+
+  const applied = await handleIssueComment(context(fake, newHeartbeat));
+  assert.equal(applied.plan.receipt.eventId, 903);
+  assert.equal(applied.plan.leaseExpiresAt, "2026-09-05T15:00:00.000Z");
 });
 
 test("a review lock cannot transfer to a second pull request", async () => {

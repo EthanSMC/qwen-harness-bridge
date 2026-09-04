@@ -309,7 +309,7 @@ code=-
 -->
 ```
 
-Reject unknown keys, duplicate keys, unsupported versions, invalid timestamps/UUIDs, actor/claim mismatches, and a claim generation that binds more than one pull-request number. `parseReceipts` sorts by GitHub comment ID, rejects duplicate event IDs with different content, and selects only workflow-authored verified receipts supplied by the adapter.
+Reject unknown keys, duplicate keys, unsupported versions, invalid timestamps/UUIDs, actor/claim mismatches, out-of-sequence claim states, non-advancing lease renewals, and a claim generation that binds more than one pull-request number. `parseReceipts` sorts by GitHub comment ID, rejects duplicate event IDs with different content, and selects only workflow-authored verified receipts supplied by the adapter.
 
 - [x] **Step 8: Run policy tests and commit**
 
@@ -459,7 +459,7 @@ Cover open/draft/synchronize moving the primary Issue to review only when the PR
 
 - [x] **Step 9: Implement pull-request reconciliation**
 
-Read the pull request live. A qualifying original `opened` event uses its matching immutable GitHub `created_at`; edits, reopens, and scheduled reconciliation use the live-matching `updated_at`. The qualifying timestamp must fall after the claim and strictly before the active lease expiry to move `in-progress` to `review` with a durable lock bound to that PR number. A closed unmerged PR returns to `in-progress` with a renewed lease while retaining the same PR binding. A terminal PR event rejects any alternate open closing PR, and a different PR cannot inherit the prior lock. A merged PR verifies GitHub closure, main reachability through the merge response, and terminal reconciliation before applying `status:done` and removing the assignee. If a system mutation succeeds before its receipt write is interrupted, later webhook, command, or scheduled entry points recover exactly one semantically matching workflow-authored intent with its original event ID, current claim generation, transition, and PR binding; ambiguity or a later claim generation fails closed.
+Read the pull request live. A qualifying original `opened` event uses its matching immutable GitHub `created_at`; edits, reopens, and scheduled reconciliation use the live-matching `updated_at`. The qualifying timestamp must fall after the claim and strictly before the active lease expiry to move `in-progress` to `review` with a durable lock bound to that PR number. A closed unmerged PR returns to `in-progress` with a renewed lease while retaining the same PR binding. A terminal PR event rejects any alternate open closing PR, and a different PR cannot inherit the prior lock. A merged PR verifies GitHub closure, main reachability through the merge response, and terminal reconciliation before applying `status:done` and removing the assignee. If a system mutation succeeds before its receipt write is interrupted, every later webhook, command, or scheduled entry point first recovers exactly one semantically matching workflow-authored intent with its original event ID, current claim generation, transition, and PR binding. Ambiguity fails closed; a later successful receipt writes a failure receipt for the stale event and never replays its mutation, preventing lease rollback or cross-generation mutation.
 
 - [x] **Step 10: Run controller tests and commit**
 

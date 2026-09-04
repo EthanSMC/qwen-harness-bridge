@@ -462,6 +462,7 @@ for (const [pattern, message] of [
   [/pullRequestNumber:\s*pullRequest\.number/, "receipt pull-request binding"],
   [/pendingIntentEventIds/, "cross-run pending system-intent recovery"],
   [/matchesCurrentClaim/, "pending-intent claim generation binding"],
+  [/supersededPlans/, "durable stale pending-intent supersession"],
   [/pullRequest\?\.updated_at/, "timely live pull-request qualification"],
   [/stableSystemEventId/, "deterministic system event identities"],
 ]) {
