@@ -456,7 +456,7 @@ describe("PostgreSQL Connector outbox", () => {
       "Dispatch expiry lock",
     );
     const callerNow = new Date();
-    const expiresAt = await expiryAfter(250);
+    const expiresAt = await expiryAfter(2_000);
     await database.query("UPDATE jobs SET expires_at = $1 WHERE id = $2", [
       expiresAt,
       job.jobId,
@@ -792,6 +792,83 @@ describe("PostgreSQL Connector outbox", () => {
     await expectStoreError(
       store.acceptClientMessage(identity, gap),
       "CLIENT_SEQUENCE_GAP",
+    );
+  });
+
+  it("replays an exact expired client message without reapplying it", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const expiresAt = await expiryAfter(250);
+    const sentAt = new Date(Date.parse(String(expiresAt)) - 60_000);
+    const hello = envelope(
+      "connector.hello",
+      1,
+      {
+        connector_id: testIdentity.connectorId,
+        connector_version: "integration-1.0",
+        capabilities: ["tests"],
+        last_server_sequence: 0,
+        last_client_sequence: 0,
+      },
+      {
+        sentAt,
+        expiresAt,
+      },
+    );
+    const accepted = await store.acceptClientMessage(testIdentity, hello);
+    if (accepted.response === null) throw new Error("expected a welcome");
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE message_id = $1",
+      [accepted.response.messageId],
+    );
+    await database.query(
+      "SELECT pg_sleep_until($1::timestamptz + interval '25 milliseconds')",
+      [expiresAt],
+    );
+
+    const replayed = await store.acceptClientMessage(testIdentity, hello);
+    if (replayed.response === null) throw new Error("expected replay response");
+    expect(replayed).toMatchObject({
+      duplicate: true,
+      response: {
+        sequence: accepted.response.sequence,
+        type: "connector.welcome",
+        payload: accepted.response.payload,
+      },
+    });
+    expect(replayed.response.messageId).not.toBe(accepted.response.messageId);
+    await expectClientCursor(testIdentity.connectorId, 1);
+    await expect(
+      database.query<{ client_count: string; server_count: string }>(
+        `SELECT count(*) FILTER (WHERE direction = 'client')::text AS client_count,
+                count(*) FILTER (WHERE direction = 'server')::text AS server_count
+           FROM connector_messages
+          WHERE connector_id = $1`,
+        [testIdentity.connectorId],
+      ),
+    ).resolves.toMatchObject({
+      rows: [{ client_count: "1", server_count: "1" }],
+    });
+
+    await expectStoreError(
+      store.acceptClientMessage(testIdentity, {
+        ...hello,
+        correlation_id: crypto.randomUUID(),
+      }),
+      "CLIENT_REPLAY_MISMATCH",
+    );
+    const freshExpired = envelope(
+      "connector.heartbeat",
+      2,
+      {},
+      {
+        sentAt,
+        expiresAt,
+      },
+    );
+    await expectStoreError(
+      store.acceptClientMessage(testIdentity, freshExpired),
+      "CLIENT_REPLAY_MISMATCH",
     );
   });
 

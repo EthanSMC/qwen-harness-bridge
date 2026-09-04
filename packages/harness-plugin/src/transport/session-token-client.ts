@@ -2,10 +2,13 @@ import { request as httpsRequest, type RequestOptions } from "node:https";
 import { z } from "zod";
 
 export interface SessionTokenClient {
-  exchange(input: {
-    connectorId: string;
-    bootstrapCredential: string;
-  }): Promise<{
+  exchange(
+    input: {
+      connectorId: string;
+      bootstrapCredential: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<{
     token: string;
     expiresAt: string;
   }>;
@@ -14,6 +17,7 @@ export interface SessionTokenClient {
 export type SessionTokenHttpRequest = (
   options: RequestOptions,
   body: string,
+  signal?: AbortSignal,
 ) => Promise<{ statusCode: number; body: string }>;
 
 export class SessionTokenExchangeError extends Error {
@@ -32,7 +36,7 @@ const SessionResponseSchema = z
   })
   .strict();
 
-const defaultRequest: SessionTokenHttpRequest = (options, body) =>
+const defaultRequest: SessionTokenHttpRequest = (options, body, signal) =>
   new Promise((resolve, reject) => {
     let settled = false;
     const finish = (
@@ -46,7 +50,7 @@ const defaultRequest: SessionTokenHttpRequest = (options, body) =>
       else reject(error);
     };
 
-    const request = httpsRequest(options, (response) => {
+    const request = httpsRequest({ ...options, signal }, (response) => {
       const chunks: Buffer[] = [];
       response.on("data", (chunk: Buffer | string) => {
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -104,10 +108,13 @@ export class HttpsSessionTokenClient implements SessionTokenClient {
     this.#request = options.request ?? defaultRequest;
   }
 
-  async exchange(input: {
-    connectorId: string;
-    bootstrapCredential: string;
-  }): Promise<{ token: string; expiresAt: string }> {
+  async exchange(
+    input: {
+      connectorId: string;
+      bootstrapCredential: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<{ token: string; expiresAt: string }> {
     if (
       typeof input?.connectorId !== "string" ||
       typeof input.bootstrapCredential !== "string" ||
@@ -143,6 +150,7 @@ export class HttpsSessionTokenClient implements SessionTokenClient {
           },
         },
         body,
+        signal,
       );
     } catch {
       throw new SessionTokenExchangeError();

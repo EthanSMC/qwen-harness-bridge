@@ -1237,12 +1237,6 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
           : undefined;
       const connector = await lockConnector(tx, identity);
       const currentTime = await readDatabaseTime(tx);
-      if (Date.parse(message.expires_at) <= currentTime.getTime()) {
-        throw new ConnectorStoreError(
-          "CLIENT_REPLAY_MISMATCH",
-          "Expired message",
-        );
-      }
       const existingRows = await tx
         .select()
         .from(connectorMessages)
@@ -1291,6 +1285,13 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
             .where(eq(connectors.id, connector.id));
         }
         return { duplicate: true, replay: [], response };
+      }
+
+      if (Date.parse(message.expires_at) <= currentTime.getTime()) {
+        throw new ConnectorStoreError(
+          "CLIENT_REPLAY_MISMATCH",
+          "Expired message",
+        );
       }
 
       const expectedSequence = connector.lastClientSequence + 1;

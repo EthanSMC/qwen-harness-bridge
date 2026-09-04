@@ -271,6 +271,58 @@ describe("SQLite Harness plugin store", () => {
     reopened.close();
   });
 
+  it("transactionally replaces one inbound identity at the same sequence", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    store.recordInbound("old-message", 1, "old-body");
+    store.markInboundDelivered("old-message");
+
+    expect(store.inboundMessageBySequence(1)?.messageId).toBe("old-message");
+    store.replaceInbound({
+      previousMessageId: "old-message",
+      previousBody: "old-body",
+      messageId: "replacement-message",
+      sequence: 1,
+      body: "replacement-body",
+    });
+
+    expect(store.inboundMessage("old-message")).toBeUndefined();
+    expect(store.inboundMessageBySequence(1)).toEqual({
+      messageId: "replacement-message",
+      sequence: 1,
+      body: "replacement-body",
+      delivered: false,
+    });
+    expect(store.pendingInboundMessages()).toEqual([
+      {
+        messageId: "replacement-message",
+        sequence: 1,
+        body: "replacement-body",
+        delivered: false,
+      },
+    ]);
+    const audit = new Database(databasePath, { readonly: true });
+    expect(
+      audit
+        .prepare("SELECT value FROM metadata WHERE key = ?")
+        .get("inbound-delivered:old-message"),
+    ).toBeUndefined();
+    audit.close();
+    expect(() =>
+      store.replaceInbound({
+        previousMessageId: "old-message",
+        previousBody: "old-body",
+        messageId: "attacker-message",
+        sequence: 1,
+        body: "attacker-body",
+      }),
+    ).toThrowError(StoreInboundConflictError);
+    expect(store.inboundMessageBySequence(1)?.messageId).toBe(
+      "replacement-message",
+    );
+    store.close();
+  });
+
   it("rejects reused inbound IDs unless sequence and body match exactly", () => {
     const databasePath = makeDatabasePath();
     const store = new SqlitePluginStore(databasePath);

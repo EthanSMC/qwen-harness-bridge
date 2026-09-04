@@ -35,6 +35,14 @@ export type StoredInboundMessage = Readonly<{
   delivered: boolean;
 }>;
 
+export type InboundReplacement = Readonly<{
+  previousMessageId: string;
+  previousBody: string;
+  messageId: string;
+  sequence: number;
+  body: string;
+}>;
+
 export interface PluginStore {
   recordInbound(
     messageId: string,
@@ -43,6 +51,8 @@ export interface PluginStore {
   ): "new" | "duplicate";
   maxInboundSequence(): number;
   inboundMessage(messageId: string): StoredInboundMessage | undefined;
+  inboundMessageBySequence(sequence: number): StoredInboundMessage | undefined;
+  replaceInbound(replacement: InboundReplacement): void;
   pendingInboundMessages(): StoredInboundMessage[];
   markInboundDelivered(messageId: string): void;
   mapJob(input: {
@@ -290,6 +300,70 @@ export class SqlitePluginStore implements PluginStore {
       body: row.body,
       delivered: delivery?.value === String(row.sequence),
     };
+  }
+
+  inboundMessageBySequence(sequence: number): StoredInboundMessage | undefined {
+    this.assertOpen();
+    assertPositiveInteger(sequence, "STORE_SEQUENCE_INVALID");
+    const row = this.database
+      .prepare("SELECT message_id FROM inbound_messages WHERE sequence = ?")
+      .get(sequence) as { message_id: string } | undefined;
+    return row === undefined ? undefined : this.inboundMessage(row.message_id);
+  }
+
+  replaceInbound(replacement: InboundReplacement): void {
+    this.assertOpen();
+    assertNonEmpty(replacement.previousMessageId, "STORE_MESSAGE_ID_REQUIRED");
+    assertNonEmpty(replacement.previousBody, "STORE_MESSAGE_BODY_REQUIRED");
+    assertNonEmpty(replacement.messageId, "STORE_MESSAGE_ID_REQUIRED");
+    assertPositiveInteger(replacement.sequence, "STORE_SEQUENCE_INVALID");
+    assertNonEmpty(replacement.body, "STORE_MESSAGE_BODY_REQUIRED");
+
+    const write = this.database.transaction(() => {
+      const current = this.database
+        .prepare(
+          `SELECT message_id, sequence, body
+           FROM inbound_messages WHERE sequence = ?`,
+        )
+        .get(replacement.sequence) as InboundRow | undefined;
+      const byReplacementId = this.database
+        .prepare("SELECT sequence FROM inbound_messages WHERE message_id = ?")
+        .get(replacement.messageId) as { sequence: number } | undefined;
+      if (
+        current?.message_id !== replacement.previousMessageId ||
+        current.body !== replacement.previousBody ||
+        byReplacementId !== undefined
+      ) {
+        throw new StoreInboundConflictError();
+      }
+      const updated = this.database
+        .prepare(
+          `UPDATE inbound_messages
+           SET message_id = ?, body = ?, received_at = ?
+           WHERE sequence = ? AND message_id = ? AND body = ?`,
+        )
+        .run(
+          replacement.messageId,
+          replacement.body,
+          now(),
+          replacement.sequence,
+          replacement.previousMessageId,
+          replacement.previousBody,
+        );
+      if (updated.changes !== 1) throw new StoreInboundConflictError();
+      this.database
+        .prepare("DELETE FROM metadata WHERE key IN (?, ?)")
+        .run(
+          `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.previousMessageId}`,
+          `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.messageId}`,
+        );
+    });
+    try {
+      write.immediate();
+    } catch (error) {
+      if (error instanceof StoreInboundConflictError) throw error;
+      throw new StoreError("STORE_INBOUND_WRITE_FAILED");
+    }
   }
 
   pendingInboundMessages(): StoredInboundMessage[] {

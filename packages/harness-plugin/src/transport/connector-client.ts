@@ -38,7 +38,7 @@ export type ConnectorClientOptions = Readonly<{
   controlPlaneUrl: `wss://${string}`;
   store: PluginStore;
   sessionTokenClient: SessionTokenClient;
-  bootstrapCredentialProvider: () => Promise<string>;
+  bootstrapCredentialProvider: (signal?: AbortSignal) => Promise<string>;
   connectorVersion?: string;
   capabilities?: readonly string[];
   now?: () => Date;
@@ -263,17 +263,20 @@ export class DurableConnectorClient implements ConnectorClient {
     if (session === undefined) {
       const bootstrapCredential = await this.#abortable(
         Promise.resolve().then(() =>
-          this.#options.bootstrapCredentialProvider(),
+          this.#options.bootstrapCredentialProvider(signal),
         ),
         signal,
       );
       if (bootstrapCredential === ABORTED) return false;
       const exchanged = await this.#abortable(
         Promise.resolve().then(() =>
-          this.#options.sessionTokenClient.exchange({
-            connectorId: this.#options.connectorId,
-            bootstrapCredential,
-          }),
+          this.#options.sessionTokenClient.exchange(
+            {
+              connectorId: this.#options.connectorId,
+              bootstrapCredential,
+            },
+            signal,
+          ),
         ),
         signal,
       );
@@ -293,7 +296,8 @@ export class DurableConnectorClient implements ConnectorClient {
     this.#welcomeWaiter = new Promise<void>((resolve) => {
       this.#resolveWelcome = resolve;
     });
-    this.#receivePump = Promise.resolve();
+    // Keep receive work serialized across socket generations. A handler from the
+    // previous connection may still own an uncompleted durable delivery.
     this.#sendPump = Promise.resolve();
     const closePromise = new Promise<void>((resolve, reject) => {
       let settled = false;
@@ -329,6 +333,9 @@ export class DurableConnectorClient implements ConnectorClient {
     try {
       await closePromise;
       return this.#welcomeReceived;
+    } catch (error) {
+      if (this.#welcomeReceived) return true;
+      throw error;
     } finally {
       if (this.#socket === socket) this.#socket = undefined;
       this.#welcomeWaiter = undefined;
@@ -399,8 +406,36 @@ export class DurableConnectorClient implements ConnectorClient {
       this.#closeSocket(socket);
       return;
     }
+    const existingAtSequence =
+      existing === undefined
+        ? this.#options.store.inboundMessageBySequence(message.sequence)
+        : existing;
+    let replacement = false;
     if (
       existing === undefined &&
+      existingAtSequence !== undefined &&
+      this.#validReplacement(existingAtSequence, message)
+    ) {
+      try {
+        this.#options.store.replaceInbound({
+          previousMessageId: existingAtSequence.messageId,
+          previousBody: existingAtSequence.body,
+          messageId: message.message_id,
+          sequence: message.sequence,
+          body: serialized,
+        });
+        replacement = true;
+      } catch {
+        this.#closeSocket(socket);
+        return;
+      }
+    } else if (existing === undefined && existingAtSequence !== undefined) {
+      this.#closeSocket(socket);
+      return;
+    }
+    if (
+      existing === undefined &&
+      !replacement &&
       message.sequence !== this.#serverCursor.lastSequence + 1
     ) {
       this.#closeSocket(socket);
@@ -409,12 +444,13 @@ export class DurableConnectorClient implements ConnectorClient {
     if (
       message.type === "connector.welcome" &&
       this.#welcomeReceived &&
-      existing === undefined
+      existing === undefined &&
+      !replacement
     ) {
       this.#closeSocket(socket);
       return;
     }
-    if (existing === undefined) {
+    if (existing === undefined && !replacement) {
       try {
         this.#options.store.recordInbound(
           message.message_id,
@@ -445,6 +481,43 @@ export class DurableConnectorClient implements ConnectorClient {
     await this.#completeInbound(message, existing?.delivered ?? false);
   }
 
+  #validReplacement(
+    stored: StoredInboundMessage,
+    replacement: ConnectorServerMessage,
+  ): boolean {
+    const previous = this.#parseStoredInbound(stored);
+    if (
+      previous === undefined ||
+      previous.message_id === replacement.message_id ||
+      previous.sequence !== replacement.sequence ||
+      previous.correlation_id !== replacement.correlation_id
+    ) {
+      return false;
+    }
+    const previousExpired =
+      Date.parse(previous.expires_at) <= this.#now().getTime();
+    const sameSemanticEnvelope =
+      previous.type === replacement.type &&
+      JSON.stringify(previous.payload) === JSON.stringify(replacement.payload);
+    const replacementCode =
+      replacement.type === "protocol.error"
+        ? replacement.payload.code
+        : undefined;
+    const isExpiryTombstone = replacementCode === "MESSAGE_EXPIRED";
+    const isInactiveOfferTombstone =
+      previous.type === "job.offer" &&
+      (isExpiryTombstone || replacementCode === "JOB_CANCELLED");
+    const restoresWelcome =
+      previous.type === "protocol.error" &&
+      previous.payload.code === "MESSAGE_EXPIRED" &&
+      replacement.type === "connector.welcome";
+    return (
+      (previousExpired && (sameSemanticEnvelope || isExpiryTombstone)) ||
+      isInactiveOfferTombstone ||
+      restoresWelcome
+    );
+  }
+
   #validWelcome(
     message: Extract<ConnectorServerMessage, { type: "connector.welcome" }>,
   ): boolean {
@@ -466,6 +539,10 @@ export class DurableConnectorClient implements ConnectorClient {
       const message = this.#parseStoredInbound(stored);
       if (message === undefined) {
         throw new Error("CONNECTOR_STORED_INBOUND_INVALID");
+      }
+      if (Date.parse(message.expires_at) <= this.#now().getTime()) {
+        this.#options.store.markInboundDelivered(message.message_id);
+        continue;
       }
       await this.#completeInbound(message, false);
     }
@@ -717,17 +794,20 @@ export class DurableConnectorClient implements ConnectorClient {
     try {
       const bootstrapCredential = await this.#abortable(
         Promise.resolve().then(() =>
-          this.#options.bootstrapCredentialProvider(),
+          this.#options.bootstrapCredentialProvider(signal),
         ),
         signal,
       );
       if (bootstrapCredential === ABORTED) return;
       const session = await this.#abortable(
         Promise.resolve().then(() =>
-          this.#options.sessionTokenClient.exchange({
-            connectorId: this.#options.connectorId,
-            bootstrapCredential,
-          }),
+          this.#options.sessionTokenClient.exchange(
+            {
+              connectorId: this.#options.connectorId,
+              bootstrapCredential,
+            },
+            signal,
+          ),
         ),
         signal,
       );

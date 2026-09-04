@@ -43,13 +43,14 @@ const envelope = (
   sequence: number,
   payload: unknown,
   correlationId = randomUUID(),
+  sentAt = new Date(),
 ): ConnectorServerMessage =>
   ConnectorServerMessageSchema.parse({
     protocol_version: "1.0",
     message_id: randomUUID(),
     sequence,
-    sent_at: new Date().toISOString(),
-    expires_at: isoAfter(60_000),
+    sent_at: sentAt.toISOString(),
+    expires_at: new Date(sentAt.getTime() + 60_000).toISOString(),
     correlation_id: correlationId,
     type,
     payload,
@@ -464,6 +465,192 @@ describe("authenticated connector transport", () => {
     expect(replayed.map(({ sequence }) => sequence)).toEqual([2, 3, 4]);
   });
 
+  it("reconnects after hello expiry with a refreshed same-sequence welcome", async () => {
+    const fixture = await startFixture();
+    fixture.autoWelcome = false;
+    fixtures.push(fixture);
+    const { store, directory } = makeStore();
+    stores.push({ store, directory });
+    let clock = new Date();
+    const controller = new AbortController();
+    const client = makeClient(fixture, store, { now: () => clock });
+    const running = client.start(controller.signal);
+    await waitFor(() =>
+      fixture.clientMessages.some(({ type }) => type === "connector.hello"),
+    );
+    const firstHello = fixture.clientMessages.find(
+      ({ type }) => type === "connector.hello",
+    );
+    const firstSocket = [...fixture.sockets][0];
+    if (firstHello === undefined || firstSocket === undefined) {
+      throw new Error("fixture handshake missing");
+    }
+    const welcomePayload = {
+      connector_id: CONNECTOR_ID,
+      server_sequence: 1,
+      replay_from: 1,
+    };
+    const originalWelcome = envelope(
+      "connector.welcome",
+      1,
+      welcomePayload,
+      firstHello.correlation_id as `${string}-${string}-${string}-${string}-${string}`,
+      clock,
+    );
+    fixture.send(firstSocket, originalWelcome);
+    await waitFor(
+      () =>
+        store.inboundMessage(originalWelcome.message_id)?.delivered === true,
+    );
+
+    clock = new Date(clock.getTime() + 61_000);
+    firstSocket.close();
+    await waitFor(
+      () =>
+        fixture.clientMessages.filter(({ type }) => type === "connector.hello")
+          .length === 2,
+    );
+    const replayedHello = fixture.clientMessages.filter(
+      ({ type }) => type === "connector.hello",
+    )[1];
+    const secondSocket = [...fixture.sockets][0];
+    if (replayedHello === undefined || secondSocket === undefined) {
+      throw new Error("fixture replay handshake missing");
+    }
+    expect(replayedHello).toMatchObject({
+      message_id: firstHello.message_id,
+      sequence: firstHello.sequence,
+    });
+    expect(Date.parse(String(replayedHello.expires_at))).toBeLessThan(
+      clock.getTime(),
+    );
+    const refreshedWelcome = envelope(
+      "connector.welcome",
+      1,
+      welcomePayload,
+      firstHello.correlation_id as `${string}-${string}-${string}-${string}-${string}`,
+      clock,
+    );
+    fixture.send(secondSocket, refreshedWelcome);
+    const accepted = await becomesTrue(
+      () =>
+        store.inboundMessage(refreshedWelcome.message_id)?.delivered === true,
+    );
+    const originalAfterReplacement = store.inboundMessage(
+      originalWelcome.message_id,
+    );
+
+    controller.abort();
+    await running;
+    expect(accepted).toBe(true);
+    expect(originalAfterReplacement).toBeUndefined();
+  });
+
+  it("processes a same-sequence command tombstone once and re-ACKs its duplicate", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const { store, directory } = makeStore();
+    stores.push({ store, directory });
+    const controller = new AbortController();
+    const client = makeClient(fixture, store);
+    let handlerCalls = 0;
+    client.onCommand(async () => {
+      handlerCalls += 1;
+    });
+    const running = client.start(controller.signal);
+    await waitFor(() =>
+      fixture.clientMessages.some(
+        (message) =>
+          message.type === "ack" &&
+          (message.payload as JsonRecord).sequence === 1,
+      ),
+    );
+    const socket = [...fixture.sockets][0];
+    if (socket === undefined) throw new Error("fixture socket missing");
+    const command = envelope("job.offer", 2, {
+      job_id: JOB_ID,
+      attempt: 1,
+      lease_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      repository_id: "repo-one",
+      request: "command replaced by tombstone",
+    });
+    fixture.send(socket, command);
+    await waitFor(
+      () => store.inboundMessage(command.message_id)?.delivered === true,
+    );
+    const tombstone = envelope(
+      "protocol.error",
+      command.sequence,
+      {
+        code: "MESSAGE_EXPIRED",
+        message: "A Connector message expired before delivery.",
+      },
+      command.correlation_id,
+    );
+    fixture.send(socket, tombstone);
+    const replacementAccepted = await becomesTrue(
+      () => store.inboundMessage(tombstone.message_id)?.delivered === true,
+    );
+    if (replacementAccepted) fixture.send(socket, tombstone);
+    const duplicateReacked = await becomesTrue(
+      () =>
+        fixture.clientMessages.filter(
+          (message) =>
+            message.type === "ack" &&
+            (message.payload as JsonRecord).sequence === command.sequence,
+        ).length === 3,
+    );
+
+    controller.abort();
+    await running;
+    expect(replacementAccepted).toBe(true);
+    expect(duplicateReacked).toBe(true);
+    expect(store.inboundMessage(command.message_id)).toBeUndefined();
+    expect(handlerCalls).toBe(1);
+  });
+
+  it("rejects a fresh-ID rewrite of a still-valid incompatible sequence", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const { store, directory } = makeStore();
+    stores.push({ store, directory });
+    const controller = new AbortController();
+    const running = makeClient(fixture, store, {
+      reconnectDelay: () => 10_000,
+    }).start(controller.signal);
+    await waitFor(() =>
+      fixture.clientMessages.some(
+        (message) =>
+          message.type === "ack" &&
+          (message.payload as JsonRecord).sequence === 1,
+      ),
+    );
+    const socket = [...fixture.sockets][0];
+    if (socket === undefined) throw new Error("fixture socket missing");
+    const original = envelope("protocol.error", 2, {
+      code: "ORIGINAL",
+      message: "Original durable envelope.",
+    });
+    fixture.send(socket, original);
+    await waitFor(
+      () => store.inboundMessage(original.message_id)?.delivered === true,
+    );
+    const incompatible = envelope(
+      "protocol.error",
+      original.sequence,
+      { code: "REWRITTEN", message: "Must fail closed." },
+      original.correlation_id,
+    );
+    fixture.send(socket, incompatible);
+    await waitFor(() => fixture.sockets.size === 0);
+    const durable = store.inboundMessageBySequence(original.sequence);
+
+    controller.abort();
+    await running;
+    expect(durable?.messageId).toBe(original.message_id);
+    expect(store.inboundMessage(incompatible.message_id)).toBeUndefined();
+  });
+
   it("sends a heartbeat every ten seconds", async () => {
     vi.useFakeTimers();
     const fixture = await startFixture();
@@ -570,6 +757,119 @@ describe("authenticated connector transport", () => {
     await running;
   });
 
+  it("does not redispatch a blocked command on a replacement connection", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const { store, directory } = makeStore();
+    stores.push({ store, directory });
+    const controller = new AbortController();
+    let releaseHandler: (() => void) | undefined;
+    let handlerCalls = 0;
+    const client = makeClient(fixture, store);
+    client.onCommand(async () => {
+      handlerCalls += 1;
+      await new Promise<void>((resolve) => {
+        releaseHandler = resolve;
+      });
+    });
+    const running = client.start(controller.signal);
+    await waitFor(() =>
+      fixture.clientMessages.some(
+        (message) =>
+          message.type === "ack" &&
+          (message.payload as JsonRecord).sequence === 1,
+      ),
+    );
+    const firstSocket = [...fixture.sockets][0];
+    if (firstSocket === undefined) throw new Error("fixture socket missing");
+    const command = envelope("job.offer", 2, {
+      job_id: JOB_ID,
+      attempt: 1,
+      lease_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      repository_id: "repo-one",
+      request: "serialize handler generations",
+    });
+    fixture.send(firstSocket, command);
+    await waitFor(() => handlerCalls === 1);
+
+    fixture.nextServerSequence = 3;
+    firstSocket.close();
+    await waitFor(
+      () =>
+        fixture.clientMessages.filter(({ type }) => type === "connector.hello")
+          .length === 2,
+    );
+    const concurrentRedispatch = await becomesTrue(() => handlerCalls > 1);
+    releaseHandler?.();
+    await waitFor(
+      () => store.inboundMessage(command.message_id)?.delivered === true,
+    );
+
+    controller.abort();
+    await running;
+    expect(concurrentRedispatch).toBe(false);
+    expect(handlerCalls).toBe(1);
+  });
+
+  it("retries a failed in-flight command only after the old generation settles", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const { store, directory } = makeStore();
+    stores.push({ store, directory });
+    const controller = new AbortController();
+    let releaseFailure: (() => void) | undefined;
+    let handlerCalls = 0;
+    const client = makeClient(fixture, store);
+    client.onCommand(async () => {
+      handlerCalls += 1;
+      if (handlerCalls === 1) {
+        await new Promise<void>((resolve) => {
+          releaseFailure = resolve;
+        });
+        throw new Error("old generation failed");
+      }
+    });
+    const running = client.start(controller.signal);
+    await waitFor(() =>
+      fixture.clientMessages.some(
+        (message) =>
+          message.type === "ack" &&
+          (message.payload as JsonRecord).sequence === 1,
+      ),
+    );
+    const firstSocket = [...fixture.sockets][0];
+    if (firstSocket === undefined) throw new Error("fixture socket missing");
+    const command = envelope("job.offer", 2, {
+      job_id: JOB_ID,
+      attempt: 1,
+      lease_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      repository_id: "repo-one",
+      request: "retry after old handler failure",
+    });
+    fixture.send(firstSocket, command);
+    await waitFor(() => handlerCalls === 1);
+
+    fixture.nextServerSequence = 3;
+    firstSocket.close();
+    await waitFor(
+      () =>
+        fixture.clientMessages.filter(({ type }) => type === "connector.hello")
+          .length === 2,
+    );
+    const concurrentRedispatch = await becomesTrue(() => handlerCalls > 1);
+    releaseFailure?.();
+    await waitFor(
+      () =>
+        handlerCalls === 2 &&
+        store.inboundMessage(command.message_id)?.delivered === true,
+    );
+
+    controller.abort();
+    await running;
+    expect(concurrentRedispatch).toBe(false);
+    expect(handlerCalls).toBe(2);
+  });
+
   it("enqueues a received-message ACK before putting it on the socket", async () => {
     const fixture = await startFixture();
     fixtures.push(fixture);
@@ -583,6 +883,9 @@ describe("authenticated connector transport", () => {
       },
       maxInboundSequence: () => baseStore.maxInboundSequence(),
       inboundMessage: (messageId) => baseStore.inboundMessage(messageId),
+      inboundMessageBySequence: (sequence) =>
+        baseStore.inboundMessageBySequence(sequence),
+      replaceInbound: (replacement) => baseStore.replaceInbound(replacement),
       pendingInboundMessages: () => baseStore.pendingInboundMessages(),
       markInboundDelivered: (messageId) =>
         baseStore.markInboundDelivered(messageId),
@@ -883,6 +1186,60 @@ describe("authenticated connector transport", () => {
     expect(hello?.payload).toMatchObject({ last_server_sequence: 1 });
   });
 
+  it("reconciles an expired recovered command without dispatching or ACKing it", async () => {
+    const fixture = await startFixture();
+    fixture.nextServerSequence = 2;
+    fixtures.push(fixture);
+    const { store, directory } = makeStore();
+    stores.push({ store, directory });
+    const clock = new Date();
+    const expiredCommand = envelope(
+      "job.offer",
+      1,
+      {
+        job_id: JOB_ID,
+        attempt: 1,
+        lease_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        repository_id: "repo-one",
+        request: "expired recovered command",
+      },
+      randomUUID(),
+      new Date(clock.getTime() - 120_000),
+    );
+    store.recordInbound(
+      expiredCommand.message_id,
+      expiredCommand.sequence,
+      JSON.stringify(expiredCommand),
+    );
+    let handlerCalls = 0;
+    const controller = new AbortController();
+    const client = makeClient(fixture, store, { now: () => clock });
+    client.onCommand(async () => {
+      handlerCalls += 1;
+    });
+    const running = client.start(controller.signal);
+    await waitFor(
+      () => store.inboundMessage(expiredCommand.message_id)?.delivered === true,
+    );
+    await waitFor(() =>
+      fixture.clientMessages.some(
+        (message) =>
+          message.type === "ack" &&
+          (message.payload as JsonRecord).sequence === 2,
+      ),
+    );
+    const expiredAcked = fixture.clientMessages.some(
+      (message) =>
+        message.type === "ack" &&
+        (message.payload as JsonRecord).sequence === expiredCommand.sequence,
+    );
+
+    controller.abort();
+    await running;
+    expect(handlerCalls).toBe(0);
+    expect(expiredAcked).toBe(false);
+  });
+
   it("retries an unfinished durable command after restart and re-ACKs only after success", async () => {
     const fixture = await startFixture();
     fixtures.push(fixture);
@@ -1041,6 +1398,141 @@ describe("authenticated connector transport", () => {
     },
   );
 
+  it("passes the start signal to a cancellable bootstrap provider", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const { store, directory } = makeStore();
+    stores.push({ store, directory });
+    let entered = false;
+    let observedSignal: AbortSignal | undefined;
+    let providerAborted = false;
+    const controller = new AbortController();
+    const client = makeClient(fixture, store, {
+      bootstrapCredentialProvider: (signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          entered = true;
+          observedSignal = signal;
+          signal?.addEventListener(
+            "abort",
+            () => {
+              providerAborted = true;
+              reject(new Error("bootstrap provider aborted"));
+            },
+            { once: true },
+          );
+        }),
+    });
+    const running = client.start(controller.signal);
+    await waitFor(() => entered);
+
+    controller.abort();
+    await running;
+
+    expect(observedSignal).toBe(controller.signal);
+    expect(providerAborted).toBe(true);
+    expect(fixture.tokenRequests).toHaveLength(0);
+  });
+
+  it("passes AbortSignal through the HTTPS session request", async () => {
+    let entered = false;
+    let observedSignal: AbortSignal | undefined;
+    let requestAborted = false;
+    const sessionClient = new HttpsSessionTokenClient({
+      endpoint: "https://control-plane.example/connector/v1/session",
+      credentialId: CREDENTIAL_ID,
+      request: (_options, _body, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          entered = true;
+          observedSignal = signal;
+          signal?.addEventListener(
+            "abort",
+            () => {
+              requestAborted = true;
+              reject(new Error("session request aborted"));
+            },
+            { once: true },
+          );
+        }),
+    });
+    const controller = new AbortController();
+    const exchange = sessionClient.exchange(
+      {
+        connectorId: CONNECTOR_ID,
+        bootstrapCredential: BOOTSTRAP_CREDENTIAL,
+      },
+      controller.signal,
+    );
+    await waitFor(() => entered);
+
+    controller.abort();
+    const settledPromptly = await Promise.race([
+      exchange.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+    ]);
+
+    expect(observedSignal).toBe(controller.signal);
+    expect(requestAborted).toBe(true);
+    expect(settledPromptly).toBe(true);
+  });
+
+  it("cancels an in-flight refresh exchange without late state work", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const { store, directory } = makeStore();
+    stores.push({ store, directory });
+    vi.useFakeTimers();
+    let exchangeCalls = 0;
+    let refreshSignal: AbortSignal | undefined;
+    let refreshAborted = false;
+    const controller = new AbortController();
+    const client = makeClient(fixture, store, {
+      sessionTokenClient: {
+        exchange: (_input, signal?: AbortSignal) => {
+          exchangeCalls += 1;
+          if (exchangeCalls === 1) {
+            return Promise.resolve({
+              token: "short-lived-session",
+              expiresAt: isoAfter(30_000),
+            });
+          }
+          return new Promise((_resolve, reject) => {
+            refreshSignal = signal;
+            signal?.addEventListener(
+              "abort",
+              () => {
+                refreshAborted = true;
+                reject(new Error("refresh exchange aborted"));
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+    });
+    const running = client.start(controller.signal);
+    await vi.waitFor(() =>
+      expect(
+        fixture.clientMessages.some(({ type }) => type === "connector.hello"),
+      ).toBe(true),
+    );
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.waitFor(() => expect(exchangeCalls).toBe(2));
+
+    controller.abort();
+    await running;
+    await vi.advanceTimersByTimeAsync(1_001);
+    const timersAfterAbort = vi.getTimerCount();
+
+    expect(refreshSignal).toBe(controller.signal);
+    expect(refreshAborted).toBe(true);
+    expect(exchangeCalls).toBe(2);
+    expect(fixture.socketTokens).toEqual(["Bearer short-lived-session"]);
+    expect(timersAfterAbort).toBe(0);
+  });
+
   it.each(["bootstrap credential", "session exchange"] as const)(
     "abandons a pending refresh %s on abort without scheduling late work",
     async (boundary) => {
@@ -1140,6 +1632,50 @@ describe("authenticated connector transport", () => {
     controller.abort();
     await running;
     expect(firstThreeDelays).toEqual([1_000, 2_000, 4_000]);
+  });
+
+  it("resets reconnect backoff after welcome even when the socket later errors", async () => {
+    const fixture = await startFixture();
+    fixture.preWelcomeClosesRemaining = 2;
+    fixtures.push(fixture);
+    const { store, directory } = makeStore();
+    stores.push({ store, directory });
+    const observedDelays: number[] = [];
+    const clientSockets: WebSocket[] = [];
+    const controller = new AbortController();
+    const running = makeClient(fixture, store, {
+      webSocketFactory: (url, webSocketOptions) => {
+        const socket = new WebSocket(url, {
+          ...webSocketOptions,
+          ca: LOCALHOST_TLS.cert,
+        });
+        clientSockets.push(socket);
+        return socket;
+      },
+      reconnectDelay: (attempt) => {
+        observedDelays.push(reconnectDelayMs(attempt, 0.5));
+        return 0;
+      },
+    }).start(controller.signal);
+    await waitFor(() => observedDelays.length === 2);
+    await waitFor(() =>
+      fixture.clientMessages.some(
+        (message) =>
+          message.type === "ack" &&
+          (message.payload as JsonRecord).sequence === 1,
+      ),
+    );
+    const welcomedSocket = clientSockets[2];
+    if (welcomedSocket === undefined) {
+      throw new Error("welcomed client socket missing");
+    }
+    welcomedSocket.emit("error", new Error("post-welcome socket failure"));
+    await waitFor(() => observedDelays.length === 3);
+    const firstThreeDelays = observedDelays.slice(0, 3);
+
+    controller.abort();
+    await running;
+    expect(firstThreeDelays).toEqual([1_000, 2_000, 1_000]);
   });
 
   it("stops reconnecting and closes the socket through AbortSignal", async () => {
