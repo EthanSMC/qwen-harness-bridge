@@ -29,6 +29,8 @@
 
 ## Planned File Map
 
+The approved dependency graph is Task 1 → independent Tasks 2, 3 and 4 → Task 5 → Task 6 → Task 7. Task 5 directly depends on Tasks 2, 3 and 4; Task 6 directly depends on Tasks 2, 3, 4 and 5. Task 1 retains the preceding Foundation completion prerequisite. Each independent task uses its own Issue, branch, worktree and PR; shared integration and merges are serialized. [ADR 0003](../../adr/0003-m1-dependency-graph.md) defines the management synchronization contract. Task order in this document does not turn the independent tasks into a linear dependency chain.
+
 ```text
 packages/harness-plugin/package.json             extension package and exports
 packages/harness-plugin/src/index.ts             Cordis apply(ctx) entry point

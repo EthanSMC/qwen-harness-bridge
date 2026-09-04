@@ -150,6 +150,10 @@ Blocked by #12, #19
 `Blocked by none` is explicit when an implementation Issue has no dependencies.
 The declaration is bounded to 512 UTF-8 bytes and at most 20 unique, non-self Issue references. The controller hydrates dependencies through a four-request worker pool and ignores untyped Issues before hydration.
 
+### 6.1 Approved M1 dependency graph
+
+Management synchronization preserves the Harness Connector plan's approved parallel graph: Task 1 keeps the Foundation completion prerequisite; Tasks 2, 3 and 4 each depend on Task 1; Task 5 depends on Tasks 2, 3 and 4; Task 6 depends on Tasks 2, 3, 4 and 5; Task 7 depends on Task 6. Resolve actual Issue identities using their unique plan-task markers, never consecutive Issue numbers or API ordering. All other plan edges remain unchanged. Matching active claims retain their exact body; an actual active dependency mismatch still fails closed instead of being silently rewritten. [ADR 0003](../../adr/0003-m1-dependency-graph.md) records the correction and required evidence.
+
 ## 7. Exclusive claim protocol
 
 ### 7.1 Command
