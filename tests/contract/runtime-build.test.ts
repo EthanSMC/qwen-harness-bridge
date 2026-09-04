@@ -421,6 +421,45 @@ describe("release runtime build contract", () => {
     }
   });
 
+  it("removes only the canonical runtime-root pnpm lockfile", () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-prune-lockfile-"));
+    const runtimeRoot = join(fixtureRoot, "runtime");
+    const nodeModulesRoot = join(runtimeRoot, "node_modules");
+    const externalLockfile = join(fixtureRoot, "external-pnpm-lock.yaml");
+    const runtimeLockfile = join(runtimeRoot, "pnpm-lock.yaml");
+    const packageJson = JSON.stringify({
+      name: "fixture-runtime",
+      version: "0.1.0",
+    });
+    try {
+      mkdirSync(nodeModulesRoot, { recursive: true });
+      writeFileSync(join(runtimeRoot, "package.json"), packageJson);
+      writeFileSync(externalLockfile, "external lockfile must remain\n");
+      symlinkSync(externalLockfile, runtimeLockfile, "file");
+
+      expect(() =>
+        execFileSync(
+          process.execPath,
+          [
+            absolute("scripts/runtime/prune-production-dependencies.mjs"),
+            runtimeRoot,
+          ],
+          { stdio: "pipe" },
+        ),
+      ).not.toThrow();
+
+      expect(existsSync(runtimeLockfile)).toBe(false);
+      expect(readFileSync(externalLockfile, "utf8")).toBe(
+        "external lockfile must remain\n",
+      );
+      expect(readFileSync(join(runtimeRoot, "package.json"), "utf8")).toBe(
+        packageJson,
+      );
+    } finally {
+      rmSync(fixtureRoot, { force: true, recursive: true });
+    }
+  });
+
   it("unlinks an external pnpm workspace link without traversing its target", () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-prune-workspace-"));
     const buildRoot = join(fixtureRoot, "buildRoot");
@@ -952,6 +991,7 @@ describe("release runtime build contract", () => {
         ["scripts/runtime/prune-production-dependencies.mjs", runtimeRoot],
         { cwd: buildRoot, env: environment, stdio: "pipe" },
       );
+      expect(existsSync(join(runtimeRoot, "pnpm-lock.yaml"))).toBe(false);
       for (const path of [
         "dist/main.js",
         "dist/db/migrate.js",

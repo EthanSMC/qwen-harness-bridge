@@ -207,3 +207,4 @@ const prune = async (directory) => {
 };
 
 await prune(canonicalNodeModulesRoot);
+await rm(join(canonicalRoot, "pnpm-lock.yaml"), { force: true });
