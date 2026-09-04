@@ -2,7 +2,7 @@ name: qwen-harness-bridge
 
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-qhb}
@@ -17,7 +17,21 @@ services:
       retries: 12
       start_period: 5s
 
+  migrate:
+    image: qwen-harness-bridge-control-plane
+    build:
+      context: .
+      dockerfile: apps/control-plane/Dockerfile
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-qhb}:${POSTGRES_PASSWORD:-qhb}@postgres:5432/${POSTGRES_DB:-qhb}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["node", "dist/db/migrate.js"]
+
   control-plane:
+    image: qwen-harness-bridge-control-plane
     build:
       context: .
       dockerfile: apps/control-plane/Dockerfile
@@ -34,24 +48,23 @@ services:
       QHB_TLS_CERT_PATH: /run/secrets/qhb_tls_cert
       QHB_TLS_KEY_PATH: /run/secrets/qhb_tls_key
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: ["node", "dist/main.js"]
     ports:
-      - "${CONTROL_PLANE_PORT:-8443}:8443"
+      - "127.0.0.1:${CONTROL_PLANE_PORT:-8443}:8443"
     secrets:
       - source: qhb_tls_cert
         target: qhb_tls_cert
-        mode: "0444"
       - source: qhb_tls_key
         target: qhb_tls_key
-        mode: "0444"
     healthcheck:
       test:
         - CMD
         - node
         - -e
         - >-
-          const https = require('node:https'); const request = https.get('https://127.0.0.1:8443/healthz', { rejectUnauthorized: false }, response => { response.resume(); process.exitCode = response.statusCode === 200 ? 0 : 1; }); request.on('error', () => process.exit(1));
+          const https = require('node:https'); const request = https.get('https://127.0.0.1:8443/health/ready', { rejectUnauthorized: false }, response => { response.resume(); process.exitCode = response.statusCode === 200 ? 0 : 1; }); request.on('error', () => process.exit(1));
       interval: 5s
       timeout: 5s
       retries: 12

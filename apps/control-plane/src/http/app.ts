@@ -3,7 +3,11 @@ import type {
   ServerOptions as HttpsServerOptions,
 } from "node:https";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, {
+  type FastifyInstance,
+  type FastifyReply,
+  type FastifyRequest,
+} from "fastify";
 import { createConnectorBootstrapAuthenticator } from "../connector/auth.js";
 import {
   type ConnectorGatewayOptions,
@@ -13,6 +17,8 @@ import {
 import { createMcpAuthenticator, McpAuthenticationError } from "../mcp/auth.js";
 import { createMcpServer } from "../mcp/server.js";
 import type { McpCoordinator } from "../mcp/tools.js";
+import type { ReadinessProbe } from "./health.js";
+import type { MetricsRegistry } from "./metrics.js";
 
 export type CreateAppOptions = Readonly<{
   coordinator: McpCoordinator;
@@ -20,6 +26,9 @@ export type CreateAppOptions = Readonly<{
   mcpBearerToken: string;
   https: HttpsServerOptions;
   connectorGateway?: ConnectorGatewayOptions;
+  readinessProbe?: ReadinessProbe;
+  isDraining?: () => boolean;
+  metrics?: MetricsRegistry;
 }>;
 
 const authenticationFailure = {
@@ -110,6 +119,7 @@ export async function createApp(
           expires_at: connectorSessionExpiry(claims),
         });
       } catch {
+        options.metrics?.recordError("AUTHORIZATION_FAILED");
         return reply
           .code(401)
           .type("application/json")
@@ -120,12 +130,53 @@ export async function createApp(
       await connectorGateway.close(app.server as unknown as HttpsServer);
     };
     app.addHook("preClose", closeConnectorGateway);
-    app.addHook("onClose", closeConnectorGateway);
   }
 
-  app.get("/healthz", async (_request, reply) =>
-    reply.type("application/json").send({ status: "ok" }),
-  );
+  const liveHandler = async (_request: FastifyRequest, reply: FastifyReply) =>
+    reply.type("application/json").send({ status: "ok" });
+  app.get("/health/live", liveHandler);
+  app.get("/healthz", liveHandler);
+
+  app.get("/health/ready", async (_request, reply) => {
+    if (
+      options.isDraining?.() === true ||
+      options.readinessProbe === undefined
+    ) {
+      return reply
+        .code(503)
+        .type("application/json")
+        .send({ status: "not_ready" });
+    }
+    try {
+      await options.readinessProbe.assertReady();
+      return reply.type("application/json").send({ status: "ready" });
+    } catch {
+      options.metrics?.recordError("INTERNAL");
+      return reply
+        .code(503)
+        .type("application/json")
+        .send({ status: "not_ready" });
+    }
+  });
+
+  app.get("/metrics", async (_request, reply) => {
+    if (options.metrics === undefined) {
+      return reply
+        .code(503)
+        .type("application/json")
+        .send({ status: "unavailable" });
+    }
+    try {
+      const body = await options.metrics.render();
+      return reply.type("text/plain; version=0.0.4; charset=utf-8").send(body);
+    } catch {
+      options.metrics.recordError("INTERNAL");
+      return reply
+        .code(503)
+        .type("application/json")
+        .send({ status: "unavailable" });
+    }
+  });
 
   app.post("/mcp", async (request, reply) => {
     let owner: ReturnType<typeof authenticator.authenticate>;
@@ -135,6 +186,7 @@ export async function createApp(
       }
       owner = authenticator.authenticate(request.headers);
     } catch {
+      options.metrics?.recordError("UNAUTHENTICATED");
       return reply
         .code(401)
         .type("application/json")
@@ -144,6 +196,7 @@ export async function createApp(
     const server = createMcpServer({
       coordinator: options.coordinator,
       ownerId: owner.id,
+      metrics: options.metrics,
     });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,

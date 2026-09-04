@@ -5,13 +5,22 @@ import { resolve } from "node:path";
 import { createSecureContext } from "node:tls";
 import { fileURLToPath } from "node:url";
 import { type AppConfig, config, requireTlsPaths } from "./config.js";
-import { db } from "./db/client.js";
+import { closeDatabase, db, terminateDatabaseOperations } from "./db/client.js";
 import { JobRepository } from "./db/job-repository.js";
 import {
   Aes256GcmEncryptor,
   JobCoordinator,
 } from "./domain/job-coordinator.js";
 import { createApp } from "./http/app.js";
+import {
+  createCancellablePostgresReadinessProbe,
+  createReadinessSqlClientFactory,
+} from "./http/health.js";
+import {
+  createMetricsRegistry,
+  createPostgresMetricsAdapter,
+} from "./http/metrics.js";
+import { closeRuntimeResources } from "./http/shutdown.js";
 
 export type RuntimeConfiguration = Readonly<{
   ownerId: string;
@@ -70,18 +79,50 @@ export async function start() {
     encryptor: cipher,
     now: () => new Date(),
   });
+  let draining = false;
+  const metrics = createMetricsRegistry({
+    readSnapshot: createPostgresMetricsAdapter(db).readSnapshot,
+  });
+  const readinessProbe = createCancellablePostgresReadinessProbe(
+    createReadinessSqlClientFactory(config.databaseUrl, {
+      connectTimeoutSeconds: 1,
+    }),
+    { statementTimeoutMs: 250 },
+  );
   const app = await createApp({
     coordinator,
     ownerId: runtime.ownerId,
     mcpBearerToken: runtime.mcpBearerToken,
     https,
+    readinessProbe,
+    isDraining: () => draining,
+    metrics,
     connectorGateway: {
       database: db,
       sessionSigningKey: runtime.connectorSessionSigningKey,
+      terminateStoreOperations: terminateDatabaseOperations,
       requestDecryptor: cipher,
+      metrics,
     },
   });
   await app.listen({ port: config.port, host: config.host });
+
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = async (): Promise<void> => {
+    if (shutdownPromise !== undefined) {
+      return shutdownPromise;
+    }
+    draining = true;
+    shutdownPromise = closeRuntimeResources(() => app.close(), closeDatabase);
+    return shutdownPromise;
+  };
+  const onSignal = (): void => {
+    void shutdown().catch(() => {
+      process.exitCode = 1;
+    });
+  };
+  process.once("SIGTERM", onSignal);
+  process.once("SIGINT", onSignal);
   return app;
 }
 

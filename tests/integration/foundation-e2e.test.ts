@@ -23,16 +23,30 @@ afterAll(async () => {
   await database.stop();
 });
 
+const waitForCondition = async (
+  condition: () => boolean | Promise<boolean>,
+  timeoutMessage: string,
+): Promise<void> => {
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    if (await condition()) return;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, Math.min(10, remaining)),
+    );
+  }
+  throw new Error(timeoutMessage);
+};
+
 const waitForStatus = async (jobId: string, status: string): Promise<void> => {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
+  await waitForCondition(async () => {
     const result = await database.query<{ status: string }>(
       "SELECT status FROM jobs WHERE id = $1",
       [jobId],
     );
-    if (result.rows[0]?.status === status) return;
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-  throw new Error(`Timed out waiting for job status ${status}`);
+    return result.rows[0]?.status === status;
+  }, `Timed out waiting for job status ${status}`);
 };
 
 const nextAckFor = async (connector: FakeConnector, clientSequence: number) => {
@@ -50,17 +64,13 @@ const waitForWireOccurrences = async (
   messageId: string,
   expected: number,
 ): Promise<void> => {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    if (
+  await waitForCondition(
+    () =>
       connector.wireReceived.filter(
         (message) => message.message_id === messageId,
-      ).length >= expected
-    ) {
-      return;
-    }
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-  throw new Error(`Timed out waiting for ${expected} wire deliveries`);
+      ).length >= expected,
+    `Timed out waiting for ${expected} wire deliveries`,
+  );
 };
 
 describe("Foundation fake Connector end to end", () => {

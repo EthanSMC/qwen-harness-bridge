@@ -298,6 +298,7 @@ const seedConnector = async (
 const startApp = async (
   dispatchIntervalMs?: number,
   requestDecryptor?: Aes256GcmEncryptor,
+  terminateStoreOperations?: () => Promise<void>,
 ) => {
   const app = await createGatewayApp({
     coordinator: noOpCoordinator as never,
@@ -309,6 +310,9 @@ const startApp = async (
       sessionSigningKey: SESSION_SIGNING_KEY,
       ...(dispatchIntervalMs === undefined ? {} : { dispatchIntervalMs }),
       ...(requestDecryptor === undefined ? {} : { requestDecryptor }),
+      ...(terminateStoreOperations === undefined
+        ? {}
+        : { terminateStoreOperations }),
     },
   });
   await app.listen({ host: "127.0.0.1", port: 0 });
@@ -1978,7 +1982,7 @@ describe("Connector gateway authentication and handshake", () => {
     }
   });
 
-  it("waits for in-flight store work before app.close resolves", async () => {
+  it("terminates stalled store work and waits for release before app.close resolves", async () => {
     const originalAcceptClientMessage =
       PostgresConnectorStore.prototype.acceptClientMessage;
     let releaseHeartbeat: (() => void) | undefined;
@@ -1999,6 +2003,10 @@ describe("Connector gateway authentication and handshake", () => {
     });
     const heartbeatWorkSettled = new Promise<void>((resolve) => {
       heartbeatStoreSettled = resolve;
+    });
+    const terminateStoreOperations = vi.fn(async () => {
+      releaseHeartbeat?.();
+      await heartbeatWorkSettled;
     });
     vi.spyOn(
       PostgresConnectorStore.prototype,
@@ -2022,7 +2030,11 @@ describe("Connector gateway authentication and handshake", () => {
     });
 
     try {
-      const runningApp = await startApp(5_000);
+      const runningApp = await startApp(
+        5_000,
+        undefined,
+        terminateStoreOperations,
+      );
       app = runningApp;
       runningApp.server.once("secureConnection", (acceptedSocket: Socket) => {
         gatewaySocket = acceptedSocket;
@@ -2096,13 +2108,13 @@ describe("Connector gateway authentication and handshake", () => {
       await socketClosed;
       expect(gatewaySocket?.destroyed).toBe(true);
       await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(closeResolved).toBe(false);
-
-      releaseHeartbeat?.();
-      await heartbeatWorkSettled;
-      expect(closeResolved).toBe(false);
-      await closing;
+      await expect(closing).resolves.toBeUndefined();
+      expect(closeResolved).toBe(true);
+      expect(terminateStoreOperations).toHaveBeenCalledTimes(1);
       expect(closeResolvedBeforeHeartbeatStore).toBe(false);
+      expect(heartbeatStoreIsSettled).toBe(true);
+
+      await heartbeatWorkSettled;
       await expect(
         db.query<{ last_client_sequence: number }>(
           "SELECT last_client_sequence::integer AS last_client_sequence FROM connectors WHERE id = $1",

@@ -1,0 +1,17 @@
+.git
+.env
+.env.*
+node_modules
+tests
+.superpowers
+.pnpm-store
+coverage
+dist
+*.log
+**/*.key
+**/*.pem
+**/*.crt
+**/*.cert
+**/*.p12
+.DS_Store
+.npmrc

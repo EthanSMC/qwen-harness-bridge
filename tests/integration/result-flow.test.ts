@@ -134,22 +134,35 @@ const nextAckFor = async (connector: FakeConnector, clientSequence: number) => {
   );
 };
 
+const waitForCondition = async <T>(
+  read: () => T | undefined,
+  description: string,
+): Promise<T> => {
+  const timeoutMs = 3_000;
+  const intervalMs = 10;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const value = read();
+    if (value !== undefined) return value;
+    await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  throw new Error(`Timed out after ${timeoutMs}ms waiting for ${description}`);
+};
+
 const waitForWireOccurrences = async (
   connector: FakeConnector,
   messageId: string,
   expected: number,
 ): Promise<void> => {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    if (
+  await waitForCondition(
+    () =>
       connector.wireReceived.filter(
         (message) => message.message_id === messageId,
-      ).length >= expected
-    ) {
-      return;
-    }
-    await new Promise<void>((resolve) => setImmediate(resolve));
-  }
-  throw new Error(`Timed out waiting for ${expected} wire deliveries`);
+      ).length >= expected || undefined,
+    `${expected} wire deliveries`,
+  );
 };
 
 const submitAndClaim = async (fixture: ResultFixture) => {
@@ -243,6 +256,28 @@ afterAll(async () => {
 });
 
 describe("authenticated Connector terminal results through production MCP", () => {
+  it("waits for a condition beyond 200 event-loop turns", async () => {
+    let turns = 0;
+    let ready = false;
+    const producer = (async () => {
+      while (turns < 250) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        turns += 1;
+      }
+      ready = true;
+    })();
+    try {
+      await expect(
+        waitForCondition(
+          () => (ready ? turns : undefined),
+          "delayed condition",
+        ),
+      ).resolves.toBe(250);
+    } finally {
+      await producer;
+    }
+  });
+
   it("returns a bounded and redacted terminal result with changed files and artifacts", async () => {
     const fixture = await startResultFixture();
     try {
@@ -466,21 +501,18 @@ describe("authenticated Connector terminal results through production MCP", () =
       });
       expect(laterEvent.message_id).not.toBe(terminal.event.message_id);
 
-      const laterResponse = await (async () => {
-        for (let attempt = 0; attempt < 200; attempt += 1) {
-          const response = fixture.connector.wireReceived
+      const laterResponse = await waitForCondition(
+        () =>
+          fixture.connector.wireReceived
             .slice(responseStart)
             .find(
               (message) =>
                 (message.type === "ack" &&
                   message.payload.sequence === laterEvent.sequence) ||
                 message.type === "protocol.error",
-            );
-          if (response !== undefined) return response;
-          await new Promise<void>((resolve) => setImmediate(resolve));
-        }
-        throw new Error("Timed out waiting for the later terminal response");
-      })();
+            ),
+        "the later terminal response",
+      );
       expect(laterResponse).toMatchObject({
         type: "ack",
         payload: { sequence: laterEvent.sequence },
@@ -587,21 +619,18 @@ describe("authenticated Connector terminal results through production MCP", () =
         payload: { stage: "must-not-run-after-terminal" },
         source: "fake-connector",
       });
-      const response = await (async () => {
-        for (let attempt = 0; attempt < 200; attempt += 1) {
-          const candidate = fixture.connector.wireReceived
+      const response = await waitForCondition(
+        () =>
+          fixture.connector.wireReceived
             .slice(responseStart)
             .find(
               (message) =>
                 (message.type === "ack" &&
                   message.payload.sequence === progress.sequence) ||
                 message.type === "protocol.error",
-            );
-          if (candidate !== undefined) return candidate;
-          await new Promise<void>((resolve) => setImmediate(resolve));
-        }
-        throw new Error("Timed out waiting for the late progress response");
-      })();
+            ),
+        "the late progress response",
+      );
 
       expect(response).toMatchObject({
         type: "protocol.error",

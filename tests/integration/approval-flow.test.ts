@@ -823,6 +823,7 @@ describe("approval flow", () => {
       actionFingerprint: FINGERPRINT_A,
       now: new Date(0),
     });
+    const decisionOutcome = Promise.allSettled([decision]);
     let outcome: PromiseSettledResult<unknown> | undefined;
     try {
       await expect
@@ -839,7 +840,7 @@ describe("approval flow", () => {
         .toBeGreaterThan(0);
       releaseHolder();
       await holder;
-      [outcome] = await Promise.allSettled([decision]);
+      [outcome] = await decisionOutcome;
     } finally {
       releaseHolder();
       await holder;

@@ -39,6 +39,17 @@ export function createDbClient(options: DatabaseOptions = {}): Database {
 export const database = createDatabase();
 export const db = database.db;
 
+let databaseClosePromise: Promise<void> | undefined;
+
+const endDatabase = (timeout: number): Promise<void> => {
+  databaseClosePromise ??= database.sql.end({ timeout });
+  return databaseClosePromise;
+};
+
 export async function closeDatabase(): Promise<void> {
-  await database.sql.end({ timeout: 5 });
+  await endDatabase(5);
+}
+
+export async function terminateDatabaseOperations(): Promise<void> {
+  await endDatabase(0);
 }

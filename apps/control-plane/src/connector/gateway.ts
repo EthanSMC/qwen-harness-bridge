@@ -9,6 +9,7 @@ import {
 } from "@qhb/protocol";
 import type { Database } from "../db/client.js";
 import type { RequestDecryptor } from "../domain/job-coordinator.js";
+import type { MetricsRegistry } from "../http/metrics.js";
 import {
   CONNECTOR_OFFLINE_AFTER_MS,
   type ConnectorIdentity,
@@ -32,6 +33,7 @@ const MAX_SCHEDULED_STORE_OPERATIONS = 2;
 const MAX_OUTBOUND_QUEUE_FRAMES = 128;
 const MAX_OUTBOUND_QUEUE_BYTES = 256 * 1024;
 const SOCKET_WRITE_TIMEOUT_MS = 1_000;
+const GATEWAY_SHUTDOWN_TIMEOUT_MS = 2_000;
 const DEFAULT_DISPATCH_INTERVAL_MS = 250;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 const DEADLINE_EXCEEDED = Symbol("connector gateway deadline exceeded");
@@ -69,9 +71,11 @@ const awaitBeforeDeadline = async <T>(
 export type ConnectorGatewayOptions = Readonly<{
   database: Database;
   sessionSigningKey: string | Uint8Array;
+  terminateStoreOperations?: () => Promise<void>;
   requestDecryptor?: RequestDecryptor;
   dispatchIntervalMs?: number;
   now?: () => Date;
+  metrics?: Pick<MetricsRegistry, "recordConnectorMessage" | "recordError">;
 }>;
 
 type FrameHandlers = Readonly<{
@@ -520,7 +524,11 @@ export class ConnectorGateway {
   readonly #store: PostgresConnectorStore;
   readonly #sessionService: ReturnType<typeof createConnectorSessionService>;
   readonly #requestDecryptor: RequestDecryptor | undefined;
+  readonly #metrics:
+    | Pick<MetricsRegistry, "recordConnectorMessage" | "recordError">
+    | undefined;
   readonly #dispatchIntervalMs: number;
+  readonly #terminateStoreOperations: (() => Promise<void>) | undefined;
   readonly #connections = new Set<ServerWebSocket>();
   readonly #activeConnections = new Map<string, ActiveConnectorConnection>();
   readonly #storeOperations = new Set<Promise<unknown>>();
@@ -540,6 +548,8 @@ export class ConnectorGateway {
       now: options.now ?? (() => new Date()),
     });
     this.#requestDecryptor = options.requestDecryptor;
+    this.#terminateStoreOperations = options.terminateStoreOperations;
+    this.#metrics = options.metrics;
     this.#dispatchIntervalMs =
       options.dispatchIntervalMs === undefined
         ? DEFAULT_DISPATCH_INTERVAL_MS
@@ -559,7 +569,11 @@ export class ConnectorGateway {
     server.on("upgrade", this.#upgradeListener);
     this.#healthTimer = setInterval(() => {
       void this.#trackStoreOperation(this.#store.refreshHealth()).catch(
-        () => undefined,
+        (error: unknown) => {
+          this.#metrics?.recordError(
+            error instanceof ConnectorStoreError ? error.code : "INTERNAL",
+          );
+        },
       );
     }, HEARTBEAT_INTERVAL_MS);
     this.#healthTimer.unref();
@@ -583,10 +597,22 @@ export class ConnectorGateway {
     this.#connections.clear();
     this.#activeConnections.clear();
     this.#closePromise = (async () => {
+      const deadline = Date.now() + GATEWAY_SHUTDOWN_TIMEOUT_MS;
       await Promise.allSettled(
-        connections.map((connection) => connection.closeGracefully()),
+        connections.map((connection) =>
+          connection.closeGracefully(undefined, deadline),
+        ),
       );
-      await this.#waitForStoreOperations();
+      const drained = await this.#waitForStoreOperations(deadline);
+      if (!drained) {
+        if (this.#terminateStoreOperations === undefined) {
+          throw new Error(
+            "Connector store operations exceeded the shutdown deadline",
+          );
+        }
+        await this.#terminateStoreOperations();
+        await this.#drainTerminatedStoreOperations();
+      }
     })();
     return this.#closePromise;
   }
@@ -600,7 +626,22 @@ export class ConnectorGateway {
     return operation;
   }
 
-  async #waitForStoreOperations(): Promise<void> {
+  async #waitForStoreOperations(deadline: number): Promise<boolean> {
+    while (this.#storeOperations.size > 0) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      await Promise.race([
+        Promise.allSettled([...this.#storeOperations]),
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, remaining);
+          timer.unref();
+        }),
+      ]);
+    }
+    return true;
+  }
+
+  async #drainTerminatedStoreOperations(): Promise<void> {
     while (this.#storeOperations.size > 0) {
       await Promise.allSettled([...this.#storeOperations]);
     }
@@ -628,6 +669,7 @@ export class ConnectorGateway {
         if (authorizationHeaderCount(request) !== 1) throw new Error("auth");
         claims = this.#sessionService.authenticate(request.headers);
       } catch {
+        this.#metrics?.recordError("AUTHORIZATION_FAILED");
         return rejectUpgrade(socket);
       }
       const key = request.headers["sec-websocket-key"];
@@ -754,6 +796,7 @@ export class ConnectorGateway {
           error instanceof ConnectorStoreError &&
           String(error.code) === "MESSAGE_EXPIRED"
         ) {
+          this.#metrics?.recordError(error.code);
           return false;
         }
         throw error;
@@ -765,6 +808,9 @@ export class ConnectorGateway {
         deadline,
       );
       if (sent === DEADLINE_EXCEEDED) return false;
+      // Count every successful wire transmission, including replay and
+      // duplicate responses. Failed sends never reach this boundary.
+      this.#metrics?.recordConnectorMessage(message.type);
       if (!retransmit && canContinue(generation)) {
         scanAfterSequence = Math.max(scanAfterSequence, stored.sequence);
       }
@@ -858,8 +904,12 @@ export class ConnectorGateway {
         this.#activeConnections.delete(identity.connectorId);
       }
     };
-    const failProtocol = async (code: string): Promise<void> => {
+    const failProtocol = async (
+      code: string,
+      recordMetric = true,
+    ): Promise<void> => {
       if (!accepting || !isCurrentConnection()) return;
+      if (recordMetric) this.#metrics?.recordError(code);
       accepting = false;
       failureGeneration += 1;
       const failureGenerationAtStart = failureGeneration;
@@ -891,10 +941,13 @@ export class ConnectorGateway {
             canContinueFailure,
           );
           if (error !== DEADLINE_EXCEEDED && canContinueFailure()) {
-            await awaitBeforeDeadline(
+            const sent = await awaitBeforeDeadline(
               () => connection.sendJson(error, deadline),
               deadline,
             );
+            if (sent !== DEADLINE_EXCEEDED) {
+              this.#metrics?.recordConnectorMessage(error.type);
+            }
           }
         }
       } finally {
@@ -932,7 +985,10 @@ export class ConnectorGateway {
           initialized = true;
           dispatching = true;
           timer = setInterval(() => {
-            void pump(connection).catch(() => {
+            void pump(connection).catch((error: unknown) => {
+              this.#metrics?.recordError(
+                error instanceof ConnectorStoreError ? error.code : "INTERNAL",
+              );
               accepting = false;
               void connection.close().catch(() => undefined);
             });
@@ -1003,7 +1059,8 @@ export class ConnectorGateway {
       } catch (error) {
         const code =
           error instanceof ConnectorStoreError ? error.code : "INTERNAL";
-        await failProtocol(code);
+        this.#metrics?.recordError(code);
+        await failProtocol(code, false);
       }
     };
     connection = new ServerWebSocket(socket, {
