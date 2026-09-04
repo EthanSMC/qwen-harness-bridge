@@ -382,6 +382,26 @@ const reviewEvidenceScript = readFileSync(
   resolve(root, "scripts/github/verify-pr-review-evidence.mjs"),
   "utf8",
 );
+const githubApiScript = readFileSync(
+  resolve(root, "scripts/github/github-api.mjs"),
+  "utf8",
+);
+for (const [pattern, message] of [
+  [/DEFAULT_MAX_PAGES = 100/, "a bounded GitHub pagination default"],
+  [/maxPages > 100/, "a hard GitHub pagination safety cap"],
+  [/page <= maxPages/, "explicit GitHub API page traversal"],
+  [
+    /pagination reached.*safety cap without a short page/,
+    "fail-closed pagination cap handling",
+  ],
+]) {
+  requireSourceField(
+    githubApiScript,
+    "scripts/github/github-api.mjs",
+    pattern,
+    message,
+  );
+}
 for (const [pattern, message] of [
   [
     /needs\.static\.result must be exactly success/,
@@ -398,12 +418,7 @@ for (const [pattern, message] of [
     /repository visibility is irrelevant to direct-collaborator eligibility/i,
     "visibility-independent direct-collaborator eligibility",
   ],
-  [/GITHUB_MAX_PAGES/, "a GitHub pagination safety cap"],
-  [/page=\$\{page\}/, "explicit GitHub API page traversal"],
-  [
-    /pagination reached.*safety cap.*failing closed/,
-    "fail-closed pagination cap handling",
-  ],
+  [/github\.getAll\(/, "shared paginated GitHub API reads"],
   [/direct collaborator \$\{index \+ 1\}/, "indexed collaborator validation"],
   [/collaborator\.role_name/, "collaborator role validation"],
   [

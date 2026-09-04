@@ -334,7 +334,7 @@ git commit -m "feat(governance): add AI issue lifecycle policy"
 - Consumes: injected `fetch`, repository `owner/name`, token, REST paths, and expected postconditions.
 - Produces: `createGitHubClient({ fetchImpl, repository, token, maxPages })` with `get`, `getAll`, `post`, `patch`, `delete`, and `mutateAndVerify` methods.
 
-- [ ] **Step 1: Write API boundary tests**
+- [x] **Step 1: Write API boundary tests**
 
 ```js
 test("paginates until a short page and fails at the cap", async () => {
@@ -353,22 +353,22 @@ test("reconciles an uncertain mutation before retrying", async () => {
 });
 ```
 
-- [ ] **Step 2: Run tests and observe the missing-module failure**
+- [x] **Step 2: Run tests and observe the missing-module failure**
 
 Run: `node --test scripts/github/github-api.test.mjs`  
 Expected: FAIL because the API client does not exist.
 
-- [ ] **Step 3: Implement strict REST requests and pagination**
+- [x] **Step 3: Implement strict REST requests and pagination**
 
 Every request sets `Accept`, `Authorization`, and `X-GitHub-Api-Version`. Require object/array response shapes, positive numeric IDs, page sizes no larger than requested, and a short page before the configured cap. Include method/path/status in errors without echoing tokens or response bodies.
 
 `mutateAndVerify` performs one mutation, then a live read. On network uncertainty it reads first; it retries only when the verified postcondition is false and the operation has a stable idempotency key or is naturally idempotent.
 
-- [ ] **Step 4: Replace duplicated read helpers in the review verifier**
+- [x] **Step 4: Replace duplicated read helpers in the review verifier**
 
 Make `verify-pr-review-evidence.mjs` consume `createGitHubClient` for live reads while preserving its exported public functions and exact fail-closed behavior. Extend existing tests to prove collaborator, review, and check-run pagination still works and never performs a write.
 
-- [ ] **Step 5: Run all review/API tests and commit**
+- [x] **Step 5: Run all review/API tests and commit**
 
 Run:
 
