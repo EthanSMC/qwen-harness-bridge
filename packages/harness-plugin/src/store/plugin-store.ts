@@ -41,6 +41,7 @@ export interface PluginStore {
     status: string;
   }): void;
   findJob(jobId: string): LocalJobMapping | undefined;
+  listNonterminalJobs(): readonly LocalJobMapping[];
   enqueueEvent(event: OutboundEventInput): void;
   pendingEvents(afterSequence: number): StoredOutboundEvent[];
   acknowledgeEvent(messageId: string): void;
@@ -321,6 +322,28 @@ export class SqlitePluginStore implements PluginStore {
       sessionId: row.session_id,
       status: row.status,
     };
+  }
+
+  listNonterminalJobs(): readonly LocalJobMapping[] {
+    this.assertOpen();
+    try {
+      const rows = this.database
+        .prepare(
+          `SELECT job_id, attempt, session_id, status
+           FROM job_mappings
+           WHERE status NOT IN (?, ?, ?, ?)
+           ORDER BY job_id ASC, attempt ASC`,
+        )
+        .all("succeeded", "failed", "cancelled", "expired") as JobRow[];
+      return rows.map((row) => ({
+        jobId: row.job_id,
+        attempt: row.attempt,
+        sessionId: row.session_id,
+        status: row.status,
+      }));
+    } catch {
+      throw new StoreError("STORE_JOB_MAPPING_READ_FAILED");
+    }
   }
 
   enqueueEvent(event: OutboundEventInput): void {
