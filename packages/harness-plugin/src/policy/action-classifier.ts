@@ -21,6 +21,8 @@ import type {
 
 export type ActionPolicyOptions = Readonly<{
   repositories: RepositoryPolicySource;
+  /** Trusted command identity -> immutable canonical executable path. */
+  trustedExecutables?: Readonly<Record<string, string>>;
 }>;
 
 export type ActionInput = Readonly<{
@@ -43,7 +45,6 @@ export type TrustedExecutableResolver = (
 
 export type TrustedActionContext = Readonly<{
   provenance: "local_tool" | "cloud_command";
-  resolveExecutable?: TrustedExecutableResolver;
 }>;
 
 const resolveExecutableFromPath: TrustedExecutableResolver = (
@@ -51,7 +52,6 @@ const resolveExecutableFromPath: TrustedExecutableResolver = (
   cwd,
 ) => {
   for (const searchDirectory of (process.env.PATH ?? "").split(delimiter)) {
-    if (searchDirectory.length === 0) continue;
     const directory = isAbsolute(searchDirectory)
       ? searchDirectory
       : resolve(cwd, searchDirectory);
@@ -60,7 +60,7 @@ const resolveExecutableFromPath: TrustedExecutableResolver = (
       accessSync(candidate, constants.X_OK);
       return candidate;
     } catch {
-      // Continue through the trusted local PATH in order.
+      // PATH selects a candidate, but only registration can authorize it.
     }
   }
   return undefined;
@@ -68,8 +68,38 @@ const resolveExecutableFromPath: TrustedExecutableResolver = (
 
 const localToolContext: TrustedActionContext = {
   provenance: "local_tool",
-  resolveExecutable: resolveExecutableFromPath,
 };
+
+const executableMap = (
+  source?: RepositoryPolicySource | ActionPolicyOptions,
+): Readonly<Record<string, string>> =>
+  source !== undefined && "repositories" in source
+    ? (source.trustedExecutables ?? {})
+    : {};
+
+/** Copy caller-owned containers so later mutations cannot expand a live guard. */
+export function snapshotActionPolicy(
+  options: ActionPolicyOptions,
+): ActionPolicyOptions {
+  const trustedExecutables = Object.freeze({ ...options.trustedExecutables });
+  for (const path of Object.values(trustedExecutables)) {
+    if (
+      !isAbsolute(path) ||
+      realpathSync.native(path) !== path ||
+      !statSync(path).isFile()
+    ) {
+      throw new Error("POLICY_EXECUTABLE_NOT_CANONICAL");
+    }
+  }
+  return Object.freeze({
+    repositories: Object.freeze(
+      asRepositoryArray(options).map((repository) =>
+        Object.freeze({ ...repository }),
+      ),
+    ),
+    trustedExecutables,
+  });
+}
 
 const asRepositoryArray = (
   source: RepositoryPolicySource | ActionPolicyOptions,
@@ -154,7 +184,6 @@ const hasPathSeparator = (value: string): boolean => /[\\/]/u.test(value);
 const canonicalizeExecutable = (
   executable: string | undefined,
   cwd: string,
-  context: TrustedActionContext,
   violations: PolicyPathViolation[],
 ): string | undefined => {
   if (executable === undefined) return undefined;
@@ -164,7 +193,7 @@ const canonicalizeExecutable = (
     candidate = isAbsolute(executable) ? executable : resolve(cwd, executable);
   } else {
     try {
-      candidate = context.resolveExecutable?.(executable, cwd);
+      candidate = resolveExecutableFromPath(executable, cwd);
     } catch {
       candidate = undefined;
     }
@@ -197,7 +226,7 @@ const splitPathArgument = (
   const isVisiblyAttachedPathOption =
     shortOptionCandidate !== undefined &&
     (isAbsolute(shortOptionCandidate) ||
-      /^\.{1,2}[/\\]/u.test(shortOptionCandidate) ||
+      /^\.{1,2}(?:[/\\]|$)/u.test(shortOptionCandidate) ||
       hasPathSeparator(shortOptionCandidate) ||
       /^[a-z][a-z0-9+.-]*:\/\//iu.test(shortOptionCandidate));
   const isAttachedPathOption =
@@ -235,7 +264,7 @@ const splitPathArgument = (
   if (isAttachedPathOption) return { prefix, candidate };
   if (
     !isAbsolute(candidate) &&
-    !/^\.{1,2}[/\\]/u.test(candidate) &&
+    !/^\.{1,2}(?:[/\\]|$)/u.test(candidate) &&
     !hasPathSeparator(candidate)
   ) {
     return undefined;
@@ -323,7 +352,7 @@ const canonicalizeArguments = (
 export function canonicalizeAction(
   action: unknown,
   source?: RepositoryPolicySource | ActionPolicyOptions,
-  context: TrustedActionContext = localToolContext,
+  _context: TrustedActionContext = localToolContext,
 ): CanonicalActionResult {
   const input = isRecord(action) ? action : {};
   const repositoryId =
@@ -392,7 +421,6 @@ export function canonicalizeAction(
   const canonicalExecutable = canonicalizeExecutable(
     canonical.executable,
     canonicalCwd,
-    context,
     violations,
   );
 
@@ -622,9 +650,20 @@ const runnerExecutableMatches = (
   return executable === "tsc";
 };
 
-const automaticReason = (action: CanonicalAction): string | undefined => {
+const automaticReason = (
+  action: CanonicalAction,
+  source: RepositoryPolicySource | ActionPolicyOptions | undefined,
+): string | undefined => {
   const tool = action.toolName.toLowerCase();
   if (!automaticFlagsAreSafe(action)) return undefined;
+  if (action.executable !== undefined) {
+    const identity = Object.entries(executableMap(source)).find(
+      ([, path]) => isAbsolute(path) && path === action.executable,
+    )?.[0];
+    if (identity === undefined) return undefined;
+    // Only registration assigns command semantics; a basename grants no trust.
+    action = { ...action, executable: identity };
+  }
   if (
     /^(search|find|grep|ripgrep)$/u.test(tool) &&
     action.fileChange === "none" &&
@@ -714,9 +753,7 @@ export function classifyAction(
   const validContext =
     isRecord(context) &&
     (context.provenance === "local_tool" ||
-      context.provenance === "cloud_command") &&
-    (context.resolveExecutable === undefined ||
-      typeof context.resolveExecutable === "function");
+      context.provenance === "cloud_command");
   const trustedContext =
     validContext &&
     (context.provenance === "local_tool" ||
@@ -756,7 +793,7 @@ export function classifyAction(
   if (approval !== undefined) {
     return decision("approval_required", approval, fingerprint);
   }
-  const automatic = automaticReason(canonical.action);
+  const automatic = automaticReason(canonical.action, source);
   if (automatic === undefined) {
     return decision(
       "denied",

@@ -8,8 +8,8 @@ import type {
 import {
   type ActionPolicyOptions,
   classifyAction,
+  snapshotActionPolicy,
   type TrustedActionContext,
-  type TrustedExecutableResolver,
 } from "./action-classifier.js";
 import type { CanonicalAction, PolicyDecision } from "./types.js";
 
@@ -18,7 +18,6 @@ type PolicyExecution = Pick<Readonly<ToolExecution>, "arguments" | "name">;
 export type TrustedPolicyAction = Readonly<{
   action: CanonicalAction;
   provenance: TrustedActionContext["provenance"];
-  resolveExecutable?: TrustedExecutableResolver;
 }>;
 
 export type PolicyGuardRegistrationOptions = ActionPolicyOptions &
@@ -58,9 +57,7 @@ const resolveTrustedAction = (
     !isRecord(resolved) ||
     !isRecord(resolved.action) ||
     (resolved.provenance !== "local_tool" &&
-      resolved.provenance !== "cloud_command") ||
-    (resolved.resolveExecutable !== undefined &&
-      typeof resolved.resolveExecutable !== "function")
+      resolved.provenance !== "cloud_command")
   ) {
     return { kind: "denied", reason: "POLICY_DENIED:UNTRUSTED_ACTION" };
   }
@@ -79,9 +76,6 @@ const classifyResolvedAction = (
 ): PolicyDecision =>
   classifyAction(resolved.action, options, {
     provenance: resolved.provenance,
-    ...(resolved.resolveExecutable === undefined
-      ? {}
-      : { resolveExecutable: resolved.resolveExecutable }),
   });
 
 type ExecutionSnapshots = WeakMap<object, string>;
@@ -91,6 +85,7 @@ export function createPolicyGuard(
   options: PolicyGuardRegistrationOptions,
   snapshots: ExecutionSnapshots = new WeakMap<object, string>(),
 ): ToolGuard {
+  options = snapshotRegistration(options);
   return (execution) => {
     const resolution = resolveTrustedAction(execution, options);
     if (resolution.kind === "denied") return resolution.reason;
@@ -119,6 +114,7 @@ export function createPolicyPreExecuteListener(
   options: PolicyGuardRegistrationOptions,
   snapshots: ExecutionSnapshots = new WeakMap<object, string>(),
 ): PolicyPreExecuteListener {
+  options = snapshotRegistration(options);
   return async (execution, next) => {
     const resolution = resolveTrustedAction(execution, options);
     if (resolution.kind === "denied") {
@@ -154,12 +150,21 @@ const assertAgentSetupContext = (agentContext: Context): void => {
   }
 };
 
+const snapshotRegistration = (
+  options: PolicyGuardRegistrationOptions,
+): PolicyGuardRegistrationOptions =>
+  Object.freeze({
+    ...snapshotActionPolicy(options),
+    resolveAction: options.resolveAction,
+  });
+
 /** Register policy through the exact Context supplied to an Agent setup callback. */
 export function registerPolicyGuard(
   agentContext: Context,
   options: PolicyGuardRegistrationOptions,
 ): () => void {
   assertAgentSetupContext(agentContext);
+  options = snapshotRegistration(options);
   const snapshots: ExecutionSnapshots = new WeakMap<object, string>();
   const guardDisposer = agentContext.tools.guard(
     createPolicyGuard(options, snapshots),
@@ -182,6 +187,7 @@ export function registerPolicyGuard(
 export function createPolicyAgentSetup(
   options: PolicyGuardRegistrationOptions,
 ): AgentSetup {
+  options = snapshotRegistration(options);
   return (agentContext) => {
     registerPolicyGuard(agentContext, options);
   };

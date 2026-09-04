@@ -1,5 +1,4 @@
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -9,11 +8,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { delimiter, join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { Context } from "../../packages/harness-plugin/node_modules/@deepseek-ai/cordis/lib/index.js";
 import {
   type ActionPolicyOptions,
+  canonicalizeAction,
   classifyAction,
 } from "../../packages/harness-plugin/src/policy/action-classifier.js";
 import {
@@ -41,9 +41,12 @@ const makeFixture = () => {
   mkdirSync(outsidePath);
   mkdirSync(executableDirectory);
   for (const executable of ["pnpm", "rg", "rm"]) {
-    writeFileSync(join(executableDirectory, executable), "test executable\n");
+    writeFileSync(join(executableDirectory, executable), "test executable\n", {
+      mode: 0o755,
+    });
   }
   temporaryDirectories.push(directory);
+  vi.stubEnv("PATH", executableDirectory);
   return {
     directory,
     executableDirectory,
@@ -109,6 +112,12 @@ const trustedPolicyOptions = (
   trustedActions: WeakMap<object, TrustedPolicyAction>,
 ): PolicyGuardRegistrationOptions => ({
   repositories: [fixture.repository],
+  trustedExecutables: Object.fromEntries(
+    ["pnpm", "rg", "rm"].map((name) => [
+      name,
+      join(realpathSync(fixture.executableDirectory), name),
+    ]),
+  ),
   resolveAction(execution) {
     return trustedActions.get(execution);
   },
@@ -118,20 +127,17 @@ const trustExecution = (
   trustedActions: WeakMap<object, TrustedPolicyAction>,
   execution: TestExecution,
   action: CanonicalAction,
-  fixture: ReturnType<typeof makeFixture>,
+  _fixture: ReturnType<typeof makeFixture>,
   provenance: TrustedPolicyAction["provenance"] = "local_tool",
 ): void => {
   trustedActions.set(execution, {
     action,
     provenance,
-    resolveExecutable(executable: string): string | undefined {
-      const candidate = join(fixture.executableDirectory, executable);
-      return existsSync(candidate) ? candidate : undefined;
-    },
   });
 };
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   while (temporaryDirectories.length > 0) {
     rmSync(temporaryDirectories.pop() as string, {
       recursive: true,
@@ -141,6 +147,207 @@ afterEach(() => {
 });
 
 describe("local repository policy boundary", () => {
+  it("treats an empty PATH entry as cwd before a trusted executable", () => {
+    const fixture = makeFixture();
+    writeFileSync(
+      join(fixture.repository.canonicalPath, "rg"),
+      "attacker fixture\n",
+      { mode: 0o755 },
+    );
+    vi.stubEnv("PATH", `${delimiter}${fixture.executableDirectory}`);
+    const action = makeAction(fixture, {
+      toolName: "search",
+      executable: "rg",
+      argv: ["--files"],
+    });
+    const options = {
+      repositories: [fixture.repository],
+      trustedExecutables: {
+        rg: realpathSync(join(fixture.executableDirectory, "rg")),
+      },
+    };
+    expect(classifyAction(action, options).classification).toBe("denied");
+  });
+
+  it("denies a same-name PATH shadow despite a registered safe rg", () => {
+    const fixture = makeFixture();
+    const trustedActions = new WeakMap<object, TrustedPolicyAction>();
+    const { agentContext, guards } = makeAgentScope();
+    registerPolicyGuard(
+      agentContext,
+      trustedPolicyOptions(fixture, trustedActions),
+    );
+    const attacker = join(fixture.outsidePath, "rg");
+    writeFileSync(attacker, "attacker fixture\n", { mode: 0o755 });
+    vi.stubEnv("PATH", fixture.outsidePath);
+    const action = makeAction(fixture, {
+      toolName: "search",
+      executable: "rg",
+      argv: ["--files"],
+    });
+    const execution = makeExecution(action);
+    trustExecution(trustedActions, execution, action, fixture);
+    expect(guards[0]?.(execution)).toBe(
+      "POLICY_DENIED:EXECUTABLE_TOOL_MISMATCH",
+    );
+  });
+
+  it("denies bare rg supplied by a per-action resolver without registration trust", () => {
+    const fixture = makeFixture();
+    const context = {
+      provenance: "local_tool" as const,
+      resolveExecutable: () => join(fixture.executableDirectory, "rg"),
+    };
+    expect(
+      classifyAction(
+        makeAction(fixture, {
+          toolName: "search",
+          executable: "rg",
+          argv: ["--files"],
+        }),
+        policyOptions(fixture),
+        context,
+      ).classification,
+    ).toBe("denied");
+  });
+
+  it.each([
+    ["search", "rg", "rg", ["--files", "."], "automatic"],
+    ["test", "pnpm", "pnpm", ["test"], "automatic"],
+    ["build", "tsc", "tsc.js", ["--outDir=."], "automatic"],
+    ["build", "tsc", "compiler-entry.js", ["--noEmit"], "automatic"],
+    ["build", "pnpm", "pnpm", ["install"], "approval_required"],
+    ["git_push", "git", "git", ["push"], "approval_required"],
+    ["deploy", "vercel", "vercel", ["deploy"], "approval_required"],
+  ])(
+    "preserves explicit trusted %s %s",
+    (toolName, identity, filename, argv, expected) => {
+      const fixture = makeFixture();
+      const executable = join(fixture.executableDirectory, filename);
+      writeFileSync(executable, "fixture\n", { mode: 0o755 });
+      if (identity !== filename)
+        symlinkSync(executable, join(fixture.executableDirectory, identity));
+      const options = {
+        repositories: [fixture.repository],
+        trustedExecutables: { [identity]: realpathSync(executable) },
+      };
+      for (const spelling of [identity, executable]) {
+        expect(
+          classifyAction(
+            makeAction(fixture, { toolName, executable: spelling, argv }),
+            options,
+          ).classification,
+        ).toBe(expected);
+      }
+    },
+  );
+
+  it.each([
+    ["search", "rg", ["--files", ".."]],
+    ["grep", "grep", ["needle", ".."]],
+    ["build", "tsc", ["--outDir", ".."]],
+    ["build", "tsc", ["--outDir=.."]],
+    ["build", "tsc", ["-o.."]],
+    ["search", "rg", ["-C.."]],
+  ])("rejects exact traversal in %s %s %j", (toolName, executable, argv) => {
+    const fixture = makeFixture();
+    const path = join(fixture.executableDirectory, executable);
+    writeFileSync(path, "fixture\n");
+    const options = {
+      repositories: [fixture.repository],
+      trustedExecutables: { [executable]: realpathSync(path) },
+    };
+    expect(
+      classifyAction(
+        makeAction(fixture, { toolName, executable: path, argv }),
+        options,
+      ),
+    ).toMatchObject({ classification: "denied", reasonCode: "PATH_TRAVERSAL" });
+  });
+
+  it.each([".", "--outDir=.", "-o."])(
+    "canonicalizes exact current directory %s",
+    (argument) => {
+      const fixture = makeFixture();
+      const result = canonicalizeAction(
+        makeAction(fixture, { argv: [argument] }),
+        policyOptions(fixture),
+      );
+      expect(result.violations).toEqual([]);
+      expect(result.action.argv).toEqual([
+        argument.replace(/\.$/u, fixture.repository.canonicalPath),
+      ]);
+    },
+  );
+
+  it.each([
+    ["search", "rg", ["--files"]],
+    ["build", "tsc.js", ["--noEmit"]],
+  ])(
+    "does not trust an arbitrary %s executable named %s",
+    (toolName, name, argv) => {
+      const fixture = makeFixture();
+      const executable = join(fixture.outsidePath, name);
+      writeFileSync(executable, "attacker fixture\n");
+      expect(
+        classifyAction(
+          makeAction(fixture, { toolName, executable, argv }),
+          policyOptions(fixture),
+        ).classification,
+      ).toBe("denied");
+    },
+  );
+
+  it("ignores per-execution executable trust and snapshots registration", async () => {
+    const fixture = makeFixture();
+    const attacker = join(fixture.outsidePath, "rg");
+    writeFileSync(attacker, "attacker fixture\n");
+    const trusted = realpathSync(join(fixture.executableDirectory, "rg"));
+    const trustedActions = new WeakMap<object, TrustedPolicyAction>();
+    const options = {
+      ...trustedPolicyOptions(fixture, trustedActions),
+      trustedExecutables: { rg: trusted },
+    };
+    const { agentContext, guards } = makeAgentScope();
+    registerPolicyGuard(agentContext, options);
+    const repositoryId = fixture.repository.id;
+    fixture.repository.canonicalPath = realpathSync(fixture.outsidePath);
+    options.trustedExecutables.rg = realpathSync(attacker);
+    options.repositories = [
+      {
+        id: fixture.repository.id,
+        canonicalPath: realpathSync(fixture.outsidePath),
+      },
+    ];
+    const action = makeAction(fixture, {
+      toolName: "search",
+      executable: "rg",
+      argv: ["--files"],
+      cwd: realpathSync(fixture.repositoryPath),
+      repositoryId,
+    });
+    const execution = makeExecution(action);
+    const injected = {
+      action,
+      provenance: "local_tool" as const,
+      resolveExecutable: () => attacker,
+      trustedExecutables: { rg: attacker },
+    };
+    trustedActions.set(execution, injected);
+    options.resolveAction = () => undefined;
+    expect(guards[0]?.(execution)).toBeUndefined();
+    await expect(
+      agentContext.waterfall("tools/pre-execute", execution, async () => ({
+        kind: "allow" as const,
+      })),
+    ).resolves.toMatchObject({ kind: "allow" });
+    trustedActions.set(execution, {
+      action: { ...action, executable: attacker },
+      provenance: "local_tool",
+    });
+    expect(guards[0]?.(execution)).toMatch(/^POLICY_DENIED:/u);
+  });
+
   it("resolves a new target through its nearest existing ancestor", () => {
     const fixture = makeFixture();
     const newTarget = join(fixture.repository.canonicalPath, "new", "file.txt");
@@ -357,16 +564,16 @@ describe("local repository policy boundary", () => {
 
   it("resolves a trusted bare executable before automatic authorization", () => {
     const fixture = makeFixture();
-    rmSync(join(fixture.executableDirectory, "rg"));
-    symlinkSync(
-      join(fixture.executableDirectory, "rm"),
-      join(fixture.executableDirectory, "rg"),
-    );
     const { agentContext, guards } = makeAgentScope();
     const trustedActions = new WeakMap<object, TrustedPolicyAction>();
     registerPolicyGuard(
       agentContext,
       trustedPolicyOptions(fixture, trustedActions),
+    );
+    rmSync(join(fixture.executableDirectory, "rg"));
+    symlinkSync(
+      join(fixture.executableDirectory, "rm"),
+      join(fixture.executableDirectory, "rg"),
     );
     const action = makeAction(fixture, {
       toolName: "search",

@@ -1,7 +1,7 @@
 import {
-  existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   canonicalActionJson,
   canonicalizeAction,
@@ -50,12 +50,15 @@ const makeFixture = () => {
     "vercel",
     "vitest",
   ]) {
-    writeFileSync(join(executableDirectory, executable), "test executable\n");
+    writeFileSync(join(executableDirectory, executable), "test executable\n", {
+      mode: 0o755,
+    });
   }
   writeFileSync(join(repositoryPath, "src", "index.ts"), "export {};\n");
   writeFileSync(join(outsidePath, "secret.txt"), "not for the repository\n");
   writeFileSync(join(outsidePath, "ordinary.txt"), "outside data\n");
   temporaryDirectories.push(directory);
+  vi.stubEnv("PATH", executableDirectory);
 
   const repository: RepositoryPolicy = {
     id: "repo-one",
@@ -71,12 +74,14 @@ const makeFixture = () => {
   };
 };
 
-const trustedContext = (fixture: ReturnType<typeof makeFixture>) => ({
-  provenance: "local_tool" as const,
-  resolveExecutable(executable: string): string | undefined {
-    const candidate = join(fixture.executableDirectory, executable);
-    return existsSync(candidate) ? candidate : undefined;
-  },
+const trustedOptions = (fixture: ReturnType<typeof makeFixture>) => ({
+  repositories: [fixture.repository],
+  trustedExecutables: Object.fromEntries(
+    readdirSync(fixture.executableDirectory).map((name) => [
+      name,
+      realpathSync(join(fixture.executableDirectory, name)),
+    ]),
+  ),
 });
 
 const makeAction = (
@@ -121,6 +126,7 @@ const makeBareExecutableAlias = (
 };
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   while (temporaryDirectories.length > 0) {
     rmSync(temporaryDirectories.pop() as string, {
       recursive: true,
@@ -144,8 +150,7 @@ describe("classifyAction", () => {
 
     const decision = classifyAction(
       makeAction(fixture, overrides),
-      [fixture.repository],
-      trustedContext(fixture),
+      trustedOptions(fixture),
     );
 
     expect(decision.classification).toBe("automatic");
@@ -167,8 +172,7 @@ describe("classifyAction", () => {
 
       const decision = classifyAction(
         makeAction(fixture, { toolName, executable, argv }),
-        [fixture.repository],
-        trustedContext(fixture),
+        trustedOptions(fixture),
       );
 
       expect(decision.classification).toBe("automatic");
@@ -195,8 +199,7 @@ describe("classifyAction", () => {
 
       const decision = classifyAction(
         makeAction(fixture, { toolName, executable, argv }),
-        [fixture.repository],
-        trustedContext(fixture),
+        trustedOptions(fixture),
       );
 
       expect(decision.classification).toBe("denied");
@@ -205,6 +208,7 @@ describe("classifyAction", () => {
 
   it("resolves a bare allowlisted spelling before matching its identity", () => {
     const fixture = makeFixture();
+    const options = trustedOptions(fixture);
     makeBareExecutableAlias(fixture, "rg", "rm");
 
     const decision = classifyAction(
@@ -213,8 +217,7 @@ describe("classifyAction", () => {
         executable: "rg",
         argv: ["needle", "src"],
       }),
-      [fixture.repository],
-      trustedContext(fixture),
+      options,
     );
 
     expect(decision.classification).toBe("denied");
@@ -228,8 +231,7 @@ describe("classifyAction", () => {
 
     const decision = classifyAction(
       makeAction(fixture, { toolName, executable: undefined, argv }),
-      [fixture.repository],
-      trustedContext(fixture),
+      trustedOptions(fixture),
     );
 
     expect(decision.classification).toBe("denied");
@@ -261,8 +263,7 @@ describe("classifyAction", () => {
 
       const decision = classifyAction(
         makeAction(fixture, { toolName, executable: alias, argv }),
-        [fixture.repository],
-        trustedContext(fixture),
+        trustedOptions(fixture),
       );
 
       expect(decision.classification).toBe(expected);
@@ -287,8 +288,7 @@ describe("classifyAction", () => {
 
     const decision = classifyAction(
       makeAction(fixture, overrides),
-      [fixture.repository],
-      trustedContext(fixture),
+      trustedOptions(fixture),
     );
 
     expect(decision.classification).toBe("approval_required");
@@ -337,8 +337,7 @@ describe("classifyAction", () => {
 
     const decision = classifyAction(
       makeAction(fixture, resolvedOverrides),
-      [fixture.repository],
-      trustedContext(fixture),
+      trustedOptions(fixture),
     );
 
     expect(decision.classification).toBe("denied");
@@ -424,8 +423,7 @@ describe("classifyAction", () => {
 
       const decision = classifyAction(
         makeAction(fixture, { argv: [argumentFor(fixture)] }),
-        [fixture.repository],
-        trustedContext(fixture),
+        trustedOptions(fixture),
       );
 
       expect(decision).toMatchObject({ classification: "denied", reasonCode });
@@ -439,8 +437,7 @@ describe("classifyAction", () => {
       makeAction(fixture, {
         argv: [`-C${fixture.repository.canonicalPath}/src/./`],
       }),
-      [fixture.repository],
-      trustedContext(fixture),
+      trustedOptions(fixture),
     );
 
     expect(canonical).toMatchObject({
@@ -456,8 +453,7 @@ describe("classifyAction", () => {
       makeAction(fixture, {
         argv: [`-I${fixture.repository.canonicalPath}/src/./`],
       }),
-      [fixture.repository],
-      trustedContext(fixture),
+      trustedOptions(fixture),
     );
 
     expect(canonical).toMatchObject({
@@ -471,8 +467,7 @@ describe("classifyAction", () => {
 
     const decision = classifyAction(
       makeAction(fixture, { argv: ["-C", fixture.outsidePath] }),
-      [fixture.repository],
-      trustedContext(fixture),
+      trustedOptions(fixture),
     );
 
     expect(decision).toMatchObject({
