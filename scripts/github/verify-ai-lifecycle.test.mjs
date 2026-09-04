@@ -548,6 +548,119 @@ test("CLI resolves an exact legacy migration before claim-field lookup", async (
   ]);
 });
 
+test("strict CLI proves activation reachability and fails closed", async (t) => {
+  const temporaryDirectory = await mkdtemp(
+    join(tmpdir(), "qhb-strict-activation-"),
+  );
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const eventPath = join(temporaryDirectory, "event.json");
+  const migrationsPath = join(temporaryDirectory, "migrations.json");
+  const livePullRequest = pullRequest();
+  await writeFile(
+    eventPath,
+    JSON.stringify({
+      repository: { full_name: REPOSITORY, default_branch: "main" },
+      pull_request: livePullRequest,
+    }),
+  );
+  await writeFile(migrationsPath, JSON.stringify(strictMigrations()));
+  const activationCommitPath = `/repos/${REPOSITORY}/commits/${ACTIVATION}`;
+  const activationComparisonPath = `/repos/${REPOSITORY}/compare/${ACTIVATION}...main`;
+
+  const runScenario = async (comparisonResponse) => {
+    const requests = [];
+    const fetchImpl = async (url, options = {}) => {
+      const requestUrl = new URL(url);
+      const path = `${requestUrl.pathname}${requestUrl.search}`;
+      requests.push({ method: options.method, path });
+      let response;
+      if (requestUrl.pathname.endsWith("/pulls/51")) {
+        response = livePullRequest;
+      } else if (requestUrl.pathname.endsWith("/issues/46")) {
+        response = issue();
+      } else if (requestUrl.pathname.endsWith("/issues/46/comments")) {
+        response = commentsFor();
+      } else if (requestUrl.pathname.endsWith("/pulls")) {
+        response = [livePullRequest];
+      } else if (requestUrl.pathname === activationCommitPath) {
+        response = { sha: ACTIVATION };
+      } else if (requestUrl.pathname === activationComparisonPath) {
+        return comparisonResponse();
+      } else {
+        throw new Error(`unexpected request ${path}`);
+      }
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const operation = main({
+      eventPath,
+      token: "test-token",
+      repository: REPOSITORY,
+      staticResult: "success",
+      mode: "enforce",
+      migrationsPath,
+      fetchImpl,
+      now: NOW,
+    });
+    return { operation, requests };
+  };
+
+  await t.test("accepts an activation commit reachable from main", async () => {
+    const { operation, requests } = await runScenario(
+      () =>
+        new Response(JSON.stringify({ status: "ahead" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    assert.equal((await operation).valid, true);
+    assert.deepEqual(requests.slice(-2), [
+      { method: "GET", path: activationCommitPath },
+      { method: "GET", path: activationComparisonPath },
+    ]);
+    assert.deepEqual(
+      new Set(requests.map(({ method }) => method)),
+      new Set(["GET"]),
+    );
+  });
+
+  for (const scenario of [
+    {
+      name: "rejects a diverged activation commit",
+      response: () =>
+        new Response(JSON.stringify({ status: "diverged" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      error: /not reachable/i,
+    },
+    {
+      name: "rejects a missing activation commit comparison",
+      response: () =>
+        new Response(JSON.stringify({ message: "Not Found" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }),
+      error: /HTTP 404/i,
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const { operation, requests } = await runScenario(scenario.response);
+      await assert.rejects(() => operation, scenario.error);
+      assert.deepEqual(requests.slice(-2), [
+        { method: "GET", path: activationCommitPath },
+        { method: "GET", path: activationComparisonPath },
+      ]);
+      assert.deepEqual(
+        new Set(requests.map(({ method }) => method)),
+        new Set(["GET"]),
+      );
+    });
+  }
+});
+
 test("strict activation requires one main commit and no migrations", () => {
   assert.throws(
     () =>

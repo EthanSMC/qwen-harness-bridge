@@ -1651,6 +1651,16 @@ test("main drains commands but never treats a pull-request comment target as an 
       method: options.method,
       path: `${requestUrl.pathname}${requestUrl.search}`,
     });
+    if (
+      requestUrl.pathname.includes(
+        "/compare/b06aceb805f03dc809b37b80cb45a240bb5be66d...main",
+      )
+    ) {
+      return new Response(JSON.stringify({ status: "ahead" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     if (requestUrl.pathname.endsWith("/issues/comments")) {
       return new Response("[]", {
         status: 200,
@@ -1672,6 +1682,14 @@ test("main drains commands but never treats a pull-request comment target as an 
     commandDrain: { status: "enforce", processed: 0, results: [] },
     lifecycle: { status: "ignored" },
   });
+  const activationComparisonPath =
+    "/repos/octo/example/compare/b06aceb805f03dc809b37b80cb45a240bb5be66d...main";
+  assert.equal(requests[0]?.method, "GET");
+  assert.equal(requests[0]?.path, activationComparisonPath);
+  assert.ok(
+    requests.findIndex(({ path }) => path.includes("/issues/comments")) >
+      requests.findIndex(({ path }) => path === activationComparisonPath),
+  );
   assert.equal(
     requests.some(({ path }) => path.endsWith("/issues/51")),
     false,
@@ -1680,4 +1698,80 @@ test("main drains commands but never treats a pull-request comment target as an 
     new Set(requests.map(({ method }) => method)),
     new Set(["GET"]),
   );
+});
+
+test("main fails closed before lifecycle processing when activation is unreachable", async (t) => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "qhb-activation-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const eventPath = join(temporaryDirectory, "event.json");
+  await writeFile(
+    eventPath,
+    JSON.stringify({
+      repository: { full_name: REPOSITORY, default_branch: "main" },
+      issue: {
+        number: 51,
+        pull_request: {
+          url: `https://api.github.com/repos/${REPOSITORY}/pulls/51`,
+        },
+      },
+      comment: {
+        id: 901,
+        body: "/ai-claim\nagent: codex",
+        issue_url: `https://api.github.com/repos/${REPOSITORY}/issues/51`,
+        user: { login: "alice" },
+      },
+    }),
+  );
+  const activationComparisonPath =
+    "/repos/octo/example/compare/b06aceb805f03dc809b37b80cb45a240bb5be66d...main";
+
+  for (const scenario of [
+    {
+      name: "diverged comparison",
+      response: () =>
+        new Response(JSON.stringify({ status: "diverged" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      error: /not reachable/i,
+    },
+    {
+      name: "missing activation commit comparison",
+      response: () =>
+        new Response(JSON.stringify({ message: "Not Found" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }),
+      error: /HTTP 404/i,
+    },
+  ]) {
+    await t.test(scenario.name, async () => {
+      const requests = [];
+      const fetchImpl = async (url, options = {}) => {
+        const requestUrl = new URL(url);
+        requests.push({
+          method: options.method,
+          path: `${requestUrl.pathname}${requestUrl.search}`,
+        });
+        assert.equal(requestUrl.pathname, activationComparisonPath);
+        return scenario.response();
+      };
+      await assert.rejects(
+        () =>
+          main({
+            eventPath,
+            eventName: "issue_comment",
+            repository: REPOSITORY,
+            token: "test-token",
+            mode: "enforce",
+            now: NOW,
+            fetchImpl,
+          }),
+        scenario.error,
+      );
+      assert.deepEqual(requests, [
+        { method: "GET", path: activationComparisonPath },
+      ]);
+    });
+  }
 });
