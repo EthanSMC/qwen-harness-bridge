@@ -107,7 +107,7 @@ Behavior changes follow red-green-refactor. Commits are small, coherent, verifie
 - security, privacy, protocol, migration, compatibility, and rollback effects; and
 - the existing formal or solo independent-review evidence.
 
-Opening a qualifying pull request before the implementation deadline moves the Issue to `status:review` and records a v2 durable review-admission receipt bound to that exact pull-request number. The claim generation cannot admit a different primary pull request; close and reopen the same PR, or release and create a fresh claim generation. The reviewer must differ from the implementer and review the complete final range. Findings return to a fix loop. Every push invalidates stale review evidence; a fresh PASS and successful current-head checks are required.
+Opening a qualifying pull request before the implementation deadline moves the Issue to `status:review` and records a v2 durable review-admission receipt bound to that exact pull-request number. GitHub `created_at` proves a matching original `opened` event; an edited, reopened, or reconciled PR must have a matching live `updated_at` before the current lease expires. A delayed delivery can recover the original bot-authored intent, but cannot turn a late edit or reopen into timely admission. The claim generation cannot admit a different primary pull request; close and reopen the same PR, or release and create a fresh claim generation. The reviewer must differ from the implementer and review the complete final range. Findings return to a fix loop. Every push invalidates stale review evidence; a fresh PASS and successful current-head checks are required.
 
 ## Merge and close
 

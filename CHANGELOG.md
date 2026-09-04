@@ -6,7 +6,7 @@ All notable changes use synchronized Semantic Versioning and are recorded here. 
 
 ### Added
 
-- Human-accountable AI Issue claims with a repository-wide mutation queue, bounded ordered command recovery, PR-comment isolation, exclusive GitHub-clocked 24-hour implementation leases, exact-PR-bound durable review admission, safe public provenance, explicit handoff/block/resume commands, independent current-head review, claim-bound merge/close/reopen reconciliation, and independently staged mutation/validation activation.
+- Human-accountable AI Issue claims with a repository-wide mutation queue, bounded ordered command recovery, cross-run system-intent recovery, PR-comment isolation, exclusive GitHub-clocked 24-hour implementation leases, timely exact-PR-bound durable review admission, safe public provenance, explicit handoff/block/resume commands, independent current-head review, claim-bound merge/close/reopen reconciliation, and independently staged mutation/validation activation.
 - Approved Qwen Harness Bridge product and system Spec.
 - Five detailed test-driven implementation plans and master roadmap.
 - Public-repository governance, issue templates, planning validation, and GitHub synchronization tooling.

@@ -460,6 +460,8 @@ for (const [pattern, message] of [
     "pull-request comment lifecycle isolation",
   ],
   [/pullRequestNumber:\s*pullRequest\.number/, "receipt pull-request binding"],
+  [/pendingIntentEventIds/, "cross-run pending system-intent recovery"],
+  [/pullRequest\?\.updated_at/, "timely live pull-request qualification"],
   [/stableSystemEventId/, "deterministic system event identities"],
 ]) {
   requireSourceField(

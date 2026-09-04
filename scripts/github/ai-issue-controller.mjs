@@ -194,22 +194,33 @@ const requireChronology = ({ claim, pullRequest, issueClosedAt }) => {
   }
 };
 
-const requireReviewAdmissionChronology = ({ claim, pullRequest }) => {
+const requireReviewAdmissionChronology = ({
+  claim,
+  pullRequest,
+  eventAction,
+}) => {
   const claimedAt = Date.parse(claim?.claimedAt ?? "");
   const expiresAt = Date.parse(claim?.leaseExpiresAt ?? "");
   const pullCreatedAt = Date.parse(pullRequest?.created_at ?? "");
+  const qualifyingAt = Date.parse(
+    eventAction === "opened"
+      ? (pullRequest?.created_at ?? "")
+      : (pullRequest?.updated_at ?? ""),
+  );
   if (
     Number.isNaN(claimedAt) ||
     Number.isNaN(expiresAt) ||
     Number.isNaN(pullCreatedAt) ||
-    pullCreatedAt < claimedAt
+    Number.isNaN(qualifyingAt) ||
+    pullCreatedAt < claimedAt ||
+    qualifyingAt < claimedAt
   ) {
     throw new LifecycleError(
       "STATE_MISMATCH",
       "The claim and pull request review-admission chronology is invalid.",
     );
   }
-  if (pullCreatedAt >= expiresAt) {
+  if (pullCreatedAt >= expiresAt || qualifyingAt >= expiresAt) {
     throw new LifecycleError(
       "LEASE_EXPIRED",
       "The claim lease expired before pull request review admission.",
@@ -421,7 +432,9 @@ const pendingIntentFor = (comments, receipts, eventId) => {
     (comment) =>
       comment.user?.login === WORKFLOW_LOGIN &&
       comment.body?.includes("<!-- qhb-ai-intent:v2") &&
-      comment.body.includes(`event-id=${eventId}`),
+      [...comment.body.matchAll(/^event-id=([1-9]\d*)$/gmu)].some(
+        (match) => Number(match[1]) === Number(eventId),
+      ),
   );
   if (new Set(intents.map(({ body }) => body)).size > 1) {
     throw new LifecycleError(
@@ -472,9 +485,33 @@ const pendingIntentFor = (comments, receipts, eventId) => {
       from: parsed.from,
       to: parsed.to,
       leaseExpiresAt: parsed.leaseExpiresAt,
+      pullRequestNumber: parsed.pullRequestNumber,
       code: parsed.code,
     },
   };
+};
+
+const pendingIntentEventIds = (comments, receipts) => {
+  const completed = new Set(receipts.map(({ eventId }) => eventId));
+  const pending = new Set();
+  for (const comment of comments) {
+    if (
+      comment.user?.login !== WORKFLOW_LOGIN ||
+      !comment.body?.includes("<!-- qhb-ai-intent:v2")
+    ) {
+      continue;
+    }
+    const matches = [...comment.body.matchAll(/^event-id=([1-9]\d*)$/gmu)];
+    if (matches.length !== 1) {
+      throw new LifecycleError(
+        "STATE_MISMATCH",
+        "A pending lifecycle intent has an invalid event ID.",
+      );
+    }
+    const intentEventId = Number(matches[0][1]);
+    if (!completed.has(intentEventId)) pending.add(intentEventId);
+  }
+  return [...pending];
 };
 
 const postReceipt = async (github, issueNumber, receipt) => {
@@ -559,24 +596,41 @@ const recoverPendingIntent = async ({
   eventId,
   expectedActions,
 }) => {
-  const plan = pendingIntentFor(
+  const requestedEventId = Number(eventId);
+  const requestedPlan = pendingIntentFor(
     loaded.comments,
     loaded.receipts,
-    Number(eventId),
+    requestedEventId,
   );
+  const observedState = observedStatusOf(loaded.issue);
+  if (
+    requestedPlan &&
+    (!expectedActions.includes(requestedPlan.command) ||
+      ![requestedPlan.from, requestedPlan.to].includes(observedState))
+  ) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "The pending lifecycle intent does not match the current event or Issue state.",
+    );
+  }
+  const candidatePlans = pendingIntentEventIds(loaded.comments, loaded.receipts)
+    .map((candidateEventId) =>
+      pendingIntentFor(loaded.comments, loaded.receipts, candidateEventId),
+    )
+    .filter(
+      (candidate) =>
+        candidate &&
+        expectedActions.includes(candidate.command) &&
+        [candidate.from, candidate.to].includes(observedState),
+    );
+  if (candidatePlans.length > 1) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "More than one pending lifecycle intent matches the current Issue state.",
+    );
+  }
+  const plan = requestedPlan ?? candidatePlans[0] ?? null;
   if (!plan) return null;
-  if (!expectedActions.includes(plan.command)) {
-    throw new LifecycleError(
-      "STATE_MISMATCH",
-      "The pending lifecycle intent does not match the current event.",
-    );
-  }
-  if (![plan.from, plan.to].includes(observedStatusOf(loaded.issue))) {
-    throw new LifecycleError(
-      "STATE_MISMATCH",
-      "The Issue no longer matches the pending lifecycle intent.",
-    );
-  }
   await mutateIssueToPlan(github, issueNumber, loaded.issue, plan);
   await postReceipt(github, issueNumber, plan.receipt);
   const issue = await github.get(`/issues/${issueNumber}`);
@@ -902,6 +956,11 @@ const verifyPullRequestIdentity = (eventPullRequest, currentPullRequest) => {
     ["body", eventPullRequest.body, currentPullRequest.body],
     ["head SHA", eventPullRequest.head?.sha, currentPullRequest.head?.sha],
     ["author", eventPullRequest.user?.login, currentPullRequest.user?.login],
+    [
+      "updated timestamp",
+      eventPullRequest.updated_at,
+      currentPullRequest.updated_at,
+    ],
   ]) {
     if (eventValue !== liveValue) {
       throw new LifecycleError(
@@ -1044,7 +1103,11 @@ export const handlePullRequest = async ({
     state === "in-progress" &&
     (pullRequest.state === "open" || pullRequest.merged === true)
   ) {
-    requireReviewAdmissionChronology({ claim, pullRequest });
+    requireReviewAdmissionChronology({
+      claim,
+      pullRequest,
+      eventAction: event.action,
+    });
   }
 
   let plan;
@@ -1218,7 +1281,7 @@ export const handleIssueChange = async ({
       issueNumber,
       loaded,
       eventId,
-      expectedActions: ["close", "reopen", "initialize", "refresh"],
+      expectedActions: ["close", "reopen", "initialize", "refresh", "expire"],
     });
     if (recovered) return recovered;
   }

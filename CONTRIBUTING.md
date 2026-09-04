@@ -35,7 +35,7 @@ A pull request is ready only when:
 
 - Its author, primary Issue assignee, accountable-owner field, and verified claim actor match.
 - Its branch contains the primary Issue number and the body contains exactly one `Closes #<issue>`.
-- The primary Issue is in `status:review` with a live, unreleased claim generation and a durable `pr-open` review-admission receipt created before its implementation lease expired.
+- The primary Issue is in `status:review` with a live, unreleased claim generation and a durable `pr-open` receipt proving that the exact qualifying pull request entered its current qualifying form before the implementation lease expired.
 - The linked issue's checkboxes and definition of done are satisfied.
 - Relevant unit, contract, integration, security, build, and document checks pass.
 - A Changeset is present for user-visible package behavior, unless the change is docs/tests only.

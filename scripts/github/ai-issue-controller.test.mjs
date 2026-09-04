@@ -118,6 +118,7 @@ class FakeGitHub {
     user = "alice",
     head = `docs/${issueNumber}-lifecycle`,
     createdAt = NOW,
+    updatedAt = createdAt,
   } = {}) {
     const claimReceipt = this.workflowReceipts(issueNumber)
       .filter(
@@ -141,6 +142,7 @@ class FakeGitHub {
         `Closes #${issueNumber}`,
       ].join("\n"),
       user: { login: user },
+      updated_at: updatedAt,
       base: {
         ref: "main",
         sha: "base123",
@@ -156,10 +158,11 @@ class FakeGitHub {
     return this.clone(pull);
   }
 
-  pullEvent(pull) {
+  pullEvent(pull, action = undefined) {
     return {
       repository: { full_name: REPOSITORY, default_branch: "main" },
       pull_request: this.clone(pull),
+      ...(action ? { action } : {}),
     };
   }
 
@@ -829,6 +832,72 @@ test("review admission rejects an implementation claim at its expiry boundary", 
   );
 });
 
+test("review admission rejects a qualifying edit after lease expiry", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const pull = fake.pull({
+    createdAt: "2026-09-04T13:00:00.000Z",
+    updatedAt: "2026-09-05T13:00:00.000Z",
+  });
+  await assert.rejects(
+    () =>
+      handlePullRequest(
+        context(fake, fake.pullEvent(pull, "edited"), {
+          eventId: 910,
+          now: "2026-09-05T13:00:00.000Z",
+        }),
+      ),
+    /lease.*expired|expired.*lease/i,
+  );
+});
+
+test("review admission rejects reopening after the renewed lease expires", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const pull = fake.pull({ createdAt: "2026-09-04T13:00:00.000Z" });
+  await handlePullRequest(
+    context(fake, fake.pullEvent(pull, "opened"), { eventId: 910 }),
+  );
+  const closed = fake.pulls.get(51);
+  closed.state = "closed";
+  closed.updated_at = "2026-09-04T14:00:00.000Z";
+  await handlePullRequest(
+    context(fake, fake.pullEvent(closed, "closed"), {
+      eventId: 911,
+      now: "2026-09-04T14:00:00.000Z",
+    }),
+  );
+  closed.state = "open";
+  closed.updated_at = "2026-09-05T14:00:00.000Z";
+  await assert.rejects(
+    () =>
+      handlePullRequest(
+        context(fake, fake.pullEvent(closed, "reopened"), {
+          eventId: 912,
+          now: "2026-09-05T14:00:00.000Z",
+        }),
+      ),
+    /lease.*expired|expired.*lease/i,
+  );
+});
+
+test("a delayed qualifying opened event retains its immutable admission time", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const pull = fake.pull({
+    createdAt: "2026-09-04T13:00:00.000Z",
+    updatedAt: "2026-09-04T13:00:00.000Z",
+  });
+  const result = await handlePullRequest(
+    context(fake, fake.pullEvent(pull, "opened"), {
+      eventId: 910,
+      now: "2026-09-06T12:00:00.000Z",
+    }),
+  );
+  assert.equal(result.status, "applied");
+  assert.equal(fake.workflowReceipts().at(-1).action, "pr-open");
+});
+
 test("manual review state without a review-admission receipt fails closed", async () => {
   const fake = new FakeGitHub();
   await claim(fake);
@@ -850,6 +919,214 @@ test("manual review state without a review-admission receipt fails closed", asyn
     status: "repair-required",
     code: "STATE_MISMATCH",
   });
+});
+
+test("recovers the exact pull request binding after a review receipt interruption", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const pullRequest = fake.pull();
+  const event = fake.pullEvent(pullRequest);
+  fake.failNextReceiptPost = true;
+  await assert.rejects(
+    () => handlePullRequest(context(fake, event, { eventId: 910 })),
+    /receipt write interruption/i,
+  );
+  assert.ok(fake.issue().labels.some(({ name }) => name === "status:review"));
+
+  const recovered = await handlePullRequest(
+    context(fake, event, { eventId: 910 }),
+  );
+  assert.equal(recovered.recovered, true);
+  const reviewReceipt = fake
+    .workflowReceipts()
+    .find(({ eventId }) => eventId === 910);
+  assert.equal(reviewReceipt.action, "pr-open");
+  assert.equal(reviewReceipt.pullRequestNumber, 51);
+});
+
+test("scheduled reconciliation recovers interrupted pull request system receipts", async () => {
+  for (const action of ["pr-open", "pr-close", "merge"]) {
+    const fake = new FakeGitHub();
+    await claim(fake);
+    const pull = fake.pull();
+    if (action !== "pr-open") {
+      await handlePullRequest(
+        context(fake, fake.pullEvent(pull, "opened"), { eventId: 910 }),
+      );
+    }
+    const livePull = fake.pulls.get(51);
+    if (action === "pr-close") {
+      livePull.state = "closed";
+      livePull.updated_at = "2026-09-04T14:00:00.000Z";
+    } else if (action === "merge") {
+      livePull.state = "closed";
+      livePull.merged = true;
+      livePull.merged_at = "2026-09-04T14:00:00.000Z";
+      livePull.updated_at = "2026-09-04T14:00:00.000Z";
+      livePull.merge_commit_sha = "abc1234";
+      const issue = fake.issues.get(46);
+      issue.state = "closed";
+      issue.state_reason = "completed";
+      issue.closed_at = "2026-09-04T14:00:00.000Z";
+    }
+    fake.failNextReceiptPost = true;
+    await assert.rejects(
+      () =>
+        handlePullRequest(
+          context(fake, fake.pullEvent(livePull, action), {
+            eventId: 920,
+            now: "2026-09-04T14:00:00.000Z",
+          }),
+        ),
+      /receipt write interruption/i,
+    );
+
+    await reconcileRepositoryState(
+      context(
+        fake,
+        {},
+        {
+          defaultBranch: "main",
+          now: "2026-09-04T15:00:00.000Z",
+        },
+      ),
+    );
+    assert.equal(
+      fake.workflowReceipts().filter((receipt) => receipt.action === action)
+        .length,
+      1,
+      `${action} receipt should recover on the scheduled entry point`,
+    );
+  }
+});
+
+test("cross-run recovery fails closed when two pending intents match", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const pull = fake.pull();
+  fake.failNextReceiptPost = true;
+  await assert.rejects(
+    () =>
+      handlePullRequest(
+        context(fake, fake.pullEvent(pull, "opened"), { eventId: 920 }),
+      ),
+    /receipt write interruption/i,
+  );
+  const original = fake
+    .issueComments()
+    .find(
+      ({ body }) =>
+        body.includes("<!-- qhb-ai-intent:v2") &&
+        body.includes("action=pr-open"),
+    );
+  fake.comments.get(46).push({
+    ...original,
+    id: fake.nextCommentId,
+    body: original.body.replace("event-id=920", "event-id=921"),
+  });
+  fake.nextCommentId += 1;
+  await assert.rejects(
+    () =>
+      reconcileRepositoryState(context(fake, {}, { defaultBranch: "main" })),
+    (error) =>
+      error instanceof AggregateError &&
+      error.errors.some((failure) =>
+        /more than one pending lifecycle intent/i.test(failure.message),
+      ),
+  );
+  assert.equal(fake.workflowReceipts().length, 1);
+});
+
+test("scheduled reconciliation recovers interrupted Issue system receipts", async () => {
+  for (const action of ["initialize", "refresh", "reopen"]) {
+    const fake = new FakeGitHub();
+    const issue = fake.issues.get(46);
+    if (action === "initialize") {
+      issue.labels = [{ name: "type:docs" }];
+    } else if (action === "refresh") {
+      issue.labels = [{ name: "type:docs" }, { name: "status:waiting" }];
+    } else {
+      issue.labels = [{ name: "type:docs" }, { name: "status:done" }];
+    }
+    fake.failNextReceiptPost = true;
+    await assert.rejects(
+      () =>
+        handleIssueChange(context(fake, fake.issueEvent(), { eventId: 930 })),
+      /receipt write interruption/i,
+    );
+
+    await reconcileRepositoryState(
+      context(fake, {}, { defaultBranch: "main" }),
+    );
+    assert.equal(
+      fake.workflowReceipts().filter((receipt) => receipt.action === action)
+        .length,
+      1,
+      `${action} receipt should recover on the scheduled entry point`,
+    );
+  }
+});
+
+test("scheduled reconciliation recovers interrupted close and expiry receipts", async () => {
+  const closedFake = new FakeGitHub();
+  await claim(closedFake);
+  const pull = closedFake.pull();
+  await handlePullRequest(
+    context(closedFake, closedFake.pullEvent(pull, "opened"), {
+      eventId: 910,
+    }),
+  );
+  const merged = closedFake.pulls.get(51);
+  merged.state = "closed";
+  merged.merged = true;
+  merged.merged_at = "2026-09-04T14:00:00.000Z";
+  merged.updated_at = "2026-09-04T14:00:00.000Z";
+  merged.merge_commit_sha = "abc1234";
+  const closedIssue = closedFake.issues.get(46);
+  closedIssue.state = "closed";
+  closedIssue.state_reason = "completed";
+  closedIssue.closed_at = "2026-09-04T14:00:00.000Z";
+  closedFake.failNextReceiptPost = true;
+  await assert.rejects(
+    () =>
+      handleIssueChange(
+        context(closedFake, closedFake.issueEvent(), { eventId: 940 }),
+      ),
+    /receipt write interruption/i,
+  );
+  await reconcileRepositoryState(
+    context(closedFake, {}, { defaultBranch: "main" }),
+  );
+  assert.equal(closedFake.workflowReceipts().at(-1).action, "close");
+
+  const expiredFake = new FakeGitHub();
+  await claim(expiredFake);
+  expiredFake.failNextReceiptPost = true;
+  await assert.rejects(
+    () =>
+      reconcileExpiredClaims(
+        context(
+          expiredFake,
+          {},
+          {
+            eventId: 950,
+            now: "2026-09-05T12:00:00.000Z",
+          },
+        ),
+      ),
+    /expired claim|receipt write interruption/i,
+  );
+  await reconcileRepositoryState(
+    context(
+      expiredFake,
+      {},
+      {
+        defaultBranch: "main",
+        now: "2026-09-05T13:00:00.000Z",
+      },
+    ),
+  );
+  assert.equal(expiredFake.workflowReceipts().at(-1).action, "expire");
 });
 
 test("a review lock cannot transfer to a second pull request", async () => {
