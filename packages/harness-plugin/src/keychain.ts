@@ -165,6 +165,7 @@ export class MacOSKeychainCredentialReader implements CredentialReader {
         if (stdoutBytes <= MAX_CREDENTIAL_BYTES) {
           stdoutChunks.push(buffer);
         } else {
+          buffer.fill(0);
           fail(true);
         }
       };
@@ -195,6 +196,7 @@ export class MacOSKeychainCredentialReader implements CredentialReader {
           return;
         }
         settled = true;
+        scrubStdout();
         cleanup();
         resolve(credential);
       };

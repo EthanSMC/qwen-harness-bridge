@@ -354,6 +354,43 @@ describe("macOS Keychain credential reader", () => {
     );
   });
 
+  it("scrubs emitted stdout buffers after a successful read", async () => {
+    const controlled = makeControlledSpawn();
+    const retainedChunk = Buffer.from("buffer-secret\n");
+    const reader = new MacOSKeychainCredentialReader(controlled.spawn);
+    const result = reader.read("service-name", "account-name");
+
+    controlled.stdout.emit("data", retainedChunk);
+    controlled.child.emit("close", 0, null);
+
+    await expect(result).resolves.toBe("buffer-secret");
+    expect(retainedChunk.every((byte) => byte === 0)).toBe(true);
+  });
+
+  it("scrubs every emitted stdout buffer when output exceeds its bound", async () => {
+    const controlled = makeControlledSpawn();
+    controlled.kill.mockImplementation(() => {
+      controlled.child.emit("close", null, "SIGTERM");
+      return true;
+    });
+    const retainedChunks = [
+      Buffer.from("buffer-secret"),
+      Buffer.alloc(16 * 1_024 + 1, 0x73),
+    ];
+    const reader = new MacOSKeychainCredentialReader(controlled.spawn);
+    const result = reader.read("service-name", "account-name");
+
+    controlled.stdout.emit("data", retainedChunks[0]);
+    controlled.stdout.emit("data", retainedChunks[1]);
+
+    await expect(result).rejects.toEqual(
+      expect.objectContaining({ code: "CONNECTOR_CREDENTIAL_UNAVAILABLE" }),
+    );
+    expect(
+      retainedChunks.every((chunk) => chunk.every((byte) => byte === 0)),
+    ).toBe(true);
+  });
+
   it("maps command failures to a safe credential-unavailable error", async () => {
     const spawn = makeFakeSpawn({
       stderr: "credential value must not appear in this error",
