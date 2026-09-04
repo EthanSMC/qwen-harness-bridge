@@ -839,13 +839,17 @@ Set `activation_commit` to the exact 40-character protected-main commit containi
 
 The activation Issue itself must be claimed through `/ai-claim`, use a new `docs/<issue>-activate-ai-lifecycle` branch/worktree, and create a PR with complete lifecycle evidence while validation remains report-only. After it merges and both variables enter enforce, use the reopened disposable Issue for one fresh claim and final documentation smoke PR whose lifecycle evidence passes strict validation and closes the fixture. This proves that the system can govern work before and after its own activation without a circular gate.
 
-- [ ] **Step 7: Verify final closure and repository-wide invariants**
+- [x] **Step 7: Verify final closure and repository-wide invariants**
 
 After merge, query every governed Issue and assert exactly one lifecycle label, valid assignee cardinality, dependency/readiness consistency, and no expired active claim. Verify the activation Issue closed, the required `governance` check is green, branch protection remains enabled, and the report-mode rollback remains documented.
 
-- [ ] **Step 8: Record final completion**
+Completed on 2026-09-04 after repair PR [#57](https://github.com/EthanSMC/qwen-harness-bridge/pull/57) merged and Issue [#56](https://github.com/EthanSMC/qwen-harness-bridge/issues/56) reached closed-completed, unassigned `status:done` with a workflow terminal receipt. Main-branch reconciliation run [33890627233](https://github.com/EthanSMC/qwen-harness-bridge/actions/runs/33890627233) processed 34 governed objects as unchanged, skipped exactly the 12 activation-bound historical snapshots, drained no commands, and released no claims. Both lifecycle modes remained `enforce`; branch protection retained strict required `governance`, linear history, resolved conversations, admin enforcement, and disabled force-push/deletion.
+
+- [x] **Step 8: Record final completion**
 
 Update Issue #46 or the activation Issue with the public acceptance evidence. The objective is complete only after both strict modes are live, the post-activation smoke PR passes, all tests pass, migration entries are empty, `mutation_acceptance` is null, and the repository-wide invariant audit succeeds.
+
+Final public evidence is recorded in `docs/github/repository-status.md` and Issue [#58](https://github.com/EthanSMC/qwen-harness-bridge/issues/58). The activation registry remains bound to `b06aceb805f03dc809b37b80cb45a240bb5be66d` with empty migrations and null mutation acceptance; the post-activation smoke, 198 governance tests, 384 product tests, independent exact-range review, protected merge, and successful repository-wide invariant audit all passed.
 
 ## Plan completion evidence
 
