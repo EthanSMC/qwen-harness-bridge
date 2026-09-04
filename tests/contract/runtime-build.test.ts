@@ -104,6 +104,107 @@ const workflowStep = (workflow: string, name: string): string => {
   return lines.slice(start, end === -1 ? lines.length : end).join("\n");
 };
 
+const workflowRunScript = (step: string): string => {
+  const lines = step.split("\n");
+  const runIndex = lines.findIndex((line) => /^\s*run:\s*\|\s*$/.test(line));
+  expect(runIndex, "workflow step must contain a run block").toBeGreaterThan(
+    -1,
+  );
+  const runLine = lines[runIndex ?? -1] ?? "";
+  const runIndent = runLine.length - runLine.trimStart().length;
+  const contentIndent = runIndent + 2;
+  return lines
+    .slice((runIndex ?? -1) + 1)
+    .map((line) => {
+      if (line.trim().length === 0) return "";
+      expect(
+        line.length - line.trimStart().length,
+        "workflow run lines must be indented below run: |",
+      ).toBeGreaterThanOrEqual(contentIndent);
+      return line.slice(contentIndent);
+    })
+    .join("\n");
+};
+
+const configDigestParserScript = (step: string): string => {
+  const lines = workflowRunScript(step).split("\n");
+  const digestStart = lines.findIndex((line) =>
+    /^\s*config_digest\s*=/.test(line),
+  );
+  expect(digestStart, "workflow must assign config_digest").toBeGreaterThan(-1);
+  const parserMarker = lines.findIndex(
+    (line) => line.trim() === "# config-digest-parser",
+  );
+  expect(
+    parserMarker === -1 || parserMarker < digestStart,
+    "config-digest parser marker must precede config_digest",
+  ).toBe(true);
+  const start = parserMarker === -1 ? digestStart : parserMarker + 1;
+  const end = lines.findIndex(
+    (line, index) =>
+      index > start &&
+      line.includes('"$config_digest"') &&
+      line.includes("grep -E"),
+  );
+  expect(
+    end,
+    "workflow must validate config_digest after parsing it",
+  ).toBeGreaterThan(start);
+  return [
+    "set -euo pipefail",
+    ...lines.slice(start, end + 1),
+    "printf '%s\\n' \"$config_digest\"",
+  ].join("\n");
+};
+
+const runConfigDigestParser = (
+  parserScript: string,
+  composeOutput: string,
+  composeStatus = 0,
+  composeStderr = "",
+): { status: number | null; stdout: string; stderr: string } => {
+  const result = spawnSync(
+    "bash",
+    [
+      "-c",
+      `
+image_digest=sha256:${"0".repeat(64)}
+docker() {
+  test "$#" -eq 6
+  test "$1" = compose
+  test "$2" = --env-file
+  test "$3" = "$RUNTIME_ENV_FILE"
+  test "$4" = config
+  test "$5" = --hash
+  test "$6" = control-plane
+  if test "$RUNTIME_COMPOSE_STATUS" -ne 0; then
+    printf '%s' "$RUNTIME_CONFIG_HASH_STDERR" >&2
+    printf '%s' "$RUNTIME_CONFIG_HASH_OUTPUT"
+    return "$RUNTIME_COMPOSE_STATUS"
+  fi
+  printf '%s' "$RUNTIME_CONFIG_HASH_OUTPUT"
+}
+${parserScript}
+`,
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        RUNTIME_ENV_FILE: "/tmp/qhb-runtime.env",
+        RUNTIME_COMPOSE_STATUS: String(composeStatus),
+        RUNTIME_CONFIG_HASH_OUTPUT: composeOutput,
+        RUNTIME_CONFIG_HASH_STDERR: composeStderr,
+      },
+    },
+  );
+  return {
+    status: result.status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
+};
+
 const copyWorkingTree = (runFreshBuildCommand: FreshBuildCommand): string => {
   const target = mkdtempSync(join(tmpdir(), "qhb-runtime-build-"));
   try {
@@ -1692,7 +1793,7 @@ describe("release runtime build contract", () => {
     expect(evidence).toMatch(
       /image_digest[\s\S]*docker\s+image\s+inspect[\s\S]*(?:image_ref|RUNTIME_IMAGE_REF)/i,
     );
-    expect(evidence).toMatch(/config_digest\s*=\s*["']?sha256:/i);
+    expect(evidence).toMatch(/config_digest\s*=\s*["']?\$\(/i);
     expect(evidence).toMatch(
       /docker compose[\s\S]*--env-file\s+["']?\$RUNTIME_ENV_FILE["']?[\s\S]*config\s+--hash\s+control-plane/,
     );
@@ -1747,6 +1848,150 @@ describe("release runtime build contract", () => {
     expect(runbook).toMatch(
       /sudo\s+install[^\n]*-o\s+1000[^\n]*-g\s+1000[^\n]*-m\s+0400[^\n]*QHB_TLS_KEY/i,
     );
+  });
+
+  it("executes the config hash parser and rejects non-canonical Compose output", () => {
+    const workflow = read(".github/workflows/runtime.yml");
+    const runtimeJob = yamlMappingBlock(workflow, "jobs", "runtime");
+    const evidence = workflowStep(runtimeJob, "Capture runtime evidence");
+    const parserScript = configDigestParserScript(evidence);
+    const hash = "a".repeat(64);
+    const cases = [
+      {
+        name: "the selected service with a lowercase 64-hex hash",
+        output: `control-plane ${hash}\n`,
+        expectedStatus: 0,
+        expectedStdout: `sha256:${hash}\n`,
+      },
+      {
+        name: "a different service",
+        output: `worker ${hash}\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "a hash without a service",
+        output: `${hash}\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "a malformed hash",
+        output: "control-plane not-a-hash\n",
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "a short hash",
+        output: `control-plane ${hash.slice(0, -1)}\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "a non-hex hash",
+        output: `control-plane ${"g".repeat(64)}\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "an uppercase hash",
+        output: `control-plane ${"A".repeat(64)}\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "a long hash",
+        output: `control-plane ${hash}a\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "an extra token",
+        output: `control-plane ${hash} extra\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "trailing text",
+        output: `control-plane ${hash} trailing text\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "leading whitespace",
+        output: ` control-plane ${hash}\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "trailing whitespace",
+        output: `control-plane ${hash} \n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "double whitespace",
+        output: `control-plane  ${hash}\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "tabs",
+        output: `control-plane\t${hash}\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "CRLF",
+        output: `control-plane ${hash}\r\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "an extra blank line",
+        output: `control-plane ${hash}\n\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "multiple records",
+        output: `control-plane ${hash}\ncontrol-plane ${hash}\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "empty output",
+        output: "",
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "diagnostics mixed into stdout",
+        output: `control-plane ${hash}\ndiagnostic: warning\n`,
+        expectedStatus: "nonzero",
+      },
+      {
+        name: "valid-looking output from a failed Compose command",
+        output: `control-plane ${hash}\n`,
+        expectedStatus: "nonzero",
+        composeStatus: 7,
+        composeStderr: "compose failed\n",
+      },
+    ];
+    const results = cases.map((testCase) =>
+      runConfigDigestParser(
+        parserScript,
+        testCase.output,
+        testCase.composeStatus,
+        testCase.composeStderr,
+      ),
+    );
+
+    expect(results[0], cases[0]?.name).toMatchObject({
+      status: cases[0]?.expectedStatus,
+      stdout: cases[0]?.expectedStdout,
+    });
+    for (const [index, testCase] of cases.entries()) {
+      if (testCase.expectedStatus === "nonzero") {
+        expect(results[index]?.status, testCase.name).not.toBe(0);
+      } else {
+        expect(results[index]?.status, testCase.name).toBe(0);
+      }
+    }
+    expect(results.at(-1), "Compose stderr must remain separate").toMatchObject(
+      {
+        stdout: "",
+        stderr: expect.stringContaining("compose failed"),
+      },
+    );
+    expect(parserScript).toContain("LC_ALL=C");
+    expect(parserScript).toContain("set -euo pipefail");
+    expect(parserScript).not.toMatch(/2>\s*&1|&>\s*/);
+    expect(parserScript).not.toMatch(/\b(?:head|tail|tr)\b/);
+    expect(parserScript).not.toMatch(/\bgrep\s+-[A-Za-z]*o/);
   });
 
   it("keeps the fixed repository error enum out of privacy matches", () => {

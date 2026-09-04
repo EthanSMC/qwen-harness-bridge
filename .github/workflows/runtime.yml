@@ -316,9 +316,31 @@ jobs:
           test "$migration_when" = "1788244364352"
           test "$migration_sha256" = "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89"
           image_digest="$(docker image inspect --format '{{.Id}}' "$RUNTIME_IMAGE_REF")"
-          config_digest="sha256:$(docker compose --env-file "$RUNTIME_ENV_FILE" config --hash control-plane)" # config--hash
           if ! printf '%s\n' "$image_digest" | grep -E '^sha256:[0-9a-f]{64}$'; then exit 1; fi
-          if ! printf '%s\n' "$config_digest" | grep -E '^sha256:[0-9a-f]{64}$'; then exit 1; fi
+          # config-digest-parser
+          config_hash_output="$(
+            compose_status=0
+            docker compose --env-file "$RUNTIME_ENV_FILE" config --hash control-plane || compose_status=$? # config--hash
+            printf '\037'
+            exit "$compose_status"
+          )"
+          config_hash_output="${config_hash_output%$'\037'}"
+          config_digest="$(
+            printf '%s' "$config_hash_output" |
+              LC_ALL=C awk '
+                BEGIN { valid = 1; line_count = 0 }
+                {
+                  line_count++
+                  if (line_count != 1 || $0 !~ /^control-plane [0-9a-f]{64}$/) valid = 0
+                  else hash = substr($0, 15)
+                }
+                END {
+                  if (valid != 1 || line_count != 1) exit 1
+                  printf "sha256:%s\n", hash
+                }
+              '
+          )"
+          if ! printf '%s\n' "$config_digest" | grep -Eq '^sha256:[0-9a-f]{64}$'; then exit 1; fi
           run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           observed_at_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
           node_version=$(node --version)
