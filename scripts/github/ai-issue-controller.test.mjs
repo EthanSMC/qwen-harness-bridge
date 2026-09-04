@@ -1917,6 +1917,33 @@ test("repository reconciliation verifies a released prior unmerged pull request 
         error.errors.some((failure) => message.test(failure.message)),
     );
 
+  fake.comments.set(
+    46,
+    validComments.filter(({ body }) => !body.includes("\naction=merge\n")),
+  );
+  await assertReconciliationFailure(/final terminal receipt/i);
+
+  fake.comments.set(
+    46,
+    validComments.map((comment) =>
+      comment.body.includes("\naction=merge\n")
+        ? {
+            ...comment,
+            body: comment.body.replace(
+              "\npull-request=52\n",
+              "\npull-request=51\n",
+            ),
+          }
+        : comment,
+    ),
+  );
+  await assertReconciliationFailure(/pull request receipt|claim generation/i);
+
+  fake.comments.set(46, validComments);
+  fake.comparisonStatus = "diverged";
+  await assertReconciliationFailure(/not reachable/i);
+  fake.comparisonStatus = "ahead";
+
   closedFirstPull.body = closedFirstPull.body.replace(
     /issuecomment-[1-9]\d*/u,
     "issuecomment-999",

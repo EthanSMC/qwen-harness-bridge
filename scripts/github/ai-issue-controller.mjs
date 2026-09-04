@@ -1330,7 +1330,16 @@ export const handlePullRequest = async ({
     pullRequest.merged !== true &&
     currentClaim?.pullRequestNumber !== pullRequest.number
   ) {
-    assertIssueInvariant(loaded.issue);
+    const { state } = assertIssueInvariant(loaded.issue);
+    if (state === "done") {
+      await verifyCompletedIssueEvidence({
+        github,
+        issueNumber,
+        repository,
+        defaultBranch,
+        loaded,
+      });
+    }
     verifyClosedUnmergedPullRequestEvidence({
       pullRequest,
       issueNumber,
