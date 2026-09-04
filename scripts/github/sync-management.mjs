@@ -164,9 +164,12 @@ export const buildPlanIssueGraph = (planDefinitions, existingIssues) => {
           ? M1_TASK_DEPENDENCIES[definition.tasks[taskIndex].number]
           : undefined;
       if (m1Dependencies) {
-        blockedBy.push(...m1Dependencies.map((number) =>
-          issueForTask(definition, { number }, existingIssues).number,
-        ));
+        blockedBy.push(
+          ...m1Dependencies.map(
+            (number) =>
+              issueForTask(definition, { number }, existingIssues).number,
+          ),
+        );
       } else if (taskIndex > 0) {
         blockedBy.push(planIssues[definitionIndex][taskIndex - 1].number);
       } else if (definitionIndex > 0 && definitionIndex <= 3) {

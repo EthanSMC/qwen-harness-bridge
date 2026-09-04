@@ -4,19 +4,18 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, delimiter, join, resolve } from "node:path";
 import test from "node:test";
-
+import { parseDependencies } from "./ai-issue-policy.mjs";
 import {
   branchProtectionFor,
   buildPlanIssueGraph,
   createGh,
   deriveLifecycleState,
   loadHistoricalPullRequests,
-  mergePlanIssueBody,
   loadPlanTasks,
+  mergePlanIssueBody,
   renderPlanIssueBody,
   verifyHistoricalClosure,
 } from "./sync-management.mjs";
-import { parseDependencies } from "./ai-issue-policy.mjs";
 
 const root = resolve(import.meta.dirname, "../..");
 const syncManagement = resolve(root, "scripts/github/sync-management.mjs");
@@ -61,18 +60,22 @@ test("orders tasks within each plan and gates each stable plan", () => {
 });
 
 const approvedPlans = loadPlanTasks();
-const markerIssues = approvedPlans.flatMap((definition, planIndex) =>
-  definition.tasks.map((task) => ({
-    number: 1000 + planIndex * 100 + ((task.number * 3) % 8) * 11,
-    body: task.marker,
-    state: "open",
-    labels: [],
-    assignees: [],
-  })),
-).reverse();
-const issueAt = (planIndex, taskNumber) => markerIssues.find(
-  (issue) => issue.body === approvedPlans[planIndex].tasks[taskNumber - 1].marker,
-);
+const markerIssues = approvedPlans
+  .flatMap((definition, planIndex) =>
+    definition.tasks.map((task) => ({
+      number: 1000 + planIndex * 100 + ((task.number * 3) % 8) * 11,
+      body: task.marker,
+      state: "open",
+      labels: [],
+      assignees: [],
+    })),
+  )
+  .reverse();
+const issueAt = (planIndex, taskNumber) =>
+  markerIssues.find(
+    (issue) =>
+      issue.body === approvedPlans[planIndex].tasks[taskNumber - 1].marker,
+  );
 const approvedM1 = [[7], [1], [1], [1], [2, 3, 4], [2, 3, 4, 5], [6]];
 
 test("resolves every approved M1 edge by marker and preserves all other plan edges", () => {
@@ -80,19 +83,30 @@ test("resolves every approved M1 edge by marker and preserves all other plan edg
   assert.equal(graph.size, 34);
   approvedPlans.forEach((definition, planIndex) => {
     definition.tasks.forEach((task) => {
-      const prerequisites = planIndex === 1
-        ? approvedM1[task.number - 1].map((number) =>
-            issueAt(task.number === 1 ? 0 : 1, number).number)
-        : task.number > 1
-          ? [issueAt(planIndex, task.number - 1).number]
-          : planIndex > 0 && planIndex <= 3
-            ? [issueAt(planIndex - 1, approvedPlans[planIndex - 1].tasks.length).number]
-            : [];
-      assert.deepEqual(graph.get(issueAt(planIndex, task.number).number), {
-        issueNumber: issueAt(planIndex, task.number).number,
-        marker: task.marker,
-        blockedBy: prerequisites,
-      }, `${definition.file} Task ${task.number}`);
+      const prerequisites =
+        planIndex === 1
+          ? approvedM1[task.number - 1].map(
+              (number) => issueAt(task.number === 1 ? 0 : 1, number).number,
+            )
+          : task.number > 1
+            ? [issueAt(planIndex, task.number - 1).number]
+            : planIndex > 0 && planIndex <= 3
+              ? [
+                  issueAt(
+                    planIndex - 1,
+                    approvedPlans[planIndex - 1].tasks.length,
+                  ).number,
+                ]
+              : [];
+      assert.deepEqual(
+        graph.get(issueAt(planIndex, task.number).number),
+        {
+          issueNumber: issueAt(planIndex, task.number).number,
+          marker: task.marker,
+          blockedBy: prerequisites,
+        },
+        `${definition.file} Task ${task.number}`,
+      );
     });
   });
 });
@@ -100,10 +114,22 @@ test("resolves every approved M1 edge by marker and preserves all other plan edg
 test("fails closed for missing or duplicate M1 task marker identities", () => {
   for (const task of approvedPlans[1].tasks) {
     const issue = issueAt(1, task.number);
-    assert.throws(() => buildPlanIssueGraph(approvedPlans,
-      markerIssues.filter((candidate) => candidate !== issue)), /found 0/u);
-    assert.throws(() => buildPlanIssueGraph(approvedPlans,
-      [...markerIssues, { ...issue, number: 9999 }]), /found 2/u);
+    assert.throws(
+      () =>
+        buildPlanIssueGraph(
+          approvedPlans,
+          markerIssues.filter((candidate) => candidate !== issue),
+        ),
+      /found 0/u,
+    );
+    assert.throws(
+      () =>
+        buildPlanIssueGraph(approvedPlans, [
+          ...markerIssues,
+          { ...issue, number: 9999 },
+        ]),
+      /found 2/u,
+    );
   }
 });
 
@@ -111,28 +137,60 @@ test("synchronizes complete M1 dependencies while preserving notes, checklists a
   const graph = buildPlanIssueGraph(approvedPlans, markerIssues);
   for (const task of approvedPlans[1].tasks) {
     const blockedBy = graph.get(issueAt(1, task.number).number).blockedBy;
-    const expected = approvedM1[task.number - 1].map((number) =>
-      issueAt(task.number === 1 ? 0 : 1, number).number);
+    const expected = approvedM1[task.number - 1].map(
+      (number) => issueAt(task.number === 1 ? 0 : 1, number).number,
+    );
     const canonicalBody = renderPlanIssueBody({
-      definition: approvedPlans[1], task, repository: "owner/repository", blockedBy,
+      definition: approvedPlans[1],
+      task,
+      repository: "owner/repository",
+      blockedBy,
     });
     assert.deepEqual(parseDependencies(canonicalBody), expected);
     const contributorBody = `${canonicalBody.replace("- [ ]", "- [x]")}\n## Contributor notes\nKeep this note.\n`;
-    const outdatedBody = contributorBody.replace(/^Blocked by .+$/mu, "Blocked by #9999");
-    assert.equal(mergePlanIssueBody({
-      existingBody: outdatedBody, canonicalBody, blockedBy, active: false,
-    }), contributorBody);
+    const outdatedBody = contributorBody.replace(
+      /^Blocked by .+$/mu,
+      "Blocked by #9999",
+    );
+    assert.equal(
+      mergePlanIssueBody({
+        existingBody: outdatedBody,
+        canonicalBody,
+        blockedBy,
+        active: false,
+      }),
+      contributorBody,
+    );
     for (const state of ["in-progress", "review", "blocked"]) {
-      const issue = { ...issueAt(1, task.number), body: contributorBody,
-        labels: [`status:${state}`], assignees: ["owner"] };
-      assert.deepEqual(deriveLifecycleState({ issue, body: canonicalBody, dependencies: [] }),
-        { state, assignees: ["owner"] });
-      assert.equal(mergePlanIssueBody({
-        existingBody: issue.body, canonicalBody, blockedBy, active: true,
-      }), contributorBody);
-      assert.throws(() => mergePlanIssueBody({
-        existingBody: outdatedBody, canonicalBody, blockedBy, active: true,
-      }), /cannot change/u);
+      const issue = {
+        ...issueAt(1, task.number),
+        body: contributorBody,
+        labels: [`status:${state}`],
+        assignees: ["owner"],
+      };
+      assert.deepEqual(
+        deriveLifecycleState({ issue, body: canonicalBody, dependencies: [] }),
+        { state, assignees: ["owner"] },
+      );
+      assert.equal(
+        mergePlanIssueBody({
+          existingBody: issue.body,
+          canonicalBody,
+          blockedBy,
+          active: true,
+        }),
+        contributorBody,
+      );
+      assert.throws(
+        () =>
+          mergePlanIssueBody({
+            existingBody: outdatedBody,
+            canonicalBody,
+            blockedBy,
+            active: true,
+          }),
+        /cannot change/u,
+      );
     }
   }
 });
@@ -143,17 +201,28 @@ test("Task 5 waits for either transport or policy despite completed adapter", ()
   const issue = issueAt(1, 5);
   const blockedBy = graph.get(issue.number).blockedBy;
   const body = renderPlanIssueBody({
-    definition: approvedPlans[1], task, repository: "owner/repository", blockedBy,
+    definition: approvedPlans[1],
+    task,
+    repository: "owner/repository",
+    blockedBy,
   });
   for (const openTask of [2, 3, null]) {
     const dependencies = blockedBy.map((number) => ({
       number,
-      state: number === (openTask && issueAt(1, openTask).number) ? "open" : "closed",
+      state:
+        number === (openTask && issueAt(1, openTask).number)
+          ? "open"
+          : "closed",
       state_reason: "completed",
     }));
-    assert.deepEqual(deriveLifecycleState({ issue, body, dependencies }), {
-      state: openTask === null ? "ready" : "waiting", assignees: [],
-    }, `open task: ${openTask}`);
+    assert.deepEqual(
+      deriveLifecycleState({ issue, body, dependencies }),
+      {
+        state: openTask === null ? "ready" : "waiting",
+        assignees: [],
+      },
+      `open task: ${openTask}`,
+    );
   }
 });
 
