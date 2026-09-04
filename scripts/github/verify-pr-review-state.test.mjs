@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { formatReviewReport, parseReviewReport } from "./review-report.mjs";
 import { validatePullRequestState } from "./verify-pr-review-evidence.mjs";
 
 const REPOSITORY = "EthanSMC/qwen-harness-bridge";
@@ -8,8 +9,8 @@ const TOKEN = "test-token";
 const RUN_ID = "9001";
 const PR_NUMBER = 37;
 const AUTHOR = "EthanSMC";
-const BASE_SHA = "base-sha-37";
-const HEAD_SHA = "head-sha-37";
+const BASE_SHA = "a".repeat(40);
+const HEAD_SHA = "b".repeat(40);
 const PAGE_SIZE = 100;
 
 const bodyFor = ({
@@ -22,7 +23,9 @@ const bodyFor = ({
   ciEvidence = `https://github.com/${REPOSITORY}/pull/${PR_NUMBER}/checks`,
 } = {}) =>
   [
+    "Closes #62",
     "## Review evidence",
+    `- Independent review report URL (required for solo mode): ${mode === "solo" ? `https://github.com/${REPOSITORY}/pull/${PR_NUMBER}#issuecomment-123` : ""}`,
     `- [${mode === "formal" ? "x" : " "}] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.`,
     `- [${mode === "solo" ? "x" : " "}] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.`,
     `- Formal GitHub review URL (required for formal mode): ${formalUrl}`,
@@ -231,6 +234,28 @@ const fixturesFor = ({
     reviewPages ?? (reviews === undefined ? undefined : [reviews]);
 
   return {
+    [`/repos/${REPOSITORY}/issues/comments/123`]: {
+      id: 123,
+      html_url: `https://github.com/${REPOSITORY}/pull/${PR_NUMBER}#issuecomment-123`,
+      issue_url: `https://api.github.com/repos/${REPOSITORY}/issues/${PR_NUMBER}`,
+      user: { login: AUTHOR, type: "User" },
+      created_at: "2026-09-05T01:00:00Z",
+      updated_at: "2026-09-05T01:00:00Z",
+      body: formatReviewReport({
+        schema_version: 1,
+        repository: REPOSITORY,
+        issue_number: 62,
+        base_sha: BASE_SHA,
+        head_sha: HEAD_SHA,
+        implementer_id: "agent-implementer-37",
+        reviewer_id: "agent-reviewer-37",
+        reviewer_identity: "reviewer-agent-37",
+        verdict: "PASS",
+        findings: [],
+        fix_rounds: 1,
+        verification: ["Governance tests passed"],
+      }),
+    },
     [`/repos/${REPOSITORY}/pulls/${PR_NUMBER}`]:
       pullRequest ?? pullRequestFor(),
     [`/repos/${REPOSITORY}/actions/runs/${RUN_ID}`]: runFor(),
@@ -821,4 +846,37 @@ test("fails closed on a GitHub API error", async () => {
     stateFor(eventFor(), fixtures),
     /GitHub API request failed|fail closed/i,
   );
+});
+
+test("solo rejects missing, foreign, stale, edited and FAIL structured reports", async () => {
+  const key = `/repos/${REPOSITORY}/issues/comments/123`;
+  for (const patch of [
+    { failure: true, status: 404 },
+    { updated_at: "2026-09-05T02:00:00Z" },
+    { issue_url: `https://api.github.com/repos/${REPOSITORY}/issues/99` },
+    { user: { login: "other", type: "User" } },
+    { body: "PASS" },
+  ]) {
+    const fixtures = fixturesFor();
+    fixtures[key] = { ...fixtures[key], ...patch };
+    await assert.rejects(stateFor(eventFor(), fixtures));
+  }
+});
+
+test("live solo validator rejects stale range, identity mismatch and actual FAIL reports", async () => {
+  const key = `/repos/${REPOSITORY}/issues/comments/123`;
+  for (const patch of [
+    { head_sha: "c".repeat(40) },
+    { base_sha: "c".repeat(40) },
+    { reviewer_id: "different-reviewer" },
+    { issue_number: 99 },
+    { verdict: "FAIL" },
+  ]) {
+    const fixtures = fixturesFor();
+    fixtures[key].body = formatReviewReport({
+      ...parseReviewReport(fixtures[key].body),
+      ...patch,
+    });
+    await assert.rejects(stateFor(eventFor(), fixtures), /report.*mismatch/);
+  }
 });

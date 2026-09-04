@@ -40,6 +40,7 @@ const bodyFor = ({
   ciEvidence = "https://github.com/EthanSMC/qwen-harness-bridge/actions/runs/123456789",
 } = {}) =>
   [
+    `- Independent review report URL (required for solo mode): ${mode === "solo" ? "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#issuecomment-123" : ""}`,
     "## Review evidence",
     "",
     `- [${mode === "formal" ? "x" : " "}] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.`,
@@ -73,6 +74,10 @@ const completedSoloTemplate = () => {
   lines[soloMode] = lines[soloMode].replace("- [ ]", "- [x]");
 
   const fieldValues = [
+    [
+      "Independent review report URL (required for solo mode)",
+      "https://github.com/EthanSMC/qwen-harness-bridge/pull/42#issuecomment-123",
+    ],
     [
       "Solo eligibility evidence URL or repository-status reference (required for solo mode)",
       "docs/github/repository-status.md#review-gate-status",
@@ -129,6 +134,8 @@ test("parses every required field from the completed real pull-request template"
   assert.deepEqual(result, {
     mode: "solo",
     fields: {
+      reportUrl:
+        "https://github.com/EthanSMC/qwen-harness-bridge/pull/42#issuecomment-123",
       formalUrl: "",
       formalIdentity: "",
       soloRef: "docs/github/repository-status.md#review-gate-status",
@@ -314,4 +321,18 @@ test("accepts a PR checks URL as CI evidence", () => {
   });
 
   assert.equal(validatePullRequestEvent(eventWithBody(body)).mode, "solo");
+});
+
+test("solo report URL is required exactly once and must identify a PR comment", () => {
+  const body = bodyFor();
+  const label = "- Independent review report URL (required for solo mode):";
+  for (const value of [
+    body
+      .split("\n")
+      .filter((line) => !line.startsWith(label))
+      .join("\n"),
+    body.replace(/#issuecomment-123/, ""),
+    `${body}\n${label} https://github.com/Owner/repo/pull/37#issuecomment-1`,
+  ])
+    assert.throws(() => validatePullRequestBody(value));
 });

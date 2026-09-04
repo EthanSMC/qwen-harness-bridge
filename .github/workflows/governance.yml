@@ -39,6 +39,8 @@ jobs:
           scripts/github/ai-issue-policy.test.mjs
           scripts/github/ai-lifecycle-registry.test.mjs
           scripts/github/github-api.test.mjs
+          scripts/github/review-report.test.mjs
+          scripts/github/stale-work.test.mjs
           scripts/github/ai-issue-controller.test.mjs
           scripts/github/verify-ai-lifecycle.test.mjs
           scripts/github/verify-pr-review-evidence.test.mjs

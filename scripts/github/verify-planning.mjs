@@ -266,6 +266,10 @@ for (const [pattern, message] of [
     "the solo eligibility evidence field",
   ],
   [/Implementer agent ID:/, "the implementer agent ID field"],
+  [
+    /Independent review report URL \(required for solo mode\):/,
+    "the same-PR structured report URL",
+  ],
   [/Reviewer agent ID:/, "the reviewer agent ID field"],
   [/Fresh review of this exact commit range:/, "the fresh-review declaration"],
   [
@@ -409,6 +413,8 @@ for (const [pattern, message] of [
   ],
   [/node --test/, "the repository governance node:test command"],
   [/ai-issue-policy\.test\.mjs/, "the AI lifecycle policy tests"],
+  [/review-report\.test\.mjs/, "structured review report tests"],
+  [/stale-work\.test\.mjs/, "stalled-work report tests"],
   [/github-api\.test\.mjs/, "the strict GitHub API tests"],
   [/ai-issue-controller\.test\.mjs/, "the lifecycle controller tests"],
   [/ai-lifecycle-registry\.test\.mjs/, "the lifecycle rollout registry tests"],
@@ -435,6 +441,15 @@ for (const [pattern, message] of [
   requireGovernanceField(workflow, pattern, message);
 
 const lifecycleWorkflow = ".github/workflows/ai-issue-lifecycle.yml";
+for (const [pattern, message] of [
+  [
+    /stalled-work:[\s\S]*?permissions:[\s\S]*?issues: read/,
+    "isolated read-only stalled-work job",
+  ],
+  [/node scripts\/github\/stale-work\.mjs/, "stalled-work report CLI"],
+  [/actions\/upload-artifact@v4/, "stalled-work report artifact visibility"],
+])
+  requireGovernanceField(lifecycleWorkflow, pattern, message);
 for (const [pattern, message] of [
   [/issue_comment:/, "the Issue comment trigger"],
   [/pull_request_target:/, "the trusted pull-request target trigger"],

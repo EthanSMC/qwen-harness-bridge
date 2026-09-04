@@ -2,9 +2,15 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { closingIssueNumbers } from "./ai-issue-policy.mjs";
 import { createGitHubClient } from "./github-api.mjs";
+import {
+  reviewCommentId,
+  verifyReviewReportComment,
+} from "./review-report.mjs";
 
 const FIELD_LABELS = {
+  reportUrl: "Independent review report URL (required for solo mode)",
   formalUrl: "Formal GitHub review URL (required for formal mode)",
   formalIdentity: "Formal reviewer GitHub identity (required for formal mode)",
   soloRef:
@@ -535,6 +541,28 @@ export async function validatePullRequestState({
   if (bodyResult.mode === "solo") {
     if (reviewMode === "formal")
       throw new Error("solo mode is invalid while an eligible reviewer exists");
+    const issues = closingIssueNumbers(currentPullRequest.body);
+    if (issues.length !== 1)
+      throw new Error("Solo review report requires one primary closing Issue");
+    const reportUrl = bodyResult.fields.reportUrl;
+    const commentId = reviewCommentId(
+      reportUrl,
+      repository,
+      eventPullRequest.number,
+    );
+    verifyReviewReportComment({
+      url: reportUrl,
+      comment: await github.get(`/issues/comments/${commentId}`),
+      repository,
+      pullRequestNumber: eventPullRequest.number,
+      issueNumber: issues[0],
+      authorLogin: eventPullRequest.authorLogin,
+      baseSha: eventPullRequest.base.sha,
+      headSha: eventPullRequest.head.sha,
+      implementer: bodyResult.fields.implementer,
+      reviewer: bodyResult.fields.reviewer,
+      reviewerIdentity: bodyResult.fields.reviewerIdentity,
+    });
   } else {
     const formalIdentity = bodyResult.fields.formalIdentity;
     if (
@@ -638,6 +666,19 @@ export function validatePullRequestBody(body, { authorLogin } = {}) {
     if (soloRef || soloDate)
       throw new Error("formal mode must not include solo eligibility evidence");
   } else {
+    requiredValue(fields.reportUrl, FIELD_LABELS.reportUrl);
+    const reportUrl = githubUrl(fields.reportUrl, FIELD_LABELS.reportUrl);
+    if (
+      !/^\/[^/]+\/[^/]+\/pull\/[1-9][0-9]*$/.test(reportUrl.pathname) ||
+      !/^#issuecomment-[1-9][0-9]*$/.test(reportUrl.hash) ||
+      reportUrl.search ||
+      reportUrl.username ||
+      reportUrl.password ||
+      reportUrl.port
+    )
+      throw new Error(
+        "Independent review report URL must identify one PR comment",
+      );
     requiredValue(soloRef, FIELD_LABELS.soloRef);
     requiredValue(soloDate, FIELD_LABELS.soloDate);
     if (

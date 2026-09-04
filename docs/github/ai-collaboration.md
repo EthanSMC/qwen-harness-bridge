@@ -162,3 +162,42 @@ The workflow fails closed with one safe next action. Common codes are:
 - `LEASE_EXPIRED`: renew before review admission, or claim again after the Issue returns to ready.
 - `STATE_MISMATCH`: stop and ask a maintainer to repair labels/assignees.
 - `GITHUB_STATE_UNAVAILABLE`: retry after GitHub state can be verified.
+
+## Structured review report
+
+For every newly evaluated solo PR, the controller captures the actual independent review in local JSON with exactly these keys (values must come from the actual review):
+
+| Field | Contract |
+|---|---|
+| `schema_version` | `1` |
+| `repository`, `issue_number` | Exact `Owner/repo` and positive primary closing Issue number |
+| `base_sha`, `head_sha` | Exact lowercase 40-character SHAs from the current PR |
+| `implementer_id`, `reviewer_id`, `reviewer_identity` | Public slugs, 1–64 characters, starting with a letter; letters, digits and hyphens only; implementer/reviewer IDs distinct; no private session identifiers |
+| `verdict` | Actual `PASS` or `FAIL` |
+| `findings` | Up to 20 objects: `severity` (`blocker` or `non-blocker`), `status` (`open` or `resolved`), `summary` (safe single line, 240 UTF-8 bytes maximum) |
+| `fix_rounds` | Actual integer count, 0–100 |
+| `verification` | 1–20 safe single-line observed verification summaries, each at most 240 UTF-8 bytes |
+
+Run the formatter locally:
+
+```sh
+node scripts/github/review-report.mjs reviewer-report.json reviewer-comment.md
+```
+
+The formatter writes canonical Markdown with SHA256, performs no network/write action on GitHub, and never invents reviewer facts. Input and output are capped at 16 KiB; unknown fields and unsafe public evidence are rejected. Manually check that summaries contain no secrets, source, logs, private thread IDs or paths. The accountable controller posts the exact output as a **new comment on the PR**, without adding a newline or surrounding text, then copies that comment URL into `Independent review report URL (required for solo mode):`. `gh pr comment NUMBER --body-file reviewer-comment.md` can post it when authorized. Do not edit a report; publish a fresh report after each changed base/head or correction. Update the PR body range and identity fields to match it, and require the final current-head checks to pass.
+
+The authenticated validator checks the same repository/PR association, accountable author, creation/update timestamps, schema, canonical content, digest, Issue and identity match, exact current base/head and PASS with no unresolved blockers. The controller attests that it captured the real independent review. This is controller-attested traceability, not cryptographic proof of independent AI execution; a digest does not establish who ran a local agent. Formal review retains the eligible collaborator's actual current-head approval and permits an empty report URL. Historical merged evidence remains valid. Never disable validation to bootstrap this requirement.
+
+## Stalled-work report and recovery
+
+The hourly scheduled or manual **AI Issue Lifecycle** workflow exposes a separate **stalled-work visibility** job with an Actions summary and `stalled-work-report` artifact retained for 14 days. It shows zero actionable results explicitly. Review work is flagged at 48 hours and blocked work at 24 hours since the latest public human checkpoint (Issue/linked open PR creation, new Issue/PR comments, submitted reviews). Generic `updated_at`, bot housekeeping, local work and branch pushes do not refresh this clock. This measures stalled collaboration, not proof that no local work occurred.
+
+The read-only CLI uses `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, optional `GITHUB_STEP_SUMMARY` and optional `STALE_WORK_REPORT_PATH` (default `stale-work-report.md`):
+
+```sh
+node scripts/github/stale-work.mjs
+```
+
+Time comes from the existing GitHub API Date header. Each collection has a three-page cap; candidate Issues and linked PRs are capped at 100 each. Ambiguous state or exceeded limits produce a visible failure rather than an incomplete success. Results contain at most 50 numeric Issue/PR references, state, elapsed hours and fixed safe recovery guidance, with total actionable and truncated Issue counts. A row containing both Issue and PR consumes two references. No source bodies or comments are output. Errors remain visible in the independent job without disabling lifecycle mutations. There are no automatic Issue comments, releases, PR closures or extra reminders.
+
+Inspect the current claim, branch/PR and observed tests first. Ask the current worker for a checkpoint or to continue. If work is abandoned or handed off, safely close the existing PR, then use current-claim release and a fresh reclaim. Never silently take over an open PR.
