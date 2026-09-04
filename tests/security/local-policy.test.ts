@@ -1,4 +1,7 @@
+import childProcess, { execFileSync, spawnSync } from "node:child_process";
 import {
+  chmodSync,
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -41,6 +44,10 @@ import type {
 } from "../../packages/harness-plugin/src/policy/types.js";
 
 const temporaryDirectories: string[] = [];
+// Mandatory interoperability prerequisite: fail visibly if the real rg is absent.
+const actualRipgrep = realpathSync(
+  execFileSync("which", ["rg"], { encoding: "utf8" }).trim(),
+);
 
 const makeFixture = () => {
   const directory = mkdtempSync(join(tmpdir(), "qhb-local-policy-"));
@@ -50,11 +57,28 @@ const makeFixture = () => {
   mkdirSync(repositoryPath);
   mkdirSync(outsidePath);
   mkdirSync(executableDirectory);
-  for (const executable of ["pnpm", "rg", "rm"]) {
+  for (const executable of [
+    "pnpm",
+    "npm",
+    "git",
+    "vercel",
+    "grep",
+    "rg",
+    "rm",
+    "python",
+    "python3",
+    "python3.12",
+    "cmd.exe",
+    "powershell.exe",
+    "pwsh.exe",
+  ]) {
     writeFileSync(join(executableDirectory, executable), "test executable\n", {
       mode: 0o755,
     });
   }
+  copyFileSync(actualRipgrep, join(executableDirectory, "rg"));
+  chmodSync(join(executableDirectory, "rg"), 0o755);
+  writeFileSync(join(repositoryPath, "source.txt"), "nonsecret fixture\n");
   temporaryDirectories.push(directory);
   vi.stubEnv("PATH", executableDirectory);
   return {
@@ -112,6 +136,7 @@ describe("accepted complete-range findings", () => {
     for (const name of ["rg", "grep", "tsc", "vitest", "pnpm"]) {
       const file = join(fixture.executableDirectory, name);
       writeFileSync(file, "fixture\n", { mode: 0o755 });
+      if (name === "rg") copyFileSync(actualRipgrep, file);
       trustedExecutables[name] = realpathSync(file);
     }
     return {
@@ -336,6 +361,9 @@ const runtimeFixture = (
     | "rejected"
     | "unavailable"
     | "cancelled" = "allowed-once",
+  override?: (
+    fixture: ReturnType<typeof makeFixture>,
+  ) => Partial<CanonicalAction>,
 ) => {
   const fixture = makeFixture();
   const root = new Context();
@@ -371,9 +399,10 @@ const runtimeFixture = (
     toolName: "delete_file",
     fileChange: "destructive",
     touchedPaths: ["output.txt"],
+    ...override?.(fixture),
   });
   agent.ctx.tools.register({
-    name: "delete_file",
+    name: action.toolName,
     description: "counter-only fixture",
     parameters: { type: "object", properties: {} },
     output: {
@@ -388,6 +417,12 @@ const runtimeFixture = (
   agent.ctx.on("approval/request", async () => outcome);
   const options = {
     repositories: [fixture.repository],
+    trustedExecutables: Object.fromEntries(
+      ["pnpm", "npm", "git", "vercel", "rg"].map((name) => [
+        name,
+        realpathSync(join(fixture.executableDirectory, name)),
+      ]),
+    ),
     agentId: agent.id,
     resolveAction: () => ({ action, provenance: "local_tool" as const }),
   };
@@ -395,7 +430,7 @@ const runtimeFixture = (
   const execute = (signal = new AbortController().signal) =>
     root.tools.execute({
       callId: "call" as never,
-      name: "delete_file",
+      name: action.toolName,
       arguments: {},
       agent: agent as never,
       signal,
@@ -413,6 +448,724 @@ const runtimeFixture = (
     },
   };
 };
+
+describe("N1-N4 deterministic corrective wave", () => {
+  const policy = (f: ReturnType<typeof makeFixture>) => ({
+    repositories: [f.repository],
+    trustedExecutables: Object.fromEntries(
+      ["pnpm", "npm", "git", "vercel", "grep", "rg"].map((name) => [
+        name,
+        realpathSync(join(f.executableDirectory, name)),
+      ]),
+    ),
+  });
+
+  it.each([
+    [
+      "git",
+      "git_push",
+      ["-C", "..", "push", "origin", "main"],
+      "PATH_TRAVERSAL",
+    ],
+    ["git", "git_push", ["-C../outside", "push"], "PATH_TRAVERSAL"],
+    [
+      "npm",
+      "package_install",
+      ["install", "--prefix", "../outside"],
+      "PATH_TRAVERSAL",
+    ],
+    [
+      "npm",
+      "package_install",
+      ["install", "--prefix=../outside"],
+      "PATH_TRAVERSAL",
+    ],
+    [
+      "npm",
+      "package_install",
+      ["install", "--userconfig", ".npmrc"],
+      "PROTECTED_RESOURCE",
+    ],
+    [
+      "pnpm",
+      "package_install",
+      ["install", "--dir", "../outside"],
+      "PATH_TRAVERSAL",
+    ],
+    ["vercel", "deploy", ["deploy", "../outside"], "PATH_TRAVERSAL"],
+    [
+      "vercel",
+      "deploy",
+      ["deploy", "--local-config=.env"],
+      "PROTECTED_RESOURCE",
+    ],
+  ])(
+    "N1 validates %s %s %j before approval",
+    (executable, toolName, argv, reasonCode) => {
+      const f = makeFixture();
+      expect(
+        classifyAction(
+          makeAction(f, { executable, toolName, argv }),
+          policy(f),
+        ),
+      ).toMatchObject({ classification: "denied", reasonCode });
+    },
+  );
+
+  it.each(["git", "npm", "vercel"])(
+    "N1 blocks outside and symlink administrative paths for %s in real runtime",
+    async (command) => {
+      const f = runtimeFixture("allowed-once", (fixture) => {
+        symlinkSync(
+          fixture.outsidePath,
+          join(fixture.repositoryPath, "linked"),
+        );
+        const argv =
+          command === "git"
+            ? ["-C", "linked", "push", "origin", "main"]
+            : command === "npm"
+              ? ["install", "--prefix", fixture.outsidePath]
+              : ["deploy", "linked"];
+        return {
+          executable: command,
+          toolName:
+            command === "git"
+              ? "git_push"
+              : command === "npm"
+                ? "package_install"
+                : "deploy",
+          argv,
+          touchedPaths: [],
+          fileChange: "none",
+        };
+      });
+      expect((await f.execute()).isError).toBe(true);
+      expect(f.bodies()).toBe(0);
+      expect(f.events).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["git", "git_push", ["-C", ".", "push", "origin", "main"]],
+    [
+      "npm",
+      "package_install",
+      ["install", "--prefix", "dist", "example-package"],
+    ],
+    ["pnpm", "package_install", ["install", "--dir=dist"]],
+    ["vercel", "deploy", ["deploy", "."]],
+  ])(
+    "N1 preserves contained approved %s",
+    async (executable, toolName, argv) => {
+      const f = runtimeFixture("allowed-once", () => ({
+        executable,
+        toolName,
+        argv,
+        touchedPaths: [],
+        fileChange: "none",
+      }));
+      expect((await f.execute()).isError).toBe(false);
+      expect(f.bodies()).toBe(1);
+      expect(f.events.map((event) => event.type)).toEqual([
+        "turn/start",
+        "approval/asked",
+        "approval/decided",
+      ]);
+    },
+  );
+
+  it.each([
+    ["npm", ["run", "build", "--", "--build", "--clean"]],
+    ["pnpm", ["build", "--build", "--clean"]],
+  ])(
+    "N2 requires actual approval for forwarded %s clean",
+    async (executable, argv) => {
+      for (const outcome of ["rejected", "allowed-once"] as const) {
+        const f = runtimeFixture(outcome, () => ({
+          executable,
+          toolName: "build",
+          argv,
+          fileChange: "bounded",
+          touchedPaths: ["dist"],
+        }));
+        expect((await f.execute()).isError).toBe(outcome !== "allowed-once");
+        expect(f.bodies()).toBe(outcome === "allowed-once" ? 1 : 0);
+        expect(f.events.map((event) => event.type)).toEqual([
+          "turn/start",
+          "approval/asked",
+          "approval/decided",
+        ]);
+      }
+    },
+  );
+
+  it.each(["npm", "pnpm"])(
+    "N2 preserves safe bounded %s build",
+    async (executable) => {
+      const f = runtimeFixture("rejected", () => ({
+        executable,
+        toolName: "build",
+        argv: ["run", "build", "--", "--outDir", "dist"],
+        fileChange: "bounded",
+        touchedPaths: ["dist"],
+      }));
+      expect((await f.execute()).isError).toBe(false);
+      expect(f.bodies()).toBe(1);
+      expect(f.events).toHaveLength(1);
+    },
+  );
+
+  it("N3 verifies installed grep and rg attached-equals filename semantics without reading targets", () => {
+    const f = makeFixture();
+    writeFileSync(join(f.repositoryPath, "source.txt"), "nonsecret fixture\n");
+    for (const [executable, expectedName] of [
+      ["/usr/bin/grep", "=qhb_missing_patterns"],
+      [actualRipgrep, "qhb_missing_patterns"],
+    ]) {
+      const result = spawnSync(
+        executable as string,
+        ["-f=qhb_missing_patterns", "source.txt"],
+        { cwd: f.repositoryPath, encoding: "utf8" },
+      );
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain(expectedName);
+      if (executable.endsWith("/rg"))
+        expect(result.stderr).not.toContain("=qhb_missing_patterns");
+    }
+  });
+
+  it("N3 checks the equals-prefixed grep file rather than its decoy", () => {
+    const f = makeFixture();
+    writeFileSync(join(f.repositoryPath, "patterns"), "nonsecret fixture\n");
+    writeFileSync(join(f.repositoryPath, "source.txt"), "nonsecret fixture\n");
+    symlinkSync(
+      join(f.outsidePath, "patterns"),
+      join(f.repositoryPath, "=patterns"),
+    );
+    writeFileSync(
+      join(f.outsidePath, "patterns"),
+      "nonsecret outside fixture\n",
+    );
+    const action = makeAction(f, {
+      toolName: "search",
+      executable: "grep",
+      argv: ["-f=patterns", "source.txt"],
+    });
+    expect(classifyAction(action, policy(f))).toMatchObject({
+      classification: "denied",
+      reasonCode: "SYMLINK_ESCAPE",
+    });
+  });
+
+  it("N3 separates grep filenames while retaining rg equals equivalence", () => {
+    const f = makeFixture();
+    writeFileSync(join(f.repositoryPath, "source.txt"), "nonsecret fixture\n");
+    for (const executable of ["grep", "rg"]) {
+      const decisions = ["-f=patterns", "-f=./patterns"].map((argument) =>
+        classifyAction(
+          makeAction(f, {
+            toolName: "search",
+            executable,
+            argv: [argument, "source.txt"],
+          }),
+          policy(f),
+        ),
+      );
+      expect(
+        decisions.every((decision) => decision.classification === "automatic"),
+      ).toBe(true);
+      expect(decisions[0]?.fingerprint === decisions[1]?.fingerprint).toBe(
+        executable === "rg",
+      );
+    }
+  });
+
+  it.each(["python", "python3", "python3.12"])(
+    "N4 prioritizes explicit %s environment denial over approval effects",
+    (executable) => {
+      const f = makeFixture();
+      for (const expression of ["os.environ", "os.getenv('EXAMPLE')"]) {
+        expect(
+          classifyAction(
+            makeAction(f, {
+              toolName: "delete_file",
+              executable,
+              argv: ["-c", `print(${expression})`],
+              fileChange: "destructive",
+              networkIntent: "write",
+              externalSideEffect: "deploy",
+            }),
+            policy(f),
+          ),
+        ).toMatchObject({
+          classification: "denied",
+          reasonCode: "SECRET_ACCESS",
+        });
+      }
+    },
+  );
+
+  it.each(["cmd.exe", "powershell.exe", "pwsh.exe"])(
+    "N4 prioritizes interpreter denial for %s",
+    (executable) => {
+      const f = makeFixture();
+      expect(
+        classifyAction(
+          makeAction(f, {
+            toolName: "delete_file",
+            executable,
+            argv: [],
+            fileChange: "destructive",
+          }),
+          policy(f),
+        ),
+      ).toMatchObject({
+        classification: "denied",
+        reasonCode: "ARBITRARY_COMMAND",
+      });
+    },
+  );
+});
+
+describe("N1 administrative argument scope transitions", () => {
+  it.each([
+    ["search", "rg", ["-e", "--pre=fixture", "source.txt"]],
+    ["test", "pnpm", ["test", "--testNamePattern", "install"]],
+  ])(
+    "does not reinterpret parsed %s data as a capability",
+    (toolName, executable, argv) => {
+      const fixture = makeFixture();
+      expect(
+        classifyAction(makeAction(fixture, { toolName, executable, argv }), {
+          repositories: [fixture.repository],
+          trustedExecutables: {
+            [executable]: realpathSync(
+              join(fixture.executableDirectory, executable),
+            ),
+          },
+        }).classification,
+      ).toBe("automatic");
+    },
+  );
+
+  it.each([
+    ["install", "--cache", "cache", "--dir", "nested"],
+    ["install", "--dir", "nested", "--cache", "cache"],
+    ["link", "--dir", "nested", "package"],
+  ])("denies unsupported context-dependent path resolution %j", (...argv) => {
+    const fixture = makeFixture();
+    mkdirSync(join(fixture.repositoryPath, "nested"));
+    symlinkSync(
+      fixture.outsidePath,
+      join(fixture.repositoryPath, "nested", "cache"),
+    );
+    symlinkSync(
+      fixture.outsidePath,
+      join(fixture.repositoryPath, "nested", "package"),
+    );
+    const action = makeAction(fixture, {
+      toolName: "package_install",
+      executable: "pnpm",
+      argv,
+    });
+    expect(
+      classifyAction(action, { repositories: [fixture.repository] })
+        .classification,
+    ).toBe("denied");
+  });
+
+  it("rechecks a canonical administrative path after audited approval in actual runtime", async () => {
+    let fixturePath = "";
+    const f = runtimeFixture("allowed-once", (fixture) => {
+      fixturePath = fixture.repositoryPath;
+      mkdirSync(join(fixturePath, "first"));
+      mkdirSync(join(fixturePath, "second"));
+      symlinkSync(join(fixturePath, "first"), join(fixturePath, "alias"));
+      return {
+        toolName: "git_push",
+        executable: "git",
+        argv: ["-C", "alias", "push", "origin", "main"],
+        touchedPaths: [],
+        fileChange: "none",
+      };
+    });
+    f.agent.ctx.on(
+      "tools/pre-execute",
+      async (_execution, next) => {
+        await next();
+        rmSync(join(fixturePath, "alias"));
+        symlinkSync(join(fixturePath, "second"), join(fixturePath, "alias"));
+        return { kind: "allow" };
+      },
+      { prepend: true },
+    );
+    expect((await f.execute()).isError).toBe(true);
+    expect(f.bodies()).toBe(0);
+    expect(f.events.map((event) => event.type)).toEqual([
+      "turn/start",
+      "approval/asked",
+      "approval/decided",
+    ]);
+  });
+});
+
+describe("N5 actual ripgrep search domain", () => {
+  const domainFixture = () => {
+    const f = makeFixture();
+    mkdirSync(join(f.repositoryPath, ".git"));
+    mkdirSync(join(f.repositoryPath, "src"));
+    writeFileSync(
+      join(f.repositoryPath, "src", "safe.ts"),
+      "nonsecret fixture\n",
+    );
+    writeFileSync(
+      join(f.repositoryPath, ".gitignore"),
+      "node_modules/\nignored/\n",
+    );
+    const options = {
+      repositories: [f.repository],
+      trustedExecutables: { rg: actualRipgrep },
+    };
+    const action = (argv: string[]) =>
+      makeAction(f, { toolName: "search", executable: actualRipgrep, argv });
+    return { ...f, options, action };
+  };
+
+  it("allows default root search despite ignored protected files and more than 10000 ignored entries", () => {
+    const f = domainFixture();
+    const dependencies = join(f.repositoryPath, "node_modules");
+    mkdirSync(dependencies);
+    for (let i = 0; i < 10020; i++)
+      writeFileSync(join(dependencies, `fixture-${i}`), "nonsecret\n");
+    writeFileSync(join(dependencies, ".env"), "nonsecret fixture\n");
+    writeFileSync(
+      join(f.repositoryPath, ".git", "id_rsa"),
+      "nonsecret fixture\n",
+    );
+    expect(
+      classifyAction(f.action(["-n", "fixture", "."]), f.options)
+        .classification,
+    ).toBe("automatic");
+  });
+
+  it.each([
+    [["fixture", "."], "automatic"],
+    [["--hidden", "fixture", "."], "denied"],
+    [["--hidden", "-g", "!.env", "fixture", "."], "automatic"],
+    [["-g", ".env", "fixture", "."], "denied"],
+    [["fixture", ".env"], "denied"],
+  ])(
+    "matches actual hidden/glob/explicit selection %j",
+    (argv, classification) => {
+      const f = domainFixture();
+      writeFileSync(join(f.repositoryPath, ".env"), "nonsecret fixture\n");
+      expect(classifyAction(f.action(argv), f.options).classification).toBe(
+        classification,
+      );
+    },
+  );
+
+  it.each([
+    [["fixture", "."], "automatic"],
+    [["--no-ignore", "fixture", "."], "denied"],
+    [["-g", "ignored/**", "fixture", "."], "denied"],
+    [["fixture", "ignored/private.txt"], "denied"],
+  ])(
+    "matches ignored and explicitly selected configured resources %j",
+    (argv, classification) => {
+      const f = domainFixture();
+      mkdirSync(join(f.repositoryPath, "ignored"));
+      writeFileSync(
+        join(f.repositoryPath, "ignored", "private.txt"),
+        "nonsecret fixture\n",
+      );
+      const options = {
+        ...f.options,
+        protectedPaths: { "repo-one": ["ignored/private.txt"] },
+      };
+      expect(classifyAction(f.action(argv), options).classification).toBe(
+        classification,
+      );
+    },
+  );
+
+  it("preserves type/depth selection and filenames containing line delimiters", () => {
+    const f = domainFixture();
+    writeFileSync(
+      join(f.repositoryPath, "src", "line\nbreak\tname.ts"),
+      "nonsecret fixture\n",
+    );
+    writeFileSync(
+      join(f.repositoryPath, "src", "private.txt"),
+      "nonsecret fixture\n",
+    );
+    const options = {
+      ...f.options,
+      protectedPaths: { "repo-one": ["src/private.txt"] },
+    };
+    const action = f.action(["-t", "ts", "fixture", "."]);
+    expect(classifyAction(action, options).classification).toBe("automatic");
+    expect(canonicalizeAction(action, options).action.touchedPaths).toContain(
+      join(f.repository.canonicalPath, "src", "line\nbreak\tname.ts"),
+    );
+    expect(
+      classifyAction(f.action(["--max-depth", "1", "fixture", "."]), options)
+        .classification,
+    ).toBe("automatic");
+  });
+
+  it("does not enumerate symlink descendants but denies explicit outside links", () => {
+    const f = domainFixture();
+    writeFileSync(join(f.outsidePath, "ordinary.txt"), "nonsecret fixture\n");
+    symlinkSync(f.outsidePath, join(f.repositoryPath, "linked"));
+    expect(
+      classifyAction(f.action(["fixture", "."]), f.options).classification,
+    ).toBe("automatic");
+    expect(
+      classifyAction(f.action(["fixture", "linked"]), f.options).classification,
+    ).toBe("denied");
+  });
+
+  it("preserves explicit alias operand spellings for glob selection before canonicalizing candidates", () => {
+    const f = domainFixture();
+    symlinkSync(join(f.repositoryPath, "src"), join(f.repositoryPath, "alias"));
+    const argv = [
+      "-g",
+      "alias/**",
+      "-g",
+      "source.txt",
+      "fixture",
+      "alias",
+      "source.txt",
+    ];
+    const actual = spawnSync(
+      actualRipgrep,
+      [
+        "--files",
+        "--null",
+        "--no-config",
+        "-g",
+        "alias/**",
+        "-g",
+        "source.txt",
+        "alias",
+        "source.txt",
+      ],
+      { cwd: f.repositoryPath, encoding: "utf8" },
+    );
+    expect(actual.status).toBe(0);
+    expect(actual.stdout.split("\0")).toContain("alias/safe.ts");
+    expect(
+      classifyAction(f.action(argv), {
+        ...f.options,
+        protectedPaths: { "repo-one": ["src/safe.ts"] },
+      }),
+    ).toMatchObject({
+      classification: "denied",
+      reasonCode: "PROTECTED_RESOURCE",
+    });
+  });
+
+  it.each(["safe-file", "protected-file", "config"])(
+    "rechecks %s domain changes at the actual runtime final guard",
+    async (change) => {
+      let repositoryPath = "";
+      const f = runtimeFixture("allowed-once", (fixture) => {
+        repositoryPath = fixture.repositoryPath;
+        return {
+          toolName: "search",
+          executable: "rg",
+          argv: ["--hidden", "fixture", "."],
+          touchedPaths: [],
+          fileChange: "none",
+        };
+      });
+      f.agent.ctx.on(
+        "tools/pre-execute",
+        async (_execution, next) => {
+          await next();
+          if (change === "config")
+            vi.stubEnv("RIPGREP_CONFIG_PATH", "unread-config");
+          else
+            writeFileSync(
+              join(
+                repositoryPath,
+                change === "safe-file" ? "added.txt" : ".env",
+              ),
+              "nonsecret fixture\n",
+            );
+          return { kind: "allow" };
+        },
+        { prepend: true },
+      );
+      expect((await f.execute()).isError).toBe(true);
+      expect(f.bodies()).toBe(0);
+      expect(f.events).toHaveLength(1);
+    },
+  );
+
+  it("executes a stable ordinary root search through actual runtime without approval", async () => {
+    const f = runtimeFixture("rejected", () => ({
+      toolName: "search",
+      executable: "rg",
+      argv: ["fixture", "."],
+      touchedPaths: [],
+      fileChange: "none",
+    }));
+    expect((await f.execute()).isError).toBe(false);
+    expect(f.bodies()).toBe(1);
+    expect(f.events).toHaveLength(1);
+  });
+
+  it("does not strip a leading Unicode BOM from candidate filenames", () => {
+    const f = domainFixture();
+    mkdirSync(join(f.repositoryPath, "\ufeffsrc"));
+    writeFileSync(
+      join(f.repositoryPath, "\ufeffsrc", "safe.ts"),
+      "nonsecret fixture\n",
+    );
+    expect(
+      classifyAction(f.action(["fixture", "\ufeffsrc"]), {
+        ...f.options,
+        protectedPaths: { "repo-one": ["\ufeffsrc/safe.ts"] },
+      }),
+    ).toMatchObject({
+      classification: "denied",
+      reasonCode: "PROTECTED_RESOURCE",
+    });
+  });
+
+  it.each([["-r", "fixture"], ["-rn", "fixture"], ["fixture"]])(
+    "requires an explicit grep search scope for %j",
+    (...argv) => {
+      const f = domainFixture();
+      writeFileSync(join(f.repositoryPath, ".env"), "nonsecret fixture\n");
+      expect(
+        classifyAction(
+          makeAction(f, { toolName: "search", executable: "grep", argv }),
+          {
+            ...f.options,
+            trustedExecutables: {
+              grep: realpathSync(join(f.executableDirectory, "grep")),
+            },
+          },
+        ),
+      ).toMatchObject({
+        classification: "denied",
+        reasonCode: "UNSUPPORTED_ARGUMENTS",
+      });
+    },
+  );
+
+  it("requires explicit no-config when RIPGREP_CONFIG_PATH is nonempty", () => {
+    const f = domainFixture();
+    vi.stubEnv("RIPGREP_CONFIG_PATH", join(f.repositoryPath, "unread-config"));
+    expect(
+      classifyAction(f.action(["fixture", "."]), f.options).classification,
+    ).toBe("denied");
+    expect(
+      classifyAction(f.action(["--no-config", "fixture", "."]), f.options)
+        .classification,
+    ).toBe("automatic");
+  });
+
+  it("enumerates with bounded filename-only arguments, excluding regex and pattern-file inputs", () => {
+    const f = domainFixture();
+    writeFileSync(
+      join(f.repositoryPath, "patterns.txt"),
+      "nonsecret fixture\n",
+    );
+    const spy = vi.spyOn(childProcess, "spawnSync");
+    try {
+      expect(
+        classifyAction(
+          f.action([
+            "--no-config",
+            "-f",
+            "patterns.txt",
+            "-e",
+            "unique-data-pattern",
+            "-g",
+            "*.ts",
+            "src",
+          ]),
+          f.options,
+        ).classification,
+      ).toBe("automatic");
+      expect(spy).toHaveBeenCalledOnce();
+      const [executable, argv, options] = spy.mock.calls[0] as unknown as [
+        string,
+        string[],
+        Record<string, unknown>,
+      ];
+      expect(executable).toBe(actualRipgrep);
+      expect(argv).toContain("--files");
+      expect(argv).toContain("--null");
+      expect(argv).toContain("--no-config");
+      expect(argv).not.toContain("unique-data-pattern");
+      expect(argv).not.toContain("-f");
+      expect(argv.join(" ")).not.toContain("patterns.txt");
+      expect(options).toMatchObject({
+        shell: false,
+        timeout: 2000,
+        maxBuffer: 2 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it.each([
+    "timeout",
+    "truncated",
+    "malformed",
+    "too-many",
+    "outside",
+    "protected",
+    "nonzero",
+  ])("fails closed for bounded helper result %s", (kind) => {
+    const f = domainFixture();
+    let stdout = Buffer.from("");
+    if (kind === "malformed") stdout = Buffer.from("unterminated");
+    if (kind === "too-many")
+      stdout = Buffer.from("src/safe.ts\0".repeat(10001));
+    if (kind === "outside")
+      stdout = Buffer.from(`${f.outsidePath}/ordinary.txt\0`);
+    if (kind === "protected") stdout = Buffer.from(".env\0");
+    const spy = vi.spyOn(childProcess, "spawnSync").mockReturnValue({
+      status: kind === "nonzero" ? 2 : 0,
+      signal: null,
+      stdout,
+      stderr: Buffer.alloc(0),
+      error:
+        kind === "timeout" || kind === "truncated"
+          ? new Error("fixture failure")
+          : undefined,
+    } as never);
+    try {
+      expect(
+        classifyAction(f.action(["fixture", "."]), f.options).classification,
+      ).toBe("denied");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("requires concrete native search files and denies unspecified or directory scope", () => {
+    const f = domainFixture();
+    for (const touchedPaths of [[], ["."], ["src/safe.ts"]]) {
+      const action = makeAction(f, {
+        toolName: "search",
+        argv: ["token"],
+        touchedPaths,
+      });
+      expect(classifyAction(action, f.options).classification).toBe(
+        touchedPaths[0] === "src/safe.ts" ? "automatic" : "denied",
+      );
+    }
+  });
+});
 
 describe("actual scoped runtime approval and ownership", () => {
   it("does not mint proof when the approval audit cannot commit", async () => {
@@ -806,6 +1559,7 @@ describe("local repository policy boundary", () => {
       const fixture = makeFixture();
       const executable = join(fixture.executableDirectory, filename);
       writeFileSync(executable, "fixture\n", { mode: 0o755 });
+      if (identity === "rg") copyFileSync(actualRipgrep, executable);
       if (identity !== filename)
         symlinkSync(executable, join(fixture.executableDirectory, identity));
       const options = {
@@ -1169,9 +1923,7 @@ describe("local repository policy boundary", () => {
     const execution = makeExecution(action);
     trustExecution(trustedActions, execution, action, fixture);
 
-    expect(guards[0]?.(execution)).toBe(
-      "POLICY_DENIED:EXECUTABLE_TOOL_MISMATCH",
-    );
+    expect(guards[0]?.(execution)).toBe("POLICY_DENIED:UNSUPPORTED_ARGUMENTS");
   });
 
   it("rejects an inside-repository directory symlink swap through the guard", async () => {

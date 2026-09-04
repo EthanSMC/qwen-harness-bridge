@@ -1,4 +1,6 @@
+import { execFileSync } from "node:child_process";
 import {
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -19,6 +21,9 @@ import {
 import type { CanonicalAction, RepositoryPolicy } from "./types.js";
 
 const temporaryDirectories: string[] = [];
+const actualRipgrep = realpathSync(
+  execFileSync("which", ["rg"], { encoding: "utf8" }).trim(),
+);
 
 const makeFixture = () => {
   const directory = mkdtempSync(join(tmpdir(), "qhb-policy-classifier-"));
@@ -54,6 +59,7 @@ const makeFixture = () => {
       mode: 0o755,
     });
   }
+  copyFileSync(actualRipgrep, join(executableDirectory, "rg"));
   writeFileSync(join(repositoryPath, "src", "index.ts"), "export {};\n");
   writeFileSync(join(outsidePath, "secret.txt"), "not for the repository\n");
   writeFileSync(join(outsidePath, "ordinary.txt"), "outside data\n");

@@ -46,4 +46,6 @@ export type PolicyPathViolation =
 export type CanonicalActionResult = Readonly<{
   action: CanonicalAction;
   violations: readonly PolicyPathViolation[];
+  destructive: boolean;
+  administrative: "install" | "push" | "deploy" | undefined;
 }>;

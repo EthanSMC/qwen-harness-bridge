@@ -16,6 +16,7 @@ import {
   type ProtectedPaths,
   resolveProtectedPaths,
 } from "./protected-paths.js";
+import { ripgrepCandidates } from "./search-domain.js";
 import type {
   CanonicalAction,
   CanonicalActionResult,
@@ -314,14 +315,14 @@ export function canonicalizeAction(
       addViolation(violations, error);
     }
   }
-  const resolvePath = (path: string): string => {
-    if (repository === undefined) return lexicalFallback(path, canonicalCwd);
-    const lexical = resolve(canonicalCwd, path);
+  const resolvePath = (path: string, base = canonicalCwd): string => {
+    if (repository === undefined) return lexicalFallback(path, base);
+    const lexical = resolve(base, path);
     if (isProtectedPath(repository.canonicalPath, lexical, configured)) {
       violations.push("PROTECTED_RESOURCE");
     }
     const resolved = canonicalizePath(repository.canonicalPath, path, {
-      basePath: canonicalCwd,
+      basePath: base,
     });
     if (isProtectedPath(repository.canonicalPath, resolved, configured)) {
       violations.push("PROTECTED_RESOURCE");
@@ -349,6 +350,8 @@ export function canonicalizeAction(
         )?.[0] ??
         executableName({ ...canonical, executable: canonicalExecutable }));
   let canonicalArgv = [...canonical.argv];
+  let destructive = false;
+  let administrative: CanonicalActionResult["administrative"];
   try {
     const parsed = parseArguments(
       command,
@@ -358,8 +361,36 @@ export function canonicalizeAction(
       canonicalCwd,
     );
     canonicalArgv = parsed.argv;
-    if (parsed.search === "content" && repository !== undefined)
+    destructive = parsed.destructive;
+    administrative = parsed.administrative;
+    if (command === "rg" && !parsed.noConfig && process.env.RIPGREP_CONFIG_PATH)
+      throw new CanonicalPathError("UNSUPPORTED_ARGUMENTS");
+    if (parsed.search === "content" && command === "rg") {
+      // Basenames and per-execution fields must never authorize a subprocess.
+      if (
+        canonicalExecutable !== executableMap(source).rg ||
+        canonicalExecutable === undefined
+      )
+        throw new CanonicalPathError("UNSUPPORTED_ARGUMENTS");
+      if (violations.length === 0)
+        canonicalTouchedPaths.push(
+          ...ripgrepCandidates(
+            canonicalExecutable,
+            canonicalCwd,
+            parsed.selection,
+            parsed.searchOperands,
+            resolvePath,
+          ),
+        );
+    } else if (parsed.search === "content" && repository !== undefined)
       assertSearchResources(repository.canonicalPath, parsed.paths, configured);
+    if (
+      command === undefined &&
+      /^(search|find|grep|ripgrep)$/u.test(canonical.toolName.toLowerCase()) &&
+      (canonicalTouchedPaths.length === 0 ||
+        canonicalTouchedPaths.some((path) => !statSync(path).isFile()))
+    )
+      throw new CanonicalPathError("UNSUPPORTED_ARGUMENTS");
   } catch (error) {
     addViolation(violations, error);
   }
@@ -371,9 +402,9 @@ export function canonicalizeAction(
       : { executable: canonicalExecutable }),
     argv: canonicalArgv,
     cwd: canonicalCwd,
-    touchedPaths: canonicalTouchedPaths,
+    touchedPaths: [...new Set(canonicalTouchedPaths)].sort(),
   };
-  return { action: normalized, violations };
+  return { action: normalized, violations, destructive, administrative };
 }
 
 const canonicalFingerprintRecord = (
@@ -444,7 +475,7 @@ const denialForCommand = (action: CanonicalAction): string | undefined => {
     /^(arbitrary[-_ ]?command|cloud[-_ ]?command|shell|exec|execute[-_ ]?command)$/u.test(
       tool,
     ) ||
-    /^(sh|bash|zsh|fish|dash|ksh|csh|tcsh|cmd(?:\\.exe)?|powershell(?:\\.exe)?|pwsh(?:\\.exe)?)$/u.test(
+    /^(sh|bash|zsh|fish|dash|ksh|csh|tcsh|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh(?:\.exe)?)$/u.test(
       command,
     )
   )
@@ -461,8 +492,8 @@ const denialForCommand = (action: CanonicalAction): string | undefined => {
   )
     return "SECRET_ACCESS";
   if (
-    /^python(?:\\d+(?:\\.\\d+)*)?$/u.test(command) &&
-    action.argv.some((arg) => /os\\.(?:environ|getenv)/u.test(arg))
+    /^python(?:\d+(?:\.\d+)*)?$/u.test(command) &&
+    action.argv.some((arg) => /os\.(?:environ|getenv)/u.test(arg))
   )
     return "SECRET_ACCESS";
   if (
@@ -480,47 +511,22 @@ const denialForCommand = (action: CanonicalAction): string | undefined => {
   return undefined;
 };
 
-const semanticAction = (
+const approvalForCommand = (
   action: CanonicalAction,
-  source?: RepositoryPolicySource | ActionPolicyOptions,
-): CanonicalAction => {
-  const identity = Object.entries(executableMap(source)).find(
-    ([, path]) => path === action.executable,
-  )?.[0];
-  return identity === undefined ? action : { ...action, executable: identity };
-};
-
-const approvalForCommand = (action: CanonicalAction): string | undefined => {
-  const executable = executableName(action);
-  const args = action.argv.map((value) => value.toLowerCase());
+  semantics: Pick<CanonicalActionResult, "destructive" | "administrative">,
+): string | undefined => {
   const tool = action.toolName.toLowerCase();
-  if (executable === "tsc" && args.includes("--clean"))
-    return "DESTRUCTIVE_FILE_CHANGE";
-  const packageCommand = /^(npm|pnpm|yarn|bun|pip|pip3|cargo|brew)$/u.test(
-    executable,
-  );
-  if (
-    tool === "package_install" ||
-    (packageCommand &&
-      args.some((argument) =>
-        /^(install|ci|i|add|remove|rm|update|upgrade|link)$/u.test(argument),
-      ))
-  ) {
+  if (semantics.destructive) return "DESTRUCTIVE_FILE_CHANGE";
+  if (tool === "package_install" || semantics.administrative === "install") {
     return "PACKAGE_INSTALL";
   }
-  if (
-    tool === "git_push" ||
-    (executable === "git" && args.some((argument) => argument === "push"))
-  ) {
+  if (tool === "git_push" || semantics.administrative === "push") {
     return "GIT_PUSH";
   }
   if (
     action.externalSideEffect === "deploy" ||
     /(^|[-_ ])deploy($|[-_ ])/u.test(tool) ||
-    (executable === "vercel" && args.includes("deploy")) ||
-    (/^(npx|npm|pnpm)$/u.test(executable) &&
-      args.includes("vercel") &&
-      args.includes("deploy"))
+    semantics.administrative === "deploy"
   ) {
     return "DEPLOY";
   }
@@ -552,12 +558,6 @@ const searchExecutableMatches = (action: CanonicalAction): boolean => {
   if (action.executable === undefined) return true;
   const tool = action.toolName.toLowerCase();
   const executable = executableName(action);
-  if (
-    executable === "rg" &&
-    action.argv.some((argument) => /^--pre(?:=|$)/u.test(argument))
-  ) {
-    return false;
-  }
   if (tool === "grep") return executable === "grep";
   if (tool === "ripgrep") return executable === "rg";
   if (tool === "search") return executable === "grep" || executable === "rg";
@@ -716,7 +716,7 @@ export function classifyAction(
   if (!isKnownTool(canonical.action.toolName)) {
     return decision("denied", "UNKNOWN_TOOL", fingerprint);
   }
-  const approval = approvalForCommand(semanticAction(canonical.action, source));
+  const approval = approvalForCommand(canonical.action, canonical);
   if (approval !== undefined) {
     return decision("approval_required", approval, fingerprint);
   }
