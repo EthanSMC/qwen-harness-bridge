@@ -1833,15 +1833,48 @@ test("repository reconciliation verifies a released prior unmerged pull request 
       fake.command(912, "alice", "/ai-release\nreason: handoff requested"),
     ),
   );
+  let result = await reconcileRepositoryState({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+  });
+  assert.equal(result.processed, 2);
+  assert.deepEqual(result.historicalSkipped, []);
+  assert.ok(result.results.every(({ status }) => status === "unchanged"));
+
   await handleIssueComment(
     context(fake, fake.command(913, "bob", "/ai-claim\nagent: codex"), {
       randomUUID: () => "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     }),
   );
+  result = await reconcileRepositoryState({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+  });
+  assert.equal(result.processed, 2);
+  assert.deepEqual(result.historicalSkipped, []);
+  assert.ok(result.results.every(({ status }) => status === "unchanged"));
+
   const finalPull = fake.pull({ number: 52, user: "bob" });
   await handlePullRequest(
     context(fake, fake.pullEvent(finalPull, "opened"), { eventId: 914 }),
   );
+  result = await reconcileRepositoryState({
+    github: fake.client,
+    repository: REPOSITORY,
+    defaultBranch: "main",
+    mode: "enforce",
+    now: NOW,
+  });
+  assert.equal(result.processed, 3);
+  assert.deepEqual(result.historicalSkipped, []);
+  assert.ok(result.results.every(({ status }) => status === "unchanged"));
+
   const mergedFinalPull = fake.pulls.get(52);
   mergedFinalPull.state = "closed";
   mergedFinalPull.merged = true;
@@ -1856,7 +1889,7 @@ test("repository reconciliation verifies a released prior unmerged pull request 
     context(fake, fake.pullEvent(mergedFinalPull, "closed"), { eventId: 915 }),
   );
 
-  const result = await reconcileRepositoryState({
+  result = await reconcileRepositoryState({
     github: fake.client,
     repository: REPOSITORY,
     defaultBranch: "main",

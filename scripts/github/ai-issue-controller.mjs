@@ -1313,6 +1313,7 @@ export const handlePullRequest = async ({
     issue,
     openPullRequests,
   );
+  const currentClaim = currentClaimFromReceipts(loaded.receipts);
   if (pullRequest.state === "open") {
     if (
       loaded.closingPullRequests.length !== 1 ||
@@ -1323,7 +1324,23 @@ export const handlePullRequest = async ({
         "An open pull request must be the Issue's only open closing pull request.",
       );
     }
-  } else if (loaded.closingPullRequests.length > 0) {
+  }
+  if (
+    pullRequest.state === "closed" &&
+    pullRequest.merged !== true &&
+    currentClaim?.pullRequestNumber !== pullRequest.number
+  ) {
+    assertIssueInvariant(loaded.issue);
+    verifyClosedUnmergedPullRequestEvidence({
+      pullRequest,
+      issueNumber,
+      repository,
+      defaultBranch,
+      receipts: loaded.receipts,
+    });
+    return { status: "unchanged" };
+  }
+  if (pullRequest.state !== "open" && loaded.closingPullRequests.length > 0) {
     throw new LifecycleError(
       "CLOSING_PR_EXISTS",
       "A terminal pull request event cannot leave another open closing pull request.",
@@ -1372,16 +1389,6 @@ export const handlePullRequest = async ({
       }
       return { status: "unchanged" };
     }
-    if (pullRequest.state === "closed") {
-      verifyClosedUnmergedPullRequestEvidence({
-        pullRequest,
-        issueNumber,
-        repository,
-        defaultBranch,
-        receipts: loaded.receipts,
-      });
-      return { status: "unchanged" };
-    }
   }
   const { state, assignee } = assertIssueInvariant(
     pullRequest.merged ? { ...loaded.issue, state: "open" } : loaded.issue,
@@ -1392,7 +1399,7 @@ export const handlePullRequest = async ({
       "The pull request author must be the accountable Issue owner.",
     );
   }
-  const claim = currentClaimFromReceipts(loaded.receipts);
+  const claim = currentClaim;
   if (!claim || claim.owner !== assignee) {
     throw new LifecycleError(
       "STATE_MISMATCH",
