@@ -12,11 +12,15 @@ import {
   type ConnectorServerMessage,
   ConnectorServerMessageSchema,
 } from "@qhb/protocol";
+import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket, { WebSocketServer } from "ws";
 import { LOCALHOST_TLS } from "../../../../tests/integration/support/tls.js";
 import type { PluginStore } from "../store/plugin-store.js";
-import { SqlitePluginStore } from "../store/plugin-store.js";
+import {
+  SqlitePluginStore,
+  StoreSequenceError,
+} from "../store/plugin-store.js";
 import { reconnectDelayMs } from "./backoff.js";
 import {
   type ConnectorClient,
@@ -882,6 +886,7 @@ describe("authenticated connector transport", () => {
         return baseStore.recordInbound(...args);
       },
       maxInboundSequence: () => baseStore.maxInboundSequence(),
+      maxOutboundSequence: () => baseStore.maxOutboundSequence(),
       inboundMessage: (messageId) => baseStore.inboundMessage(messageId),
       inboundMessageBySequence: (sequence) =>
         baseStore.inboundMessageBySequence(sequence),
@@ -891,6 +896,7 @@ describe("authenticated connector transport", () => {
         baseStore.markInboundDelivered(messageId),
       mapJob: (input) => baseStore.mapJob(input),
       findJob: (jobId) => baseStore.findJob(jobId),
+      listNonterminalJobs: () => baseStore.listNonterminalJobs(),
       enqueueEvent: (event) => {
         const message = JSON.parse(event.payload) as JsonRecord;
         operations.push(`enqueueEvent:${String(message.type)}`);
@@ -1152,6 +1158,84 @@ describe("authenticated connector transport", () => {
 
     secondController.abort();
     await secondRunning;
+  });
+
+  it("starts promptly at sequence 100001 after 100000 acknowledged events", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const seeded = makeStore();
+    seeded.store.close();
+    const databasePath = join(seeded.directory, "state.sqlite");
+    const database = new Database(databasePath);
+    const insert = database.prepare(
+      `INSERT INTO outbound_events
+        (message_id, sequence, payload_json, attempts, acknowledged_at, created_at)
+       VALUES (?, ?, ?, 0, ?, ?)`,
+    );
+    const seedHistory = database.transaction(() => {
+      for (let sequence = 1; sequence <= 100_000; sequence += 1) {
+        insert.run(
+          `historical-${sequence}`,
+          sequence,
+          "{}",
+          "2026-09-05T00:00:00.000Z",
+          "2026-09-05T00:00:00.000Z",
+        );
+      }
+    });
+    seedHistory();
+    database.close();
+    const store = new SqlitePluginStore(databasePath);
+    stores.push({ store, directory: seeded.directory });
+    const controller = new AbortController();
+    const client = makeClient(fixture, store);
+
+    const startedAt = performance.now();
+    let running: Promise<void> | undefined;
+    expect(() => {
+      running = client.start(controller.signal);
+    }).not.toThrow();
+    const elapsedMs = performance.now() - startedAt;
+    const pending = store.pendingEvents(100_000);
+
+    controller.abort();
+    if (running === undefined) throw new Error("connector did not start");
+    await running;
+    expect(elapsedMs).toBeLessThan(1_000);
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.sequence).toBe(100_001);
+    expect(JSON.parse(pending[0]?.payload ?? "null")).toMatchObject({
+      type: "connector.hello",
+      sequence: 100_001,
+    });
+  });
+
+  it("fails closed on a concurrent outbound sequence writer without probing", async () => {
+    const fixture = await startFixture();
+    fixtures.push(fixture);
+    const { store: baseStore, directory } = makeStore();
+    stores.push({ store: baseStore, directory });
+    let enqueueAttempts = 0;
+    const store = new Proxy(baseStore, {
+      get(target, property, receiver) {
+        if (property === "enqueueEvent") {
+          return () => {
+            enqueueAttempts += 1;
+            if (enqueueAttempts === 1) throw new StoreSequenceError();
+            throw new Error("CONNECTOR_RETRIED_SEQUENCE_ALLOCATION");
+          };
+        }
+        const value = Reflect.get(target, property, receiver) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as PluginStore;
+    const client = makeClient(fixture, store);
+    const controller = new AbortController();
+
+    expect(() => client.start(controller.signal)).toThrow(
+      "CONNECTOR_SEQUENCE_CONFLICT",
+    );
+    expect(enqueueAttempts).toBe(1);
   });
 
   it("restores hello.last_server_sequence from durable inbound state", async () => {

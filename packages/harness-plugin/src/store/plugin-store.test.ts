@@ -569,6 +569,53 @@ describe("SQLite Harness plugin store", () => {
     expect(existsSync(databasePath)).toBe(true);
   });
 
+  it("reports the durable maximum outbound sequence across acknowledged and pending rows", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+
+    expect(store.maxOutboundSequence()).toBe(0);
+    store.enqueueEvent(event(7, "pending-event"));
+    store.enqueueEvent(event(11, "acknowledged-event"));
+    store.acknowledgeEvent("acknowledged-event");
+    expect(store.maxOutboundSequence()).toBe(11);
+    store.close();
+
+    const reopened = new SqlitePluginStore(databasePath);
+    expect(reopened.maxOutboundSequence()).toBe(11);
+    expect(reopened.pendingEvents(0)).toMatchObject([
+      { messageId: "pending-event", sequence: 7 },
+    ]);
+    reopened.close();
+  });
+
+  it("rejects an unsafe durable outbound sequence", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    store.close();
+    const database = new Database(databasePath);
+    database
+      .prepare(
+        `INSERT INTO outbound_events
+          (message_id, sequence, payload_json, attempts, acknowledged_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "unsafe-event",
+        Number.MAX_SAFE_INTEGER + 1,
+        "{}",
+        0,
+        "2026-09-05T00:00:00.000Z",
+        "2026-09-05T00:00:00.000Z",
+      );
+    database.close();
+
+    const reopened = new SqlitePluginStore(databasePath);
+    expect(() => reopened.maxOutboundSequence()).toThrow(
+      "STORE_SEQUENCE_INVALID",
+    );
+    reopened.close();
+  });
+
   it("always initializes outbound delivery state instead of accepting forged state", () => {
     const databasePath = makeDatabasePath();
     const store = new SqlitePluginStore(databasePath);

@@ -52,7 +52,6 @@ const HEARTBEAT_INTERVAL_MS = 10_000;
 const MESSAGE_TTL_MS = 60_000;
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 const SOCKET_CLOSE_TIMEOUT_MS = 1_000;
-const MAX_SEQUENCE_ALLOCATION_PROBES = 100_000;
 const ABORTED = Symbol("CONNECTOR_ABORTED");
 
 const assertWssUrl = (value: string): void => {
@@ -177,10 +176,10 @@ export class DurableConnectorClient implements ConnectorClient {
       options.webSocketFactory ??
       ((url, socketOptions) => new WebSocket(url, socketOptions));
     this.#serverCursor = new SequenceCursor(options.store.maxInboundSequence());
+    this.#clientSequence = options.store.maxOutboundSequence();
     const pending = options.store.pendingEvents(0);
     for (const event of pending) {
       this.#rememberPending(event);
-      this.#clientSequence = Math.max(this.#clientSequence, event.sequence);
     }
   }
 
@@ -638,32 +637,36 @@ export class DurableConnectorClient implements ConnectorClient {
   #persistMessage(
     build: (sequence: number) => ConnectorClientMessage,
   ): PendingMessage {
-    let sequence = this.#clientSequence + 1;
-    for (let probe = 0; probe < MAX_SEQUENCE_ALLOCATION_PROBES; probe += 1) {
-      const message = build(sequence);
-      const serialized = JSON.stringify(message);
-      try {
-        this.#options.store.enqueueEvent({
-          messageId: message.message_id,
-          sequence,
-          payload: serialized,
-        });
-        this.#clientSequence = sequence;
-        const stored: StoredOutboundEvent = {
-          messageId: message.message_id,
-          sequence,
-          payload: serialized,
-          attempts: 0,
-          acknowledgedAt: null,
-        };
-        this.#outboundBySequence.set(sequence, stored);
-        return { stored, message };
-      } catch (error) {
-        if (!(error instanceof StoreSequenceError)) throw error;
-        sequence += 1;
-      }
+    const sequence = this.#clientSequence + 1;
+    if (!Number.isSafeInteger(sequence)) {
+      throw new Error("CONNECTOR_SEQUENCE_EXHAUSTED");
     }
-    throw new Error("CONNECTOR_SEQUENCE_EXHAUSTED");
+    const message = build(sequence);
+    const serialized = JSON.stringify(message);
+    try {
+      this.#options.store.enqueueEvent({
+        messageId: message.message_id,
+        sequence,
+        payload: serialized,
+      });
+    } catch (error) {
+      if (error instanceof StoreSequenceError) {
+        // One client process exclusively owns a Connector store. A conflict
+        // means an unsupported concurrent writer violated that invariant.
+        throw new Error("CONNECTOR_SEQUENCE_CONFLICT");
+      }
+      throw error;
+    }
+    this.#clientSequence = sequence;
+    const stored: StoredOutboundEvent = {
+      messageId: message.message_id,
+      sequence,
+      payload: serialized,
+      attempts: 0,
+      acknowledgedAt: null,
+    };
+    this.#outboundBySequence.set(sequence, stored);
+    return { stored, message };
   }
 
   #sendJson(socket: WebSocket, message: ConnectorClientMessage): void {

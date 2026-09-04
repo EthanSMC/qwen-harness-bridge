@@ -63,6 +63,7 @@ export interface PluginStore {
   }): void;
   findJob(jobId: string): LocalJobMapping | undefined;
   listNonterminalJobs(): readonly LocalJobMapping[];
+  maxOutboundSequence(): number;
   enqueueEvent(event: OutboundEventInput): void;
   pendingEvents(afterSequence: number): StoredOutboundEvent[];
   acknowledgeEvent(messageId: string): void;
@@ -504,6 +505,16 @@ export class SqlitePluginStore implements PluginStore {
     } catch {
       throw new StoreError("STORE_JOB_MAPPING_READ_FAILED");
     }
+  }
+
+  maxOutboundSequence(): number {
+    this.assertOpen();
+    const row = this.database
+      .prepare("SELECT MAX(sequence) AS sequence FROM outbound_events")
+      .get() as { sequence: number | null };
+    const sequence = row.sequence ?? 0;
+    assertNonNegativeInteger(sequence, "STORE_SEQUENCE_INVALID");
+    return sequence;
   }
 
   enqueueEvent(event: OutboundEventInput): void {
