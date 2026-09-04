@@ -296,6 +296,14 @@ Delivery is at least once. Receivers deduplicate by `message_id` and sequence. A
 
 Connector heartbeat interval is 10 seconds. Control Plane marks the connection stale after 20 seconds and offline after 30 seconds. A dispatch offer lease lasts 30 seconds. Unclaimed jobs remain queued until their job expiry.
 
+### 9.1 Negotiated durable receipt recovery
+
+The stable Harness Connector requires the `durable-receipts-v1` capability, requested in hello and explicitly echoed in an optional welcome capabilities array. Legacy peers that do not request it retain their existing welcome shape and behavior. A missing echo is an incompatible peer, not permission to dispatch work under weaker recovery rules.
+
+Under this capability, only a client envelope's delivery `expires_at` may be renewed before transmission; message identity, sequence, original send time, correlation and payload remain immutable. Business deadlines and server-command execution deadlines cannot be renewed. Valid receipt ACKs prove durable consumption of a contiguous client prefix, including consumed business rejections, and never authorize execution. The server acknowledges consumed client ACK frames; the client does not acknowledge server ACKs, preventing receipt loops. Persist the proven prefix and active hello anchor, retain uncertain rows on shutdown, and bound unconfirmed transmission to 32 frames and 128 KiB. Recheck incoming command expiry after receipt and before execution.
+
+Identity binding, rejection rollback, lease bounds, tombstone restoration, compatibility behavior and required interoperability evidence are specified in [ADR 0001](../../adr/0001-durable-connector-receipts.md). This negotiated correction implements durable recovery without renumbering or silently dropping allocated messages.
+
 ## 10. Job and approval model
 
 ### 10.1 Public job states
