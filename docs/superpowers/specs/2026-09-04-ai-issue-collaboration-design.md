@@ -94,6 +94,7 @@ Every open implementation Issue has exactly one of these managed labels:
 
 | Label | Meaning | Assignee rule |
 |---|---|---|
+| `status:waiting` | Requirements or declared dependencies are not yet ready | none |
 | `status:ready` | Eligible to be claimed when all readiness rules pass | none |
 | `status:in-progress` | Exclusively claimed and under implementation | exactly one |
 | `status:review` | A pull request exists and is in CI/review/fix rounds | exactly one |
@@ -103,18 +104,19 @@ Every open implementation Issue has exactly one of these managed labels:
 The allowed transitions are:
 
 ```text
-draft/unclassified -> ready
+draft/unclassified -> waiting | ready
+waiting -> ready
 ready -> in-progress
 in-progress -> review | blocked | ready
 blocked -> in-progress | ready
 review -> in-progress | blocked | done
-done -> ready               # only when GitHub reopens the Issue
+done -> waiting | ready      # only when GitHub reopens the Issue
 ```
 
 Invariants:
 
 - At most one managed `status:*` label is present.
-- `status:ready` and `status:done` have no assignee.
+- `status:waiting`, `status:ready`, and `status:done` have no assignee.
 - `status:in-progress`, `status:review`, and owner-retained `status:blocked` have exactly one assignee.
 - A closed Issue has `status:done`; an open Issue never has `status:done`.
 - Only the repository lifecycle workflow creates authoritative transition receipts.
@@ -132,7 +134,7 @@ An Issue is claimable only when all of the following are true:
 - no open pull request already declares `Closes #N`; and
 - the claimant is a direct collaborator with `write`, `maintain`, or `admin` permission.
 
-An Issue that lacks sufficient requirements stays unclassified or receives `status:blocked`; an AI agent must not invent missing product scope merely to make it claimable.
+An Issue that lacks sufficient requirements or has open dependencies receives `status:waiting`; an AI agent must not invent missing product scope merely to make it claimable. `status:blocked` is reserved for claimed work whose accountable owner encountered a specific external blocking condition.
 
 Dependencies use one canonical, machine-readable line per Issue:
 
@@ -180,7 +182,7 @@ summary: protocol schema implemented; integration tests remain
 
 The summary is required, is limited to 240 UTF-8 bytes, and must contain no private execution material. The workflow verifies ownership and extends the lease from GitHub server time.
 
-A scheduled hourly reconciliation releases an expired `status:in-progress` claim by removing the assignee, restoring `status:ready`, and writing a stale-release receipt. It does not automatically release `status:review` or `status:blocked`; those states require an explicit resolution because a pull request or external dependency may still exist.
+A scheduled hourly reconciliation releases an expired `status:in-progress` claim by removing the assignee, restoring `status:ready` when readiness still passes or `status:waiting` otherwise, and writing a stale-release receipt. It does not automatically release `status:review` or `status:blocked`; those states require an explicit resolution because a pull request or external dependency may still exist.
 
 ## 8. Local execution contract
 
@@ -225,7 +227,7 @@ The owner or a maintainer uses:
 reason: implementation is being abandoned; no pull request is open
 ```
 
-Release is allowed only when no open pull request declares it will close the Issue, or after that pull request is closed. It removes the assignee, restores `status:ready`, invalidates the current lease, and records the reason.
+Release is allowed only when no open pull request declares it will close the Issue, or after that pull request is closed. It removes the assignee, restores `status:ready` when readiness still passes or `status:waiting` otherwise, invalidates the current lease, and records the reason.
 
 ### 9.4 Handoff
 
@@ -265,7 +267,7 @@ The controller merges only through the protected `main` branch after independent
 
 Failure of any postcondition is a lifecycle failure, not a successful close. Automation records the mismatch and requires repair; it does not silently mark the work complete.
 
-If a completed Issue is reopened, the workflow removes `status:done`, applies `status:ready`, and leaves it unassigned. A new claim generation is required.
+If a completed Issue is reopened, the workflow removes `status:done`, reapplies `status:ready` or `status:waiting` from live readiness, and leaves it unassigned. A new claim generation is required.
 
 ## 12. Milestone and Release closure
 
@@ -290,7 +292,7 @@ Implementation adds or updates these bounded components:
 - `README.md`: concise workflow overview and links to the authoritative documents.
 - `.github/ISSUE_TEMPLATE/implementation.yml` and `bug.yml`: outcome, dependencies, verification, readiness, and AI-safe evidence fields.
 - `.github/pull_request_template.md`: claim receipt, accountable owner, agent class, lifecycle, review, and closure evidence.
-- `.github/labels.yml`: the five mutually exclusive lifecycle labels.
+- `.github/labels.yml`: the six mutually exclusive lifecycle labels.
 - `.github/workflows/ai-issue-lifecycle.yml`: serialized commands, scheduled expiry, pull-request transitions, close/reopen reconciliation, and receipts.
 - `.github/workflows/governance.yml`: read-only lifecycle validation as a required pull-request gate.
 - `scripts/github/issue-lifecycle.mjs`: strict command parsing, transition policy, GitHub adapter boundary, and reconciliation logic.
@@ -395,7 +397,7 @@ The design is complete when all of the following are proven on the protected def
 Rollout is fail-closed and staged:
 
 1. land documentation, labels, pure policy modules, tests, and read-only validation;
-2. synchronize managed labels and classify existing open Issues as `status:ready` or `status:blocked` from explicit dependency evidence;
+2. synchronize managed labels and classify existing open Issues as `status:ready` or `status:waiting` from explicit dependency evidence;
 3. enable command handling and scheduled reconciliation;
 4. run the disposable live acceptance lifecycle;
 5. make lifecycle validation a required `governance` dependency; and
