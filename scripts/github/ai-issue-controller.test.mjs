@@ -514,6 +514,19 @@ test("repository reconciliation isolates pre-lifecycle closed history", async ()
     results: [],
   });
   assert.deepEqual(historical.mutations, []);
+  await assert.rejects(
+    () =>
+      reconcileRepositoryState({
+        github: historical.client,
+        repository: REPOSITORY,
+        defaultBranch: "main",
+        mode: "enforce",
+        now: NOW,
+        maxObjects: 0,
+        historicalIssueExemptions: exemptions,
+      }),
+    /reconciliation exceeds the 0-object cap/i,
+  );
 
   const labeledHistorical = new FakeGitHub();
   const labeledHistoricalIssue = labeledHistorical.issues.get(46);
@@ -579,6 +592,12 @@ test("repository reconciliation isolates pre-lifecycle closed history", async ()
     {
       configure: (issue) => {
         issue.closed_at = "2026-09-03T12:00:01.000Z";
+      },
+      message: /exactly one managed lifecycle label/i,
+    },
+    {
+      configure: (issue) => {
+        issue.state_reason = "not_planned";
       },
       message: /exactly one managed lifecycle label/i,
     },
@@ -1665,6 +1684,42 @@ test("completed idempotency requires terminal receipt and merge evidence", async
     () =>
       handlePullRequest(context(fake, fake.pullEvent(pull), { eventId: 921 })),
     /final terminal receipt/i,
+  );
+});
+
+test("completed idempotency rejects stale claim binding and unreachable merge", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const pull = fake.pull();
+  await handlePullRequest(
+    context(fake, fake.pullEvent(pull, "opened"), { eventId: 910 }),
+  );
+  const merged = fake.pulls.get(51);
+  merged.state = "closed";
+  merged.merged = true;
+  merged.merged_at = NOW;
+  merged.merge_commit_sha = "abc1234";
+  const governedIssue = fake.issues.get(46);
+  governedIssue.state = "closed";
+  governedIssue.state_reason = "completed";
+  governedIssue.closed_at = NOW;
+  await handlePullRequest(
+    context(fake, fake.pullEvent(merged), { eventId: 912 }),
+  );
+
+  fake.comparisonStatus = "diverged";
+  await assert.rejects(
+    () => handleIssueChange(context(fake, fake.issueEvent(), { eventId: 920 })),
+    /not reachable/i,
+  );
+  fake.comparisonStatus = "ahead";
+  merged.body = merged.body.replace(
+    /issuecomment-[1-9]\d*/u,
+    "issuecomment-999",
+  );
+  await assert.rejects(
+    () => handleIssueChange(context(fake, fake.issueEvent(), { eventId: 921 })),
+    /exactly one merged pull request/i,
   );
 });
 

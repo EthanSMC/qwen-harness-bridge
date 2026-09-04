@@ -162,6 +162,7 @@ export const validateHistoricalExemptions = (
 const matchesHistoricalExemptionSnapshot = (issue, exemption) =>
   Boolean(exemption) &&
   issue.state === "closed" &&
+  issue.state_reason === "completed" &&
   issue.closed_at === exemption.closedAt &&
   managedTypeCount(issue) === 1 &&
   (exemption.lifecycleStatus === null
