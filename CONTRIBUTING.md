@@ -17,6 +17,34 @@ Every contributor may use an AI agent, but the named human Issue assignee remain
 
 Use `/ai-block`, `/ai-resume`, and `/ai-release` exactly as documented. A handoff is a release followed by a fresh claim from the recipient; do not transfer responsibility through an unverified manual reassignment.
 
+Every post-claim command includes the current workflow-generated claim UUID:
+
+```text
+/ai-heartbeat
+claim-id: 550e8400-e29b-41d4-a716-446655440000
+summary: focused tests pass; full governance remains
+```
+
+```text
+/ai-block
+claim-id: 550e8400-e29b-41d4-a716-446655440000
+reason: staging credential is unavailable
+resume-when: the repository owner provisions the documented credential
+```
+
+```text
+/ai-resume
+claim-id: 550e8400-e29b-41d4-a716-446655440000
+```
+
+```text
+/ai-release
+claim-id: 550e8400-e29b-41d4-a716-446655440000
+reason: implementation is being abandoned; no pull request is open
+```
+
+The UUID fences one claim generation; it does not transfer ownership. On `CLAIM_MISMATCH`, stop and verify the current receipt and assigned executor. Only the executor for that generation may retry. Otherwise complete an explicit release and fresh claim. At task start, record in-scope work, out-of-scope work, and the completion condition, then update that boundary only when scope changes. Subsequent checkpoints report concrete progress, remaining work or the exact blocker, and bounded verification. Unrelated side work does not block a finished deliverable. After three repeats of the same failure, change method or state the exact blocker. Address blocking correctness findings in the review loop and move optional enhancements to follow-up work. Reuse an observed full-suite result until a relevant change or unresolved concern justifies another expensive run.
+
 ## Required engineering rules
 
 - TypeScript uses strict mode and Zod at every untrusted runtime boundary.
@@ -51,7 +79,9 @@ For either path, the reviewer must be different from the implementer, review the
 
 The management sync queries direct collaborators before applying main-branch protection. It excludes the repository owner and selects formal mode only when another distinct collaborator has `admin`, `maintain`, or `push` role/permission; formal mode requires one approval, stale-review dismissal, and approval after the last push. With no such collaborator, it selects the documented solo mode regardless of repository visibility and applies no formal pull-request review requirement. Re-run the collaborator and PR review-state checks immediately before changing or relying on the selected mode, and treat any collaborator membership, role, or permission change as a re-verification trigger.
 
-The pull-request body validator only verifies the selected evidence mode and the current PR checks URL. Before merging, the controller must independently query the GitHub checks API and confirm all required checks succeeded; the body evidence URL is not itself a CI result. The initial PR creation run may fail because the PR number is not known when the body is authored; edit the body immediately with the current PR checks URL and require the final `governance` gate to be green.
+Every newly evaluated solo-mode PR includes `Independent review report URL (required for solo mode):` linking a canonical, unedited comment posted by the accountable PR author on that same PR. Capture the actual independent review with the [review report command](docs/github/ai-collaboration.md#structured-review-report), then post the generated comment and copy its URL into the PR body. The authenticated validator binds its schema, digest, Issue, identities, exact current base/head, PASS verdict and resolved blockers. Each changed range needs a fresh report comment. Formal mode retains real current-head GitHub approval and may leave the report URL empty; historical merged records are unchanged. The digest provides controller-attested traceability, not cryptographic proof of independent AI execution. Never disable validation to bootstrap a report.
+
+The pull-request body validator verifies the selected evidence mode, solo report when required, and the current PR checks URL. Before merging, the controller must independently query the GitHub checks API and confirm all required checks succeeded; the body evidence URL is not itself a CI result. The initial PR creation run may fail because the PR number is not known when the body is authored; edit the body immediately with the current PR checks URL and require the final `governance` gate to be green.
 
 After merge, the controller verifies the intended Issue closed as completed, the merge is reachable from `main`, terminal `status:done` reconciliation succeeded, the assignee was removed, and required acceptance evidence is current. A milestone is releasable only after every Issue and Release gate has equivalent terminal evidence.
 

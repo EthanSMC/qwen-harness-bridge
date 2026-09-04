@@ -6,6 +6,7 @@ import { basename, delimiter, join, resolve } from "node:path";
 import test from "node:test";
 
 import {
+  branchProtectionFor,
   buildPlanIssueGraph,
   createGh,
   deriveLifecycleState,
@@ -55,6 +56,34 @@ test("orders tasks within each plan and gates each stable plan", () => {
   assert.deepEqual(graph.get(29).blockedBy, [28]);
   assert.deepEqual(graph.get(28).blockedBy, []);
   assert.deepEqual(graph.get(27).blockedBy, [26]);
+});
+
+test("protects main with strict governance and runtime checks", () => {
+  for (const reviewMode of ["formal", "solo"]) {
+    const protection = branchProtectionFor(reviewMode);
+    assert.deepEqual(protection.required_status_checks, {
+      strict: true,
+      contexts: ["governance", "runtime"],
+    });
+    assert.equal(protection.enforce_admins, true);
+    assert.equal(protection.restrictions, null);
+    assert.equal(protection.required_linear_history, true);
+    assert.equal(protection.allow_force_pushes, false);
+    assert.equal(protection.allow_deletions, false);
+    assert.equal(protection.required_conversation_resolution, true);
+    assert.equal(
+      protection.required_pull_request_reviews === null,
+      reviewMode === "solo",
+    );
+    if (reviewMode === "formal") {
+      assert.deepEqual(protection.required_pull_request_reviews, {
+        dismiss_stale_reviews: true,
+        require_code_owner_reviews: false,
+        required_approving_review_count: 1,
+        require_last_push_approval: true,
+      });
+    }
+  }
 });
 
 test("restarts one timed-out GET but never replays a write", () => {

@@ -31,6 +31,7 @@
 - Formal reviewer GitHub identity (required for formal mode):
 - Solo eligibility evidence URL or repository-status reference (required for solo mode):
 - Solo eligibility verification date (required for solo mode):
+- Independent review report URL (required for solo mode):
 
 ### Reviewer identity and independence (required)
 

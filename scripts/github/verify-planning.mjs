@@ -105,6 +105,30 @@ for (const command of [
   );
 }
 
+const claimIdExample = /claim-id: 550e8400-e29b-41d4-a716-446655440000/u;
+for (const file of [
+  "AGENTS.md",
+  "CONTRIBUTING.md",
+  "docs/github/ai-collaboration.md",
+  "docs/superpowers/specs/2026-09-04-ai-issue-collaboration-design.md",
+  "docs/superpowers/plans/2026-09-04-ai-issue-collaboration.md",
+]) {
+  requireGovernanceField(
+    file,
+    claimIdExample,
+    "the canonical post-claim command claim-id example",
+  );
+}
+for (const [pattern, message] of [
+  [/in scope/i, "explicit progress scope"],
+  [/out of scope/i, "explicit progress exclusions"],
+  [/same failure occurs three times/i, "the three-failure method change"],
+  [/blocking correctness findings/i, "blocking review-fix scope"],
+  [/expensive full suite/i, "outcome-based verification checkpoints"],
+]) {
+  requireGovernanceField("AGENTS.md", pattern, message);
+}
+
 const lifecycleMigrations = JSON.parse(
   contents.get("docs/github/ai-lifecycle-migrations.json"),
 );
@@ -242,6 +266,10 @@ for (const [pattern, message] of [
     "the solo eligibility evidence field",
   ],
   [/Implementer agent ID:/, "the implementer agent ID field"],
+  [
+    /Independent review report URL \(required for solo mode\):/,
+    "the same-PR structured report URL",
+  ],
   [/Reviewer agent ID:/, "the reviewer agent ID field"],
   [/Fresh review of this exact commit range:/, "the fresh-review declaration"],
   [
@@ -302,12 +330,12 @@ for (const [pattern, message] of [
     "conditional formal/solo mode selection",
   ],
   [
-    /const requiredPullRequestReviews =\s*reviewMode === "formal" \? formalReviewRequirements : null;/,
+    /required_pull_request_reviews:\s*reviewMode === "formal" \? formalReviewRequirements : null/,
     "conditional formal review payload",
   ],
   [
-    /required_pull_request_reviews: requiredPullRequestReviews/,
-    "the conditional required_pull_request_reviews payload",
+    /contexts:\s*\["governance", "runtime"\]/,
+    "the governance and runtime required checks",
   ],
   [/dismiss_stale_reviews:\s*true/, "dismiss_stale_reviews=true"],
   [/require_last_push_approval:\s*true/, "require_last_push_approval=true"],
@@ -385,6 +413,8 @@ for (const [pattern, message] of [
   ],
   [/node --test/, "the repository governance node:test command"],
   [/ai-issue-policy\.test\.mjs/, "the AI lifecycle policy tests"],
+  [/review-report\.test\.mjs/, "structured review report tests"],
+  [/stale-work\.test\.mjs/, "stalled-work report tests"],
   [/github-api\.test\.mjs/, "the strict GitHub API tests"],
   [/ai-issue-controller\.test\.mjs/, "the lifecycle controller tests"],
   [/ai-lifecycle-registry\.test\.mjs/, "the lifecycle rollout registry tests"],
@@ -411,6 +441,15 @@ for (const [pattern, message] of [
   requireGovernanceField(workflow, pattern, message);
 
 const lifecycleWorkflow = ".github/workflows/ai-issue-lifecycle.yml";
+for (const [pattern, message] of [
+  [
+    /stalled-work:[\s\S]*?permissions:[\s\S]*?issues: read/,
+    "isolated read-only stalled-work job",
+  ],
+  [/node scripts\/github\/stale-work\.mjs/, "stalled-work report CLI"],
+  [/actions\/upload-artifact@v4/, "stalled-work report artifact visibility"],
+])
+  requireGovernanceField(lifecycleWorkflow, pattern, message);
 for (const [pattern, message] of [
   [/issue_comment:/, "the Issue comment trigger"],
   [/pull_request_target:/, "the trusted pull-request target trigger"],
@@ -480,8 +519,8 @@ for (const [pattern, message] of [
     "the explicit enabled branch-protection state",
   ],
   [
-    /required status check.*`governance`/i,
-    "the required governance status check",
+    /requires both `governance` and `runtime`.*strict up-to-date branch enforcement/i,
+    "the required governance and runtime status checks",
   ],
   [
     /force pushes and branch deletions are disabled/i,

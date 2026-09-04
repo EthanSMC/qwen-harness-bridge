@@ -123,33 +123,55 @@ test("parses every lifecycle command with exact fields", () => {
   });
   assert.deepEqual(
     parseLifecycleCommand(
-      "/ai-heartbeat\nsummary: parser passes; controller remains",
+      `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: parser passes; controller remains`,
     ),
     {
       name: "heartbeat",
-      fields: { summary: "parser passes; controller remains" },
+      fields: {
+        "claim-id": UUID,
+        summary: "parser passes; controller remains",
+      },
     },
   );
   assert.deepEqual(
     parseLifecycleCommand(
-      "/ai-block\nreason: staging unavailable\nresume-when: staging recovers",
+      `/ai-block\nclaim-id: ${UUID}\nreason: staging unavailable\nresume-when: staging recovers`,
     ),
     {
       name: "block",
       fields: {
+        "claim-id": UUID,
         reason: "staging unavailable",
         "resume-when": "staging recovers",
       },
     },
   );
-  assert.deepEqual(parseLifecycleCommand("/ai-resume"), {
+  assert.deepEqual(parseLifecycleCommand(`/ai-resume\nclaim-id: ${UUID}`), {
     name: "resume",
-    fields: {},
+    fields: { "claim-id": UUID },
   });
   assert.deepEqual(
-    parseLifecycleCommand("/ai-release\nreason: work is abandoned"),
-    { name: "release", fields: { reason: "work is abandoned" } },
+    parseLifecycleCommand(
+      `/ai-release\nclaim-id: ${UUID}\nreason: work is abandoned`,
+    ),
+    {
+      name: "release",
+      fields: { "claim-id": UUID, reason: "work is abandoned" },
+    },
   );
+});
+
+test("requires one canonical claim generation on every post-claim command", () => {
+  for (const body of [
+    "/ai-heartbeat\nsummary: missing generation",
+    "/ai-block\nreason: missing generation\nresume-when: later",
+    "/ai-resume",
+    "/ai-release\nreason: missing generation",
+    "/ai-heartbeat\nclaim-id: 550E8400-E29B-41D4-A716-446655440000\nsummary: uppercase",
+    "/ai-heartbeat\nclaim-id: not-a-uuid\nsummary: malformed",
+  ]) {
+    expectCode(() => parseLifecycleCommand(body), "INVALID_COMMAND");
+  }
 });
 
 test("rejects malformed, duplicate, unknown, missing, and extra command fields", () => {
@@ -181,28 +203,28 @@ test("rejects unsafe agent classes and private public-field content", () => {
   expectCode(
     () =>
       parseLifecycleCommand(
-        "/ai-heartbeat\nsummary: codex://threads/01private",
+        `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: codex://threads/01private`,
       ),
     "INVALID_COMMAND",
   );
   expectCode(
     () =>
       parseLifecycleCommand(
-        "/ai-block\nreason: token=secret\nresume-when: rotate it",
+        `/ai-block\nclaim-id: ${UUID}\nreason: token=secret\nresume-when: rotate it`,
       ),
     "INVALID_COMMAND",
   );
   expectCode(
     () =>
       parseLifecycleCommand(
-        "/ai-release\nreason: files are in /Users/alice/private",
+        `/ai-release\nclaim-id: ${UUID}\nreason: files are in /Users/alice/private`,
       ),
     "INVALID_COMMAND",
   );
   expectCode(
     () =>
       parseLifecycleCommand(
-        "/ai-release\nreason: inspect http://github.com/org/repo/issues/1",
+        `/ai-release\nclaim-id: ${UUID}\nreason: inspect http://github.com/org/repo/issues/1`,
       ),
     "INVALID_COMMAND",
   );
@@ -440,6 +462,93 @@ test("rejects an ineligible or competing claimant", () => {
   );
 });
 
+test("rejects a different expected claim generation before planning owner or maintainer actions", () => {
+  const claimReceipt = plan().receipt;
+  const activeIssue = issue({
+    labels: ["type:docs", "status:in-progress"],
+    assignees: ["alice"],
+  });
+  const staleClaimId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  for (const { actor, actorPermission, body } of [
+    {
+      actor: "alice",
+      actorPermission: "write",
+      body: `/ai-heartbeat\nclaim-id: ${staleClaimId}\nsummary: stale worker`,
+    },
+    {
+      actor: "alice",
+      actorPermission: "write",
+      body: `/ai-block\nclaim-id: ${staleClaimId}\nreason: stale worker\nresume-when: never`,
+    },
+    {
+      actor: "alice",
+      actorPermission: "write",
+      body: `/ai-resume\nclaim-id: ${staleClaimId}`,
+    },
+    {
+      actor: "maintainer",
+      actorPermission: "maintain",
+      body: `/ai-release\nclaim-id: ${staleClaimId}\nreason: stale recovery`,
+    },
+  ]) {
+    expectCode(
+      () =>
+        plan({
+          command: parseLifecycleCommand(body),
+          issue: activeIssue,
+          actor,
+          actorPermission,
+          receipts: [claimReceipt],
+          eventId: 902,
+        }),
+      "CLAIM_MISMATCH",
+    );
+  }
+});
+
+test("claim mismatch recovery stops stale executors instead of sharing the current generation", () => {
+  const claimReceipt = plan().receipt;
+  assert.throws(
+    () =>
+      plan({
+        command: parseLifecycleCommand(
+          "/ai-heartbeat\nclaim-id: aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\nsummary: stale worker",
+        ),
+        issue: issue({
+          labels: ["type:docs", "status:in-progress"],
+          assignees: ["alice"],
+        }),
+        receipts: [claimReceipt],
+        eventId: 902,
+      }),
+    (error) => {
+      assert.equal(error.code, "CLAIM_MISMATCH");
+      assert.match(error.message, /stop.*assigned executor.*handoff/is);
+      assert.doesNotMatch(
+        error.message,
+        /retry with (?:its|the) exact claim-id/i,
+      );
+      return true;
+    },
+  );
+
+  const publicReceipt = receiptBody({
+    ...claimReceipt,
+    eventId: 902,
+    result: "failure",
+    claimId: null,
+    from: "in-progress",
+    to: "in-progress",
+    leaseExpiresAt: null,
+    code: "CLAIM_MISMATCH",
+  });
+  assert.match(publicReceipt, /stop.*assigned executor.*fresh claim/is);
+  assert.doesNotMatch(
+    publicReceipt,
+    /retry with (?:its|the|that) exact `?claim-id/i,
+  );
+});
+
 test("round-trips a workflow-authored receipt and ignores other comments", () => {
   const claim = plan().receipt;
   const body = receiptBody(claim);
@@ -490,7 +599,7 @@ test("prevalidates a candidate receipt against the current durable ledger", () =
   ];
   const heartbeat = plan({
     command: parseLifecycleCommand(
-      "/ai-heartbeat\nsummary: implementation continues",
+      `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: implementation continues`,
     ),
     issue: issue({
       labels: ["type:docs", "status:in-progress"],
@@ -549,7 +658,7 @@ test("rejects malformed, unsupported, or inconsistent receipts", () => {
 
   const heartbeat = plan({
     command: parseLifecycleCommand(
-      "/ai-heartbeat\nsummary: implementation continues",
+      `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: implementation continues`,
     ),
     issue: issue({
       labels: ["type:docs", "status:in-progress"],
@@ -625,7 +734,7 @@ test("parses system transitions and retains the active claim generation", () => 
   );
   const heartbeat = plan({
     command: parseLifecycleCommand(
-      "/ai-heartbeat\nsummary: resumed after a closed pull request",
+      `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: resumed after a closed pull request`,
     ),
     issue: issue({
       labels: ["type:docs", "status:in-progress"],
@@ -798,7 +907,7 @@ test("renews only the current owner's active claim", () => {
   });
   const heartbeat = plan({
     command: parseLifecycleCommand(
-      "/ai-heartbeat\nsummary: policy tests pass; controller remains",
+      `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: policy tests pass; controller remains`,
     ),
     issue: activeIssue,
     receipts: [claim],
@@ -812,7 +921,7 @@ test("renews only the current owner's active claim", () => {
     () =>
       plan({
         command: parseLifecycleCommand(
-          "/ai-heartbeat\nsummary: unauthorized renewal",
+          `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: unauthorized renewal`,
         ),
         actor: "bob",
         issue: activeIssue,
@@ -825,7 +934,7 @@ test("renews only the current owner's active claim", () => {
     () =>
       plan({
         command: parseLifecycleCommand(
-          "/ai-heartbeat\nsummary: attempted after lease expiry",
+          `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: attempted after lease expiry`,
         ),
         issue: activeIssue,
         receipts: [claim],
@@ -850,7 +959,7 @@ test("rejects heartbeats after a claim receives its durable review lock", () => 
     () =>
       plan({
         command: parseLifecycleCommand(
-          "/ai-heartbeat\nsummary: final review is still in progress",
+          `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: final review is still in progress`,
         ),
         issue: issue({
           labels: ["type:docs", "status:review"],
@@ -872,7 +981,7 @@ test("plans owner block and resume with the same claim generation", () => {
   });
   const blocked = plan({
     command: parseLifecycleCommand(
-      "/ai-block\nreason: staging unavailable\nresume-when: staging recovers",
+      `/ai-block\nclaim-id: ${UUID}\nreason: staging unavailable\nresume-when: staging recovers`,
     ),
     issue: activeIssue,
     receipts: [claim],
@@ -880,7 +989,7 @@ test("plans owner block and resume with the same claim generation", () => {
   });
   assert.equal(blocked.to, "blocked");
   const resumed = plan({
-    command: parseLifecycleCommand("/ai-resume"),
+    command: parseLifecycleCommand(`/ai-resume\nclaim-id: ${UUID}`),
     issue: issue({
       labels: ["type:docs", "status:blocked"],
       assignees: ["alice"],
@@ -905,7 +1014,7 @@ test("plans owner block and resume with the same claim generation", () => {
     () =>
       plan({
         command: parseLifecycleCommand(
-          "/ai-block\nreason: invalid repeat\nresume-when: never",
+          `/ai-block\nclaim-id: ${UUID}\nreason: invalid repeat\nresume-when: never`,
         ),
         issue: issue({
           labels: ["type:docs", "status:blocked"],
@@ -926,7 +1035,7 @@ test("releases to ready or waiting and refuses an open closing PR", () => {
   });
   const released = plan({
     command: parseLifecycleCommand(
-      "/ai-release\nreason: implementation is abandoned",
+      `/ai-release\nclaim-id: ${UUID}\nreason: implementation is abandoned`,
     ),
     issue: activeIssue,
     receipts: [claim],
@@ -939,7 +1048,7 @@ test("releases to ready or waiting and refuses an open closing PR", () => {
     () =>
       plan({
         command: parseLifecycleCommand(
-          "/ai-release\nreason: implementation is abandoned",
+          `/ai-release\nclaim-id: ${UUID}\nreason: implementation is abandoned`,
         ),
         issue: activeIssue,
         receipts: [claim],
@@ -951,7 +1060,9 @@ test("releases to ready or waiting and refuses an open closing PR", () => {
 
   const dependencyBody = validBody.replace("Blocked by none", "Blocked by #12");
   const waiting = plan({
-    command: parseLifecycleCommand("/ai-release\nreason: dependency reopened"),
+    command: parseLifecycleCommand(
+      `/ai-release\nclaim-id: ${UUID}\nreason: dependency reopened`,
+    ),
     issue: issue({
       body: dependencyBody,
       labels: ["type:docs", "status:in-progress"],
@@ -971,7 +1082,9 @@ test("allows a maintainer to release but not heartbeat another owner's claim", (
     assignees: ["alice"],
   });
   const released = plan({
-    command: parseLifecycleCommand("/ai-release\nreason: maintainer recovery"),
+    command: parseLifecycleCommand(
+      `/ai-release\nclaim-id: ${UUID}\nreason: maintainer recovery`,
+    ),
     actor: "maintainer",
     actorPermission: "maintain",
     issue: activeIssue,
@@ -983,7 +1096,7 @@ test("allows a maintainer to release but not heartbeat another owner's claim", (
     () =>
       plan({
         command: parseLifecycleCommand(
-          "/ai-heartbeat\nsummary: maintainer cannot impersonate owner",
+          `/ai-heartbeat\nclaim-id: ${UUID}\nsummary: maintainer cannot impersonate owner`,
         ),
         actor: "maintainer",
         actorPermission: "maintain",

@@ -72,10 +72,10 @@ const RECEIPT_KEYS = [
 
 const COMMAND_FIELDS = Object.freeze({
   claim: ["agent"],
-  heartbeat: ["summary"],
-  block: ["reason", "resume-when"],
-  resume: [],
-  release: ["reason"],
+  heartbeat: ["claim-id", "summary"],
+  block: ["claim-id", "reason", "resume-when"],
+  resume: ["claim-id"],
+  release: ["claim-id", "reason"],
 });
 
 const ERROR_CODES = new Set([
@@ -85,6 +85,7 @@ const ERROR_CODES = new Set([
   "DEPENDENCY_OPEN",
   "CLOSING_PR_EXISTS",
   "NOT_OWNER",
+  "CLAIM_MISMATCH",
   "INVALID_COMMAND",
   "INVALID_TRANSITION",
   "LEASE_EXPIRED",
@@ -407,6 +408,14 @@ export const parseLifecycleCommand = (body) => {
   if (name === "claim" && !/^[a-z0-9][a-z0-9._-]{0,31}$/u.test(fields.agent)) {
     fail("INVALID_COMMAND", "The agent class must be a public slug.");
   }
+  if (
+    name !== "claim" &&
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+      fields["claim-id"],
+    )
+  ) {
+    fail("INVALID_COMMAND", "The claim ID must be a canonical UUID.");
+  }
   return { name, fields };
 };
 
@@ -631,6 +640,12 @@ export const planLifecycleCommand = ({
   if (!currentClaim || currentClaim.owner !== assignee) {
     fail("STATE_MISMATCH", "No active receipt matches the assigned owner.");
   }
+  if (command.fields["claim-id"] !== currentClaim.claimId) {
+    fail(
+      "CLAIM_MISMATCH",
+      "Stop and verify the current receipt, assignee, and assigned executor before any retry or explicit handoff.",
+    );
+  }
   const isOwner = actor === currentClaim.owner;
 
   if (action === "heartbeat") {
@@ -755,6 +770,12 @@ export const receiptBody = (receipt) => {
   ).join("\n");
   return [
     `AI lifecycle ${receipt.action}: ${receipt.from} → ${receipt.to}.`,
+    ...(receipt.result === "failure" && receipt.code === "CLAIM_MISMATCH"
+      ? [
+          "",
+          "Stop and verify the current receipt, assignee, and assigned executor. Only that generation's executor may retry; otherwise use explicit release and a fresh claim.",
+        ]
+      : []),
     "",
     RECEIPT_START,
     marker,

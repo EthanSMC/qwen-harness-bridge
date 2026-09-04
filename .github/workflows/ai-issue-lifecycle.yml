@@ -56,3 +56,34 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: node scripts/github/ai-issue-controller.mjs
+
+  stalled-work:
+    name: stalled-work visibility
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Check out trusted default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Report stalled collaboration
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STALE_WORK_REPORT_PATH: stale-work-report.md
+        run: node scripts/github/stale-work.mjs
+      - name: Preserve stalled-work report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stalled-work-report
+          path: stale-work-report.md
+          if-no-files-found: error
+          retention-days: 14

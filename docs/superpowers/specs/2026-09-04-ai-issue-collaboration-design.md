@@ -185,6 +185,7 @@ An active implementation claim has a 24-hour renewable lease. Meaningful public 
 
 ```text
 /ai-heartbeat
+claim-id: 550e8400-e29b-41d4-a716-446655440000
 summary: protocol schema implemented; integration tests remain
 ```
 
@@ -216,6 +217,7 @@ The owner records a genuine blocker with:
 
 ```text
 /ai-block
+claim-id: 550e8400-e29b-41d4-a716-446655440000
 reason: staging credential is unavailable
 resume-when: repository owner provisions the documented test credential
 ```
@@ -224,7 +226,14 @@ Both fields are required and bounded to 240 UTF-8 bytes. The workflow changes th
 
 ### 9.2 Resume
 
-The owner uses `/ai-resume` after verifying the recovery condition. The workflow returns the Issue to `status:in-progress`, renews the lease, and records a receipt.
+The owner uses `/ai-resume` after verifying the recovery condition:
+
+```text
+/ai-resume
+claim-id: 550e8400-e29b-41d4-a716-446655440000
+```
+
+The workflow returns the Issue to `status:in-progress`, renews the lease, and records a receipt.
 
 ### 9.3 Release
 
@@ -232,6 +241,7 @@ The owner or a maintainer uses:
 
 ```text
 /ai-release
+claim-id: 550e8400-e29b-41d4-a716-446655440000
 reason: implementation is being abandoned; no pull request is open
 ```
 
@@ -338,6 +348,7 @@ Every rejected command receives one bounded public explanation and one safe next
 - `DEPENDENCY_OPEN`
 - `CLOSING_PR_EXISTS`
 - `NOT_OWNER`
+- `CLAIM_MISMATCH`
 - `INVALID_COMMAND`
 - `INVALID_TRANSITION`
 - `LEASE_EXPIRED`
@@ -415,3 +426,27 @@ Rollout is fail-closed and staged:
 7. record activation evidence in `docs/github/repository-status.md`.
 
 Existing closed Issues do not require synthetic claim receipts. Repository-wide reconciliation reports and skips only an exact entry in the activation-bound historical-exemption registry whose Issue number, `closed_at`, and expected legacy lifecycle status still match, whose current shape is closed as completed with exactly one managed type, and whose complete comment history contains no workflow lifecycle receipt. The registry records `status:done` for seven completed implementation Issues synchronized before activation and null status for five auxiliary records. Any missing entry, changed close timestamp, close reason or status, prior receipt, or malformed type/state is processed normally and fails closed. Outside this exact compatibility registry, synchronization accepts `status:done` only after finding a final terminal receipt, exactly one claim-bound merged closing pull request, valid close-after-merge chronology, and a merge commit reachable from `main`. A prior closed-unmerged PR remains valid history only when the same claim generation contains its exact `pr-open` and `pr-close` receipts followed by a release or expiry. Existing open pull requests receive a documented one-time migration receipt or must re-enter the lifecycle from `status:ready`; migrations are honored only while activation is null and are never accepted afterward, even in report mode.
+
+## 19. Collaboration hardening amendment
+
+Every owner-initiated post-claim command (`/ai-heartbeat`, `/ai-block`, `/ai-resume`, and `/ai-release`) carries a required `claim-id` field containing the canonical lowercase UUID from the active claim receipt. Before planning any state, assignee, lease, or receipt mutation, the controller compares that expected generation with the current claim generation. This applies to maintainer release as well as owner commands. A missing or malformed identifier is `INVALID_COMMAND`; a valid identifier for another generation is `CLAIM_MISMATCH`. On mismatch, the executor stops and verifies the current receipt, assignee, and assigned executor. Only the executor assigned to that generation may retry; otherwise recovery uses explicit release and a fresh claim. The GitHub commenter remains the accountable owner or authorized maintainer; the identifier is a generation fence, not an alternate identity or credential.
+
+Durable v2 lifecycle receipts and `/ai-claim` syntax remain unchanged. Event replay checks an existing durable receipt before applying the stricter command schema, so a historical command that already has a receipt remains idempotently replayable. A historical command without a receipt must satisfy the current schema and therefore cannot mutate a later claim generation.
+
+At task start, the executor records the deliverable's explicit in-scope work, out-of-scope work, and completion condition, and updates that boundary only when scope changes. Subsequent public checkpoints state concrete progress, remaining work or the exact blocker, and bounded verification. Unrelated side tasks do not block a finished deliverable. After three repetitions of the same failure, the executor changes method or records the exact blocker. Review fixes address blocking correctness findings; optional enhancements become follow-up work. Verification checkpoints record the actual observed outcome and do not repeat expensive full suites when no relevant change or unresolved concern justifies another run.
+
+Protected `main` requires both the final `governance` check and the product `runtime` check with strict up-to-date branch enforcement. Management synchronization preserves the existing review-mode selection, force-push and deletion restrictions, conversation resolution, administrator enforcement, and every other protection field while registering both required checks.
+
+### 19.1 Structured independent review evidence
+
+Every newly evaluated solo-mode PR must link exactly one immutable report comment on that same PR in `Independent review report URL (required for solo mode):`. The authenticated validator verifies the comment's repository/PR association, numeric comment ID, original accountable PR-author login, equal creation/update timestamps, canonical content and SHA256 digest. The version-1 report binds repository, primary Issue number, exact current base/head SHA, distinct public implementer/reviewer IDs, reviewer identity, PASS/FAIL verdict, bounded findings (severity, resolution status, summary), fix-round count and observed verification summaries. PASS cannot contain unresolved blockers. Identities must match the PR body. Reports use only public slugs and bounded safe summaries; private session IDs, links, secrets, logs and source are prohibited. Unknown fields, oversized input and noncanonical or edited comments fail closed.
+
+The local formatter validates supplied JSON and writes canonical comment text; it performs no network requests and invents no reviewer facts. The controller captures actual independent reviewer output and attests it by posting the comment. This is controller-attested traceability, not cryptographic proof of independent AI execution: the digest detects content drift, not a dishonest controller. Every changed base/head requires fresh review and a new comment. Formal mode continues to require a real eligible collaborator's current-head approval and may leave the report URL empty. Historical merged records remain valid and are not retroactively rewritten. Validation is never disabled to bootstrap this requirement.
+
+### 19.2 Read-only stalled-work visibility
+
+The scheduled/manual lifecycle workflow emits an Actions summary and artifact, including zero actionable results, for open governed Issues in review or blocked state. Review is stalled at 48 hours and blocked work at 24 hours since the latest public human checkpoint: Issue/linked open PR creation, new Issue/PR comments, or submitted PR reviews. Bot housekeeping and generic `updated_at` values never renew this clock. This measures stalled collaboration, not proof that no local work occurred. Time comes from the existing authenticated GitHub client's server-time API; invalid/future timestamps fail visibly.
+
+The report uses bounded repository reads (three pages per collection, at most 100 candidate Issues and 100 linked open PRs) and contains at most 50 numeric Issue/PR references with state, elapsed hours, and a fixed safe recovery action. It reports total actionable and truncated counts; read caps fail visibly instead of presenting incomplete counts as complete. No source Issue body, comment, log, or private path is emitted. A separate read-only job isolates errors from lifecycle mutations. The report never comments, releases claims, closes PRs, changes labels, or schedules reminders.
+
+Recovery starts by inspecting the current claim, branch/PR and observed tests. Ask the worker for a checkpoint or continuation. If abandoning or handing off work, safely close the open PR before current-claim release and fresh reclaim. Never silently take over an open PR.
