@@ -73,6 +73,25 @@ const stripFencedCode = (body) => {
     .join("\n");
 };
 
+const safePullRequestBody = (body) => {
+  if (typeof body !== "string" || body.trim().length === 0) {
+    fail("Pull request body is required");
+  }
+  const publicBody = stripFencedCode(body);
+  if (Buffer.byteLength(publicBody, "utf8") > 60_000) {
+    fail("Pull request body exceeds the public evidence limit");
+  }
+  try {
+    for (const line of publicBody.split(/\r?\n/u)) {
+      if (line.trim()) safePublicText(line, 10_000);
+    }
+  } catch (error) {
+    if (error instanceof LifecycleError) fail(error.message);
+    throw error;
+  }
+  return publicBody;
+};
+
 const fieldValue = (body, label) => {
   const escaped = label.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
   const matches = [
@@ -121,10 +140,7 @@ const parseReceiptUrl = (value) => {
 };
 
 export const extractLifecycleFields = (body) => {
-  if (typeof body !== "string" || body.trim().length === 0) {
-    fail("Pull request body is required");
-  }
-  const publicBody = stripFencedCode(body);
+  const publicBody = safePullRequestBody(body);
   const closing = closingIssueNumber(publicBody);
   const primaryValue = fieldValue(publicBody, "Primary Issue");
   const primaryMatch = /^#([1-9]\d*)$/u.exec(primaryValue);
@@ -359,11 +375,12 @@ export const validatePullRequestLifecycleState = (input) => {
     input.pullRequest?.number,
     "Pull request number",
   );
-  const fields = extractLifecycleFields(input.pullRequest.body);
+  const publicBody = safePullRequestBody(input.pullRequest.body);
+  const issueNumber = closingIssueNumber(publicBody);
   const migration = validateMigrationRegistry(input.migrations, {
     mode,
     pullRequestNumber,
-    issueNumber: fields.issueNumber,
+    issueNumber,
     now: input.now,
   });
   if (migration.migrated) {
@@ -371,10 +388,12 @@ export const validatePullRequestLifecycleState = (input) => {
       valid: true,
       mode,
       migrated: true,
-      issueNumber: fields.issueNumber,
+      issueNumber,
       pullRequestNumber,
     };
   }
+
+  const fields = extractLifecycleFields(input.pullRequest.body);
 
   try {
     const strict = strictLifecycleEvidence({ ...input, fields });

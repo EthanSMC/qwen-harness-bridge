@@ -312,7 +312,7 @@ if (!approvalCount || Number(approvalCount[1]) < 1) {
 const repositoryStatus = "docs/github/repository-status.md";
 for (const [pattern, message] of [
   [
-    /Verified on 2026-09-03/,
+    /Verified on 2026-09-04/,
     "the current collaborator evidence verification date",
   ],
   [/EthanSMC\/qwen-harness-bridge/, "the repository identity"],

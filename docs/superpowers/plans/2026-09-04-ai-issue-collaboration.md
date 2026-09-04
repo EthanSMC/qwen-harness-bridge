@@ -681,7 +681,7 @@ git commit -m "ci(governance): verify PR claim lifecycle"
 - Consumes: all plan task sections, existing marker-linked Issues, current Issue states, and six managed labels.
 - Produces: explicit `Blocked by` lines, deterministic task dependency edges, exactly one lifecycle label per governed Issue, and dry-run migration output.
 
-- [ ] **Step 1: Write dependency-graph tests**
+- [x] **Step 1: Write dependency-graph tests**
 
 Test the exact policy:
 
@@ -698,28 +698,28 @@ test("orders tasks within each plan and gates the next stable plan", () => {
 
 Within a plan, Task N depends on Task N-1. The first task of M1, M2, and M3 depends on the previous stable milestone's final task. The first RTC implementation task after the RTC contract depends on the contract task, while stable M5 qualification depends on the final M3 task and never on experimental RTC.
 
-- [ ] **Step 2: Run sync tests and observe failure**
+- [x] **Step 2: Run sync tests and observe failure**
 
 Run: `node --test scripts/github/sync-management.test.mjs`  
 Expected: FAIL because the graph and lifecycle payload do not exist.
 
-- [ ] **Step 3: Build all Issue identities before rendering bodies**
+- [x] **Step 3: Build all Issue identities before rendering bodies**
 
 Refactor synchronization into two passes: resolve/create every marker-linked Issue and map `(plan file, task number)` to Issue number; then render bodies with exact dependency numbers. Preserve existing body sections and append exactly one dependency line.
 
-- [ ] **Step 4: Derive lifecycle classification without overwriting active work**
+- [x] **Step 4: Derive lifecycle classification without overwriting active work**
 
 For open Issues with no active claim or PR, set `status:ready` only when all dependencies are closed as completed and required fields exist; otherwise set `status:waiting`. Preserve valid `in-progress`, `review`, and `blocked` states. Set closed-completed Issues to `status:done` and remove assignees only after verifying the closing PR or recorded historical state.
 
-- [ ] **Step 5: Add dry-run and postcondition verification**
+- [x] **Step 5: Add dry-run and postcondition verification**
 
 `node scripts/github/sync-management.mjs --dry-run` prints a bounded JSON ledger of intended Issue/label changes and performs no writes. The normal command re-reads all affected Issues and fails if any Issue has multiple status labels, an invalid assignee count, or a rendered dependency mismatch.
 
-- [ ] **Step 6: Extend repository status documentation**
+- [x] **Step 6: Extend repository status documentation**
 
 Record the lifecycle mode, activation status, labels, workflow/check names, migration entries, last reconciliation timestamp, and live acceptance links. State clearly that this section is evidence, not authority over live GitHub state.
 
-- [ ] **Step 7: Run sync and planning tests, then commit**
+- [x] **Step 7: Run sync and planning tests, then commit**
 
 Run:
 

@@ -156,7 +156,7 @@ test("rejects multiple closing Issues and private agent references", () => {
   assert.throws(
     () =>
       extractLifecycleFields(pullBody({ agent: "codex://threads/private" })),
-    /agent class/i,
+    /agent class|private codex/i,
   );
 });
 
@@ -363,6 +363,20 @@ test("allows only an exact unexpired migration before activation", () => {
   );
   assert.equal(migrated.valid, true);
   assert.equal(migrated.migrated, true);
+
+  const migratedLegacyBody = validatePullRequestLifecycleState(
+    validInput({
+      comments: [],
+      mode: "report",
+      migrations,
+      pullRequest: {
+        ...validInput().pullRequest,
+        body: "## Tracking\n\nCloses #46",
+      },
+    }),
+  );
+  assert.equal(migratedLegacyBody.valid, true);
+  assert.equal(migratedLegacyBody.migrated, true);
 
   const wrongPair = structuredClone(migrations);
   wrongPair.entries[0].issue = 47;

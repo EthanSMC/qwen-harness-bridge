@@ -1,17 +1,28 @@
 # GitHub Repository Status
 
-Verified on 2026-09-03 against [EthanSMC/qwen-harness-bridge](https://github.com/EthanSMC/qwen-harness-bridge).
+Verified on 2026-09-04 against [EthanSMC/qwen-harness-bridge](https://github.com/EthanSMC/qwen-harness-bridge). This page is an evidence snapshot, not authority over current GitHub state; every controller and merge gate re-reads GitHub.
+
+## AI Issue lifecycle rollout
+
+- Activation: pre-activation bootstrap. The lifecycle workflow is not yet on `main`, the `AI_LIFECYCLE_MODE` repository variable is absent, and strict enforcement is not claimed.
+- Candidate mode: `report`, using the workflow default until an explicit repository variable is set after activation evidence lands.
+- Candidate workflows/checks: `AI Issue Lifecycle / lifecycle` handles commands and reconciliation; `Governance / governance` includes the read-only PR lifecycle validator.
+- Managed lifecycle labels: six (`status:waiting`, `status:ready`, `status:in-progress`, `status:review`, `status:blocked`, and `status:done`), bringing the candidate managed-label total from 19 to 25.
+- Activation commit: `null` until a full 40-character commit reachable from `main` contains the complete implementation.
+- Open migration entries: PR [#45](https://github.com/EthanSMC/qwen-harness-bridge/pull/45) closing Issue [#7](https://github.com/EthanSMC/qwen-harness-bridge/issues/7), approved by `EthanSMC`, expiring 2026-09-11T00:00:00Z. This bounded record accepts the pre-activation PR without inventing a historical claim receipt; it must be removed before enforce mode.
+- Last reconciliation evidence: a no-write dry-run at 2026-09-04T05:46:37Z resolved all 34 marker-linked plan Issues, all six milestones, the complete paginated collaborator set, all open PRs, and the branch-protection payload. It proposed #1 and #28 as ready, #7 as migrated review owned by its PR author, #2–#6 as historical done, and the remaining open plan Issues as waiting.
+- Live acceptance links: none yet. The disposable claim/heartbeat/PR/merge/close/reopen acceptance cycle is required after the bootstrap merge and before strict activation.
 
 ## Active management state
 
 - Visibility: public.
 - Default branch: `main`.
 - Governance workflow: active.
-- Managed labels: 19, alongside GitHub's default labels.
+- Live managed labels: 19, alongside GitHub's default labels; the six lifecycle labels remain pending bootstrap synchronization.
 - Milestones: 6 (`M0` through `M5`).
 - Plan implementation issues: 34.
 - Distribution: M0 7, M1 7, M2 6, M3 6, M4 7, M5 1.
-- Source commits: approved Spec, five-plan roadmap, and repository governance are pushed.
+- Source commits: approved Spec, five-plan roadmap, and existing repository governance are pushed; the lifecycle bootstrap remains on `docs/46-ai-issue-lifecycle` until reviewed and merged.
 
 ## Review gate status
 

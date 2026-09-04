@@ -1,5 +1,13 @@
 {
   "schema_version": 1,
   "activation_commit": null,
-  "entries": []
+  "entries": [
+    {
+      "pull_request": 45,
+      "issue": 7,
+      "reason": "Pull request predates AI lifecycle activation",
+      "approved_by": "EthanSMC",
+      "expires_at": "2026-09-11T00:00:00Z"
+    }
+  ]
 }
