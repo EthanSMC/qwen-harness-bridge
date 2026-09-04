@@ -141,6 +141,25 @@ describe("Harness session event normalizer", () => {
     });
   });
 
+  it("fails closed for an unknown structurally valid terminal reason", () => {
+    const terminal = normalize(
+      event("turn/end", {
+        turn: 1,
+        reason: {
+          kind: "plugin-terminal-reason",
+          private: "do not export",
+        },
+      }),
+    );
+
+    expect(terminal).toMatchObject({
+      type: "job.failed",
+      stage: "failed",
+      summary: "HARNESS_TURN_FAILED",
+    });
+    expect(JSON.stringify(terminal)).not.toContain("do not export");
+  });
+
   it("bounds summaries and ignores unknown or seed-only events", () => {
     const unknown = normalize(
       event("future/event" as SessionEvent["type"], {

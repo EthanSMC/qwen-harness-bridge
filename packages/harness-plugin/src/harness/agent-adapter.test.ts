@@ -1,9 +1,14 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
 import {
-  type Session,
+  SESSION_FORMAT_VERSION,
+  Session,
   type SessionEvent,
   SessionId,
+  SessionLogOffset,
 } from "@deepseek-ai/dsh-session";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -12,6 +17,7 @@ import type {
   NormalizedHarnessEvent as PublicNormalizedHarnessEvent,
 } from "../index.js";
 import * as publicApi from "../index.js";
+import { SqlitePluginStore } from "../store/plugin-store.js";
 import {
   AgentAdapter,
   type HarnessContext,
@@ -22,6 +28,14 @@ import { registerSessionListener } from "./register-session-listener.js";
 import type { NormalizedHarnessEvent } from "./types.js";
 
 type SessionListener = (session: Session, event: SessionEvent) => void;
+
+const temporaryDirectories = new Set<string>();
+
+const makeDatabasePath = (): string => {
+  const directory = mkdtempSync(join(tmpdir(), "qhb-harness-adapter-"));
+  temporaryDirectories.add(directory);
+  return join(directory, "plugin.sqlite");
+};
 
 const deferred = <T>() => {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -44,6 +58,32 @@ const sessionEvent = (
     time: 1_725_000_000_000,
     data,
   }) as SessionEvent;
+
+const restoredSession = (
+  sessionId: string,
+  events: readonly SessionEvent[],
+): Session => {
+  const id = SessionId(sessionId);
+  return Session.fromRestore(
+    id,
+    [...events],
+    {
+      version: SESSION_FORMAT_VERSION,
+      id,
+      createdAt: 1_725_000_000_000,
+      isSeeded: false,
+    },
+    SessionLogOffset(0),
+  );
+};
+
+const withoutStartupRecovery = (
+  store: SqlitePluginStore,
+): HarnessMappingStore => ({
+  mapJob: (input) => store.mapJob(input),
+  findJob: (jobId) => store.findJob(jobId),
+  listNonterminalJobs: () => [],
+});
 
 class FakeStore implements HarnessMappingStore {
   readonly mappings = new Map<
@@ -105,6 +145,7 @@ class FakeHarness {
     sessionId: string,
     idle = Promise.resolve(),
     history: readonly SessionEvent[] = [],
+    restored?: Session,
   ) {
     const followup = vi.fn((_message: unknown) => this.calls.push("followup"));
     const cancel = vi.fn(() => this.calls.push("cancel"));
@@ -112,7 +153,7 @@ class FakeHarness {
       id: SessionId(sessionId),
       status: "running",
       ctx: {} as Context,
-      session: { ownEvents: vi.fn(() => history) },
+      session: restored ?? { ownEvents: vi.fn(() => history) },
       followup,
       whenIdle: vi.fn(() => idle),
       cancel,
@@ -147,6 +188,10 @@ const createAdapter = (
 
 afterEach(() => {
   vi.restoreAllMocks();
+  for (const directory of temporaryDirectories) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+  temporaryDirectories.clear();
 });
 
 describe("Harness Agent adapter", () => {
@@ -207,6 +252,58 @@ describe("Harness Agent adapter", () => {
     await adapter.dispose();
   });
 
+  it("marks the persisted attempt failed before rethrowing a followup failure", async () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    const fake = new FakeHarness();
+    const events: NormalizedHarnessEvent[] = [];
+    const { handle, followup } = fake.makeAgent("followup-failure-session");
+    const privateFailure = new Error("private followup failure body");
+    followup.mockImplementation(() => {
+      throw privateFailure;
+    });
+    fake.create.mockResolvedValue(handle);
+    const adapter = new AgentAdapter({
+      ctx: fake.ctx,
+      store,
+      onEvent: (event) => {
+        events.push(event);
+      },
+    });
+    let reopened: SqlitePluginStore | undefined;
+
+    try {
+      await expect(
+        adapter.create({
+          jobId: "followup-failure-job",
+          repositoryPath: "/repo",
+          request: "go",
+        }),
+      ).rejects.toBe(privateFailure);
+
+      expect(handle.dispose).toHaveBeenCalledOnce();
+      expect(events).toEqual([]);
+      expect(JSON.stringify(events)).not.toContain(privateFailure.message);
+      expect(store.findJob("followup-failure-job")).toEqual({
+        jobId: "followup-failure-job",
+        attempt: 1,
+        sessionId: "followup-failure-session",
+        status: "failed",
+      });
+      expect(store.listNonterminalJobs()).toEqual([]);
+
+      await adapter.dispose();
+      store.close();
+      reopened = new SqlitePluginStore(databasePath);
+      expect(reopened.findJob("followup-failure-job")?.status).toBe("failed");
+      expect(reopened.listNonterminalJobs()).toEqual([]);
+    } finally {
+      await adapter.dispose();
+      store.close();
+      reopened?.close();
+    }
+  });
+
   it("resumes a persisted session with the official resume identity and setup", async () => {
     const fake = new FakeHarness();
     const store = new FakeStore();
@@ -230,6 +327,152 @@ describe("Harness Agent adapter", () => {
     expect(fake.resume).toHaveBeenCalledOnce();
     expect(fake.create).not.toHaveBeenCalled();
     await adapter.dispose();
+  });
+
+  it.each([
+    ["startup", "queued"],
+    ["startup", "dispatched"],
+    ["startup", "running"],
+    ["startup", "waiting_approval"],
+    ["startup", "cancelling"],
+    ["explicit", "queued"],
+    ["explicit", "dispatched"],
+    ["explicit", "running"],
+    ["explicit", "waiting_approval"],
+    ["explicit", "cancelling"],
+  ] as const)(
+    "preserves the canonical %s resume status %s",
+    async (mode, status) => {
+      const fake = new FakeHarness();
+      const store = new FakeStore();
+      const mapping = {
+        jobId: `${mode}-${status}-job`,
+        attempt: 2,
+        sessionId: `${mode}-${status}-session`,
+        status,
+      };
+      if (mode === "startup") {
+        store.recovered.push(mapping);
+      } else {
+        store.mappings.set(mapping.jobId, mapping);
+      }
+      const { handle } = fake.makeAgent(mapping.sessionId);
+      fake.resume.mockResolvedValue(handle);
+      const adapter = createAdapter(fake, store);
+
+      await adapter.ready;
+      if (mode === "explicit") {
+        await adapter.resume({
+          jobId: mapping.jobId,
+          sessionId: mapping.sessionId,
+        });
+      }
+
+      expect(store.mappings.get(mapping.jobId)?.status).toBe(status);
+      await adapter.dispose();
+    },
+  );
+
+  it("keeps a terminal latest attempt immutable on explicit resume", async () => {
+    const databasePath = makeDatabasePath();
+    const canonicalStore = new SqlitePluginStore(databasePath);
+    canonicalStore.mapJob({
+      jobId: "terminal-resume-job",
+      attempt: 1,
+      sessionId: "terminal-resume-session-1",
+      status: "failed",
+    });
+    canonicalStore.mapJob({
+      jobId: "terminal-resume-job",
+      attempt: 2,
+      sessionId: "terminal-resume-session-2",
+      status: "succeeded",
+    });
+    const fake = new FakeHarness();
+    const events: NormalizedHarnessEvent[] = [];
+    const adapter = new AgentAdapter({
+      ctx: fake.ctx,
+      store: withoutStartupRecovery(canonicalStore),
+      onEvent: (event) => {
+        events.push(event);
+      },
+    });
+
+    try {
+      await adapter.resume({
+        jobId: "terminal-resume-job",
+        sessionId: "terminal-resume-session-2",
+      });
+
+      expect(fake.resume).not.toHaveBeenCalled();
+      expect(events).toEqual([]);
+      expect(canonicalStore.findJob("terminal-resume-job")?.status).toBe(
+        "succeeded",
+      );
+    } finally {
+      await adapter.dispose();
+      canonicalStore.close();
+    }
+  });
+
+  it("does not poison the current attempt when a wrong session is resumed", async () => {
+    const databasePath = makeDatabasePath();
+    const canonicalStore = new SqlitePluginStore(databasePath);
+    canonicalStore.mapJob({
+      jobId: "mismatched-resume-job",
+      attempt: 1,
+      sessionId: "mismatched-resume-session-1",
+      status: "failed",
+    });
+    canonicalStore.mapJob({
+      jobId: "mismatched-resume-job",
+      attempt: 2,
+      sessionId: "mismatched-resume-session-2",
+      status: "waiting_approval",
+    });
+    const fake = new FakeHarness();
+    const { handle } = fake.makeAgent("mismatched-resume-session-2");
+    fake.resume.mockResolvedValue(handle);
+    const events: NormalizedHarnessEvent[] = [];
+    const adapter = new AgentAdapter({
+      ctx: fake.ctx,
+      store: withoutStartupRecovery(canonicalStore),
+      onEvent: (event) => {
+        events.push(event);
+      },
+    });
+
+    try {
+      await adapter.resume({
+        jobId: "mismatched-resume-job",
+        sessionId: "wrong-requested-session",
+      });
+      await adapter.resume({
+        jobId: "mismatched-resume-job",
+        sessionId: "wrong-requested-session",
+      });
+      await adapter.resume({
+        jobId: "mismatched-resume-job",
+        sessionId: "mismatched-resume-session-2",
+      });
+
+      expect(events).toEqual([
+        expect.objectContaining({
+          jobId: "mismatched-resume-job",
+          summary: "HARNESS_SESSION_LOST",
+        }),
+      ]);
+      expect(fake.resume).toHaveBeenCalledOnce();
+      expect(canonicalStore.findJob("mismatched-resume-job")).toEqual({
+        jobId: "mismatched-resume-job",
+        attempt: 2,
+        sessionId: "mismatched-resume-session-2",
+        status: "waiting_approval",
+      });
+    } finally {
+      await adapter.dispose();
+      canonicalStore.close();
+    }
   });
 
   it("isolates session events to sessions owned by this adapter", async () => {
@@ -306,6 +549,41 @@ describe("Harness Agent adapter", () => {
       type: "job.succeeded",
       stage: "completed",
     });
+    await adapter.dispose();
+  });
+
+  it("fails closed after idle for an unknown committed turn-end reason", async () => {
+    const fake = new FakeHarness();
+    const idle = deferred<void>();
+    const events: NormalizedHarnessEvent[] = [];
+    const { handle } = fake.makeAgent("unknown-terminal-session", idle.promise);
+    fake.create.mockResolvedValue(handle);
+    const adapter = createAdapter(fake, new FakeStore(), events);
+    await adapter.create({
+      jobId: "unknown-terminal-job",
+      repositoryPath: "/repo",
+      request: "go",
+    });
+
+    fake.emit(
+      "unknown-terminal-session",
+      sessionEvent("turn/end", {
+        turn: 1,
+        reason: { kind: "plugin-terminal-reason", private: "do not export" },
+      }),
+    );
+    idle.resolve();
+
+    await vi.waitFor(() => expect(events).toHaveLength(1));
+    expect(events).toEqual([
+      expect.objectContaining({
+        jobId: "unknown-terminal-job",
+        type: "job.failed",
+        stage: "failed",
+        summary: "HARNESS_TURN_FAILED",
+      }),
+    ]);
+    expect(JSON.stringify(events)).not.toContain("do not export");
     await adapter.dispose();
   });
 
@@ -441,34 +719,93 @@ describe("Harness Agent adapter", () => {
     await adapter.dispose();
   });
 
-  it("settles a committed terminal event recovered from session history after idle", async () => {
+  it.each([
+    [
+      "completed",
+      { kind: "completed" },
+      "job.succeeded",
+      "Harness task completed",
+    ],
+    [
+      "error",
+      {
+        kind: "error",
+        error: { code: "E_RESTORED", message: "private restored error" },
+      },
+      "job.failed",
+      "E_RESTORED",
+    ],
+  ] as const)(
+    "recovers a restored %s turn before the official end-seed marker",
+    async (_reasonName, reason, expectedType, expectedSummary) => {
+      const fake = new FakeHarness();
+      const store = new FakeStore();
+      const sessionId = `restored-${reason.kind}-session`;
+      store.recovered.push({
+        jobId: `restored-${reason.kind}-job`,
+        attempt: 1,
+        sessionId,
+        status: "running",
+      });
+      const restored = restoredSession(sessionId, [
+        sessionEvent("turn/start", { turn: 1 }, 0),
+        sessionEvent("turn/end", { turn: 1, reason }, 1),
+      ]);
+      expect(restored.ownEvents().at(-1)?.type).toBe("session/end-seed");
+      const { handle } = fake.makeAgent(
+        sessionId,
+        Promise.resolve(),
+        [],
+        restored,
+      );
+      fake.resume.mockResolvedValue(handle);
+      const events: NormalizedHarnessEvent[] = [];
+      const adapter = createAdapter(fake, store, events);
+
+      await adapter.ready;
+      await vi.waitFor(() => expect(events).toHaveLength(1));
+      expect(events).toEqual([
+        expect.objectContaining({
+          jobId: `restored-${reason.kind}-job`,
+          type: expectedType,
+          summary: expectedSummary,
+        }),
+      ]);
+      expect(JSON.stringify(events)).not.toContain("private restored error");
+      await adapter.dispose();
+    },
+  );
+
+  it("does not reuse an older restored terminal after a newer turn starts", async () => {
     const fake = new FakeHarness();
-    const idle = deferred<void>();
     const store = new FakeStore();
     store.recovered.push({
-      jobId: "history-job",
+      jobId: "restored-active-job",
       attempt: 1,
-      sessionId: "history-session",
+      sessionId: "restored-active-session",
       status: "running",
     });
-    const { handle } = fake.makeAgent("history-session", idle.promise, [
-      sessionEvent("turn/end", {
-        turn: 1,
-        reason: { kind: "completed" },
-      }),
+    const restored = restoredSession("restored-active-session", [
+      sessionEvent("turn/start", { turn: 1 }, 0),
+      sessionEvent("turn/end", { turn: 1, reason: { kind: "completed" } }, 1),
+      sessionEvent("turn/start", { turn: 2 }, 2),
     ]);
+    expect(restored.ownEvents().at(-1)?.type).toBe("session/end-seed");
+    const { handle } = fake.makeAgent(
+      "restored-active-session",
+      Promise.resolve(),
+      [],
+      restored,
+    );
     fake.resume.mockResolvedValue(handle);
     const events: NormalizedHarnessEvent[] = [];
     const adapter = createAdapter(fake, store, events);
 
     await adapter.ready;
+    await Promise.resolve();
+
     expect(events).toEqual([]);
-    idle.resolve();
-    await vi.waitFor(() => expect(events).toHaveLength(1));
-    expect(events[0]).toMatchObject({
-      jobId: "history-job",
-      type: "job.succeeded",
-    });
+    expect(store.mappings.get("restored-active-job")?.status).toBe("running");
     await adapter.dispose();
   });
 

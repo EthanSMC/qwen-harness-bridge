@@ -202,6 +202,16 @@ export class AgentAdapter implements HarnessAgentAdapter {
     try {
       owner.handle.agent.followup(message);
     } catch (error) {
+      try {
+        this.#store.mapJob({
+          jobId: owner.jobId,
+          attempt: owner.attempt,
+          sessionId: owner.sessionId,
+          status: "failed",
+        });
+      } catch {
+        // Preserve the original enqueue failure if the best-effort terminal write fails.
+      }
       this.#detach(owner);
       await owner.handle.dispose().catch(() => undefined);
       throw error;
@@ -220,23 +230,22 @@ export class AgentAdapter implements HarnessAgentAdapter {
     }
 
     const existing = this.#latestByJob.get(input.jobId);
-    if (existing !== undefined) return;
+    if (existing !== undefined) {
+      if (existing.sessionId !== input.sessionId) this.#emitSessionLost(input);
+      return;
+    }
 
     const lookup = this.#findMapping(input.jobId);
     const mapping = lookup.mapping;
-    if (
-      lookup.unavailable ||
-      mapping === undefined ||
-      mapping.sessionId !== input.sessionId ||
-      !isActiveStatus(mapping.status)
-    ) {
-      this.#emitSessionLost({
-        jobId: input.jobId,
-        attempt: mapping?.attempt,
-        sessionId: input.sessionId,
-      });
+    if (lookup.unavailable || mapping === undefined) {
+      this.#emitSessionLost(input);
       return;
     }
+    if (mapping.sessionId !== input.sessionId) {
+      this.#emitSessionLost(input);
+      return;
+    }
+    if (!isActiveStatus(mapping.status)) return;
 
     await this.#startResume(mapping);
   }
@@ -403,7 +412,7 @@ export class AgentAdapter implements HarnessAgentAdapter {
         jobId: attached.jobId,
         attempt: attached.attempt,
         sessionId: attached.sessionId,
-        status: "running",
+        status: mapping.status,
       });
       this.#captureTerminalFromHistory(attached);
       this.#watchIdle(attached);
@@ -462,10 +471,15 @@ export class AgentAdapter implements HarnessAgentAdapter {
   #captureTerminalFromHistory(owner: OwnedAgent): void {
     try {
       const events = owner.handle.agent.session?.ownEvents?.();
-      const lastEvent = events?.[events.length - 1];
-      if (lastEvent === undefined) return;
-      const terminal = normalizeTerminalEvent(owner.jobId, lastEvent);
-      if (terminal !== undefined) owner.terminal = terminal;
+      if (events === undefined) return;
+      for (let index = events.length - 1; index >= 0; index -= 1) {
+        const event = events[index];
+        if (event?.type === "turn/start") return;
+        if (event?.type !== "turn/end") continue;
+        const terminal = normalizeTerminalEvent(owner.jobId, event);
+        if (terminal !== undefined) owner.terminal = terminal;
+        return;
+      }
     } catch {
       // Live event delivery remains authoritative if history is unavailable.
     }

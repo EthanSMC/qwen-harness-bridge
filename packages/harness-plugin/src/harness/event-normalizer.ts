@@ -123,7 +123,13 @@ const terminalFor = (
         "HARNESS_SESSION_LOST",
       );
     default:
-      return undefined;
+      return output(
+        jobId,
+        event,
+        "job.failed",
+        "failed",
+        "HARNESS_TURN_FAILED",
+      );
   }
 };
 
