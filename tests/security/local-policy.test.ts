@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Context } from "../../packages/harness-plugin/node_modules/@deepseek-ai/cordis/lib/index.js";
 import {
@@ -48,6 +48,103 @@ const temporaryDirectories: string[] = [];
 const actualRipgrep = realpathSync(
   execFileSync("which", ["rg"], { encoding: "utf8" }).trim(),
 );
+const actualNpmRoot = dirname(
+  dirname(
+    realpathSync(execFileSync("which", ["npm"], { encoding: "utf8" }).trim()),
+  ),
+);
+// The package-manager launcher may select a different installed version. Supply
+// its 10.15.1 CLI explicitly in that case; never download or silently skip it.
+const actualPnpmCli = realpathSync(
+  process.env.QHB_POLICY_PNPM_CLI ??
+    process.env.npm_execpath ??
+    execFileSync("which", ["pnpm"], { encoding: "utf8" }).trim(),
+);
+
+const nativeInstallPaths = (
+  fixture: ReturnType<typeof makeFixture>,
+  command: string,
+  cases: { option: string; value: string; attached: boolean }[],
+): unknown[] =>
+  JSON.parse(
+    execFileSync(
+      process.execPath,
+      [
+        "-e",
+        String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const { createRequire } = require('node:module');
+const { command, npmRoot, pnpmCli, cases } = JSON.parse(fs.readFileSync(0, 'utf8'));
+let parse;
+if (command === 'npm') {
+  const load = createRequire(path.join(npmRoot, 'package.json'));
+  const Config = load('@npmcli/config');
+  const definitions = load('@npmcli/config/lib/definitions');
+  parse = (argv, key) => {
+    const config = new Config({ ...definitions, npmPath: npmRoot, argv: ['node', 'npm', ...argv], env: { ...process.env } });
+    config.home = process.env.HOME;
+    // Deliberately no Config.load(), loadDefaults(), or config-file reads.
+    config.loadCLI();
+    return config.data.get('cli').data[key];
+  };
+} else {
+  const root = path.dirname(path.dirname(pnpmCli));
+  if (JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')).version !== '10.15.1') {
+    throw new Error('Native policy evidence requires installed pnpm 10.15.1; set QHB_POLICY_PNPM_CLI to its bin/pnpm.cjs');
+  }
+  const source = fs.readFileSync(path.join(root, 'dist/pnpm.cjs'), 'utf8');
+  // Extract only lazy CommonJS parser modules and their dependencies. Never
+  // evaluate the bundle entrypoint or invoke npm-conf's config-file loader.
+  const modules = new Map([...source.matchAll(/^var (require_\w+) = __commonJS\(\{[\s\S]*?^\}\);/gm)].map(m => [m[1], m[0]]));
+  const selected = new Map();
+  function select(name) {
+    if (selected.has(name)) return;
+    const text = modules.get(name);
+    if (!text) throw new Error('Unsupported installed pnpm parser layout: ' + name);
+    selected.set(name, text);
+    for (const match of text.matchAll(/\b(require_\w+)\(/g)) select(match[1]);
+  }
+  for (const name of ['require_nopt', 'require_util', 'require_types2']) select(name);
+  const loader = new Function('require', 'process',
+    'const __commonJS = (cb, mod) => () => { if (!mod) { mod = {exports:{}}; cb[Object.keys(cb)[0]](mod.exports, mod); } return mod.exports; };\n' +
+    [...selected.values()].join('\n') +
+    '\nreturn { nopt: require_nopt(), util: require_util(), types: require_types2().types };');
+  const { nopt, util, types } = loader(require, process);
+  parse = (argv, key) => {
+    const parsed = nopt(types, { C: '--dir' }, argv, 0);
+    // This is the actual CLI nopt + npm-conf field pipeline. dir is resolved
+    // before npm-conf in pnpm getConfig; inspect its CLI value separately.
+    return key === 'dir' ? path.resolve(parsed[key]) : util.parseField(types, parsed[key], key);
+  };
+}
+// Module source and test input are loaded. Any config/content read during the
+// actual parsing phase is a test failure, including pnpm's npm-conf helpers.
+fs.readFileSync = fs.readFile = () => { throw new Error('Parser attempted a file read'); };
+const result = cases.map(({option, value, attached}) => parse(
+  ['install', ...(attached ? [option + '=' + value] : [option, value])],
+  option === '-C' ? 'dir' : option.slice(2)));
+process.stdout.write(JSON.stringify(result));
+`,
+      ],
+      {
+        cwd: fixture.repository.canonicalPath,
+        env: {
+          HOME: fixture.outsidePath,
+          QHB_NATIVE_PATH: "../../native-outside",
+        },
+        input: JSON.stringify({
+          command,
+          npmRoot: actualNpmRoot,
+          pnpmCli: actualPnpmCli,
+          cases,
+        }),
+        encoding: "utf8",
+        timeout: 5000,
+        maxBuffer: 1024 * 1024,
+      },
+    ),
+  ) as unknown[];
 
 const makeFixture = () => {
   const directory = mkdtempSync(join(tmpdir(), "qhb-local-policy-"));
@@ -448,6 +545,231 @@ const runtimeFixture = (
     },
   };
 };
+
+describe("R1 native installation path semantics", () => {
+  const options = (fixture: ReturnType<typeof makeFixture>) => ({
+    repositories: [fixture.repository],
+    trustedExecutables: Object.fromEntries(
+      ["npm", "pnpm", "git", "vercel", "grep"].map((name) => [
+        name,
+        realpathSync(join(fixture.executableDirectory, name)),
+      ]),
+    ),
+  });
+  const ambiguous = [
+    ["--userconfig", " .npmrc "],
+    ["--globalconfig", "\t.npmrc\r\n"],
+    ["--cache", "\v\fcache\u00a0\ufeff"],
+    ["--cache", " /native-outside "],
+    ["--cache", "~/cache"],
+    ["--cache", `\${QHB_NATIVE_PATH}`],
+    ["--cache", `cache/\${QHB_NATIVE_PATH}`],
+    ["--cache", `\${QHB_NATIVE_PATH:-../../native-outside}`],
+    ["--cache", `\${QHB_NATIVE_PATH?}`],
+    ["--cache", "file://./cache"],
+  ] as const;
+
+  it.each(["npm", "pnpm"])(
+    "confirms actual %s CLI transformations with no config-file loader or installer",
+    (command) => {
+      const fixture = makeFixture();
+      for (const attached of [false, true]) {
+        const cases = [
+          { option: "--userconfig", value: " .npmrc ", attached },
+          { option: "--globalconfig", value: "\t.npmrc\r\n", attached },
+          { option: "--cache", value: "\v\fcache\u00a0\ufeff", attached },
+          { option: "--cache", value: ` ${fixture.outsidePath} `, attached },
+          { option: "--cache", value: "~/cache", attached },
+          { option: "--cache", value: `\${QHB_NATIVE_PATH}`, attached },
+          { option: "--cache", value: "cache", attached },
+          {
+            option: command === "npm" ? "--prefix" : "--dir",
+            value: "dist",
+            attached,
+          },
+          ...(command === "pnpm"
+            ? [{ option: "-C", value: "dist", attached }]
+            : []),
+        ];
+        const values = nativeInstallPaths(fixture, command, cases);
+        expect(values).toEqual([
+          join(fixture.repository.canonicalPath, ".npmrc"),
+          join(fixture.repository.canonicalPath, ".npmrc"),
+          join(fixture.repository.canonicalPath, "cache"),
+          fixture.outsidePath,
+          join(fixture.outsidePath, "cache"),
+          join(fixture.repository.canonicalPath, "../../native-outside"),
+          join(fixture.repository.canonicalPath, "cache"),
+          join(fixture.repository.canonicalPath, "dist"),
+          ...(command === "pnpm"
+            ? [join(fixture.repository.canonicalPath, "dist")]
+            : []),
+        ]);
+      }
+    },
+  );
+
+  it("uses pnpm's supported short directory forms and denies concatenation", async () => {
+    for (const argv of [
+      ["install", "-C", "dist"],
+      ["install", "-C=dist"],
+    ]) {
+      const fixture = makeFixture();
+      const action = makeAction(fixture, {
+        toolName: "package_install",
+        executable: "pnpm",
+        argv,
+      });
+      const canonical = canonicalizeAction(action, options(fixture));
+      expect(canonical.action.argv.at(-1)).toBe(
+        `${argv.length === 2 ? "-C=" : ""}${join(fixture.repository.canonicalPath, "dist")}`,
+      );
+      expect(classifyAction(action, options(fixture)).classification).toBe(
+        "approval_required",
+      );
+    }
+    const f = runtimeFixture("allowed-once", () => ({
+      executable: "pnpm",
+      toolName: "package_install",
+      argv: ["install", "-Cdist"],
+      touchedPaths: [],
+      fileChange: "none",
+    }));
+    expect((await f.execute()).isError).toBe(true);
+    expect(f.bodies()).toBe(0);
+    expect(f.events).toHaveLength(1);
+  });
+
+  it.each(["npm", "pnpm"])(
+    "denies ambiguous %s paths before approval and execution in the real runtime",
+    async (command) => {
+      for (const attached of [false, true]) {
+        for (const [option, value] of [
+          ...ambiguous,
+          [command === "npm" ? "--prefix" : "--dir", " dist "],
+          ...(command === "pnpm" ? [["-C", "\tdist\n"]] : []),
+        ]) {
+          const argv = [
+            "install",
+            ...(attached
+              ? [option === "-C" ? `-C${value}` : `${option}=${value}`]
+              : [option as string, value as string]),
+          ];
+          const f = runtimeFixture("allowed-once", (fixture) => {
+            const action = makeAction(fixture, {
+              toolName: "package_install",
+              executable: command,
+              argv,
+            });
+            return { ...action, touchedPaths: [], fileChange: "none" };
+          });
+          expect((await f.execute()).isError).toBe(true);
+          expect(f.bodies()).toBe(0);
+          expect(f.events.map((event) => event.type)).toEqual(["turn/start"]);
+        }
+      }
+    },
+  );
+
+  it.each(["npm", "pnpm"])(
+    "preserves ordinary contained %s approval grant and denial",
+    async (command) => {
+      for (const outcome of ["allowed-once", "rejected"] as const) {
+        for (const attached of [false, true]) {
+          const argv = [
+            "install",
+            "example-package@~1.0.0",
+            ...(attached
+              ? ["--cache=cache directory"]
+              : ["--cache", "cache directory"]),
+          ];
+          const f = runtimeFixture(outcome, (fixture) => {
+            const action = makeAction(fixture, {
+              toolName: "package_install",
+              executable: command,
+              argv,
+            });
+            expect(
+              classifyAction(action, options(fixture)).classification,
+            ).toBe("approval_required");
+            expect(
+              canonicalizeAction(action, options(fixture)).action.argv.at(-1),
+            ).toBe(
+              `${attached ? "--cache=" : ""}${join(fixture.repository.canonicalPath, "cache directory")}`,
+            );
+            return { ...action, touchedPaths: [], fileChange: "none" };
+          });
+          expect((await f.execute()).isError).toBe(outcome === "rejected");
+          expect(f.bodies()).toBe(outcome === "allowed-once" ? 1 : 0);
+          expect(f.events.map((event) => event.type)).toEqual([
+            "turn/start",
+            "approval/asked",
+            "approval/decided",
+          ]);
+        }
+      }
+    },
+  );
+
+  it.each(["npm", "pnpm"])(
+    "rechecks %s path normalization and expansion after the audited grant",
+    async (command) => {
+      for (const [option, value] of ambiguous) {
+        const argv = ["install", option, "cache"];
+        const f = runtimeFixture("allowed-once", () => ({
+          executable: command,
+          toolName: "package_install",
+          argv,
+          touchedPaths: [],
+          fileChange: "none",
+        }));
+        f.agent.ctx.on(
+          "tools/pre-execute",
+          async (_execution, next) => {
+            await next();
+            argv[2] = value;
+            return { kind: "allow" };
+          },
+          { prepend: true },
+        );
+        expect((await f.execute()).isError).toBe(true);
+        expect(f.bodies()).toBe(0);
+        expect(f.events.map((event) => event.type)).toEqual([
+          "turn/start",
+          "approval/asked",
+          "approval/decided",
+        ]);
+      }
+    },
+  );
+
+  it("keeps other command paths and native data literal", () => {
+    const fixture = makeFixture();
+    const value = ` \t\${QHB_NATIVE_PATH}~/literal `;
+    for (const [toolName, executable, argv] of [
+      ["git_push", "git", ["-C", value, "push", "origin", "main"]],
+      ["deploy", "vercel", ["deploy", "--cwd", value]],
+      ["search", "grep", ["-e", "needle", value]],
+    ] as const) {
+      const action = makeAction(fixture, { toolName, executable, argv });
+      expect(
+        canonicalizeAction(action, options(fixture)).action.argv,
+      ).toContain(join(fixture.repository.canonicalPath, value));
+    }
+    const action = makeAction(fixture, {
+      toolName: "write_file",
+      argv: [value],
+      touchedPaths: ["source.txt"],
+      fileChange: "bounded",
+    });
+    expect(classifyAction(action, options(fixture)).classification).toBe(
+      "automatic",
+    );
+    expect(canonicalizeAction(action, options(fixture)).action.argv).toEqual([
+      value,
+    ]);
+  });
+});
 
 describe("N1-N4 deterministic corrective wave", () => {
   const policy = (f: ReturnType<typeof makeFixture>) => ({

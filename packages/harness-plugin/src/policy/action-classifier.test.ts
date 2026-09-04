@@ -90,6 +90,52 @@ const trustedOptions = (fixture: ReturnType<typeof makeFixture>) => ({
   ),
 });
 
+describe("R1 installation option path interpretation", () => {
+  it.each(["npm", "pnpm"])(
+    "rejects %s normalization and expansion forms",
+    (executable) => {
+      const fixture = makeFixture();
+      const paths = [
+        " .npmrc ",
+        "\t.npmrc\r\n",
+        ` ${fixture.outsidePath} `,
+        "~/cache",
+        `\${QHB_NATIVE_PATH}`,
+        "\v\fcache\u00a0\ufeff",
+      ];
+      for (const option of [
+        "--cache",
+        "--userconfig",
+        "--globalconfig",
+        executable === "npm" ? "--prefix" : "--dir",
+      ]) {
+        for (const value of paths) {
+          for (const argv of [
+            ["install", option, value],
+            ["install", `${option}=${value}`],
+          ]) {
+            expect(
+              classifyAction(
+                makeAction(fixture, {
+                  toolName: "package_install",
+                  executable,
+                  argv,
+                  touchedPaths: [],
+                }),
+                trustedOptions(fixture),
+              ),
+              JSON.stringify(argv),
+            ).toMatchObject({
+              classification: "denied",
+              reasonCode: "UNSUPPORTED_ARGUMENTS",
+            });
+          }
+        }
+      }
+    },
+  );
+});
+
 const makeAction = (
   fixture: ReturnType<typeof makeFixture>,
   overrides: Partial<CanonicalAction> = {},

@@ -155,6 +155,20 @@ const installOptions = (command: string) =>
       ...(command === "npm" ? ["--prefix"] : ["--dir", "-C"]),
     ],
   );
+
+const validateInstallPath = (value: string): void => {
+  // npm and pnpm's CLI/config parsers trim path options and expand home/env
+  // syntax. Do not authorize their literal spelling or consult hidden config.
+  // Restrict this rule to install options: search data and other commands have
+  // different native semantics. File URLs are not native config path values.
+  if (
+    value !== value.trim() ||
+    /^~[/\\]/u.test(value) ||
+    value.includes("${") ||
+    value.startsWith("file://")
+  )
+    unsupported();
+};
 const deploymentOptions = options(
   ["--prod", "--prebuilt", "--force", "--yes"],
   ["--cwd", "--local-config"],
@@ -308,12 +322,18 @@ export function parseArguments(
       const equals = argument.indexOf("=");
       if (
         equals >= 0 &&
-        (argument.startsWith("--") || (command === "rg" && equals === 2))
+        (argument.startsWith("--") ||
+          (command === "rg" && equals === 2) ||
+          (command === "pnpm" &&
+            administrative === "install" &&
+            argument.startsWith("-C=")))
       ) {
         name = argument.slice(0, equals);
         attached = argument.slice(equals + 1);
         prefix = `${name}=`;
       } else if (!grammar.has(name) && /^-[^-].+/u.test(argument)) {
+        // pnpm nopt supports -C value and -C=value, not Git's -Cvalue.
+        if (command === "pnpm" && administrative === "install") unsupported();
         name = argument.slice(0, 2);
         attached = argument.slice(2);
         prefix = name;
@@ -365,6 +385,8 @@ export function parseArguments(
         if (value === "..") throw new CanonicalPathError("PATH_TRAVERSAL");
         unsupported();
       }
+      if (administrative === "install" && role === "path")
+        validateInstallPath(value);
       const canonical = role === "path" ? pathValue(value) : value;
       if (
         command === "rg" &&
