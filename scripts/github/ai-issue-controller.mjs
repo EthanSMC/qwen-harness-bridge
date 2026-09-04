@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   assertIssueInvariant,
+  assertReceiptAppendable,
   closingIssueNumbers,
   currentClaimFromReceipts,
   evaluateReadiness,
@@ -517,7 +518,8 @@ const pendingIntentEventIds = (comments, receipts) => {
 };
 
 const postReceipt = async (github, issueNumber, receipt) => {
-  const existing = parseReceipts(await commentsFor(github, issueNumber));
+  const comments = await commentsFor(github, issueNumber);
+  const existing = parseReceipts(comments);
   const prior = existing.find(({ eventId }) => eventId === receipt.eventId);
   if (prior) {
     if (
@@ -532,6 +534,9 @@ const postReceipt = async (github, issueNumber, receipt) => {
     }
     return prior;
   }
+  assertReceiptAppendable(comments, receipt, {
+    workflowLogin: WORKFLOW_LOGIN,
+  });
   await github.mutateAndVerify({
     mutation: {
       method: "POST",

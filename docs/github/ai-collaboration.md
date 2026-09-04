@@ -66,7 +66,7 @@ Keep public progress bounded and useful:
 summary: claim parser and state tests pass; controller integration remains
 ```
 
-The summary is a single line of at most 240 UTF-8 bytes. It renews an implementation lease for 24 hours only while the Issue is `status:in-progress`; branch pushes do not renew it implicitly. A qualifying pull request must be created after the claim and strictly before the implementation lease expires. Admission to `status:review` replaces that deadline with a durable review lock, so review does not depend on a time-sensitive required check and `/ai-heartbeat` is no longer accepted. Closing the pull request without merging returns the Issue to `status:in-progress` with a fresh 24-hour lease.
+The summary is a single line of at most 240 UTF-8 bytes. It renews an implementation lease for 24 hours only while the Issue is `status:in-progress`; branch pushes do not renew it implicitly. Renewal uses the later of the verified command time plus 24 hours or the prior lease plus one second, so even same-second GitHub commands produce strictly ordered evidence. A qualifying pull request must be created after the claim and strictly before the implementation lease expires. Admission to `status:review` replaces that deadline with a durable review lock, so review does not depend on a time-sensitive required check and `/ai-heartbeat` is no longer accepted. Closing the pull request without merging returns the Issue to `status:in-progress` with a fresh 24-hour lease.
 
 ## Block, resume, release, and handoff
 

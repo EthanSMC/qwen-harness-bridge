@@ -188,7 +188,7 @@ An active implementation claim has a 24-hour renewable lease. Meaningful public 
 summary: protocol schema implemented; integration tests remain
 ```
 
-The summary is required, is limited to 240 UTF-8 bytes, and must contain no private execution material. The workflow verifies ownership and extends the lease from the immutable command-comment timestamp. Scheduled expiry and migration decisions use the GitHub response `Date` header, never the runner's local clock.
+The summary is required, is limited to 240 UTF-8 bytes, and must contain no private execution material. The workflow verifies ownership and extends the lease to the later of the immutable command-comment timestamp plus 24 hours or the prior lease plus one second. This preserves strict receipt ordering when GitHub gives multiple commands the same second. Scheduled expiry and migration decisions use the GitHub response `Date` header, never the runner's local clock.
 
 A scheduled hourly reconciliation releases an expired `status:in-progress` claim by removing the assignee, restoring `status:ready` when readiness still passes or `status:waiting` otherwise, and writing a stale-release receipt. A qualifying pull request must have been created after the claim and strictly before this implementation deadline. Its verified `pr-open` transition replaces the deadline with a durable review lock, so required checks do not become stale merely because wall-clock time advances and `/ai-heartbeat` is rejected in `status:review`. Closing the pull request unmerged returns to `status:in-progress` with a fresh 24-hour lease. `status:blocked` still requires explicit resolution because an external dependency exists.
 

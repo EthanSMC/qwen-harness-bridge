@@ -665,6 +665,42 @@ test("owner blocks, resumes, and releases while maintainer recovery is allowed",
   assert.deepEqual(fake.issue().assignees, []);
 });
 
+test("same-second renewals advance the lease before durable receipt writes", async () => {
+  const fake = new FakeGitHub();
+  await claim(fake);
+  const sameSecond = "2026-09-04T13:00:00.000Z";
+  const run = (id, body) =>
+    handleIssueComment(
+      context(fake, fake.command(id, "alice", body, 46, sameSecond), {
+        now: sameSecond,
+      }),
+    );
+
+  await run(902, "/ai-heartbeat\nsummary: first same-second renewal");
+  assert.equal(
+    currentClaimFromReceipts(fake.workflowReceipts()).leaseExpiresAt,
+    "2026-09-05T13:00:00.000Z",
+  );
+  await run(903, "/ai-heartbeat\nsummary: second same-second renewal");
+  assert.equal(
+    currentClaimFromReceipts(fake.workflowReceipts()).leaseExpiresAt,
+    "2026-09-05T13:00:01.000Z",
+  );
+  await run(
+    904,
+    "/ai-block\nreason: same-second dependency\nresume-when: dependency clears",
+  );
+  assert.equal(
+    currentClaimFromReceipts(fake.workflowReceipts()).leaseExpiresAt,
+    "2026-09-05T13:00:01.000Z",
+  );
+  await run(905, "/ai-resume");
+  assert.equal(
+    currentClaimFromReceipts(fake.workflowReceipts()).leaseExpiresAt,
+    "2026-09-05T13:00:02.000Z",
+  );
+});
+
 test("release is rejected while an open closing pull request exists", async () => {
   const fake = new FakeGitHub();
   await claim(fake);

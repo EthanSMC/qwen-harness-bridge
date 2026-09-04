@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   ALLOWED_TRANSITIONS,
   assertIssueInvariant,
+  assertReceiptAppendable,
   COMMAND_NAMES,
   closingIssueNumbers,
   evaluateReadiness,
@@ -478,6 +479,38 @@ test("rejects a conflicting duplicate receipt event", () => {
   );
 });
 
+test("prevalidates a candidate receipt against the current durable ledger", () => {
+  const claim = plan().receipt;
+  const comments = [
+    {
+      id: 11,
+      body: receiptBody(claim),
+      user: { login: "github-actions[bot]" },
+    },
+  ];
+  const heartbeat = plan({
+    command: parseLifecycleCommand(
+      "/ai-heartbeat\nsummary: implementation continues",
+    ),
+    issue: issue({
+      labels: ["type:docs", "status:in-progress"],
+      assignees: ["alice"],
+    }),
+    receipts: [claim],
+    eventId: 902,
+  }).receipt;
+
+  assert.doesNotThrow(() => assertReceiptAppendable(comments, heartbeat));
+  expectCode(
+    () =>
+      assertReceiptAppendable(comments, {
+        ...heartbeat,
+        leaseExpiresAt: claim.leaseExpiresAt,
+      }),
+    "STATE_MISMATCH",
+  );
+});
+
 test("rejects malformed, unsupported, or inconsistent receipts", () => {
   const claim = plan().receipt;
   const validComment = (body, id = 11) => ({
@@ -857,6 +890,17 @@ test("plans owner block and resume with the same claim generation", () => {
   });
   assert.equal(resumed.to, "in-progress");
   assert.equal(resumed.receipt.claimId, UUID);
+  assert.equal(resumed.leaseExpiresAt, "2026-09-05T12:00:01.000Z");
+  assert.equal(
+    parseReceipts(
+      [claim, blocked.receipt, resumed.receipt].map((receipt, index) => ({
+        id: 70 + index,
+        body: receiptBody(receipt),
+        user: { login: "github-actions[bot]" },
+      })),
+    ).length,
+    3,
+  );
   expectCode(
     () =>
       plan({

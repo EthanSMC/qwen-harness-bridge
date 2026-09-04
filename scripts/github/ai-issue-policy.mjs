@@ -188,6 +188,16 @@ const plusOneLease = (now) => {
   return new Date(date.getTime() + LEASE_MILLISECONDS).toISOString();
 };
 
+const strictlyRenewedLease = (now, priorLeaseExpiresAt) => {
+  const priorLeaseTime = Date.parse(priorLeaseExpiresAt);
+  if (Number.isNaN(priorLeaseTime)) {
+    fail("STATE_MISMATCH", "The active claim has an invalid lease timestamp.");
+  }
+  return new Date(
+    Math.max(Date.parse(plusOneLease(now)), priorLeaseTime + 1_000),
+  ).toISOString();
+};
+
 const isExpired = (leaseExpiresAt, now) => {
   const leaseTime = Date.parse(leaseExpiresAt);
   const nowTime = Date.parse(now);
@@ -634,7 +644,10 @@ export const planLifecycleCommand = ({
     if (isExpired(currentClaim.leaseExpiresAt, now)) {
       fail("LEASE_EXPIRED", "The claim lease expired before this heartbeat.");
     }
-    const leaseExpiresAt = plusOneLease(now);
+    const leaseExpiresAt = strictlyRenewedLease(
+      now,
+      currentClaim.leaseExpiresAt,
+    );
     return basePlan({
       eventId,
       claim: currentClaim,
@@ -670,7 +683,10 @@ export const planLifecycleCommand = ({
     if (state !== "blocked") {
       fail("INVALID_TRANSITION", "Only blocked work can resume.");
     }
-    const leaseExpiresAt = plusOneLease(now);
+    const leaseExpiresAt = strictlyRenewedLease(
+      now,
+      currentClaim.leaseExpiresAt,
+    );
     return basePlan({
       eventId,
       claim: currentClaim,
@@ -1068,4 +1084,41 @@ export const parseReceipts = (
     });
   }
   return receipts;
+};
+
+export const assertReceiptAppendable = (
+  comments,
+  receipt,
+  { workflowLogin = "github-actions[bot]" } = {},
+) => {
+  let latestCommentId = 0;
+  for (const comment of comments ?? []) {
+    const commentId = Number(comment.id);
+    if (!Number.isSafeInteger(commentId) || commentId < 1) {
+      fail("STATE_MISMATCH", "A lifecycle comment has an invalid ID.");
+    }
+    latestCommentId = Math.max(latestCommentId, commentId);
+  }
+  if (latestCommentId === Number.MAX_SAFE_INTEGER) {
+    fail("STATE_MISMATCH", "A lifecycle receipt cannot be ordered safely.");
+  }
+  const candidateCommentId = latestCommentId + 1;
+  const parsed = parseReceipts(
+    [
+      ...(comments ?? []),
+      {
+        id: candidateCommentId,
+        body: receiptBody(receipt),
+        user: { login: workflowLogin },
+      },
+    ],
+    { workflowLogin },
+  );
+  const candidate = parsed.find(
+    ({ commentId }) => commentId === candidateCommentId,
+  );
+  if (!candidate) {
+    fail("STATE_MISMATCH", "A lifecycle receipt cannot be appended safely.");
+  }
+  return candidate;
 };

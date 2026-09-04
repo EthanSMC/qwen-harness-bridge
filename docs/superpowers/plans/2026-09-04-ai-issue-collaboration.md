@@ -183,7 +183,7 @@ git commit -m "docs(governance): define AI issue lifecycle"
 
 **Interfaces:**
 - Consumes: Issue/label/assignee/comment data already normalized from GitHub.
-- Produces: `STATUS_LABELS`, `COMMAND_NAMES`, `parseLifecycleCommand(body)`, `parseDependencies(body)`, `assertIssueInvariant(issue)`, `evaluateReadiness(input)`, `parseReceipts(comments)`, `planLifecycleCommand(input)`, `receiptBody(input)`, and `safePublicText(value, maxBytes)`.
+- Produces: `STATUS_LABELS`, `COMMAND_NAMES`, `parseLifecycleCommand(body)`, `parseDependencies(body)`, `assertIssueInvariant(issue)`, `evaluateReadiness(input)`, `parseReceipts(comments)`, `assertReceiptAppendable(comments, receipt)`, `planLifecycleCommand(input)`, `receiptBody(input)`, and `safePublicText(value, maxBytes)`.
 
 - [x] **Step 1: Write parser and safe-field tests**
 
@@ -287,7 +287,7 @@ Accept `now` and `randomUUID` as injected dependencies. Never read wall-clock ti
 
 - [x] **Step 6: Write claim, lease, block, resume, release, and replay tests**
 
-Cover first claim success, second claim rejection, non-owner heartbeat rejection, exact 24-hour renewal, expired lease, owner block/resume, owner/maintainer release, release to waiting when dependencies reopened, duplicate event idempotency, and invalid transition rejection. Assert stable error codes from the design.
+Cover first claim success, second claim rejection, non-owner heartbeat rejection, exact 24-hour renewal, strictly advancing same-second renewals, expired lease, owner block/resume, owner/maintainer release, release to waiting when dependencies reopened, duplicate event idempotency, and invalid transition rejection. Assert stable error codes from the design.
 
 - [x] **Step 7: Implement versioned machine receipts**
 
