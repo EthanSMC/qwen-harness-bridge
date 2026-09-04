@@ -128,7 +128,7 @@ After merge, verify all of these outcomes:
 
 Reopening a completed Issue removes `status:done`, leaves it unassigned, and recalculates `status:ready` or `status:waiting`. A new claim is required.
 
-Closed Issues that predate lifecycle activation and have no lifecycle label remain read-only historical records; scheduled repository reconciliation reports their numbers and skips them without synthesizing claims or terminal receipts. This exception applies only when there are zero lifecycle labels. Any closed Issue that entered the lifecycle remains subject to the full state, assignee, claim, pull-request, and terminal-evidence checks.
+The exact pre-enrollment closed Issues listed in `docs/github/ai-lifecycle-historical-exemptions.json` remain read-only historical records. The allowlist is bound to the activation commit and each entry's original `closed_at` value. Scheduled reconciliation skips an entry only while it is closed with that exact timestamp, has exactly one managed type and zero lifecycle labels, and has no workflow-authored lifecycle receipt. A missing entry, snapshot mismatch, prior receipt, or malformed type/state returns the Issue to the normal fail-closed path. The controller never synthesizes claims, lifecycle labels, or terminal receipts for this history.
 
 ## Release closure
 

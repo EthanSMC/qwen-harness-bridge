@@ -18,9 +18,13 @@ import {
   RECEIPT_ACTIONS,
   receiptBody,
   STATUS_LABELS,
+  safePublicText,
   stripMarkdownCode,
 } from "./ai-issue-policy.mjs";
-import { validateLifecycleMutationMode } from "./ai-lifecycle-registry.mjs";
+import {
+  requireRegistryTimestamp,
+  validateLifecycleMutationMode,
+} from "./ai-lifecycle-registry.mjs";
 import { createGitHubClient } from "./github-api.mjs";
 
 const WORKFLOW_LOGIN = "github-actions[bot]";
@@ -35,6 +39,12 @@ const MIGRATION_PATH = resolve(
   import.meta.dirname,
   "../../docs/github/ai-lifecycle-migrations.json",
 );
+const HISTORICAL_EXEMPTIONS_PATH = resolve(
+  import.meta.dirname,
+  "../../docs/github/ai-lifecycle-historical-exemptions.json",
+);
+const FULL_SHA = /^[0-9a-f]{40}$/u;
+const MAX_HISTORICAL_EXEMPTIONS = 100;
 
 const requirePositiveInteger = (value, label) => {
   const number = Number(value);
@@ -78,8 +88,73 @@ const managedTypeCount = (issue) =>
 const managedStatusCount = (issue) =>
   labelsOf(issue).filter((label) => STATUS_LABELS.includes(label)).length;
 
-const isClosedPreLifecycleHistory = (issue) =>
+const requireExactKeys = (value, expected, label) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const actual = Object.keys(value).sort();
+  if (JSON.stringify(actual) !== JSON.stringify([...expected].sort())) {
+    throw new Error(`${label} has unknown or missing fields`);
+  }
+};
+
+export const validateHistoricalExemptions = (
+  registry,
+  { activationCommit },
+) => {
+  requireExactKeys(
+    registry,
+    ["activation_commit", "entries", "schema_version"],
+    "Historical lifecycle exemption registry",
+  );
+  if (registry.schema_version !== 1) {
+    throw new Error(
+      "Historical lifecycle exemption registry schema_version must be 1",
+    );
+  }
+  if (
+    !FULL_SHA.test(registry.activation_commit ?? "") ||
+    registry.activation_commit !== activationCommit
+  ) {
+    throw new Error(
+      "Historical lifecycle exemptions must match the lifecycle activation commit",
+    );
+  }
+  if (
+    !Array.isArray(registry.entries) ||
+    registry.entries.length > MAX_HISTORICAL_EXEMPTIONS
+  ) {
+    throw new Error("Historical lifecycle exemptions must be a bounded array");
+  }
+  const entries = new Map();
+  for (const [index, entry] of registry.entries.entries()) {
+    const label = `Historical lifecycle exemption ${index + 1}`;
+    requireExactKeys(entry, ["closed_at", "issue", "reason"], label);
+    if (!Number.isSafeInteger(entry.issue) || entry.issue < 1) {
+      throw new Error(`${label} Issue must be a positive safe integer`);
+    }
+    const issue = entry.issue;
+    requireRegistryTimestamp(entry.closed_at, `${label} close time`);
+    try {
+      safePublicText(entry.reason, 240);
+    } catch {
+      throw new Error(`${label} reason is unsafe`);
+    }
+    if (entries.has(issue)) {
+      throw new Error("Historical lifecycle exemption Issues must be unique");
+    }
+    entries.set(issue, {
+      closedAt: entry.closed_at,
+      reason: entry.reason,
+    });
+  }
+  return entries;
+};
+
+const matchesHistoricalExemptionSnapshot = (issue, exemption) =>
+  Boolean(exemption) &&
   issue.state === "closed" &&
+  issue.closed_at === exemption.closedAt &&
   managedTypeCount(issue) === 1 &&
   managedStatusCount(issue) === 0;
 
@@ -1758,6 +1833,7 @@ export const reconcileRepositoryState = async ({
   mode = "report",
   now,
   maxObjects = MAX_RECONCILIATION_OBJECTS,
+  historicalIssueExemptions = new Map(),
 }) => {
   assertMode(mode);
   const [listedIssues, listedPullRequests] = await Promise.all([
@@ -1773,13 +1849,24 @@ export const reconcileRepositoryState = async ({
   const managedIssues = listedIssues.filter(
     (issue) => !issue.pull_request && managedTypeCount(issue) > 0,
   );
-  const historicalSkipped = managedIssues
-    .filter(isClosedPreLifecycleHistory)
-    .map(({ number }) => requirePositiveInteger(number, "Issue number"))
-    .sort((left, right) => left - right);
-  const issues = managedIssues.filter(
-    (issue) => !isClosedPreLifecycleHistory(issue),
-  );
+  const historicalSkipped = [];
+  const issues = [];
+  for (const issue of managedIssues) {
+    const issueNumber = requirePositiveInteger(issue.number, "Issue number");
+    const exemption = historicalIssueExemptions.get(issueNumber);
+    if (matchesHistoricalExemptionSnapshot(issue, exemption)) {
+      const comments = await github.getAll(
+        `/issues/${issueNumber}/comments`,
+        `Issue #${issueNumber} comments`,
+      );
+      if (parseReceipts(comments).length === 0) {
+        historicalSkipped.push(issueNumber);
+        continue;
+      }
+    }
+    issues.push(issue);
+  }
+  historicalSkipped.sort((left, right) => left - right);
   const openPullRequests = listedPullRequests.filter(
     (pullRequest) => pullRequest.state === "open",
   );
@@ -1924,6 +2011,7 @@ export const main = async ({
   fetchImpl = globalThis.fetch,
   now = null,
   migrationsPath = MIGRATION_PATH,
+  historicalExemptionsPath = HISTORICAL_EXEMPTIONS_PATH,
 } = {}) => {
   if (typeof eventPath !== "string" || eventPath.length === 0) {
     throw new Error("GITHUB_EVENT_PATH is required");
@@ -1946,6 +2034,20 @@ export const main = async ({
     mode,
     now: authoritativeNow,
   });
+  let historicalExemptions;
+  try {
+    historicalExemptions = JSON.parse(
+      readFileSync(resolve(historicalExemptionsPath), "utf8"),
+    );
+  } catch {
+    throw new Error(
+      "Historical lifecycle exemption registry must contain valid JSON",
+    );
+  }
+  const historicalIssueExemptions = validateHistoricalExemptions(
+    historicalExemptions,
+    { activationCommit: activation.activationCommit },
+  );
   if (activation.phase === "activated") {
     const comparison = await github.get(
       `/compare/${activation.activationCommit}...${encodeURIComponent(event.repository.default_branch)}`,
@@ -2054,6 +2156,7 @@ export const main = async ({
             defaultBranch,
             mode,
             now: authoritativeNow,
+            historicalIssueExemptions,
           }),
       },
       {

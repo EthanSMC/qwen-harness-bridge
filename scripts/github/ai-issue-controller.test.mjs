@@ -16,6 +16,7 @@ import {
   runLifecycleController,
   runReconciliationPhases,
   stableSystemEventId,
+  validateHistoricalExemptions,
 } from "./ai-issue-controller.mjs";
 import { currentClaimFromReceipts, parseReceipts } from "./ai-issue-policy.mjs";
 
@@ -479,11 +480,15 @@ test("scheduled live-state reconciliation recovers a dropped PR event", async ()
 });
 
 test("repository reconciliation isolates pre-lifecycle closed history", async () => {
+  const closedAt = "2026-09-03T12:00:00.000Z";
+  const exemptions = new Map([
+    [46, { closedAt, reason: "Closed before lifecycle enrollment" }],
+  ]);
   const historical = new FakeGitHub();
   const historicalIssue = historical.issues.get(46);
   historicalIssue.state = "closed";
   historicalIssue.state_reason = "completed";
-  historicalIssue.closed_at = "2026-09-03T12:00:00.000Z";
+  historicalIssue.closed_at = closedAt;
   historicalIssue.labels = [{ name: "type:docs" }];
   historicalIssue.assignees = [{ login: "legacy-owner" }];
 
@@ -493,6 +498,7 @@ test("repository reconciliation isolates pre-lifecycle closed history", async ()
     defaultBranch: "main",
     mode: "enforce",
     now: NOW,
+    historicalIssueExemptions: exemptions,
   });
   assert.deepEqual(result, {
     status: "enforce",
@@ -502,22 +508,38 @@ test("repository reconciliation isolates pre-lifecycle closed history", async ()
   });
   assert.deepEqual(historical.mutations, []);
 
-  for (const { labels, message } of [
+  for (const { configure, exemptions: scenarioExemptions, message } of [
     {
-      labels: [{ name: "type:docs" }, { name: "status:ready" }],
+      configure: (issue) => {
+        issue.labels = [{ name: "type:docs" }, { name: "status:ready" }];
+      },
       message: /Only claimed review work can reconcile to done/i,
     },
     {
-      labels: [{ name: "type:docs" }, { name: "type:bug" }],
+      configure: (issue) => {
+        issue.labels = [{ name: "type:docs" }, { name: "type:bug" }];
+      },
       message: /exactly one managed type label/i,
+    },
+    {
+      configure: (issue) => {
+        issue.closed_at = "2026-09-03T12:00:01.000Z";
+      },
+      message: /exactly one managed lifecycle label/i,
+    },
+    {
+      configure: () => {},
+      exemptions: new Map(),
+      message: /exactly one managed lifecycle label/i,
     },
   ]) {
     const malformedManaged = new FakeGitHub();
     const malformedIssue = malformedManaged.issues.get(46);
     malformedIssue.state = "closed";
     malformedIssue.state_reason = "completed";
-    malformedIssue.closed_at = "2026-09-03T12:00:00.000Z";
-    malformedIssue.labels = labels;
+    malformedIssue.closed_at = closedAt;
+    malformedIssue.labels = [{ name: "type:docs" }];
+    configure(malformedIssue);
     await assert.rejects(
       () =>
         reconcileRepositoryState({
@@ -526,10 +548,101 @@ test("repository reconciliation isolates pre-lifecycle closed history", async ()
           defaultBranch: "main",
           mode: "enforce",
           now: NOW,
+          historicalIssueExemptions: scenarioExemptions ?? exemptions,
         }),
       (error) =>
         error instanceof AggregateError &&
         error.errors.some((failure) => message.test(failure.message)),
+    );
+  }
+
+  const receiptBearing = new FakeGitHub();
+  await claim(receiptBearing);
+  const receiptBearingIssue = receiptBearing.issues.get(46);
+  receiptBearingIssue.state = "closed";
+  receiptBearingIssue.state_reason = "completed";
+  receiptBearingIssue.closed_at = closedAt;
+  receiptBearingIssue.labels = [{ name: "type:docs" }];
+  await assert.rejects(
+    () =>
+      reconcileRepositoryState({
+        github: receiptBearing.client,
+        repository: REPOSITORY,
+        defaultBranch: "main",
+        mode: "enforce",
+        now: NOW,
+        historicalIssueExemptions: exemptions,
+      }),
+    (error) =>
+      error instanceof AggregateError &&
+      error.errors.some((failure) =>
+        /exactly one managed lifecycle label/i.test(failure.message),
+      ),
+  );
+});
+
+test("historical exemption registry is bounded and activation-bound", () => {
+  const activationCommit = "a".repeat(40);
+  const valid = {
+    schema_version: 1,
+    activation_commit: activationCommit,
+    entries: [
+      {
+        issue: 46,
+        closed_at: "2026-09-03T12:00:00.000Z",
+        reason: "Closed before lifecycle enrollment",
+      },
+    ],
+  };
+  assert.deepEqual(
+    validateHistoricalExemptions(valid, { activationCommit }),
+    new Map([
+      [
+        46,
+        {
+          closedAt: "2026-09-03T12:00:00.000Z",
+          reason: "Closed before lifecycle enrollment",
+        },
+      ],
+    ]),
+  );
+  for (const { mutate, message } of [
+    {
+      mutate: (registry) => {
+        registry.activation_commit = "b".repeat(40);
+      },
+      message: /match.*activation commit/i,
+    },
+    {
+      mutate: (registry) => {
+        registry.entries.push(structuredClone(registry.entries[0]));
+      },
+      message: /Issues must be unique/i,
+    },
+    {
+      mutate: (registry) => {
+        registry.entries[0].closed_at = "not-a-timestamp";
+      },
+      message: /timestamp/i,
+    },
+    {
+      mutate: (registry) => {
+        registry.entries[0].unexpected = true;
+      },
+      message: /unknown or missing fields/i,
+    },
+    {
+      mutate: (registry) => {
+        registry.entries[0].issue = "46";
+      },
+      message: /positive safe integer/i,
+    },
+  ]) {
+    const malformed = structuredClone(valid);
+    mutate(malformed);
+    assert.throws(
+      () => validateHistoricalExemptions(malformed, { activationCommit }),
+      message,
     );
   }
 });
