@@ -152,6 +152,8 @@ const buildEnvironment = (): NodeJS.ProcessEnv => {
 };
 
 const FRESH_BUILD_COMMAND_BUDGET_MS = 90_000;
+const FRESH_BUILD_OUTPUT_LIMIT = 4_096;
+const FRESH_BUILD_OUTPUT_TRUNCATION = "\n...[truncated]";
 type FreshBuildCommandOptions = Omit<
   ExecFileSyncOptions,
   "killSignal" | "timeout"
@@ -162,6 +164,63 @@ type FreshBuildCommand = (
   options?: FreshBuildCommandOptions,
 ) => ReturnType<typeof execFileSync>;
 
+type FreshBuildCommandFailure = Error & {
+  cmd?: string;
+  command?: string;
+  status?: number | null;
+  signal?: NodeJS.Signals | null;
+  stdout?: string | Buffer;
+  stderr?: string | Buffer;
+};
+
+const boundedChildOutput = (output: unknown): string => {
+  const readable = Buffer.isBuffer(output)
+    ? output.toString("utf8")
+    : typeof output === "string"
+      ? output
+      : output === undefined || output === null
+        ? ""
+        : String(output);
+  if (readable.length <= FRESH_BUILD_OUTPUT_LIMIT) return readable;
+  return `${readable.slice(
+    0,
+    FRESH_BUILD_OUTPUT_LIMIT - FRESH_BUILD_OUTPUT_TRUNCATION.length,
+  )}${FRESH_BUILD_OUTPUT_TRUNCATION}`;
+};
+
+const describeFreshBuildCommandFailure = (
+  error: unknown,
+  file: string,
+  args: readonly string[],
+): FreshBuildCommandFailure => {
+  const original = (error ?? {}) as FreshBuildCommandFailure;
+  const command = original.cmd ?? [file, ...args].join(" ");
+  const status = original.status ?? null;
+  const signal = original.signal ?? null;
+  const stdout = boundedChildOutput(original.stdout);
+  const stderr = boundedChildOutput(original.stderr);
+  const diagnostic = new Error(
+    [
+      original.message ?? `fresh build command failed: ${command}`,
+      `command: ${command}`,
+      `status: ${String(status)}`,
+      `signal: ${String(signal)}`,
+      `stdout:\n${stdout || "<empty>"}`,
+      `stderr:\n${stderr || "<empty>"}`,
+    ].join("\n"),
+    { cause: error },
+  ) as FreshBuildCommandFailure;
+  Object.assign(diagnostic, original, {
+    cmd: command,
+    command,
+    status,
+    signal,
+    stdout,
+    stderr,
+  });
+  return diagnostic;
+};
+
 const createFreshBuildCommandRunner = (budgetMs: number): FreshBuildCommand => {
   const deadline = performance.now() + budgetMs;
   return (file, args, options = {}) => {
@@ -169,11 +228,15 @@ const createFreshBuildCommandRunner = (budgetMs: number): FreshBuildCommand => {
     if (remainingMs <= 0) {
       throw new Error(`Fresh build command budget exhausted before ${file}`);
     }
-    return execFileSync(file, args, {
-      ...options,
-      timeout: remainingMs,
-      killSignal: "SIGKILL",
-    });
+    try {
+      return execFileSync(file, args, {
+        ...options,
+        timeout: remainingMs,
+        killSignal: "SIGKILL",
+      });
+    } catch (error) {
+      throw describeFreshBuildCommandFailure(error, file, args);
+    }
   };
 };
 
@@ -683,15 +746,55 @@ describe("release runtime build contract", () => {
     expect(performance.now() - startedAt).toBeLessThan(1_000);
   });
 
+  it("exposes bounded readable output and execution metadata for a failed child", () => {
+    const runFreshBuildCommand = createFreshBuildCommandRunner(1_000);
+    let error: unknown;
+    try {
+      runFreshBuildCommand(
+        process.execPath,
+        [
+          "-e",
+          "process.stdout.write('stdout details '.repeat(400)); process.stderr.write('stderr details '.repeat(400)); process.exitCode = 9",
+        ],
+        { stdio: "pipe" },
+      );
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toMatchObject({
+      cmd: expect.stringContaining(process.execPath),
+      status: 9,
+      signal: null,
+      stdout: expect.any(String),
+      stderr: expect.any(String),
+    });
+    const failure = error as {
+      message: string;
+      stdout: string;
+      stderr: string;
+    };
+    expect(failure.stdout).toContain("stdout details");
+    expect(failure.stderr).toContain("stderr details");
+    expect(failure.stdout.length).toBeLessThanOrEqual(4_096);
+    expect(failure.stderr.length).toBeLessThanOrEqual(4_096);
+    expect(failure.message).toContain("status: 9");
+    expect(failure.message).toContain("signal: null");
+    expect(failure.message).toContain("stdout details");
+    expect(failure.message).toContain("stderr details");
+  });
+
   it("freshly builds non-empty executable artifacts and exact migrations", () => {
     const runFreshBuildCommand = createFreshBuildCommandRunner(
       FRESH_BUILD_COMMAND_BUDGET_MS,
     );
     const buildRoot = copyWorkingTree(runFreshBuildCommand);
+    const pnpmCacheDir = join(buildRoot, ".pnpm-metadata-cache");
     const built = (path: string): string => join(buildRoot, path);
     const readBuilt = (path: string): string =>
       readFileSync(built(path), "utf8");
     try {
+      mkdirSync(pnpmCacheDir);
       for (const path of [
         "packages/protocol/dist",
         "apps/control-plane/dist",
@@ -701,7 +804,14 @@ describe("release runtime build contract", () => {
       const environment = buildEnvironment();
       runFreshBuildCommand(
         "pnpm",
-        ["install", "--offline", "--frozen-lockfile", "--ignore-scripts"],
+        [
+          "--cache-dir",
+          pnpmCacheDir,
+          "install",
+          "--offline",
+          "--frozen-lockfile",
+          "--ignore-scripts",
+        ],
         {
           cwd: buildRoot,
           env: environment,
@@ -802,12 +912,13 @@ describe("release runtime build contract", () => {
       runFreshBuildCommand(
         "pnpm",
         [
+          "--cache-dir",
+          pnpmCacheDir,
           "--filter",
           "@qhb/control-plane",
           "deploy",
           "--offline",
           "--prod",
-          "--legacy",
           runtimeRoot,
         ],
         { cwd: buildRoot, env: environment, stdio: "pipe" },
@@ -947,8 +1058,9 @@ describe("release runtime build contract", () => {
       files?: string[];
     };
     expect(dockerfile).toMatch(
-      /pnpm\s+--filter\s+@qhb\/control-plane\s+deploy\s+--offline\s+--prod\s+--legacy\s+\/app\/runtime/,
+      /pnpm\s+--filter\s+@qhb\/control-plane\s+deploy\s+--offline\s+--prod\s+\/app\/runtime/,
     );
+    expect(dockerfile).not.toContain("--legacy");
     expect(dockerfile).toContain("COPY --from=build /app/runtime/ /app/");
     expect(dockerfile).toContain('CMD ["node", "dist/main.js"]');
     expect(controlPlane.files).toEqual(["dist"]);
