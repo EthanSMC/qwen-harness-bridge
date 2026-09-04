@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { AgentHandle, AgentOptions } from "@deepseek-ai/dsh-agent";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -78,6 +79,12 @@ type MappingLookup =
     }
   | { readonly mapping: undefined; readonly unavailable: true };
 
+type EventTask = {
+  task?: Promise<void>;
+  readonly drain: Promise<void>;
+  readonly releaseFromDrain: () => void;
+};
+
 export class AgentAdapter implements HarnessAgentAdapter {
   readonly ready: Promise<void>;
 
@@ -94,7 +101,8 @@ export class AgentAdapter implements HarnessAgentAdapter {
   readonly #resumeTasksByAttempt = new Map<string, Promise<boolean>>();
   readonly #lostIdentityKeys = new Set<string>();
   readonly #idleTasks = new Set<Promise<void>>();
-  readonly #eventTasks = new Set<Promise<void>>();
+  readonly #eventTaskContext = new AsyncLocalStorage<symbol>();
+  readonly #eventTasks = new Map<symbol, EventTask>();
   #unregister: (() => void) | undefined;
   #startupPersistenceUnavailable = false;
   #disposed = false;
@@ -264,6 +272,10 @@ export class AgentAdapter implements HarnessAgentAdapter {
   }
 
   async dispose(): Promise<void> {
+    const currentEventTask = this.#eventTaskContext.getStore();
+    if (currentEventTask !== undefined) {
+      this.#eventTasks.get(currentEventTask)?.releaseFromDrain();
+    }
     if (this.#disposePromise !== undefined) return this.#disposePromise;
 
     this.#disposePromise = (async () => {
@@ -280,7 +292,9 @@ export class AgentAdapter implements HarnessAgentAdapter {
       const owners = [...this.#ownedByAttempt.values()];
       await Promise.allSettled(owners.map((owner) => owner.handle.dispose()));
       await Promise.allSettled([...this.#idleTasks]);
-      await Promise.allSettled([...this.#eventTasks]);
+      await Promise.allSettled(
+        [...this.#eventTasks.values()].map((task) => task.drain),
+      );
       this.#ownedBySession.clear();
       this.#ownedByAttempt.clear();
       this.#latestByJob.clear();
@@ -556,11 +570,36 @@ export class AgentAdapter implements HarnessAgentAdapter {
 
   #emit(event: NormalizedHarnessEvent): void {
     if (this.#disposed) return;
+    const token = Symbol("event-task");
+    let drainReleased = false;
+    let resolveDrain!: () => void;
+    const drain = new Promise<void>((resolve) => {
+      resolveDrain = resolve;
+    });
+    const eventTask: EventTask = {
+      drain,
+      releaseFromDrain: () => {
+        if (drainReleased) return;
+        drainReleased = true;
+        resolveDrain();
+      },
+    };
+    this.#eventTasks.set(token, eventTask);
+
     try {
-      const task = Promise.resolve(this.#onEvent(event)).catch(() => undefined);
-      this.#eventTasks.add(task);
-      void task.finally(() => this.#eventTasks.delete(task));
+      const task = Promise.resolve(
+        this.#eventTaskContext.run(token, () => this.#onEvent(event)),
+      ).catch(() => undefined);
+      eventTask.task = task;
+      void task.then(() => {
+        eventTask.releaseFromDrain();
+        if (this.#eventTasks.get(token) === eventTask) {
+          this.#eventTasks.delete(token);
+        }
+      });
     } catch {
+      eventTask.releaseFromDrain();
+      this.#eventTasks.delete(token);
       // An event sink cannot interrupt the Harness session or its ownership bookkeeping.
     }
   }

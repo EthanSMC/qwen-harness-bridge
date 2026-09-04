@@ -717,4 +717,60 @@ describe("Harness Agent adapter", () => {
     sink.reject(new Error("sink unavailable"));
     await expect(disposal).resolves.toBeUndefined();
   });
+
+  it("allows an event sink to return reentrant disposal", async () => {
+    const fake = new FakeHarness();
+    const { handle } = fake.makeAgent("return-dispose-session");
+    fake.create.mockResolvedValue(handle);
+    let adapter!: AgentAdapter;
+    adapter = new AgentAdapter({
+      ctx: fake.ctx,
+      store: new FakeStore(),
+      onEvent: () => adapter.dispose(),
+    });
+    await adapter.create({
+      jobId: "return-dispose-job",
+      repositoryPath: "/repo",
+      request: "go",
+    });
+
+    fake.emit(
+      "return-dispose-session",
+      sessionEvent("step/start", { turn: 1, step: 1 }),
+    );
+
+    expect(fake.listeners).toHaveLength(0);
+    await expect(adapter.dispose()).resolves.toBeUndefined();
+    expect(handle.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("allows an awaited reentrant disposal after an event sink yields", async () => {
+    const fake = new FakeHarness();
+    const { handle } = fake.makeAgent("await-dispose-session");
+    fake.create.mockResolvedValue(handle);
+    let adapter!: AgentAdapter;
+    adapter = new AgentAdapter({
+      ctx: fake.ctx,
+      store: new FakeStore(),
+      onEvent: async () => {
+        await Promise.resolve();
+        await adapter.dispose();
+      },
+    });
+    await adapter.create({
+      jobId: "await-dispose-job",
+      repositoryPath: "/repo",
+      request: "go",
+    });
+
+    fake.emit(
+      "await-dispose-session",
+      sessionEvent("step/end", { turn: 1, step: 1 }),
+    );
+    const disposal = adapter.dispose();
+
+    expect(fake.listeners).toHaveLength(0);
+    await expect(disposal).resolves.toBeUndefined();
+    expect(handle.dispose).toHaveBeenCalledOnce();
+  });
 });
