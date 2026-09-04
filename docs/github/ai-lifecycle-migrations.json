@@ -8,6 +8,13 @@
       "reason": "Pull request predates AI lifecycle activation",
       "approved_by": "EthanSMC",
       "expires_at": "2026-09-11T00:00:00Z"
+    },
+    {
+      "pull_request": 47,
+      "issue": 46,
+      "reason": "Bootstrap pull request predates AI lifecycle activation",
+      "approved_by": "EthanSMC",
+      "expires_at": "2026-09-11T00:00:00Z"
     }
   ]
 }
