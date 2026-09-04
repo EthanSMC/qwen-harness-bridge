@@ -1090,6 +1090,42 @@ describe("release runtime build contract", () => {
     expect(compose).toContain('command: ["node", "dist/main.js"]');
   });
 
+  it("pins the Node LTS image and proves the signed package-manager preflight", () => {
+    const dockerfile = read("apps/control-plane/Dockerfile");
+    const nodeImage =
+      "node:22.23.2-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5";
+    const fromLines = dockerfile
+      .split("\n")
+      .filter((line) => /^FROM\s+/i.test(line));
+
+    expect(fromLines).toEqual([
+      `FROM ${nodeImage} AS build`,
+      `FROM ${nodeImage} AS runtime`,
+    ]);
+
+    const buildStage = dockerStageBlocks(dockerfile).find((stage) =>
+      /^FROM\s+.*\s+AS\s+build\s*$/im.test(stage),
+    );
+    expect(buildStage).toBeDefined();
+    const preflight = dockerfileInstructions(buildStage ?? "").find(
+      (instruction) => instruction.startsWith("RUN corepack_version="),
+    );
+    expect(preflight).toBeDefined();
+    expect(preflight).toContain('corepack_version="$(corepack --version)"');
+    expect(preflight).toContain(
+      "printf 'corepack_version=%s\\n' \"$corepack_version\"",
+    );
+    expect(preflight).toContain('test "$corepack_version" = "0.34.6"');
+    expect(preflight).toContain("corepack enable");
+    expect(preflight).toContain("corepack install --global pnpm@10.15.1");
+    expect(preflight).toContain('pnpm_version="$(pnpm --version)"');
+    expect(preflight).toContain(
+      "printf 'pnpm_version=%s\\n' \"$pnpm_version\"",
+    );
+    expect(preflight).toContain('test "$pnpm_version" = "10.15.1"');
+    expect(dockerfile).not.toMatch(/COREPACK_(?:INTEGRITY_KEYS|ENABLE_STRICT)/);
+  });
+
   it("uses a pinned multi-stage image whose final stage is non-root", () => {
     const dockerfile = read("apps/control-plane/Dockerfile");
     const dockerignore = read(".dockerignore");
