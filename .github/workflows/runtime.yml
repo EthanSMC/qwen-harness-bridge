@@ -160,6 +160,7 @@ jobs:
                 } catch {
                   process.exit(1);
                 }
+                if (JSON.stringify(evidence) !== raw) process.exit(1);
                 if (typeof evidence !== "object" || evidence === null || Array.isArray(evidence)) process.exit(1);
                 if (JSON.stringify(Object.keys(evidence)) !== JSON.stringify(expectedKeys)) process.exit(1);
                 if (evidence.measurement !== "in_memory_mcp_call_tool") process.exit(1);
@@ -202,11 +203,13 @@ jobs:
             tests/integration/approval-flow.test.ts \
             tests/integration/cancellation-flow.test.ts \
             tests/integration/result-flow.test.ts \
-            tests/integration/readiness.test.ts 2>&1 | tee "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
+            tests/integration/readiness.test.ts 2>&1 | \
+              sed '/^QHB_MCP_SUBMIT_LATENCY_EVIDENCE=/d' | \
+              tee "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
           # foundation-acceptance-parser
           test -s "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"
           foundation_acceptance_count=$(sed -nE 's/.*Tests[[:space:]]+([0-9]+)[[:space:]]+passed.*/\1/p' "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG" | tail -n 1)
-          [[ "$foundation_acceptance_count" =~ ^[1-9][0-9]*$ ]]
+          if ! [[ "$foundation_acceptance_count" =~ ^[1-9][0-9]*$ ]]; then exit 1; fi
           {
             printf 'foundation_acceptance_result=passed\n'
             printf 'foundation_acceptance_count=%s\n' "$foundation_acceptance_count"

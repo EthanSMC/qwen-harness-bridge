@@ -172,6 +172,24 @@ const workflowParserBlock = (
   return ["set -euo pipefail", ...lines.slice(start + 1, end)].join("\n");
 };
 
+const foundationAcceptanceRunnerScript = (step: string): string => {
+  const lines = workflowRunScript(step).split("\n");
+  const start = lines.findIndex(
+    (line) => line.trim() === ': > "$RUNTIME_FOUNDATION_ACCEPTANCE_LOG"',
+  );
+  expect(start, "workflow must initialize the foundation log").toBeGreaterThan(
+    -1,
+  );
+  const end = lines.findIndex(
+    (line, index) =>
+      index > start && line.trim() === "# end foundation-acceptance-parser",
+  );
+  expect(end, "workflow must finish the foundation parser").toBeGreaterThan(
+    start,
+  );
+  return ["set -euo pipefail", ...lines.slice(start, end + 1)].join("\n");
+};
+
 type WorkflowParserResult = {
   status: number | null;
   stdout: string;
@@ -232,6 +250,67 @@ const runFoundationAcceptanceParser = (
       stdout: result.stdout,
       stderr: result.stderr,
       observations: readFileSync(observationsFile, "utf8"),
+    };
+  } finally {
+    rmSync(fixtureRoot, { recursive: true, force: true });
+  }
+};
+
+type FoundationAcceptanceRunnerResult = WorkflowParserResult & {
+  aggregateLog: string;
+  arguments: string[];
+};
+
+const runFoundationAcceptanceRunner = (
+  runnerScript: string,
+  simulatedStdout: string,
+  simulatedStderr = "",
+  simulatedStatus = 0,
+): FoundationAcceptanceRunnerResult => {
+  const fixtureRoot = mkdtempSync(join(tmpdir(), "qhb-runtime-aggregate-run-"));
+  const aggregateLogFile = join(fixtureRoot, "foundation-acceptance.log");
+  const observationsFile = join(fixtureRoot, "gate-observations.txt");
+  const argumentsFile = join(fixtureRoot, "pnpm-arguments.txt");
+  writeFileSync(observationsFile, "");
+  const result = spawnSync(
+    "bash",
+    [
+      "-c",
+      [
+        "pnpm() {",
+        '  printf \'%s\\n\' "$@" > "$RUNTIME_FAKE_PNPM_ARGUMENTS"',
+        "  printf '%s' \"$RUNTIME_FAKE_PNPM_STDOUT\"",
+        "  printf '%s' \"$RUNTIME_FAKE_PNPM_STDERR\" >&2",
+        '  return "$RUNTIME_FAKE_PNPM_STATUS"',
+        "}",
+        runnerScript,
+      ].join("\n"),
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        RUNTIME_FOUNDATION_ACCEPTANCE_LOG: aggregateLogFile,
+        RUNTIME_GATE_OBSERVATIONS_FILE: observationsFile,
+        RUNTIME_FAKE_PNPM_ARGUMENTS: argumentsFile,
+        RUNTIME_FAKE_PNPM_STDOUT: simulatedStdout,
+        RUNTIME_FAKE_PNPM_STDERR: simulatedStderr,
+        RUNTIME_FAKE_PNPM_STATUS: String(simulatedStatus),
+      },
+    },
+  );
+  try {
+    return {
+      status: result.status,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      observations: readFileSync(observationsFile, "utf8"),
+      aggregateLog: existsSync(aggregateLogFile)
+        ? readFileSync(aggregateLogFile, "utf8")
+        : "",
+      arguments: existsSync(argumentsFile)
+        ? readFileSync(argumentsFile, "utf8").trimEnd().split("\n")
+        : [],
     };
   } finally {
     rmSync(fixtureRoot, { recursive: true, force: true });
@@ -2132,6 +2211,10 @@ describe("release runtime build contract", () => {
         log: "QHB_MCP_SUBMIT_LATENCY_EVIDENCE={not-json}\n",
       },
       {
+        name: "duplicate expected key with a valid final value",
+        log: 'QHB_MCP_SUBMIT_LATENCY_EVIDENCE={"measurement":"discarded","measurement":"in_memory_mcp_call_tool","sample_count":20,"samples_ms":[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20],"p50_ms":10,"p95_ms":19,"p99_ms":20,"max_ms":20,"budget_ms":2000}\n',
+      },
+      {
         name: "missing key",
         log: latencyLine({ ...baseEvidence, p50_ms: undefined }),
       },
@@ -2271,6 +2354,83 @@ describe("release runtime build contract", () => {
     expect(parserScript).toContain("foundation_acceptance_result=passed");
     expect(parserScript).toContain("foundation_acceptance_count");
     expect(parserScript).toMatch(/\[\[\s*"\$foundation_acceptance_count"/);
+  });
+
+  it("filters only the duplicate latency marker from the M0 aggregate and preserves failures", () => {
+    const workflow = read(".github/workflows/runtime.yml");
+    const runtimeJob = yamlMappingBlock(workflow, "jobs", "runtime");
+    const start = workflowStep(runtimeJob, "Build and start runtime");
+    const runnerScript = foundationAcceptanceRunnerScript(start);
+    const marker = 'QHB_MCP_SUBMIT_LATENCY_EVIDENCE={"measurement":"unused"}';
+    const preservedLines = [
+      "aggregate output before evidence",
+      "QHB_MCP_SUBMIT_LATENCY_EVIDENCE_EXTRA=keep",
+      "prefix QHB_MCP_SUBMIT_LATENCY_EVIDENCE=keep",
+      "QHB_MCP_SUBMIT_LATENCY_EVIDENCE",
+      "Tests 202 passed (202)",
+      "aggregate output after evidence",
+      "stderr: retain this diagnostic",
+    ];
+    const successful = runFoundationAcceptanceRunner(
+      runnerScript,
+      [preservedLines[0], marker, ...preservedLines.slice(1, -1), ""].join(
+        "\n",
+      ),
+      `${preservedLines.at(-1)}\n`,
+    );
+    expect(successful.status).toBe(0);
+    expect(successful.stderr).toBe("");
+    for (const output of [successful.stdout, successful.aggregateLog]) {
+      expect(
+        output
+          .split("\n")
+          .filter((line) =>
+            line.startsWith("QHB_MCP_SUBMIT_LATENCY_EVIDENCE="),
+          ),
+      ).toHaveLength(0);
+      for (const line of preservedLines) expect(output).toContain(line);
+    }
+    expect(successful.observations).toBe(
+      "foundation_acceptance_result=passed\nfoundation_acceptance_count=202\n",
+    );
+    expect(successful.arguments).toEqual([
+      "exec",
+      "vitest",
+      "run",
+      "--config",
+      "/dev/null",
+      "tests/contract/mcp-tools.test.ts",
+      "tests/integration/job-repository.test.ts",
+      "tests/integration/connector-outbox.test.ts",
+      "tests/integration/connector-gateway.test.ts",
+      "tests/integration/foundation-e2e.test.ts",
+      "tests/integration/approval-flow.test.ts",
+      "tests/integration/cancellation-flow.test.ts",
+      "tests/integration/result-flow.test.ts",
+      "tests/integration/readiness.test.ts",
+    ]);
+
+    const failed = runFoundationAcceptanceRunner(
+      runnerScript,
+      `${marker}\nTests 202 passed (202)\n`,
+      "stderr: upstream test failure\n",
+      7,
+    );
+    expect(failed.status).toBe(7);
+    expect(failed.stdout).toContain("stderr: upstream test failure");
+    expect(failed.aggregateLog).toContain("stderr: upstream test failure");
+    expect(failed.stdout).not.toContain(marker);
+    expect(failed.aggregateLog).not.toContain(marker);
+    expect(failed.observations).toBe("");
+
+    const missingCount = runFoundationAcceptanceRunner(
+      runnerScript,
+      `${marker}\naggregate completed without a test count\n`,
+    );
+    expect(missingCount.status).not.toBe(0);
+    expect(start).toMatch(
+      /pnpm check 2>&1 \| tee "\$RUNTIME_REPOSITORY_GATE_LOG"/,
+    );
   });
 
   it("keeps the fixed repository error enum out of privacy matches", () => {
