@@ -3,28 +3,75 @@
   "activation_commit": "b06aceb805f03dc809b37b80cb45a240bb5be66d",
   "entries": [
     {
+      "issue": 1,
+      "closed_at": "2026-09-04T06:35:42Z",
+      "lifecycle_status": "done",
+      "reason": "Completed implementation record closed before lifecycle activation"
+    },
+    {
+      "issue": 2,
+      "closed_at": "2026-09-01T05:02:24Z",
+      "lifecycle_status": "done",
+      "reason": "Completed implementation record closed before lifecycle activation"
+    },
+    {
+      "issue": 3,
+      "closed_at": "2026-09-01T06:03:37Z",
+      "lifecycle_status": "done",
+      "reason": "Completed implementation record closed before lifecycle activation"
+    },
+    {
+      "issue": 4,
+      "closed_at": "2026-09-01T09:47:14Z",
+      "lifecycle_status": "done",
+      "reason": "Completed implementation record closed before lifecycle activation"
+    },
+    {
+      "issue": 5,
+      "closed_at": "2026-09-03T18:26:52Z",
+      "lifecycle_status": "done",
+      "reason": "Completed implementation record closed before lifecycle activation"
+    },
+    {
+      "issue": 6,
+      "closed_at": "2026-09-03T20:45:59Z",
+      "lifecycle_status": "done",
+      "reason": "Completed implementation record closed before lifecycle activation"
+    },
+    {
+      "issue": 7,
+      "closed_at": "2026-09-04T06:17:22Z",
+      "lifecycle_status": "done",
+      "reason": "Completed implementation record closed before lifecycle activation"
+    },
+    {
       "issue": 35,
       "closed_at": "2026-09-03T12:28:01Z",
+      "lifecycle_status": null,
       "reason": "Closed governance record created before lifecycle enrollment"
     },
     {
       "issue": 37,
       "closed_at": "2026-09-01T04:34:38Z",
+      "lifecycle_status": null,
       "reason": "Closed planning record created before lifecycle enrollment"
     },
     {
       "issue": 41,
       "closed_at": "2026-09-03T13:30:16Z",
+      "lifecycle_status": null,
       "reason": "Closed governance record created before lifecycle enrollment"
     },
     {
       "issue": 46,
       "closed_at": "2026-09-04T10:27:45Z",
+      "lifecycle_status": null,
       "reason": "Closed rollout record created before lifecycle enrollment"
     },
     {
       "issue": 49,
       "closed_at": "2026-09-04T08:18:36Z",
+      "lifecycle_status": null,
       "reason": "Closed governance record created before lifecycle enrollment"
     }
   ]

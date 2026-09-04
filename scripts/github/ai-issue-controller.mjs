@@ -129,12 +129,19 @@ export const validateHistoricalExemptions = (
   const entries = new Map();
   for (const [index, entry] of registry.entries.entries()) {
     const label = `Historical lifecycle exemption ${index + 1}`;
-    requireExactKeys(entry, ["closed_at", "issue", "reason"], label);
+    requireExactKeys(
+      entry,
+      ["closed_at", "issue", "lifecycle_status", "reason"],
+      label,
+    );
     if (!Number.isSafeInteger(entry.issue) || entry.issue < 1) {
       throw new Error(`${label} Issue must be a positive safe integer`);
     }
     const issue = entry.issue;
     requireRegistryTimestamp(entry.closed_at, `${label} close time`);
+    if (![null, "done"].includes(entry.lifecycle_status)) {
+      throw new Error(`${label} lifecycle status must be null or done`);
+    }
     try {
       safePublicText(entry.reason, 240);
     } catch {
@@ -145,6 +152,7 @@ export const validateHistoricalExemptions = (
     }
     entries.set(issue, {
       closedAt: entry.closed_at,
+      lifecycleStatus: entry.lifecycle_status,
       reason: entry.reason,
     });
   }
@@ -156,7 +164,10 @@ const matchesHistoricalExemptionSnapshot = (issue, exemption) =>
   issue.state === "closed" &&
   issue.closed_at === exemption.closedAt &&
   managedTypeCount(issue) === 1 &&
-  managedStatusCount(issue) === 0;
+  (exemption.lifecycleStatus === null
+    ? managedStatusCount(issue) === 0
+    : managedStatusCount(issue) === 1 &&
+      labelsOf(issue).includes(`status:${exemption.lifecycleStatus}`));
 
 const assertManagedIssue = (issue) => {
   const count = managedTypeCount(issue);
@@ -425,6 +436,68 @@ const mergedPullRequestForIssue = async ({
     );
   }
   return merged[0];
+};
+
+const verifyCompletedIssueEvidence = async ({
+  github,
+  issueNumber,
+  repository,
+  defaultBranch,
+  loaded,
+  pullRequestNumber = null,
+}) => {
+  const successfulReceipts = loaded.receipts.filter(
+    ({ result }) => result === "success",
+  );
+  const terminalReceipt =
+    pullRequestNumber === null
+      ? successfulReceipts.at(-1)
+      : successfulReceipts.findLast(
+          ({ action, pullRequestNumber: receiptPullRequestNumber }) =>
+            ["merge", "close"].includes(action) &&
+            receiptPullRequestNumber === pullRequestNumber,
+        );
+  if (
+    !terminalReceipt ||
+    !["merge", "close"].includes(terminalReceipt.action) ||
+    terminalReceipt.to !== "done" ||
+    (pullRequestNumber === null &&
+      currentClaimFromReceipts(loaded.receipts) !== null)
+  ) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Completed lifecycle state requires a final terminal receipt.",
+    );
+  }
+  const claimReceipt = successfulReceipts.find(
+    ({ action, claimId }) =>
+      action === "claim" && claimId === terminalReceipt.claimId,
+  );
+  if (!claimReceipt) {
+    throw new LifecycleError(
+      "STATE_MISMATCH",
+      "Completed lifecycle state requires its original claim receipt.",
+    );
+  }
+  const claim = {
+    claimId: claimReceipt.claimId,
+    owner: claimReceipt.actor,
+    agent: claimReceipt.agent,
+    leaseExpiresAt: claimReceipt.leaseExpiresAt,
+    pullRequestNumber: terminalReceipt.pullRequestNumber,
+    claimCommentId: claimReceipt.commentId,
+    claimedAt: claimReceipt.createdAt,
+  };
+  const pullRequest = await mergedPullRequestForIssue({
+    github,
+    issueNumber,
+    repository,
+    defaultBranch,
+    claim,
+    issueClosedAt: loaded.issue.closed_at,
+    openClosingPullRequests: loaded.closingPullRequests,
+  });
+  return { claim, pullRequest, terminalReceipt };
 };
 
 const commentsFor = (github, issueNumber) =>
@@ -1193,6 +1266,23 @@ export const handlePullRequest = async ({
     loaded.issue.state_reason === "completed" &&
     assigneesOf(loaded.issue).length === 0
   ) {
+    const verified = await verifyCompletedIssueEvidence({
+      github,
+      issueNumber,
+      repository,
+      defaultBranch,
+      loaded,
+    });
+    if (verified.pullRequest.number !== pullRequest.number) {
+      await verifyCompletedIssueEvidence({
+        github,
+        issueNumber,
+        repository,
+        defaultBranch,
+        loaded,
+        pullRequestNumber: pullRequest.number,
+      });
+    }
     return { status: "unchanged" };
   }
   const { state, assignee } = assertIssueInvariant(
@@ -1454,6 +1544,13 @@ export const handleIssueChange = async ({
       loaded.issue.state_reason === "completed"
     ) {
       if (state === "done" && assigneesOf(loaded.issue).length === 0) {
+        await verifyCompletedIssueEvidence({
+          github,
+          issueNumber,
+          repository,
+          defaultBranch: event.repository.default_branch,
+          loaded,
+        });
         return { status: "unchanged" };
       }
       if (
@@ -1836,6 +1933,9 @@ export const reconcileRepositoryState = async ({
   historicalIssueExemptions = new Map(),
 }) => {
   assertMode(mode);
+  if (!(historicalIssueExemptions instanceof Map)) {
+    throw new Error("Historical lifecycle exemptions must be a Map");
+  }
   const [listedIssues, listedPullRequests] = await Promise.all([
     github.getAll(
       "/issues?state=all&sort=updated&direction=asc",
@@ -1846,8 +1946,21 @@ export const reconcileRepositoryState = async ({
       "repository pull requests",
     ),
   ]);
-  const managedIssues = listedIssues.filter(
-    (issue) => !issue.pull_request && managedTypeCount(issue) > 0,
+  const repositoryIssues = listedIssues.filter((issue) => !issue.pull_request);
+  const repositoryIssueNumbers = new Set(
+    repositoryIssues.map(({ number }) =>
+      requirePositiveInteger(number, "Issue number"),
+    ),
+  );
+  const missingHistoricalIssues = [...historicalIssueExemptions.keys()].filter(
+    (issueNumber) => !repositoryIssueNumbers.has(issueNumber),
+  );
+  const managedIssues = repositoryIssues.filter(
+    (issue) =>
+      managedTypeCount(issue) > 0 ||
+      historicalIssueExemptions.has(
+        requirePositiveInteger(issue.number, "Issue number"),
+      ),
   );
   const historicalSkipped = [];
   const issues = [];
@@ -1889,10 +2002,23 @@ export const reconcileRepositoryState = async ({
       `AI lifecycle reconciliation exceeds the ${maxObjects}-object cap`,
     );
   }
-  const failures = [];
+  const failures = missingHistoricalIssues.map(
+    (issueNumber) =>
+      new LifecycleError(
+        "STATE_MISMATCH",
+        `Historical lifecycle exemption Issue #${issueNumber} is missing from repository state.`,
+      ),
+  );
   const results = [];
   for (const issue of issues) {
     try {
+      if (
+        historicalIssueExemptions.has(
+          requirePositiveInteger(issue.number, "Issue number"),
+        )
+      ) {
+        assertManagedIssue(issue);
+      }
       results.push(
         await handleIssueChange({
           github,

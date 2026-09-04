@@ -482,7 +482,14 @@ test("scheduled live-state reconciliation recovers a dropped PR event", async ()
 test("repository reconciliation isolates pre-lifecycle closed history", async () => {
   const closedAt = "2026-09-03T12:00:00.000Z";
   const exemptions = new Map([
-    [46, { closedAt, reason: "Closed before lifecycle enrollment" }],
+    [
+      46,
+      {
+        closedAt,
+        lifecycleStatus: null,
+        reason: "Closed before lifecycle enrollment",
+      },
+    ],
   ]);
   const historical = new FakeGitHub();
   const historicalIssue = historical.issues.get(46);
@@ -508,6 +515,41 @@ test("repository reconciliation isolates pre-lifecycle closed history", async ()
   });
   assert.deepEqual(historical.mutations, []);
 
+  const labeledHistorical = new FakeGitHub();
+  const labeledHistoricalIssue = labeledHistorical.issues.get(46);
+  labeledHistoricalIssue.state = "closed";
+  labeledHistoricalIssue.state_reason = "completed";
+  labeledHistoricalIssue.closed_at = closedAt;
+  labeledHistoricalIssue.labels = [
+    { name: "type:docs" },
+    { name: "status:done" },
+  ];
+  assert.deepEqual(
+    await reconcileRepositoryState({
+      github: labeledHistorical.client,
+      repository: REPOSITORY,
+      defaultBranch: "main",
+      mode: "enforce",
+      now: NOW,
+      historicalIssueExemptions: new Map([
+        [
+          46,
+          {
+            closedAt,
+            lifecycleStatus: "done",
+            reason: "Completed before lifecycle activation",
+          },
+        ],
+      ]),
+    }),
+    {
+      status: "enforce",
+      processed: 0,
+      historicalSkipped: [46],
+      results: [],
+    },
+  );
+
   for (const { configure, exemptions: scenarioExemptions, message } of [
     {
       configure: (issue) => {
@@ -520,6 +562,19 @@ test("repository reconciliation isolates pre-lifecycle closed history", async ()
         issue.labels = [{ name: "type:docs" }, { name: "type:bug" }];
       },
       message: /exactly one managed type label/i,
+    },
+    {
+      configure: (issue) => {
+        issue.labels = [{ name: "area:operations" }];
+      },
+      message: /exactly one managed type label/i,
+    },
+    {
+      configure: (issue) => {
+        issue.labels = [{ name: "type:docs" }, { name: "status:done" }];
+        issue.assignees = [];
+      },
+      message: /final terminal receipt/i,
     },
     {
       configure: (issue) => {
@@ -579,6 +634,25 @@ test("repository reconciliation isolates pre-lifecycle closed history", async ()
         /exactly one managed lifecycle label/i.test(failure.message),
       ),
   );
+
+  const missingHistorical = new FakeGitHub();
+  missingHistorical.issues.delete(46);
+  await assert.rejects(
+    () =>
+      reconcileRepositoryState({
+        github: missingHistorical.client,
+        repository: REPOSITORY,
+        defaultBranch: "main",
+        mode: "enforce",
+        now: NOW,
+        historicalIssueExemptions: exemptions,
+      }),
+    (error) =>
+      error instanceof AggregateError &&
+      error.errors.some((failure) =>
+        /exemption Issue #46 is missing/i.test(failure.message),
+      ),
+  );
 });
 
 test("historical exemption registry is bounded and activation-bound", () => {
@@ -590,6 +664,7 @@ test("historical exemption registry is bounded and activation-bound", () => {
       {
         issue: 46,
         closed_at: "2026-09-03T12:00:00.000Z",
+        lifecycle_status: null,
         reason: "Closed before lifecycle enrollment",
       },
     ],
@@ -601,6 +676,7 @@ test("historical exemption registry is bounded and activation-bound", () => {
         46,
         {
           closedAt: "2026-09-03T12:00:00.000Z",
+          lifecycleStatus: null,
           reason: "Closed before lifecycle enrollment",
         },
       ],
@@ -636,6 +712,12 @@ test("historical exemption registry is bounded and activation-bound", () => {
         registry.entries[0].issue = "46";
       },
       message: /positive safe integer/i,
+    },
+    {
+      mutate: (registry) => {
+        registry.entries[0].lifecycle_status = "ready";
+      },
+      message: /lifecycle status must be null or done/i,
     },
   ]) {
     const malformed = structuredClone(valid);
@@ -1561,6 +1643,29 @@ test("merged pull request verifies completed closure and reaches done", async ()
   assert.ok(fake.issue().labels.some(({ name }) => name === "status:done"));
   assert.deepEqual(fake.issue().assignees, []);
   assert.equal(fake.workflowReceipts().at(-1).action, "merge");
+});
+
+test("completed idempotency requires terminal receipt and merge evidence", async () => {
+  const fake = new FakeGitHub();
+  const governedIssue = fake.issues.get(46);
+  governedIssue.state = "closed";
+  governedIssue.state_reason = "completed";
+  governedIssue.closed_at = NOW;
+  governedIssue.labels = [{ name: "type:docs" }, { name: "status:done" }];
+  const pull = fake.pull({ state: "closed", merged: true });
+  pull.merged_at = NOW;
+  pull.merge_commit_sha = "abc1234";
+  fake.pulls.set(51, pull);
+
+  await assert.rejects(
+    () => handleIssueChange(context(fake, fake.issueEvent(), { eventId: 920 })),
+    /final terminal receipt/i,
+  );
+  await assert.rejects(
+    () =>
+      handlePullRequest(context(fake, fake.pullEvent(pull), { eventId: 921 })),
+    /final terminal receipt/i,
+  );
 });
 
 test("a final merge event reconstructs a dropped pull-request-open transition", async () => {
