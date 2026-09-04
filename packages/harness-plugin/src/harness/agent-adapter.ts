@@ -40,6 +40,7 @@ const TERMINAL_STATUSES = new Set([
   "lost",
   "denied",
   "done",
+  "expired",
 ]);
 
 const isActiveStatus = (status: string): boolean =>
@@ -47,6 +48,20 @@ const isActiveStatus = (status: string): boolean =>
 
 const mappingKey = (jobId: string, attempt: number): string =>
   `${jobId}\u0000${attempt}`;
+
+type LostSessionIdentity = Readonly<{
+  jobId: string;
+  sessionId: string;
+  attempt?: number;
+}>;
+
+const lostIdentityKeys = (identity: LostSessionIdentity): readonly string[] => {
+  const keys = [`session\u0000${identity.jobId}\u0000${identity.sessionId}`];
+  if (identity.attempt !== undefined) {
+    keys.push(`attempt\u0000${identity.jobId}\u0000${identity.attempt}`);
+  }
+  return keys;
+};
 
 type OwnedAgent = OwnedSession & {
   readonly handle: AgentHandle;
@@ -77,9 +92,11 @@ export class AgentAdapter implements HarnessAgentAdapter {
   readonly #createTasks = new Map<string, Promise<{ sessionId: string }>>();
   readonly #resumeTasks = new Set<Promise<boolean>>();
   readonly #resumeTasksByAttempt = new Map<string, Promise<boolean>>();
-  readonly #lost = new Set<string>();
+  readonly #lostIdentityKeys = new Set<string>();
   readonly #idleTasks = new Set<Promise<void>>();
+  readonly #eventTasks = new Set<Promise<void>>();
   #unregister: (() => void) | undefined;
+  #startupPersistenceUnavailable = false;
   #disposed = false;
   #disposePromise: Promise<void> | undefined;
 
@@ -105,6 +122,7 @@ export class AgentAdapter implements HarnessAgentAdapter {
   }): Promise<{ sessionId: string }> {
     await this.ready;
     this.#assertUsable();
+    this.#assertPersistenceAvailable();
 
     const inFlight = this.#createTasks.get(input.jobId);
     if (inFlight !== undefined) return inFlight;
@@ -188,6 +206,11 @@ export class AgentAdapter implements HarnessAgentAdapter {
     await this.ready;
     this.#assertUsable();
 
+    if (this.#startupPersistenceUnavailable) {
+      this.#emitSessionLost(input);
+      return;
+    }
+
     const existing = this.#latestByJob.get(input.jobId);
     if (existing !== undefined) return;
 
@@ -201,7 +224,7 @@ export class AgentAdapter implements HarnessAgentAdapter {
     ) {
       this.#emitSessionLost({
         jobId: input.jobId,
-        attempt: mapping?.attempt ?? 1,
+        attempt: mapping?.attempt,
         sessionId: input.sessionId,
       });
       return;
@@ -215,6 +238,8 @@ export class AgentAdapter implements HarnessAgentAdapter {
   ): Promise<"requested" | "already_idle" | "unknown"> {
     await this.ready;
     this.#assertUsable();
+
+    if (this.#startupPersistenceUnavailable) return "unknown";
 
     const owner = this.#latestByJob.get(jobId);
     if (owner === undefined) {
@@ -255,6 +280,7 @@ export class AgentAdapter implements HarnessAgentAdapter {
       const owners = [...this.#ownedByAttempt.values()];
       await Promise.allSettled(owners.map((owner) => owner.handle.dispose()));
       await Promise.allSettled([...this.#idleTasks]);
+      await Promise.allSettled([...this.#eventTasks]);
       this.#ownedBySession.clear();
       this.#ownedByAttempt.clear();
       this.#latestByJob.clear();
@@ -266,17 +292,43 @@ export class AgentAdapter implements HarnessAgentAdapter {
   async #recover(
     requestedMappings: HarnessAdapterOptions["recoverMappings"] | undefined,
   ): Promise<void> {
-    let mappings: readonly LocalJobMapping[] = [];
+    let persistedMappings: readonly LocalJobMapping[] = [];
+    try {
+      persistedMappings = this.#store.listNonterminalJobs();
+    } catch {
+      this.#startupPersistenceUnavailable = true;
+    }
+
+    let knownMappings: readonly LocalJobMapping[] = [];
     try {
       if (Array.isArray(requestedMappings)) {
-        mappings = requestedMappings;
+        knownMappings = requestedMappings;
       } else if (typeof requestedMappings === "function") {
-        mappings = await requestedMappings();
-      } else {
-        mappings = this.#store.listNonterminalJobs?.() ?? [];
+        knownMappings = await requestedMappings();
       }
     } catch {
+      knownMappings = [];
+    }
+
+    if (this.#startupPersistenceUnavailable) {
+      for (const mapping of knownMappings) {
+        if (isActiveStatus(mapping.status)) this.#emitSessionLost(mapping);
+      }
       return;
+    }
+
+    const mappings = [...persistedMappings];
+    const persistedKeys = new Set(
+      persistedMappings.map((mapping) =>
+        mappingKey(mapping.jobId, mapping.attempt),
+      ),
+    );
+    for (const mapping of knownMappings) {
+      const key = mappingKey(mapping.jobId, mapping.attempt);
+      if (!persistedKeys.has(key)) {
+        persistedKeys.add(key);
+        mappings.push(mapping);
+      }
     }
 
     for (const mapping of mappings) {
@@ -313,7 +365,7 @@ export class AgentAdapter implements HarnessAgentAdapter {
   async #resumeMapping(mapping: LocalJobMapping): Promise<boolean> {
     const key = mappingKey(mapping.jobId, mapping.attempt);
     if (this.#ownedByAttempt.has(key)) return true;
-    if (this.#lost.has(key)) return false;
+    if (this.#hasEmittedSessionLost(mapping)) return false;
 
     let handle: AgentHandle | undefined;
     let attached: OwnedAgent | undefined;
@@ -469,23 +521,32 @@ export class AgentAdapter implements HarnessAgentAdapter {
     this.#emit(owner.terminal);
   }
 
-  #emitSessionLost(owner: OwnedSession): void {
+  #hasEmittedSessionLost(identity: LostSessionIdentity): boolean {
+    return lostIdentityKeys(identity).some((key) =>
+      this.#lostIdentityKeys.has(key),
+    );
+  }
+
+  #emitSessionLost(identity: LostSessionIdentity): void {
     if (this.#disposed) return;
-    const key = mappingKey(owner.jobId, owner.attempt);
-    if (this.#lost.has(key)) return;
-    this.#lost.add(key);
-    try {
-      this.#store.mapJob({
-        jobId: owner.jobId,
-        attempt: owner.attempt,
-        sessionId: owner.sessionId,
-        status: "failed",
-      });
-    } catch {
-      // A persistence outage is the reason recovery failed; do not retry or leak its details.
+    const keys = lostIdentityKeys(identity);
+    if (keys.some((key) => this.#lostIdentityKeys.has(key))) return;
+    for (const key of keys) this.#lostIdentityKeys.add(key);
+
+    if (identity.attempt !== undefined) {
+      try {
+        this.#store.mapJob({
+          jobId: identity.jobId,
+          attempt: identity.attempt,
+          sessionId: identity.sessionId,
+          status: "failed",
+        });
+      } catch {
+        // A persistence outage is the reason recovery failed; do not retry or leak its details.
+      }
     }
     this.#emit({
-      jobId: owner.jobId,
+      jobId: identity.jobId,
       type: "job.failed",
       stage: "failed",
       summary: "HARNESS_SESSION_LOST",
@@ -496,7 +557,9 @@ export class AgentAdapter implements HarnessAgentAdapter {
   #emit(event: NormalizedHarnessEvent): void {
     if (this.#disposed) return;
     try {
-      void Promise.resolve(this.#onEvent(event)).catch(() => undefined);
+      const task = Promise.resolve(this.#onEvent(event)).catch(() => undefined);
+      this.#eventTasks.add(task);
+      void task.finally(() => this.#eventTasks.delete(task));
     } catch {
       // An event sink cannot interrupt the Harness session or its ownership bookkeeping.
     }
@@ -504,6 +567,12 @@ export class AgentAdapter implements HarnessAgentAdapter {
 
   #assertUsable(): void {
     if (this.#disposed) throw new Error("HARNESS_ADAPTER_DISPOSED");
+  }
+
+  #assertPersistenceAvailable(): void {
+    if (this.#startupPersistenceUnavailable) {
+      throw new Error("HARNESS_MAPPING_UNAVAILABLE");
+    }
   }
 }
 

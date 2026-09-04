@@ -6,11 +6,19 @@ import {
   SessionId,
 } from "@deepseek-ai/dsh-session";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type {
+  HarnessAdapterOptions as PublicHarnessAdapterOptions,
+  HarnessAgentAdapter as PublicHarnessAgentAdapter,
+  NormalizedHarnessEvent as PublicNormalizedHarnessEvent,
+} from "../index.js";
+import * as publicApi from "../index.js";
 import {
   AgentAdapter,
   type HarnessContext,
   type HarnessMappingStore,
 } from "./agent-adapter.js";
+import { normalizeSessionEvent } from "./event-normalizer.js";
+import { registerSessionListener } from "./register-session-listener.js";
 import type { NormalizedHarnessEvent } from "./types.js";
 
 type SessionListener = (session: Session, event: SessionEvent) => void;
@@ -49,6 +57,9 @@ class FakeStore implements HarnessMappingStore {
     sessionId: string;
     status: string;
   }> = [];
+  failReads = false;
+  failListing = false;
+  listCalls = 0;
 
   mapJob(input: {
     jobId: string;
@@ -61,10 +72,13 @@ class FakeStore implements HarnessMappingStore {
   }
 
   findJob(jobId: string) {
+    if (this.failReads) throw new Error("store unavailable");
     return this.mappings.get(jobId);
   }
 
   listNonterminalJobs() {
+    this.listCalls += 1;
+    if (this.failListing) throw new Error("store unavailable");
     return this.recovered;
   }
 }
@@ -136,6 +150,21 @@ afterEach(() => {
 });
 
 describe("Harness Agent adapter", () => {
+  it("exports the Harness contracts and implementation from the package entrypoint", () => {
+    const publicConstructor: new (
+      options: PublicHarnessAdapterOptions,
+    ) => PublicHarnessAgentAdapter = publicApi.AgentAdapter;
+    const publicNormalizer: (
+      jobId: string,
+      event: SessionEvent,
+    ) => PublicNormalizedHarnessEvent | undefined =
+      publicApi.normalizeSessionEvent;
+
+    expect(publicConstructor).toBe(AgentAdapter);
+    expect(publicNormalizer).toBe(normalizeSessionEvent);
+    expect(publicApi.registerSessionListener).toBe(registerSessionListener);
+  });
+
   it("creates an owned official Agent, persists before followup, and waits for idle", async () => {
     const fake = new FakeHarness();
     const store = new FakeStore();
@@ -301,6 +330,111 @@ describe("Harness Agent adapter", () => {
       expect.objectContaining({
         jobId: "lost-job",
         type: "job.failed",
+        summary: "HARNESS_SESSION_LOST",
+      }),
+    ]);
+    await adapter.dispose();
+  });
+
+  it("fails closed with one loss event per known mapping when startup listing fails", async () => {
+    const fake = new FakeHarness();
+    const store = new FakeStore();
+    store.failListing = true;
+    const knownMappings = [
+      {
+        jobId: "known-job-1",
+        attempt: 1,
+        sessionId: "known-session-1",
+        status: "running",
+      },
+      {
+        jobId: "known-job-2",
+        attempt: 3,
+        sessionId: "known-session-2",
+        status: "waiting_approval",
+      },
+      {
+        jobId: "expired-job",
+        attempt: 1,
+        sessionId: "expired-session",
+        status: "expired",
+      },
+    ] as const;
+    const events: NormalizedHarnessEvent[] = [];
+    const adapter = new AgentAdapter({
+      ctx: fake.ctx,
+      store,
+      recoverMappings: knownMappings,
+      onEvent: (event) => {
+        events.push(event);
+      },
+    });
+
+    await adapter.ready;
+
+    expect(store.listCalls).toBe(1);
+    expect(fake.resume).not.toHaveBeenCalled();
+    expect(events).toEqual([
+      expect.objectContaining({
+        jobId: "known-job-1",
+        summary: "HARNESS_SESSION_LOST",
+      }),
+      expect.objectContaining({
+        jobId: "known-job-2",
+        summary: "HARNESS_SESSION_LOST",
+      }),
+    ]);
+    await expect(
+      adapter.create({
+        jobId: "new-job",
+        repositoryPath: "/repo",
+        request: "must not start",
+      }),
+    ).rejects.toThrow("HARNESS_MAPPING_UNAVAILABLE");
+    await adapter.dispose();
+  });
+
+  it("queries the durable store before awaiting supplemental recovery input", async () => {
+    const fake = new FakeHarness();
+    const store = new FakeStore();
+    const supplemental = deferred<readonly []>();
+    const adapter = new AgentAdapter({
+      ctx: fake.ctx,
+      store,
+      recoverMappings: () => supplemental.promise,
+    });
+
+    const listCallsBeforeSupplemental = store.listCalls;
+    supplemental.resolve([]);
+    await adapter.ready;
+    await adapter.dispose();
+
+    expect(listCallsBeforeSupplemental).toBe(1);
+  });
+
+  it("deduplicates startup attempt loss and explicit resume loss during an outage", async () => {
+    const fake = new FakeHarness();
+    const store = new FakeStore();
+    store.recovered.push({
+      jobId: "outage-job",
+      attempt: 2,
+      sessionId: "outage-session",
+      status: "running",
+    });
+    fake.resume.mockRejectedValue(new Error("session unavailable"));
+    const events: NormalizedHarnessEvent[] = [];
+    const adapter = createAdapter(fake, store, events);
+
+    await adapter.ready;
+    store.failReads = true;
+    await adapter.resume({
+      jobId: "outage-job",
+      sessionId: "outage-session",
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        jobId: "outage-job",
         summary: "HARNESS_SESSION_LOST",
       }),
     ]);
@@ -520,5 +654,67 @@ describe("Harness Agent adapter", () => {
     await expect(resume).resolves.toBeUndefined();
     await expect(disposal).resolves.toBeUndefined();
     expect(handle.dispose).toHaveBeenCalledOnce();
+  });
+
+  it("waits for a pending event sink before disposal resolves", async () => {
+    const fake = new FakeHarness();
+    const sink = deferred<void>();
+    const { handle } = fake.makeAgent("pending-sink-session");
+    fake.create.mockResolvedValue(handle);
+    const adapter = new AgentAdapter({
+      ctx: fake.ctx,
+      store: new FakeStore(),
+      onEvent: () => sink.promise,
+    });
+    await adapter.create({
+      jobId: "pending-sink-job",
+      repositoryPath: "/repo",
+      request: "go",
+    });
+    fake.emit(
+      "pending-sink-session",
+      sessionEvent("step/start", { turn: 1, step: 1 }),
+    );
+
+    let disposalResolved = false;
+    const disposal = adapter.dispose().then(() => {
+      disposalResolved = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(disposalResolved).toBe(false);
+
+    sink.resolve();
+    await expect(disposal).resolves.toBeUndefined();
+  });
+
+  it("waits for and contains a rejecting event sink during disposal", async () => {
+    const fake = new FakeHarness();
+    const sink = deferred<void>();
+    const { handle } = fake.makeAgent("rejecting-sink-session");
+    fake.create.mockResolvedValue(handle);
+    const adapter = new AgentAdapter({
+      ctx: fake.ctx,
+      store: new FakeStore(),
+      onEvent: () => sink.promise,
+    });
+    await adapter.create({
+      jobId: "rejecting-sink-job",
+      repositoryPath: "/repo",
+      request: "go",
+    });
+    fake.emit(
+      "rejecting-sink-session",
+      sessionEvent("step/end", { turn: 1, step: 1 }),
+    );
+
+    let disposalResolved = false;
+    const disposal = adapter.dispose().then(() => {
+      disposalResolved = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(disposalResolved).toBe(false);
+
+    sink.reject(new Error("sink unavailable"));
+    await expect(disposal).resolves.toBeUndefined();
   });
 });

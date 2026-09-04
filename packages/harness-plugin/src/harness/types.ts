@@ -72,7 +72,7 @@ export interface HarnessMappingStore {
     status: string;
   }): void;
   findJob(jobId: string): LocalJobMapping | undefined;
-  listNonterminalJobs?(): readonly LocalJobMapping[];
+  listNonterminalJobs(): readonly LocalJobMapping[];
 }
 
 export type HarnessSessionEventHandler = (

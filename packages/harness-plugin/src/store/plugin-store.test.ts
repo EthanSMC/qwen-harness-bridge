@@ -344,6 +344,100 @@ describe("SQLite Harness plugin store", () => {
     store.close();
   });
 
+  it("lists active job mappings deterministically and excludes terminal mappings", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+
+    for (const mapping of [
+      {
+        jobId: "job-zulu",
+        attempt: 2,
+        sessionId: "session-zulu-2",
+        status: "running",
+      },
+      {
+        jobId: "job-alpha",
+        attempt: 2,
+        sessionId: "session-alpha-2",
+        status: "waiting_approval",
+      },
+      {
+        jobId: "job-alpha",
+        attempt: 1,
+        sessionId: "session-alpha-1",
+        status: "failed",
+      },
+      {
+        jobId: "job-bravo",
+        attempt: 1,
+        sessionId: "session-bravo-1",
+        status: "cancelling",
+      },
+      {
+        jobId: "job-cancelled",
+        attempt: 1,
+        sessionId: "session-cancelled",
+        status: "cancelled",
+      },
+      {
+        jobId: "job-expired",
+        attempt: 1,
+        sessionId: "session-expired",
+        status: "expired",
+      },
+      {
+        jobId: "job-succeeded",
+        attempt: 1,
+        sessionId: "session-succeeded",
+        status: "succeeded",
+      },
+    ]) {
+      store.mapJob(mapping);
+    }
+    store.close();
+
+    const reopened = new SqlitePluginStore(databasePath);
+
+    expect(reopened.listNonterminalJobs()).toEqual([
+      {
+        jobId: "job-alpha",
+        attempt: 2,
+        sessionId: "session-alpha-2",
+        status: "waiting_approval",
+      },
+      {
+        jobId: "job-bravo",
+        attempt: 1,
+        sessionId: "session-bravo-1",
+        status: "cancelling",
+      },
+      {
+        jobId: "job-zulu",
+        attempt: 2,
+        sessionId: "session-zulu-2",
+        status: "running",
+      },
+    ]);
+    reopened.close();
+  });
+
+  it("fails closed with a safe error when the mapping query is unavailable", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    const sabotagingConnection = new Database(databasePath);
+    sabotagingConnection.exec("DROP TABLE job_mappings");
+    sabotagingConnection.close();
+
+    const error = captureStoreError(() => store.listNonterminalJobs());
+
+    expect(error).toMatchObject({
+      code: "STORE_JOB_MAPPING_READ_FAILED",
+      message: "STORE_JOB_MAPPING_READ_FAILED",
+    });
+    expect(error.message).not.toMatch(/job_mappings|SELECT|sqlite/iu);
+    store.close();
+  });
+
   it("keeps outbound event sequences monotonic, replays pending events, and acknowledges idempotently", () => {
     const databasePath = makeDatabasePath();
     const store = new SqlitePluginStore(databasePath);
