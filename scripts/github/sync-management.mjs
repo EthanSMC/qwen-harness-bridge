@@ -128,6 +128,17 @@ const issueForTask = (definition, task, existingIssues) => {
   return matches[0];
 };
 
+// ADR 0003: only the Harness Connector plan has parallel prerequisites.
+// Task 1 continues to use the existing Foundation completion gate.
+const M1_TASK_DEPENDENCIES = {
+  2: [1],
+  3: [1],
+  4: [1],
+  5: [2, 3, 4],
+  6: [2, 3, 4, 5],
+  7: [6],
+};
+
 export const buildPlanIssueGraph = (planDefinitions, existingIssues) => {
   const graph = new Map();
   const planIssues = planDefinitions.map((definition) =>
@@ -148,7 +159,18 @@ export const buildPlanIssueGraph = (planDefinitions, existingIssues) => {
     ) {
       const issue = planIssues[definitionIndex][taskIndex];
       const blockedBy = [];
-      if (taskIndex > 0) {
+      const m1Dependencies =
+        basename(definition.file) === "2026-09-01-harness-plugin-connector.md"
+          ? M1_TASK_DEPENDENCIES[definition.tasks[taskIndex].number]
+          : undefined;
+      if (m1Dependencies) {
+        blockedBy.push(
+          ...m1Dependencies.map(
+            (number) =>
+              issueForTask(definition, { number }, existingIssues).number,
+          ),
+        );
+      } else if (taskIndex > 0) {
         blockedBy.push(planIssues[definitionIndex][taskIndex - 1].number);
       } else if (definitionIndex > 0 && definitionIndex <= 3) {
         blockedBy.push(planIssues[definitionIndex - 1].at(-1).number);
