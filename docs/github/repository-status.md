@@ -17,7 +17,7 @@ Verified on 2026-09-04 against [EthanSMC/qwen-harness-bridge](https://github.com
 
 Observed locally on 2026-09-04 before opening the bootstrap pull request:
 
-- `node --test scripts/github/*.test.mjs`: PASS, 125 tests.
+- `node --test scripts/github/*.test.mjs`: PASS, 126 tests, including the legacy-migration CLI path.
 - `node scripts/github/verify-planning.mjs`: PASS, 25 governance/planning files and 34 implementation tasks.
 - `pnpm check`: PASS; Biome checked 65 files, both workspace TypeScript projects passed, and Vitest passed 14 files / 278 tests.
 - `git diff --check origin/main`: PASS after removing Markdown-only trailing whitespace from the candidate range.

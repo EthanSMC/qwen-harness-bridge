@@ -481,8 +481,38 @@ export const main = async ({
   ) {
     fail("Pull request event is stale relative to the live GitHub PR");
   }
+  const publicBody = safePullRequestBody(pullRequest.body);
+  const issueNumber = closingIssueNumber(publicBody);
+  const migrations = readJson(migrationsPath, "Lifecycle migration registry");
+  const migration = validateMigrationRegistry(migrations, {
+    mode,
+    pullRequestNumber: pullNumber,
+    issueNumber,
+    now,
+  });
+  const issue = await github.get(`/issues/${issueNumber}`);
+  if (issue.number !== issueNumber) {
+    fail("Live Issue does not match the migrated or primary Issue");
+  }
+  if (migration.migrated) {
+    const result = validatePullRequestLifecycleState({
+      repository,
+      defaultBranch: event.repository.default_branch,
+      pullRequest,
+      issue,
+      comments: [],
+      dependencies: [],
+      closingPullRequests: [],
+      reviewedHeadSha: null,
+      now,
+      mode,
+      migrations,
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+    return result;
+  }
+
   const fields = extractLifecycleFields(pullRequest.body);
-  const issue = await github.get(`/issues/${fields.issueNumber}`);
   const dependencyNumbers = parseDependencies(issue.body);
   const [comments, dependencies, openPullRequests] = await Promise.all([
     github.getAll(`/issues/${fields.issueNumber}/comments`, "Issue comments"),
@@ -494,7 +524,6 @@ export const main = async ({
   const closingPullRequests = openPullRequests.filter((candidate) =>
     closingIssueNumbers(candidate.body).includes(fields.issueNumber),
   );
-  const migrations = readJson(migrationsPath, "Lifecycle migration registry");
   const result = validatePullRequestLifecycleState({
     repository,
     defaultBranch: event.repository.default_branch,

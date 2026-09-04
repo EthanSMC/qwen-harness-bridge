@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { receiptBody } from "./ai-issue-policy.mjs";
 import {
   extractLifecycleFields,
+  main,
   validatePullRequestLifecycleState,
 } from "./verify-ai-lifecycle.mjs";
 
@@ -394,6 +397,64 @@ test("allows only an exact unexpired migration before activation", () => {
     ).valid,
     false,
   );
+});
+
+test("CLI resolves an exact legacy migration before claim-field lookup", async (t) => {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), "qhb-migration-"));
+  t.after(() => rm(temporaryDirectory, { recursive: true, force: true }));
+  const legacyPullRequest = pullRequest("## Tracking\n\nCloses #46");
+  const eventPath = join(temporaryDirectory, "event.json");
+  const migrationsPath = join(temporaryDirectory, "migrations.json");
+  await writeFile(
+    eventPath,
+    JSON.stringify({
+      repository: { full_name: REPOSITORY, default_branch: "main" },
+      pull_request: legacyPullRequest,
+    }),
+  );
+  await writeFile(
+    migrationsPath,
+    JSON.stringify({
+      schema_version: 1,
+      activation_commit: null,
+      entries: [
+        {
+          pull_request: 51,
+          issue: 46,
+          reason: "Pull request predates AI lifecycle activation",
+          approved_by: "maintainer",
+          expires_at: "2026-09-11T00:00:00Z",
+        },
+      ],
+    }),
+  );
+  const requests = [];
+  const fetchImpl = async (url) => {
+    requests.push(new URL(url).pathname);
+    const value = url.endsWith("/pulls/51")
+      ? legacyPullRequest
+      : { ...issue(), labels: [], assignees: [] };
+    return new Response(JSON.stringify(value), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  const result = await main({
+    eventPath,
+    token: "test-token",
+    repository: REPOSITORY,
+    staticResult: "success",
+    mode: "report",
+    migrationsPath,
+    fetchImpl,
+    now: NOW,
+  });
+  assert.equal(result.migrated, true);
+  assert.deepEqual(requests, [
+    "/repos/octo/example/pulls/51",
+    "/repos/octo/example/issues/46",
+  ]);
 });
 
 test("strict activation requires one main commit and no migrations", () => {
