@@ -6,7 +6,7 @@
 
 **Architecture:** `packages/harness-plugin` is both a Cordis extension and an outbound Connector. The extension exports `apply(ctx)`, owns only the Harness Agents that it creates, persists cloud-to-Harness mappings plus an outbox in SQLite, and talks to the Control Plane through an authenticated TLS WebSocket. Pure adapters isolate official Harness APIs from product orchestration. A local policy guard is authoritative: cloud approval may release `approval_required`, but can never release `denied`.
 
-**Tech Stack:** TypeScript strict mode, `@deepseek-ai/cordis`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-tools`, `@deepseek-ai/dsh-user-approval`, Zod, `ws`, `better-sqlite3`, Node `child_process.spawn`, Vitest, and the shared `@qhb/protocol` package.
+**Tech Stack:** TypeScript strict mode, `@deepseek-ai/cordis`, `@deepseek-ai/dsh-agent`, `@deepseek-ai/dsh-llm`, `@deepseek-ai/dsh-session`, `@deepseek-ai/dsh-tools`, `@deepseek-ai/dsh-user-approval`, Zod, `ws`, `better-sqlite3`, Node `child_process.spawn`, Vitest, and the shared `@qhb/protocol` package.
 
 **Spec:** `docs/superpowers/specs/2026-09-01-qwen-harness-bridge-design.md`
 
@@ -53,12 +53,15 @@ docs/product/v0.2.0-acceptance.md                 release evidence
 **Files:**
 - Create: `packages/harness-plugin/package.json`
 - Create: `packages/harness-plugin/tsconfig.json`
+- Create: `packages/harness-plugin/tsconfig.build.json`
+- Create: `packages/harness-plugin/src/index.ts`
 - Create: `packages/harness-plugin/src/config.ts`
 - Create: `packages/harness-plugin/src/keychain.ts`
 - Create: `packages/harness-plugin/src/store/schema.sql`
 - Create: `packages/harness-plugin/src/store/plugin-store.ts`
 - Test: `packages/harness-plugin/src/config.test.ts`
 - Test: `packages/harness-plugin/src/store/plugin-store.test.ts`
+- Modify: `pnpm-lock.yaml` (after registering the workspace package and its dependencies)
 
 **Interfaces:**
 
@@ -102,6 +105,8 @@ Expected: FAIL because the package and implementation do not exist.
 - [ ] **Step 2: Add the package and exact runtime dependencies**
 
 The package exports `.` from `dist/index.js`, declares the six official `@deepseek-ai/*` packages as peer dependencies matching the installed Harness release, and keeps `@qhb/protocol`, Zod, `ws`, and `better-sqlite3` as runtime dependencies. Add it to the root build, typecheck, and test scripts.
+
+The root `build`, `typecheck`, and `test` scripts already recurse over the `packages/*` workspace, so no additional root registration is required unless that baseline changes.
 
 - [ ] **Step 3: Implement validated configuration**
 
