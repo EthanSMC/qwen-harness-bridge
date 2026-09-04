@@ -188,17 +188,22 @@ export class MacOSKeychainCredentialReader implements CredentialReader {
           return;
         }
 
-        const credential = Buffer.concat(stdoutChunks)
-          .toString("utf8")
-          .replace(/\r?\n$/, "");
-        if (credential.length === 0) {
-          fail(false);
-          return;
+        const assembledCredential = Buffer.concat(stdoutChunks);
+        try {
+          const credential = assembledCredential
+            .toString("utf8")
+            .replace(/\r?\n$/, "");
+          if (credential.length === 0) {
+            fail(false);
+            return;
+          }
+          settled = true;
+          scrubStdout();
+          cleanup();
+          resolve(credential);
+        } finally {
+          assembledCredential.fill(0);
         }
-        settled = true;
-        scrubStdout();
-        cleanup();
-        resolve(credential);
       };
 
       child.stdout.on("data", onStdoutData);

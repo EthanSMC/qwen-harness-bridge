@@ -367,6 +367,36 @@ describe("macOS Keychain credential reader", () => {
     expect(retainedChunk.every((byte) => byte === 0)).toBe(true);
   });
 
+  it("scrubs the assembled credential buffer while preserving the returned string", async () => {
+    const controlled = makeControlledSpawn();
+    const realBufferConcat = Buffer.concat;
+    let assembledCredential: Buffer<ArrayBuffer> | undefined;
+    const concatSpy = vi
+      .spyOn(Buffer, "concat")
+      .mockImplementation((list, totalLength) => {
+        assembledCredential = realBufferConcat(list, totalLength);
+        return assembledCredential;
+      });
+    const reader = new MacOSKeychainCredentialReader(controlled.spawn);
+
+    try {
+      const result = reader.read("service-name", "account-name");
+      controlled.stdout.emit("data", Buffer.from("assembled-"));
+      controlled.stdout.emit("data", Buffer.from("secret\n"));
+      controlled.child.emit("close", 0, null);
+
+      await expect(result).resolves.toBe("assembled-secret");
+      expect(assembledCredential).toBeInstanceOf(Buffer);
+      expect(
+        assembledCredential?.equals(
+          Buffer.alloc(assembledCredential.byteLength),
+        ),
+      ).toBe(true);
+    } finally {
+      concatSpy.mockRestore();
+    }
+  });
+
   it("scrubs every emitted stdout buffer when output exceeds its bound", async () => {
     const controlled = makeControlledSpawn();
     controlled.kill.mockImplementation(() => {
