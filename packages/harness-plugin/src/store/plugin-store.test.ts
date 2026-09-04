@@ -170,6 +170,51 @@ describe("SQLite Harness plugin store", () => {
     );
   });
 
+  it.each([
+    ["table", "CREATE TABLE unexpected_table (value TEXT)"],
+    ["index", "CREATE INDEX unexpected_index ON metadata(value)"],
+    ["view", "CREATE VIEW unexpected_view AS SELECT key FROM metadata"],
+    [
+      "trigger",
+      "CREATE TRIGGER unexpected_trigger AFTER INSERT ON metadata BEGIN SELECT 1; END",
+    ],
+  ])("rejects an unexpected user %s", (_kind, sql) => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    store.close();
+
+    const database = new Database(databasePath);
+    database.exec(sql);
+    database.close();
+
+    expect(() => new SqlitePluginStore(databasePath)).toThrow(
+      "STORE_SCHEMA_INCOMPATIBLE",
+    );
+  });
+
+  it("rejects a tautological check hidden behind the canonical text in a comment", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    store.close();
+
+    const database = new Database(databasePath);
+    database.exec(`
+      ALTER TABLE inbound_messages RENAME TO inbound_messages_old;
+      CREATE TABLE inbound_messages (
+        message_id TEXT PRIMARY KEY NOT NULL,
+        sequence INTEGER NOT NULL UNIQUE CHECK (1 = 1) /*CHECK(sequence>=1)*/,
+        body TEXT NOT NULL,
+        received_at TEXT NOT NULL
+      );
+      DROP TABLE inbound_messages_old;
+    `);
+    database.close();
+
+    expect(() => new SqlitePluginStore(databasePath)).toThrow(
+      "STORE_SCHEMA_INCOMPATIBLE",
+    );
+  });
+
   it("deduplicates inbound message IDs and persists the decision after reopen", () => {
     const databasePath = makeDatabasePath();
     const first = new SqlitePluginStore(databasePath);

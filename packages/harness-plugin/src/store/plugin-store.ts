@@ -116,124 +116,43 @@ type EventRow = {
   acknowledged_at: string | null;
 };
 
-type TableInfoRow = {
-  name: string;
+type SchemaObjectRow = {
   type: string;
-  notnull: number;
-  dflt_value: string | null;
-  pk: number;
-};
-
-type IndexListRow = {
   name: string;
-  unique: number;
-};
-
-type IndexInfoRow = {
-  seqno: number;
-  name: string;
-};
-
-type TableDefinitionRow = {
+  tbl_name: string;
   sql: string | null;
 };
 
-const REQUIRED_SCHEMA = {
-  inbound_messages: {
-    columns: [
-      ["message_id", "TEXT", 1, null, 1],
-      ["sequence", "INTEGER", 1, null, 0],
-      ["body", "TEXT", 1, null, 0],
-      ["received_at", "TEXT", 1, null, 0],
-    ],
-    uniqueColumns: [["sequence"]],
-    requiredChecks: ["CHECK(SEQUENCE>=1)"],
-  },
-  job_mappings: {
-    columns: [
-      ["job_id", "TEXT", 1, null, 1],
-      ["attempt", "INTEGER", 1, null, 2],
-      ["session_id", "TEXT", 1, null, 0],
-      ["status", "TEXT", 1, null, 0],
-      ["updated_at", "TEXT", 1, null, 0],
-    ],
-    uniqueColumns: [["session_id"]],
-    requiredChecks: ["CHECK(ATTEMPT>=1)"],
-  },
-  outbound_events: {
-    columns: [
-      ["message_id", "TEXT", 1, null, 1],
-      ["sequence", "INTEGER", 1, null, 0],
-      ["payload_json", "TEXT", 1, null, 0],
-      ["attempts", "INTEGER", 1, "0", 0],
-      ["acknowledged_at", "TEXT", 0, null, 0],
-      ["created_at", "TEXT", 1, null, 0],
-    ],
-    uniqueColumns: [["sequence"]],
-    requiredChecks: ["CHECK(SEQUENCE>=1)", "CHECK(ATTEMPTS>=0)"],
-  },
-  metadata: {
-    columns: [
-      ["key", "TEXT", 1, null, 1],
-      ["value", "TEXT", 1, null, 0],
-    ],
-    uniqueColumns: [],
-    requiredChecks: [],
-  },
-} as const;
-
-const schemaMatches = (database: Database.Database): boolean => {
-  for (const [tableName, expected] of Object.entries(REQUIRED_SCHEMA)) {
-    const columns = database.pragma(
-      `table_info(${tableName})`,
-    ) as TableInfoRow[];
-    const actualColumns = columns.map((column) => [
-      column.name,
-      column.type.toUpperCase(),
-      column.notnull,
-      column.dflt_value,
-      column.pk,
-    ]);
-    if (JSON.stringify(actualColumns) !== JSON.stringify(expected.columns)) {
-      return false;
-    }
-
-    const definition = database
-      .prepare(
-        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-      )
-      .get(tableName) as TableDefinitionRow | undefined;
-    const normalizedDefinition = definition?.sql
-      ?.replace(/\s+/g, "")
-      .toUpperCase();
-    if (
-      normalizedDefinition === undefined ||
-      expected.requiredChecks.some(
-        (requiredCheck) => !normalizedDefinition.includes(requiredCheck),
-      )
-    ) {
-      return false;
-    }
-
-    const indexes = (
-      database.pragma(`index_list(${tableName})`) as IndexListRow[]
-    ).filter((index) => index.unique === 1);
-    for (const requiredColumns of expected.uniqueColumns) {
-      const hasRequiredIndex = indexes.some((index) => {
-        const indexColumns = (
-          database
-            .prepare(
-              "SELECT seqno, name FROM pragma_index_info(?) ORDER BY seqno",
-            )
-            .all(index.name) as IndexInfoRow[]
-        ).map(({ name }) => name);
-        return JSON.stringify(indexColumns) === JSON.stringify(requiredColumns);
-      });
-      if (!hasRequiredIndex) return false;
-    }
-  }
-  return true;
+const schemaObjects = (database: Database.Database): SchemaObjectRow[] => {
+  const rows = database
+    .prepare(
+      `SELECT type, name, tbl_name, sql
+       FROM sqlite_master
+       WHERE substr(lower(name), 1, 7) <> 'sqlite_'
+       ORDER BY type, name, tbl_name`,
+    )
+    .all() as SchemaObjectRow[];
+  return rows.map((row) => ({
+    ...row,
+    sql: row.sql?.replace(/\s+/gu, " ").trim() ?? null,
+  }));
 };
+
+const expectedSchemaObjects = (): SchemaObjectRow[] => {
+  const database = new Database(":memory:");
+  try {
+    database.exec(SCHEMA_SQL);
+    return schemaObjects(database);
+  } finally {
+    database.close();
+  }
+};
+
+const EXPECTED_SCHEMA_OBJECTS = expectedSchemaObjects();
+
+const schemaMatches = (database: Database.Database): boolean =>
+  JSON.stringify(schemaObjects(database)) ===
+  JSON.stringify(EXPECTED_SCHEMA_OBJECTS);
 
 export class SqlitePluginStore implements PluginStore {
   #database: Database.Database | null = null;

@@ -22,6 +22,8 @@ const MAX_STDERR_BYTES = 1_024;
 const MAX_CREDENTIAL_BYTES = 16 * 1_024;
 const DEFAULT_TIMEOUT_MS = 10_000;
 const MAX_TIMEOUT_MS = 30_000;
+const TERMINATION_GRACE_MS = 100;
+const FORCE_CLEANUP_GRACE_MS = 100;
 
 export type SpawnImplementation = (
   command: string,
@@ -70,31 +72,75 @@ export class MacOSKeychainCredentialReader implements CredentialReader {
       let stdoutBytes = 0;
       let stderrBytes = 0;
       let settled = false;
+      let cleaned = false;
       let timeout: ReturnType<typeof setTimeout> | undefined;
+      let escalationTimeout: ReturnType<typeof setTimeout> | undefined;
+      let forcedCleanupTimeout: ReturnType<typeof setTimeout> | undefined;
 
-      function ignoreLateError(): void {
-        // The safe result has already settled; absorb teardown races.
-      }
-
-      const terminate = (): void => {
+      const signalChild = (signal: NodeJS.Signals): boolean => {
         try {
-          child.kill("SIGTERM");
+          return child.kill(signal);
+        } catch {
+          return false;
+        }
+      };
+
+      const releaseResources = (): void => {
+        try {
+          child.stdin?.destroy();
+        } catch {
+          // Preserve the safe credential error.
+        }
+        try {
+          child.stdout.destroy();
+        } catch {
+          // Preserve the safe credential error.
+        }
+        try {
+          child.stderr.destroy();
+        } catch {
+          // Preserve the safe credential error.
+        }
+        try {
+          child.unref();
         } catch {
           // Preserve the safe credential error.
         }
       };
 
+      const scrubStdout = (): void => {
+        for (const chunk of stdoutChunks) chunk.fill(0);
+        stdoutChunks.length = 0;
+        stdoutBytes = 0;
+      };
+
       const cleanup = (): void => {
+        if (cleaned) return;
+        cleaned = true;
         if (timeout !== undefined) clearTimeout(timeout);
+        if (escalationTimeout !== undefined) clearTimeout(escalationTimeout);
+        if (forcedCleanupTimeout !== undefined) {
+          clearTimeout(forcedCleanupTimeout);
+        }
         child.stdout.removeListener("data", onStdoutData);
         child.stderr.removeListener("data", onStderrData);
         child.removeListener("close", onClose);
         child.removeListener("error", onChildError);
         child.stdout.removeListener("error", onStreamError);
         child.stderr.removeListener("error", onStreamError);
-        child.removeListener("error", ignoreLateError);
-        child.stdout.removeListener("error", ignoreLateError);
-        child.stderr.removeListener("error", ignoreLateError);
+      };
+
+      const terminate = (): void => {
+        signalChild("SIGTERM");
+        releaseResources();
+        if (cleaned) return;
+        escalationTimeout = setTimeout(() => {
+          if (cleaned) return;
+          signalChild("SIGKILL");
+          releaseResources();
+          if (cleaned) return;
+          forcedCleanupTimeout = setTimeout(cleanup, FORCE_CLEANUP_GRACE_MS);
+        }, TERMINATION_GRACE_MS);
       };
 
       const fail = (terminateChild: boolean): void => {
@@ -103,12 +149,11 @@ export class MacOSKeychainCredentialReader implements CredentialReader {
         if (timeout !== undefined) clearTimeout(timeout);
         child.stdout.removeListener("data", onStdoutData);
         child.stderr.removeListener("data", onStderrData);
+        scrubStdout();
         if (terminateChild) {
-          child.once("error", ignoreLateError);
-          child.stdout.once("error", ignoreLateError);
-          child.stderr.once("error", ignoreLateError);
           terminate();
         } else {
+          releaseResources();
           cleanup();
         }
         reject(new CredentialUnavailableError());
@@ -156,9 +201,9 @@ export class MacOSKeychainCredentialReader implements CredentialReader {
 
       child.stdout.on("data", onStdoutData);
       child.stderr.on("data", onStderrData);
-      child.once("error", onChildError);
-      child.stdout.once("error", onStreamError);
-      child.stderr.once("error", onStreamError);
+      child.on("error", onChildError);
+      child.stdout.on("error", onStreamError);
+      child.stderr.on("error", onStreamError);
       child.once("close", onClose);
       timeout = setTimeout(() => fail(true), this.#timeoutMs);
     });

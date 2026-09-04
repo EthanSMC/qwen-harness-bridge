@@ -283,7 +283,12 @@ const makeFakeSpawn = (options: {
     const child = new EventEmitter() as ChildProcessWithoutNullStreams;
     const stdout = new PassThrough();
     const stderr = new PassThrough();
-    Object.assign(child, { stdout, stderr, kill: vi.fn(() => true) });
+    Object.assign(child, {
+      stdout,
+      stderr,
+      kill: vi.fn(() => true),
+      unref: vi.fn(() => child),
+    });
     queueMicrotask(() => {
       if (options.stdout !== undefined) stdout.end(options.stdout);
       if (options.stderr !== undefined) stderr.end(options.stderr);
@@ -299,13 +304,15 @@ const makeControlledSpawn = () => {
   const child = new EventEmitter() as ChildProcessWithoutNullStreams;
   const stdout = new PassThrough();
   const stderr = new PassThrough();
-  const kill = vi.fn(() => true);
-  Object.assign(child, { stdout, stderr, kill });
+  const kill = vi.fn((_: NodeJS.Signals | number = "SIGTERM") => true);
+  const unref = vi.fn(() => child);
+  Object.assign(child, { stdout, stderr, kill, unref });
   return {
     child,
     stdout,
     stderr,
     kill,
+    unref,
     spawn: vi.fn(() => child),
   };
 };
@@ -414,6 +421,72 @@ describe("macOS Keychain credential reader", () => {
     expect(controlled.stderr.listenerCount("data")).toBe(0);
     expect(controlled.stderr.listenerCount("error")).toBe(0);
   });
+
+  it("preserves the ten-second default credential timeout", async () => {
+    vi.useFakeTimers();
+    const controlled = makeControlledSpawn();
+    const reader = new MacOSKeychainCredentialReader(controlled.spawn);
+    const result = reader.read("private-service", "private-account");
+    const rejection = expect(result).rejects.toEqual(
+      expect.objectContaining({ code: "CONNECTOR_CREDENTIAL_UNAVAILABLE" }),
+    );
+
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(controlled.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await rejection;
+    expect(controlled.kill).toHaveBeenCalledWith("SIGTERM");
+
+    controlled.child.emit("close", null, "SIGTERM");
+    await vi.runAllTimersAsync();
+  });
+
+  it.each(["false", "throw", "no-close"] as const)(
+    "escalates and fully releases a child when SIGTERM is %s",
+    async (termBehavior) => {
+      vi.useFakeTimers();
+      const controlled = makeControlledSpawn();
+      controlled.kill.mockImplementation((signal) => {
+        if (signal === "SIGTERM") {
+          if (termBehavior === "throw") {
+            throw new Error("private SIGTERM failure");
+          }
+          return termBehavior === "no-close";
+        }
+        return false;
+      });
+      const retainedSecret = Buffer.from("private retained credential");
+      const reader = new MacOSKeychainCredentialReader(controlled.spawn, 10);
+      const result = reader.read("private-service", "private-account");
+      const rejection = expect(result).rejects.toEqual(
+        expect.objectContaining({ code: "CONNECTOR_CREDENTIAL_UNAVAILABLE" }),
+      );
+      const redaction = expect(result).rejects.not.toThrow(
+        /private|credential|service|account|SIGTERM/,
+      );
+      controlled.stdout.emit("data", retainedSecret);
+
+      await vi.advanceTimersByTimeAsync(10);
+      await rejection;
+      await redaction;
+      await vi.runAllTimersAsync();
+
+      expect(controlled.kill.mock.calls).toEqual([["SIGTERM"], ["SIGKILL"]]);
+      expect(retainedSecret.equals(Buffer.alloc(retainedSecret.length))).toBe(
+        true,
+      );
+      expect(controlled.stdout.destroyed).toBe(true);
+      expect(controlled.stderr.destroyed).toBe(true);
+      expect(controlled.unref).toHaveBeenCalled();
+      expect(controlled.child.listenerCount("error")).toBe(0);
+      expect(controlled.child.listenerCount("close")).toBe(0);
+      expect(controlled.stdout.listenerCount("data")).toBe(0);
+      expect(controlled.stdout.listenerCount("error")).toBe(0);
+      expect(controlled.stderr.listenerCount("data")).toBe(0);
+      expect(controlled.stderr.listenerCount("error")).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
 
   it.each(["stdout", "stderr"] as const)(
     "handles a private %s stream error and terminates the child",

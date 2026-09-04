@@ -1142,6 +1142,35 @@ describe("release runtime build contract", () => {
           stdio: "pipe",
         },
       );
+      const staleProtocolSentinel = "STALE_PROTOCOL_SENTINEL";
+      mkdirSync(built("packages/protocol/dist"), { recursive: true });
+      writeFileSync(
+        built("packages/protocol/dist/index.d.ts"),
+        'export declare const RepositoryIdSchema: import("zod").ZodString;\n',
+      );
+      writeFileSync(
+        built("packages/protocol/dist/index.js"),
+        `export const RepositoryIdSchema = "${staleProtocolSentinel}";\n`,
+      );
+      writeFileSync(
+        built("packages/protocol/dist/stale-only.js"),
+        staleProtocolSentinel,
+      );
+      runFreshBuildCommand(
+        "pnpm",
+        ["--filter", "@qhb/harness-plugin", "build"],
+        {
+          cwd: buildRoot,
+          env: environment,
+          stdio: "pipe",
+        },
+      );
+      expect(readBuilt("packages/protocol/dist/index.js")).not.toContain(
+        staleProtocolSentinel,
+      );
+      expect(existsSync(built("packages/protocol/dist/stale-only.js"))).toBe(
+        false,
+      );
       runFreshBuildCommand("pnpm", ["build"], {
         cwd: buildRoot,
         env: environment,
