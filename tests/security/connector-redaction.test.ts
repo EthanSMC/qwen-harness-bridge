@@ -16,6 +16,78 @@ import {
 
 describe("connector public projection", () => {
   it.each([
+    'synthetic.send("https://example.test/report", "syntheticprivatevalue");',
+    'synthetic.send("https://example.test/report?q=synthetic", "syntheticprivatevalue");',
+    `synthetic.send("https://example.test/report", "${"synthetic".repeat(70)}");`,
+    `synthetic.send("https://example.test/report?q=synthetic", "${"synthetic".repeat(70)}");`,
+    'See https://example.test/report?x=``` then synthetic.send("syntheticprivatevalue");',
+    "See https://example.test/report?x=``` then ```syntheticprivatevalue```",
+    'See https://example.test/report?x={"synthetic":1} then {"synthetic":2}',
+    "See https://example.test/``` after",
+  ])("N4 preserves complete original private-match provenance: %s", (value) => {
+    const output = redactEvent(
+      {
+        summary: value,
+        artifacts: [
+          {
+            name: value,
+            media_type: "text/plain",
+            url: "https://example.test/report",
+          },
+        ],
+      },
+      { ...options, secrets: [] },
+    );
+    expect(output.summary).toBe("[redacted]");
+    expect(output.artifacts?.[0].name).toBe("[redacted]");
+  });
+  it.each([
+    [
+      "Before \"https://example.test/report?q=synthetic\";BUILD_ENDPOINT='synthetic privatevalue' after",
+      'Before "https://example.test/report";[redacted] after',
+    ],
+    [
+      "Before \"https://example.test/report?q=synthetic\";build_endpoint='synthetic privatevalue' after",
+      'Before "https://example.test/report";[redacted] after',
+    ],
+    [
+      "Before 'https://example.test/report?q=synthetic';Build_Endpoint=\"synthetic privatevalue\" after",
+      "Before 'https://example.test/report';[redacted] after",
+    ],
+    [
+      "Before https://example.test/report?q=synthetic\";x='synthetic privatevalue' after",
+      "[redacted]",
+    ],
+    [
+      "Before https://example.test/report?x=$'synthetic' after",
+      "Before https://example.test/report after",
+    ],
+    [
+      'Before "https://example.test/report" after',
+      'Before "https://example.test/report" after',
+    ],
+    [
+      'Before https://example.test/report?x={"synthetic":1} after',
+      "Before https://example.test/report after",
+    ],
+  ])("N5 respects original URL delimiters: %s", (value, expected) => {
+    const output = redactEvent(
+      {
+        summary: value,
+        artifacts: [
+          {
+            name: value,
+            media_type: "text/plain",
+            url: "https://example.test/report",
+          },
+        ],
+      },
+      { ...options, secrets: [] },
+    );
+    expect(output.summary).toBe(expected);
+    expect(output.artifacts?.[0].name).toBe(expected);
+  });
+  it.each([
     "export BUILD_ENDPOINT=$(printf syntheticprivatevalue)",
     "export build_endpoint=$(printf syntheticprivatevalue)",
     "export Build_Endpoint=$'synthetic\\' privatevalue'",

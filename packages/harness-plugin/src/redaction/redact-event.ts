@@ -40,6 +40,25 @@ const structuredBody =
 const invalidFilename = /[\u2028\u2029\\]|^[A-Za-z]:|^~|^file:/u;
 type Replacement = { start: number; end: number; value: string };
 
+// Surrounding quotes belong to prose. For unquoted URLs, quote-bearing data
+// must balance within the whitespace-delimited token or its extent is ambiguous.
+function humanUrlEnd(raw: string, start: number): number | null {
+  const preceding = raw[start - 1];
+  const enclosing = preceding === "'" || preceding === '"' ? preceding : null;
+  let quote: string | null = null;
+  let cursor = start;
+  for (; cursor < raw.length; cursor++) {
+    const char = raw[cursor];
+    if (enclosing && char === enclosing) return cursor;
+    if (/[\s<>]/u.test(char)) break;
+    if (!enclosing && (char === "'" || char === '"')) {
+      if (quote === char) quote = null;
+      else if (quote === null) quote = char;
+    }
+  }
+  return enclosing || quote ? null : cursor;
+}
+
 // Delimit only simple literal words. Unsupported syntax is never interpreted:
 // null asks the caller to redact the whole bounded original human field.
 function assignmentSpans(
@@ -290,15 +309,23 @@ export function redactEvent(
       const replacements: Replacement[] = [];
       const urls: Replacement[] = [];
       const tokens =
-        /https?:\/\/[^\s<>]+|(?<![\w/])(?:file:\/\/|~\/|[A-Za-z]:[\\/]|\\\\|\/)[^\s<>"']*/gi;
-      for (const match of raw.matchAll(tokens)) {
-        const token = match[0];
+        /https?:\/\/|(?<![\w/])(?:file:\/\/|~\/|[A-Za-z]:[\\/]|\\\\|\/)[^\s<>"']*/gi;
+      for (
+        let match = tokens.exec(raw);
+        match !== null;
+        match = tokens.exec(raw)
+      ) {
+        const isUrl = /^https?:\/\//i.test(match[0]);
+        const end = isUrl ? humanUrlEnd(raw, match.index) : tokens.lastIndex;
+        if (end === null) return "[redacted]";
+        tokens.lastIndex = end;
+        const token = raw.slice(match.index, end);
         const replacement = {
           start: match.index,
           end: match.index + token.length,
           value: "[redacted]",
         };
-        if (/^https?:\/\//i.test(token)) {
+        if (isUrl) {
           try {
             replacement.value = safeUrl(token);
           } catch {
@@ -320,18 +347,13 @@ export function redactEvent(
         }
         replacements.push(replacement);
       }
-      // Inspect original non-URL slices, never rewritten text. Removed URL
-      // components may contain shell-like data; retained components were checked.
-      let originalCursor = 0;
-      for (const url of [...urls, { start: raw.length, end: raw.length }]) {
-        const original = raw.slice(originalCursor, url.start);
-        if (privateText.test(original) || structuredBody.test(original))
-          return "[redacted]";
-        originalCursor = url.end;
-      }
       // A secret solely inside stripped URL components must not invalidate the
       // safe URL. Retained components were checked above in all spellings.
-      const insideUrl = (start: number, end: number): boolean => {
+      const insideUrl = (
+        start: number,
+        end: number,
+        validated = false,
+      ): boolean => {
         let low = 0,
           high = urls.length;
         while (low < high) {
@@ -339,8 +361,21 @@ export function redactEvent(
           if (urls[middle].start <= start) low = middle + 1;
           else high = middle;
         }
-        return low > 0 && end <= urls[low - 1].end;
+        return (
+          low > 0 &&
+          end <= urls[low - 1].end &&
+          (!validated || urls[low - 1].value !== "[redacted]")
+        );
       };
+      // Match the complete original field: splitting at URLs loses enclosing
+      // source syntax. Inspect every match, including ones after exempt matches.
+      for (const detector of [privateText, structuredBody]) {
+        const pattern = new RegExp(detector.source, `${detector.flags}g`);
+        for (const match of raw.matchAll(pattern)) {
+          if (!insideUrl(match.index, match.index + match[0].length, true))
+            return "[redacted]";
+        }
+      }
       const assignments = assignmentSpans(raw, insideUrl);
       if (assignments === null) return "[redacted]";
       replacements.push(...assignments);
