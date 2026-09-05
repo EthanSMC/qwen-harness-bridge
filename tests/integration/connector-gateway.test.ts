@@ -474,7 +474,7 @@ const harnessClient = (
   app: Awaited<ReturnType<typeof startApp>>,
   credentials: ConnectorCredentials,
   store: SqlitePluginStore,
-  options: Partial<ConnectorClientOptions> = {},
+  options: Partial<Omit<ConnectorClientOptions, "store">> = {},
 ) => {
   const address = app.server.address() as AddressInfo;
   return createConnectorClient({
@@ -567,6 +567,311 @@ afterAll(async () => {
 });
 
 describe("Connector gateway authentication and handshake", () => {
+  it("does not turn a retained welcome echo into working sync after server rollback", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const local = new SqlitePluginStore(
+      join(mkdtempSync(join(tmpdir(), "qhb-rollback-")), "state.sqlite"),
+    );
+    const repositoryId = `rollback-${crypto.randomUUID()}`;
+    await db.query(
+      "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, enabled) VALUES ($1, $2, 'Rollback fixture', '/redacted', false)",
+      [repositoryId, OWNER_ID],
+    );
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      repositoryId,
+      clientRequestId: crypto.randomUUID(),
+      requestCiphertext: "fixture",
+      requestDigest: "fixture",
+    });
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1 WHERE id = $2",
+      [credentials.connector_id, job.jobId],
+    );
+    const original = PostgresConnectorStore.prototype.acceptClientMessage;
+    // Model an old executable returning retained welcome evidence while its
+    // actual current admission supports only durable receipts.
+    const hook = vi
+      .spyOn(PostgresConnectorStore.prototype, "acceptClientMessage")
+      .mockImplementation(async function (identity, message, now) {
+        const result = await original.call(this, identity, message, now);
+        if (
+          identity.connectorId === credentials.connector_id &&
+          message.type === "connector.hello"
+        ) {
+          await db.query(
+            "UPDATE connectors SET capabilities = '[\"durable-receipts-v1\"]'::jsonb WHERE id = $1",
+            [credentials.connector_id],
+          );
+        }
+        return result;
+      });
+    const controller = new AbortController();
+    const client = harnessClient(app, credentials, local, {
+      requireJobCoordination: true,
+    });
+    let calls = 0;
+    client.onState(() => {
+      calls++;
+    });
+    const running = client.start(controller.signal);
+    try {
+      await vi.waitFor(() => expect(client.currentEpoch()).toBeDefined());
+      const epoch = client.currentEpoch();
+      let sequence = 0;
+      client.publishSync(
+        { job_id: job.jobId, attempt: 1, nonce: crypto.randomUUID() },
+        crypto.randomUUID(),
+        (request) => {
+          sequence = request.sequence;
+        },
+      );
+      await vi.waitFor(() => expect(epoch?.signal.aborted).toBe(true));
+      expect(calls).toBe(0);
+      expect(local.outboundEvent(sequence)?.acknowledgedAt).toBeNull();
+      expect(client.currentEpoch()).toBeUndefined();
+      expect(
+        (
+          await db.query(
+            "SELECT id FROM connector_messages WHERE connector_id = $1 AND type = 'job.state'",
+            [credentials.connector_id],
+          )
+        ).rows,
+      ).toEqual([]);
+    } finally {
+      controller.abort();
+      await running;
+      hook.mockRestore();
+      local.close();
+      await app.close();
+      await db.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    }
+  });
+
+  it.each(["before receipt", "after receipt"] as const)(
+    "recovers negotiated sync lost %s over PostgreSQL TLS and reopened SQLite without fresh permission",
+    async (loss) => {
+      const credentials = await seedConnector(db);
+      const app = await startApp(5_000);
+      const directory = mkdtempSync(
+        join(tmpdir(), "qhb-coordination-restart-"),
+      );
+      const path = join(directory, "state.sqlite");
+      let store = new SqlitePluginStore(path);
+      const repositoryId = `sync-${crypto.randomUUID()}`;
+      await db.query(
+        "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, enabled) VALUES ($1, $2, 'Coordination fixture', '/redacted', false)",
+        [repositoryId, OWNER_ID],
+      );
+      const job = await new JobRepository(db.client).createIdempotent({
+        ownerId: OWNER_ID,
+        repositoryId,
+        clientRequestId: crypto.randomUUID(),
+        requestCiphertext: "fixture",
+        requestDigest: "fixture",
+      });
+      await db.query(
+        "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1, revision = 7, mode = 'read_only' WHERE id = $2",
+        [credentials.connector_id, job.jobId],
+      );
+      const controller = new AbortController();
+      let originalState:
+        | Extract<
+            ReturnType<typeof ConnectorServerMessageSchema.parse>,
+            { type: "job.state" }
+          >
+        | undefined;
+      let request:
+        | import("../../packages/harness-plugin/src/transport/connector-client.js").PublishedSync
+        | undefined;
+      let registered = false;
+      let callbacks = 0;
+      const receivedTypes: string[] = [];
+      const first = harnessClient(app, credentials, store, {
+        requireJobCoordination: true,
+        webSocketFactory: (url, options) => {
+          const socket = new WebSocket(url, {
+            ...options,
+            ca: LOCALHOST_TLS.cert,
+          });
+          const emit = socket.emit.bind(socket);
+          socket.emit = ((event: string | symbol, ...args: unknown[]) => {
+            if (event === "message") {
+              const message = ConnectorServerMessageSchema.parse(
+                JSON.parse(String(args[0])),
+              );
+              receivedTypes.push(
+                message.type === "protocol.error"
+                  ? message.payload.code
+                  : message.type,
+              );
+              if (message.type === "job.state") {
+                expect(registered).toBe(true);
+                originalState = message;
+                if (loss === "before receipt") {
+                  controller.abort();
+                  return true;
+                }
+              }
+            }
+            return emit(event, ...args);
+          }) as typeof socket.emit;
+          return socket;
+        },
+      });
+      first.onState(() => {
+        callbacks++;
+      });
+      const record = store.recordInbound.bind(store);
+      const hook = vi
+        .spyOn(store, "recordInbound")
+        .mockImplementation((...args) => {
+          const result = record(...args);
+          if (loss === "after receipt" && args[0] === originalState?.message_id)
+            controller.abort();
+          return result;
+        });
+      const running = first.start(controller.signal);
+      let resumedController: AbortController | undefined;
+      let resumedRun: Promise<void> | undefined;
+      try {
+        await vi.waitFor(() => expect(first.currentEpoch()).toBeDefined());
+        first.publishSync(
+          { job_id: job.jobId, attempt: 1, nonce: crypto.randomUUID() },
+          crypto.randomUUID(),
+          (persisted) => {
+            request = persisted;
+            expect(
+              store.outboundEvent(persisted.sequence)?.expectedReceiptProfile,
+            ).toBe("job-coordination-v1");
+            registered = true;
+          },
+        );
+        await vi.waitFor(() =>
+          expect(receivedTypes.join(",")).toContain("job.state"),
+        );
+        await running;
+        hook.mockRestore();
+        if (request === undefined || originalState === undefined)
+          throw new Error("fixture response missing");
+        expect(request.epoch.signal.aborted).toBe(true);
+        expect(callbacks).toBe(0);
+        expect(
+          store.outboundEvent(request.sequence)?.acknowledgedAt,
+        ).toBeNull();
+        expect(originalState.payload).toMatchObject({
+          mode: "read_only",
+          job_revision: 7,
+        });
+        // Change authoritative state after consumption. Replaying the request
+        // must restore the first observation, including its original validity.
+        await db.query(
+          "UPDATE jobs SET revision = 8, mode = 'normal' WHERE id = $1",
+          [job.jobId],
+        );
+        if (loss === "before receipt") {
+          await db.query(
+            "UPDATE connector_messages SET expires_at = clock_timestamp() - interval '1 second' WHERE connector_id = $1 AND direction = 'server' AND sequence >= $2",
+            [credentials.connector_id, originalState.sequence],
+          );
+        }
+        store.close();
+        store = new SqlitePluginStore(path);
+        const deliveries: Array<{ epoch: unknown; recovered: boolean }> = [];
+        const wire: string[] = [];
+        resumedController = new AbortController();
+        const resumed = harnessClient(app, credentials, store, {
+          requireJobCoordination: true,
+          webSocketFactory: (url, options) => {
+            const socket = new WebSocket(url, {
+              ...options,
+              ca: LOCALHOST_TLS.cert,
+            });
+            socket.on("message", (data) => {
+              const message = ConnectorServerMessageSchema.parse(
+                JSON.parse(String(data)),
+              );
+              if (message.sequence === originalState?.sequence)
+                wire.push(message.type);
+            });
+            return socket;
+          },
+        });
+        resumed.onState((message, delivery) => {
+          if (!delivery.recovered)
+            expect(
+              store.outboundEvent(message.payload.request_sequence)
+                ?.acknowledgedAt,
+            ).toBeNull();
+          deliveries.push(delivery);
+        });
+        resumedRun = resumed.start(resumedController.signal);
+        await vi.waitFor(
+          () =>
+            expect(
+              store.outboundEvent(request?.sequence ?? 0)?.acknowledgedAt,
+            ).not.toBeNull(),
+          { timeout: 5_000 },
+        );
+        expect(
+          store.coordinationReceipt(originalState.sequence)
+            ?.responsePayloadJson,
+        ).toBe(
+          JSON.stringify(
+            Object.fromEntries(
+              Object.entries(originalState.payload).sort(([a], [b]) =>
+                a.localeCompare(b),
+              ),
+            ),
+          ),
+        );
+        if (loss === "after receipt")
+          expect(deliveries).toEqual([{ epoch: null, recovered: true }]);
+        else {
+          expect(wire).toContain("protocol.error");
+          expect(wire).toContain("job.state");
+          expect(deliveries).toEqual([]);
+        }
+        const freshEpoch = resumed.currentEpoch();
+        expect(freshEpoch).toBeDefined();
+        expect(freshEpoch).not.toBe(request.epoch);
+        const prior = deliveries.length;
+        let freshMessage: typeof originalState;
+        resumed.onState((message) => {
+          freshMessage = message;
+        });
+        resumed.publishSync(
+          { job_id: job.jobId, attempt: 1, nonce: crypto.randomUUID() },
+          crypto.randomUUID(),
+          (fresh) => {
+            expect(fresh.messageId).not.toBe(request?.messageId);
+            expect(fresh.epoch).toBe(freshEpoch);
+          },
+        );
+        await vi.waitFor(() => expect(deliveries).toHaveLength(prior + 1));
+        expect(deliveries.at(-1)).toEqual({
+          epoch: freshEpoch,
+          recovered: false,
+        });
+        expect(freshMessage?.payload).toMatchObject({
+          mode: "normal",
+          job_revision: 8,
+        });
+      } finally {
+        controller.abort();
+        await running;
+        hook.mockRestore();
+        resumedController?.abort();
+        await resumedRun;
+        store.close();
+        await app.close();
+        await db.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+      }
+    },
+    15_000,
+  );
+
   it("orders negotiated stale-business then immutable state and ordinary ACK over actual TLS and reconnect", async () => {
     const credentials = await seedConnector(db);
     const app = await startApp(5_000);

@@ -9,6 +9,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  ConnectorClientMessageSchema,
   type ConnectorServerMessage,
   ConnectorServerMessageSchema,
 } from "@qhb/protocol";
@@ -24,7 +25,6 @@ import {
 import { reconnectDelayMs } from "./backoff.js";
 import {
   buildConnectorHello,
-  type ConnectorClient,
   type ConnectorClientOptions,
   createConnectorClient,
 } from "./connector-client.js";
@@ -87,6 +87,7 @@ type Fixture = {
   nextServerSequence: number;
   tokenLifetimeMs: number;
   autoWelcome: boolean;
+  capabilities: string[];
   preWelcomeClosesRemaining: number;
   sendWelcome(socket: WebSocket, hello: JsonRecord): void;
   send(socket: WebSocket, message: ConnectorServerMessage): void;
@@ -136,6 +137,7 @@ const startFixture = async (): Promise<Fixture> => {
     nextServerSequence: 1,
     tokenLifetimeMs: 15 * 60_000,
     autoWelcome: true,
+    capabilities: ["durable-receipts-v1"],
     preWelcomeClosesRemaining: 0,
     sendWelcome(socket: WebSocket, hello: JsonRecord): void {
       const sequence = fixture.nextServerSequence++;
@@ -146,7 +148,7 @@ const startFixture = async (): Promise<Fixture> => {
           sequence,
           {
             connector_id: CONNECTOR_ID,
-            capabilities: ["durable-receipts-v1"],
+            capabilities: fixture.capabilities,
             server_sequence: sequence,
             replay_from:
               ((hello.payload as JsonRecord).last_server_sequence as number) +
@@ -235,19 +237,32 @@ const makeTokenClient = (
 const makeClient = (
   fixture: Fixture,
   store: PluginStore,
-  options: Partial<ConnectorClientOptions> = {},
-): ConnectorClient =>
-  createConnectorClient({
+  options: Partial<Omit<ConnectorClientOptions, "store">> = {},
+) => {
+  const input = {
     connectorId: CONNECTOR_ID,
     controlPlaneUrl: fixture.url as `wss://${string}`,
     store,
     sessionTokenClient: makeTokenClient(fixture),
     bootstrapCredentialProvider: async () => BOOTSTRAP_CREDENTIAL,
-    webSocketFactory: (url, webSocketOptions) =>
-      new WebSocket(url, { ...webSocketOptions, ca: LOCALHOST_TLS.cert }),
+    webSocketFactory: (
+      url: string,
+      webSocketOptions: import("ws").ClientOptions,
+    ) => new WebSocket(url, { ...webSocketOptions, ca: LOCALHOST_TLS.cert }),
     reconnectDelay: () => 0,
     ...options,
-  });
+  };
+  if (input.requireJobCoordination === true) {
+    if (!(input.store instanceof SqlitePluginStore))
+      throw new Error("fixture coordinating store required");
+    return createConnectorClient({
+      ...input,
+      requireJobCoordination: true,
+      store: input.store,
+    });
+  }
+  return createConnectorClient({ ...input, requireJobCoordination: false });
+};
 
 const waitFor = async (
   predicate: () => boolean,
@@ -289,6 +304,1201 @@ const jobEventPayload = (): JsonRecord => ({
   event_type: "progress",
   payload: { stage: "testing" },
   source: "harness",
+});
+
+const stateFor = (
+  request: Extract<
+    import("@qhb/protocol").ConnectorClientMessage,
+    { type: "job.sync" }
+  >,
+  sequence: number,
+) => {
+  const observed = Date.now();
+  return envelope(
+    "job.state",
+    sequence,
+    {
+      job_id: request.payload.job_id,
+      repository_id: "repo-one",
+      mode: "normal",
+      requested_attempt: request.payload.attempt,
+      current_attempt: 1,
+      status: "running",
+      job_revision: 2,
+      cancel_revision: null,
+      lease_id: null,
+      lease_expires_at: null,
+      expires_at: isoAfter(60_000),
+      observed_at: new Date(observed).toISOString(),
+      state_valid_until: new Date(observed + 2_000).toISOString(),
+      request_message_id: request.message_id,
+      request_sequence: request.sequence,
+      nonce: request.payload.nonce,
+    },
+    request.correlation_id,
+  );
+};
+
+describe("negotiated transport epochs", () => {
+  const cleanup: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    for (const close of cleanup.splice(0)) await close();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+  const rig = async (
+    options: Partial<ConnectorClientOptions> = {},
+    autoWelcome = true,
+  ) => {
+    const fixture = await startFixture();
+    fixture.capabilities.push("job-coordination-v1");
+    fixture.autoWelcome = autoWelcome;
+    const { store, directory } = makeStore();
+    const controller = new AbortController();
+    const sockets: WebSocket[] = [];
+    const client = makeClient(fixture, store, {
+      requireJobCoordination: true,
+      webSocketFactory: (url, config) => {
+        const socket = new WebSocket(url, {
+          ...config,
+          ca: LOCALHOST_TLS.cert,
+        });
+        sockets.push(socket);
+        return socket;
+      },
+      ...options,
+    });
+    const outcome = client
+      .start(controller.signal)
+      .catch((error: Error) => error.message);
+    cleanup.push(async () => {
+      controller.abort();
+      await outcome;
+      store.close();
+      await fixture.close();
+    });
+    if (autoWelcome) await waitFor(() => client.currentEpoch() !== undefined);
+    else await waitFor(() => fixture.clientMessages.length > 0);
+    return { fixture, store, directory, controller, sockets, client, outcome };
+  };
+
+  const snapshot = (directory: string) => {
+    const database = new Database(join(directory, "state.sqlite"));
+    try {
+      return {
+        inbound: database
+          .prepare("SELECT * FROM inbound_messages ORDER BY sequence")
+          .all(),
+        outbound: database
+          .prepare("SELECT * FROM outbound_events ORDER BY sequence")
+          .all(),
+        metadata: database.prepare("SELECT * FROM metadata ORDER BY key").all(),
+      };
+    } finally {
+      database.close();
+    }
+  };
+  const syncRequest = (r: Awaited<ReturnType<typeof rig>>) => {
+    r.client.publishSync(
+      { job_id: JOB_ID, attempt: 1, nonce: randomUUID() },
+      randomUUID(),
+      () => undefined,
+    );
+    const sync = ConnectorClientMessageSchema.parse(
+      JSON.parse(
+        required(r.store.outboundEvent(r.store.maxOutboundSequence())).payload,
+      ),
+    );
+    if (sync.type !== "job.sync") throw new Error("fixture sync missing");
+    return sync;
+  };
+
+  it("revalidates raw immutable disposition evidence before SQLite recovery bookkeeping", async () => {
+    const r = await rig();
+    const sync = syncRequest(r);
+    const rejection = envelope(
+      "protocol.error",
+      r.fixture.nextServerSequence++,
+      {
+        code: "JOB_AUTHORITY_UNAVAILABLE",
+        message: "The job authority is unavailable.",
+      },
+      sync.correlation_id,
+    );
+    r.store.recordInbound(
+      rejection.message_id,
+      rejection.sequence,
+      JSON.stringify(rejection),
+      { coordinationRequestSequence: sync.sequence },
+    );
+    const database = new Database(join(r.directory, "state.sqlite"));
+    database
+      .prepare("UPDATE inbound_messages SET body = ? WHERE message_id = ?")
+      .run(
+        JSON.stringify({
+          ...rejection,
+          payload: {
+            code: " JOB_AUTHORITY_UNAVAILABLE ",
+            message: "The job authority is unavailable.",
+          },
+        }),
+        rejection.message_id,
+      );
+    database.close();
+    // Force restart semantics on the same SQLite database, including its cursor.
+    r.controller.abort();
+    await r.outcome;
+    const controller = new AbortController();
+    const client = makeClient(r.fixture, r.store, {
+      requireJobCoordination: true,
+    });
+    const outcome = client
+      .start(controller.signal)
+      .catch((error: Error) => error.message);
+    let stopped = false;
+    void outcome.then(() => {
+      stopped = true;
+    });
+    try {
+      await waitFor(
+        () =>
+          r.fixture.clientMessages.filter((m) => m.type === "connector.hello")
+            .length === 2,
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await waitFor(
+        () =>
+          r.store.inboundMessage(rejection.message_id)?.delivered === true ||
+          stopped,
+      );
+      expect(r.store.inboundMessage(rejection.message_id)?.delivered).toBe(
+        false,
+      );
+      expect(await outcome).toBe("CONNECTOR_STORED_INBOUND_INVALID");
+    } finally {
+      controller.abort();
+      await outcome;
+    }
+  });
+
+  it("notifies eligibility once per socket despite duplicate welcome receipts", async () => {
+    const r = await rig();
+    let calls = 0;
+    r.client.onEpoch(() => {
+      calls++;
+    });
+    expect(calls).toBe(1);
+    const welcome = required(r.store.inboundMessageBySequence(1));
+    required(r.sockets[0]).emit("message", Buffer.from(welcome.body));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(calls).toBe(1);
+  });
+
+  it.each(["heartbeat", "renewal"] as const)(
+    "contains asynchronous %s storage failure and revokes its epoch",
+    async (fault) => {
+      vi.useFakeTimers({
+        toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+      });
+      const r = await rig();
+      const epoch = required(r.client.currentEpoch());
+      if (fault === "renewal") {
+        vi.spyOn(r.store, "renewDelivery").mockImplementation(() => {
+          throw new Error("private database detail");
+        });
+        syncRequest(r);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      } else {
+        vi.spyOn(r.store, "enqueueEvent").mockImplementation(() => {
+          throw new Error("private database detail");
+        });
+        await vi.advanceTimersByTimeAsync(10_000);
+      }
+      expect(epoch.signal.aborted).toBe(true);
+      r.controller.abort();
+      expect(await r.outcome).toBe("STORE_OUTBOUND_WRITE_FAILED");
+    },
+  );
+
+  it.each(["protocol", "storage"] as const)(
+    "makes coordinated %s intake failure fatal before cleanup",
+    async (fault) => {
+      const r = await rig({ reconnectDelay: () => 10_000 });
+      const sync = syncRequest(r);
+      await waitFor(() =>
+        r.fixture.clientMessages.some((m) => m.type === "job.sync"),
+      );
+      const epoch = required(r.client.currentEpoch());
+      const database = new Database(join(r.directory, "state.sqlite"));
+      if (fault === "storage")
+        database.exec(
+          "CREATE TRIGGER reject_state BEFORE INSERT ON inbound_messages WHEN json_extract(NEW.body, '$.type') = 'job.state' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END",
+        );
+      const before = snapshot(r.directory);
+      try {
+        const peer = required([...r.fixture.sockets][0]);
+        if (fault === "protocol") peer.send("not json");
+        else
+          r.fixture.send(peer, stateFor(sync, r.fixture.nextServerSequence++));
+        await waitFor(() => epoch.signal.aborted);
+        r.controller.abort();
+        expect(await r.outcome).toBe(
+          fault === "storage"
+            ? "STORE_INBOUND_WRITE_FAILED"
+            : "CONNECTOR_STORED_INBOUND_INVALID",
+        );
+        expect(snapshot(r.directory)).toEqual(before);
+      } finally {
+        if (fault === "storage") database.exec("DROP TRIGGER reject_state");
+        database.close();
+      }
+    },
+  );
+
+  it.each(["refresh", "receipt timeout"] as const)(
+    "aborts before deliberate %s calls socket.close",
+    async (path) => {
+      vi.useFakeTimers({
+        toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+      });
+      let now = Date.now();
+      const r = await rig({
+        now: () => new Date(now),
+        sessionTokenClient: {
+          exchange: async () => ({
+            token: "fixture-session",
+            expiresAt: new Date(
+              now + (path === "refresh" ? 61_000 : 900_000),
+            ).toISOString(),
+          }),
+        },
+      });
+      const epoch = required(r.client.currentEpoch());
+      const socket = required(r.sockets[0]);
+      const close = socket.close.bind(socket);
+      let revokedBeforeClose = false;
+      vi.spyOn(socket, "close").mockImplementation((...args) => {
+        revokedBeforeClose = epoch.signal.aborted;
+        return close(...args);
+      });
+      if (path === "receipt timeout") now += 30_001;
+      await vi.advanceTimersByTimeAsync(1_000);
+      await waitFor(() => epoch.signal.aborted);
+      expect(revokedBeforeClose).toBe(true);
+      r.controller.abort();
+      await r.outcome;
+    },
+  );
+
+  it("retains previously allocated legacy profiles under an effective pinned coordination hello", async () => {
+    const fixture = await startFixture();
+    fixture.capabilities.push("job-coordination-v1");
+    const { store } = makeStore();
+    const hello = buildConnectorHello({
+      connectorId: CONNECTOR_ID,
+      sequence: 1,
+      lastServerSequence: 0,
+      correlationId: randomUUID(),
+      now: new Date(),
+      capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+    });
+    store.enqueueEvent(
+      {
+        messageId: hello.message_id,
+        sequence: 1,
+        payload: JSON.stringify(hello),
+      },
+      true,
+    );
+    const old = {
+      ...hello,
+      type: "job.event",
+      sequence: 2,
+      message_id: randomUUID(),
+      correlation_id: randomUUID(),
+      payload: jobEventPayload(),
+    };
+    store.enqueueEvent({
+      messageId: old.message_id,
+      sequence: 2,
+      payload: JSON.stringify(old),
+    });
+    const controller = new AbortController();
+    const client = makeClient(fixture, store);
+    const outcome = client.start(controller.signal);
+    try {
+      await waitFor(() => client.currentEpoch() !== undefined);
+      await client.publish("job.event", jobEventPayload(), randomUUID());
+      const newest = store.maxOutboundSequence();
+      expect(store.outboundEvent(newest)?.expectedReceiptProfile).toBe(
+        "job-coordination-v1",
+      );
+      await waitFor(() =>
+        fixture.clientMessages.some((m) => m.message_id === old.message_id),
+      );
+      expect(store.outboundEvent(2)).not.toHaveProperty(
+        "expectedReceiptProfile",
+      );
+    } finally {
+      controller.abort();
+      await outcome;
+      store.close();
+      await fixture.close();
+    }
+  });
+
+  it("rejects ambiguous repeated business correlations without touching receipt state", async () => {
+    const r = await rig({ reconnectDelay: () => 10_000 });
+    const correlation = randomUUID();
+    await r.client.publish("job.event", jobEventPayload(), correlation);
+    await r.client.publish("job.event", jobEventPayload(), correlation);
+    await waitFor(
+      () =>
+        r.fixture.clientMessages.filter((m) => m.type === "job.event")
+          .length === 2,
+    );
+    const before = snapshot(r.directory);
+    const epoch = required(r.client.currentEpoch());
+    r.fixture.send(
+      required([...r.fixture.sockets][0]),
+      envelope(
+        "protocol.error",
+        r.fixture.nextServerSequence++,
+        {
+          code: "EVENT_REJECTED",
+          message: "The job authority has changed.",
+        },
+        correlation,
+      ),
+    );
+    await waitFor(() => epoch.signal.aborted);
+    expect(snapshot(r.directory)).toEqual(before);
+  });
+
+  it("does not relabel a queued old socket state after reconnect", async () => {
+    const r = await rig();
+    const held = deferred<void>();
+    let entered = false;
+    const off = r.client.onCommand(async () => {
+      entered = true;
+      await held.promise;
+    });
+    const command = envelope("job.cancel", r.fixture.nextServerSequence++, {
+      job_id: JOB_ID,
+      attempt: 1,
+      job_revision: 2,
+      nonce: randomUUID(),
+      reason: "owner_request",
+    });
+    const peer = required([...r.fixture.sockets][0]);
+    r.fixture.send(peer, command);
+    await waitFor(() => entered);
+    const sync = syncRequest(r);
+    const state = stateFor(sync, r.fixture.nextServerSequence++);
+    const socket = required(r.sockets[0]);
+    // Enqueue through the actual listener while its preceding handler is held.
+    socket.emit("message", Buffer.from(JSON.stringify(state)));
+    const old = required(r.client.currentEpoch());
+    socket.terminate();
+    await waitFor(() => r.sockets.length === 2);
+    expect(old.signal.aborted).toBe(true);
+    // The unsaved old frame cannot advance the durable server cursor.
+    r.fixture.nextServerSequence = state.sequence;
+    off();
+    held.resolve();
+    await waitFor(() => r.client.currentEpoch() !== undefined);
+    expect(r.store.inboundMessage(state.message_id)).toBeUndefined();
+    expect(r.client.currentEpoch()).not.toBe(old);
+  });
+
+  it.each([
+    "nonce",
+    "attempt",
+    "correlation",
+    "identity",
+    "profile",
+    "missing",
+  ] as const)(
+    "rejects state with wrong retained %s before any SQLite effect",
+    async (fault) => {
+      const r = await rig({ reconnectDelay: () => 10_000 });
+      const sync = syncRequest(r);
+      await waitFor(() =>
+        r.fixture.clientMessages.some((m) => m.type === "job.sync"),
+      );
+      const state = stateFor(sync, r.fixture.nextServerSequence++);
+      if (state.type !== "job.state") throw new Error("fixture state missing");
+      if (fault === "nonce") state.payload.nonce = randomUUID();
+      if (fault === "attempt") state.payload.requested_attempt = 2;
+      if (fault === "correlation") state.correlation_id = randomUUID();
+      if (fault === "identity") state.payload.request_message_id = randomUUID();
+      if (fault === "missing") state.payload.request_sequence = 99;
+      if (fault === "profile") {
+        const database = new Database(join(r.directory, "state.sqlite"));
+        database
+          .prepare("DELETE FROM metadata WHERE key = ?")
+          .run(`outbound-receipt-profile:${sync.sequence}`);
+        database.close();
+      }
+      let calls = 0;
+      r.client.onState(() => {
+        calls++;
+      });
+      const before = snapshot(r.directory);
+      const epoch = required(r.client.currentEpoch());
+      r.fixture.send(required([...r.fixture.sockets][0]), state);
+      await waitFor(() => epoch.signal.aborted);
+      expect(snapshot(r.directory)).toEqual(before);
+      expect(calls).toBe(0);
+    },
+  );
+
+  it.each(["code", "message"] as const)(
+    "preserves raw %s and rejects padded disposition and tombstone wire evidence",
+    async (field) => {
+      for (const tombstone of [false, true]) {
+        let now = Date.now();
+        const r = await rig({
+          now: () => new Date(now),
+          reconnectDelay: () => 10_000,
+        });
+        const sync = syncRequest(r);
+        await waitFor(() =>
+          r.fixture.clientMessages.some((m) => m.type === "job.sync"),
+        );
+        const original = envelope(
+          "protocol.error",
+          r.fixture.nextServerSequence++,
+          {
+            code: "JOB_AUTHORITY_UNAVAILABLE",
+            message: "The job authority is unavailable.",
+          },
+          sync.correlation_id,
+        );
+        const peer = required([...r.fixture.sockets][0]);
+        if (tombstone) {
+          // Formatting and intentional UUID normalization must retain exact bytes.
+          const raw = JSON.stringify(
+            {
+              ...original,
+              correlation_id: original.correlation_id.toUpperCase(),
+            },
+            null,
+            2,
+          );
+          peer.send(raw);
+          await waitFor(
+            () =>
+              r.store.inboundMessage(original.message_id)?.delivered === true,
+          );
+          expect(r.store.inboundMessage(original.message_id)?.body).toBe(raw);
+          now += 61_000;
+        }
+        const bad = {
+          ...original,
+          message_id: randomUUID(),
+          sent_at: new Date(now).toISOString(),
+          expires_at: new Date(now + 60_000).toISOString(),
+          payload: tombstone
+            ? {
+                code: "MESSAGE_EXPIRED",
+                message: "A Connector message expired before delivery.",
+              }
+            : { ...original.payload },
+        };
+        if (bad.type !== "protocol.error" || !(field in bad.payload))
+          throw new Error("fixture error missing");
+        const payload = bad.payload as { code: string; message: string };
+        payload[field] = ` ${payload[field]} `;
+        const before = snapshot(r.directory);
+        const epoch = required(r.client.currentEpoch());
+        peer.send(JSON.stringify(bad));
+        await waitFor(() => epoch.signal.aborted);
+        expect(snapshot(r.directory)).toEqual(before);
+        expect(r.store.outboundEvent(sync.sequence)?.acknowledgedAt).toBeNull();
+      }
+    },
+  );
+
+  it.each(["code", "message"] as const)(
+    "refuses restoration from a padded first tombstone %s over TLS",
+    async (field) => {
+      const r = await rig({ reconnectDelay: () => 10_000 });
+      const sync = syncRequest(r);
+      await waitFor(() =>
+        r.fixture.clientMessages.some((m) => m.type === "job.sync"),
+      );
+      const original = stateFor(sync, r.fixture.nextServerSequence++);
+      const tombstone = {
+        ...original,
+        type: "protocol.error",
+        payload: {
+          code: "MESSAGE_EXPIRED",
+          message: "A Connector message expired before delivery.",
+        },
+      };
+      tombstone.payload[field] = ` ${tombstone.payload[field]} `;
+      const peer = required([...r.fixture.sockets][0]);
+      peer.send(JSON.stringify(tombstone));
+      await waitFor(
+        () => r.store.inboundMessage(tombstone.message_id)?.delivered === true,
+      );
+      expect(r.store.coordinationReceipt(original.sequence)).toBeUndefined();
+      const before = snapshot(r.directory);
+      const epoch = required(r.client.currentEpoch());
+      peer.send(JSON.stringify({ ...original, message_id: randomUUID() }));
+      await waitFor(() => epoch.signal.aborted);
+      expect(snapshot(r.directory)).toEqual(before);
+    },
+  );
+
+  it.each(["observation", "revision", "unknown"] as const)(
+    "rejects %s replacement of retained state without changing immutable evidence",
+    async (fault) => {
+      let now = Date.now();
+      const r = await rig({
+        now: () => new Date(now),
+        reconnectDelay: () => 10_000,
+      });
+      const sync = syncRequest(r);
+      const state = stateFor(sync, r.fixture.nextServerSequence++);
+      const peer = required([...r.fixture.sockets][0]);
+      r.fixture.send(peer, state);
+      await waitFor(
+        () => r.store.inboundMessage(state.message_id)?.delivered === true,
+      );
+      now += 61_000;
+      const tombstone = envelope(
+        "protocol.error",
+        state.sequence,
+        {
+          code: "MESSAGE_EXPIRED",
+          message: "A Connector message expired before delivery.",
+        },
+        sync.correlation_id,
+        new Date(now),
+      );
+      r.fixture.send(peer, tombstone);
+      await waitFor(
+        () => r.store.inboundMessage(tombstone.message_id)?.delivered === true,
+      );
+      if (state.type !== "job.state") throw new Error("fixture state missing");
+      const replacement = {
+        ...state,
+        message_id: randomUUID(),
+        sent_at: new Date(now).toISOString(),
+        expires_at: new Date(now + 60_000).toISOString(),
+        payload: { ...state.payload },
+      };
+      if (fault === "revision") replacement.payload.job_revision++;
+      if (fault === "observation") {
+        replacement.payload.observed_at = new Date(now).toISOString();
+        replacement.payload.state_valid_until = new Date(
+          now + 2_000,
+        ).toISOString();
+      }
+      const candidate =
+        fault === "unknown"
+          ? {
+              ...replacement,
+              type: "protocol.error",
+              payload: { code: "UNKNOWN", message: "Unknown response." },
+            }
+          : replacement;
+      const before = snapshot(r.directory);
+      const epoch = required(r.client.currentEpoch());
+      peer.send(JSON.stringify(candidate));
+      await waitFor(() => epoch.signal.aborted);
+      expect(snapshot(r.directory)).toEqual(before);
+    },
+  );
+
+  it("restores immutable acknowledged state through expiry tombstones without another callback", async () => {
+    let now = Date.now();
+    const r = await rig({ now: () => new Date(now) });
+    const sync = syncRequest(r);
+    const state = stateFor(sync, r.fixture.nextServerSequence++);
+    const peer = required([...r.fixture.sockets][0]);
+    let calls = 0;
+    r.client.onState(() => {
+      calls++;
+    });
+    r.fixture.send(peer, state);
+    await waitFor(
+      () => r.store.inboundMessage(state.message_id)?.delivered === true,
+    );
+    const evidence = r.store.coordinationReceipt(state.sequence);
+    expect(calls).toBe(1);
+    r.fixture.send(
+      peer,
+      envelope(
+        "ack",
+        r.fixture.nextServerSequence++,
+        { sequence: sync.sequence },
+        sync.correlation_id,
+      ),
+    );
+    await waitFor(
+      () => r.store.outboundEvent(sync.sequence)?.acknowledgedAt !== null,
+    );
+    now += 61_000;
+    const tombstone = envelope(
+      "protocol.error",
+      state.sequence,
+      {
+        code: "MESSAGE_EXPIRED",
+        message: "A Connector message expired before delivery.",
+      },
+      sync.correlation_id,
+      new Date(now),
+    );
+    r.fixture.send(peer, tombstone);
+    await waitFor(
+      () => r.store.inboundMessage(tombstone.message_id)?.delivered === true,
+    );
+    const restored = {
+      ...state,
+      message_id: randomUUID(),
+      sent_at: new Date(now).toISOString(),
+      expires_at: new Date(now + 60_000).toISOString(),
+    };
+    r.fixture.send(peer, restored);
+    await waitFor(
+      () => r.store.inboundMessage(restored.message_id)?.delivered === true,
+    );
+    expect(r.store.coordinationReceipt(state.sequence)).toEqual(evidence);
+    expect(calls).toBe(1);
+  });
+
+  it("establishes first tombstone evidence only from the exactly bound original", async () => {
+    const r = await rig();
+    const sync = syncRequest(r);
+    const sequence = r.fixture.nextServerSequence++;
+    const peer = required([...r.fixture.sockets][0]);
+    const tombstone = envelope(
+      "protocol.error",
+      sequence,
+      {
+        code: "MESSAGE_EXPIRED",
+        message: "A Connector message expired before delivery.",
+      },
+      sync.correlation_id,
+    );
+    r.fixture.send(peer, tombstone);
+    await waitFor(
+      () => r.store.inboundMessage(tombstone.message_id)?.delivered === true,
+    );
+    expect(r.store.coordinationReceipt(sequence)).toBeUndefined();
+    const original = stateFor(sync, sequence);
+    r.fixture.send(peer, original);
+    await waitFor(() => r.store.coordinationReceipt(sequence) !== undefined);
+    expect(r.store.coordinationReceipt(sequence)?.requestMessageId).toBe(
+      sync.message_id,
+    );
+    expect(r.store.outboundEvent(sync.sequence)?.acknowledgedAt).toBeNull();
+  });
+
+  it.each(["new", "pinned"] as const)(
+    "requires the actual extended store for %s effective coordination hello",
+    async (source) => {
+      const fixture = await startFixture();
+      const { store } = makeStore();
+      if (source === "pinned") {
+        const hello = buildConnectorHello({
+          connectorId: CONNECTOR_ID,
+          sequence: 1,
+          lastServerSequence: 0,
+          correlationId: randomUUID(),
+          now: new Date(),
+          capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+        });
+        store.enqueueEvent(
+          {
+            messageId: hello.message_id,
+            sequence: 1,
+            payload: JSON.stringify(hello),
+          },
+          true,
+        );
+      }
+      const base = new Proxy(store, {
+        get(target, property) {
+          if (
+            property === "coordinationReceipt" ||
+            property === "coordinationRequest"
+          )
+            return undefined;
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const client = makeClient(
+        fixture,
+        base,
+        source === "new" ? { capabilities: ["job-coordination-v1"] } : {},
+      );
+      const before = store.activeHello();
+      try {
+        expect(() => client.start(new AbortController().signal)).toThrow(
+          "CONNECTOR_COORDINATION_STORE_REQUIRED",
+        );
+        expect(store.activeHello()).toEqual(before);
+        expect(fixture.clientMessages).toEqual([]);
+      } finally {
+        store.close();
+        await fixture.close();
+      }
+    },
+  );
+
+  it("retains an old durable-only hello and queue when mandatory coordination is requested", async () => {
+    const fixture = await startFixture();
+    const { store } = makeStore();
+    const hello = buildConnectorHello({
+      connectorId: CONNECTOR_ID,
+      sequence: 1,
+      lastServerSequence: 0,
+      correlationId: randomUUID(),
+      now: new Date(),
+      capabilities: ["durable-receipts-v1"],
+    });
+    store.enqueueEvent(
+      {
+        messageId: hello.message_id,
+        sequence: 1,
+        payload: JSON.stringify(hello),
+      },
+      true,
+    );
+    try {
+      const client = makeClient(fixture, store, {
+        requireJobCoordination: true,
+      });
+      expect(() => client.start(new AbortController().signal)).toThrow(
+        "CONNECTOR_INCOMPATIBLE_STATE",
+      );
+      expect(store.activeHello()?.payload).toBe(JSON.stringify(hello));
+      expect(store.maxOutboundSequence()).toBe(1);
+    } finally {
+      store.close();
+      await fixture.close();
+    }
+  });
+
+  it.each([
+    "job.claim",
+    "job.event",
+    "approval.requested",
+    "job.cancelled",
+  ] as const)(
+    "allocates original %s profile before welcome and preserves it on reconnect",
+    async (type) => {
+      const r = await rig({}, false);
+      const payload =
+        type === "job.claim"
+          ? { job_id: JOB_ID, attempt: 1, lease_id: randomUUID() }
+          : type === "job.event"
+            ? jobEventPayload()
+            : type === "job.cancelled"
+              ? { job_id: JOB_ID, attempt: 1, reason: "owner_request" }
+              : {
+                  job_id: JOB_ID,
+                  attempt: 1,
+                  job_revision: 2,
+                  approval_id: randomUUID(),
+                  action_summary: "Run checks",
+                  impact_summary: "Checks only",
+                  risk_class: "low",
+                  action_fingerprint: `sha256:${"a".repeat(64)}`,
+                  expires_at: isoAfter(30_000),
+                };
+      await r.client.publish(type, payload, randomUUID());
+      const row = required(r.store.outboundEvent(2));
+      expect(row.expectedReceiptProfile).toBe("job-coordination-v1");
+      expect(r.fixture.clientMessages.map((m) => m.type)).toEqual([
+        "connector.hello",
+      ]);
+      r.fixture.autoWelcome = true;
+      required(r.sockets[0]).terminate();
+      await waitFor(() => r.client.currentEpoch() !== undefined);
+      await waitFor(() =>
+        r.fixture.clientMessages.some((m) => m.type === type),
+      );
+      expect(r.store.outboundEvent(2)).toMatchObject({
+        messageId: row.messageId,
+        expectedReceiptProfile: "job-coordination-v1",
+      });
+      expect(r.store.activeHello()).not.toHaveProperty(
+        "expectedReceiptProfile",
+      );
+      const request = ConnectorClientMessageSchema.parse(
+        JSON.parse(row.payload),
+      );
+      const peer = required([...r.fixture.sockets][0]);
+      r.fixture.send(
+        peer,
+        envelope(
+          "ack",
+          r.fixture.nextServerSequence++,
+          { sequence: row.sequence },
+          request.correlation_id,
+        ),
+      );
+      await waitFor(
+        () => r.store.outboundEvent(row.sequence)?.acknowledgedAt !== null,
+      );
+      const rejection = envelope(
+        "protocol.error",
+        r.fixture.nextServerSequence++,
+        {
+          code: type === "job.claim" ? "CLAIM_REJECTED" : "EVENT_REJECTED",
+          message: "The job authority has changed.",
+        },
+        request.correlation_id,
+      );
+      r.fixture.send(peer, rejection);
+      await waitFor(
+        () => r.store.inboundMessage(rejection.message_id)?.delivered === true,
+      );
+      expect(
+        r.store.coordinationReceipt(rejection.sequence)?.requestSequence,
+      ).toBe(row.sequence);
+      for (const event of r.store.pendingEvents(0)) {
+        if (JSON.parse(event.payload).type === "ack")
+          expect(event).not.toHaveProperty("expectedReceiptProfile");
+      }
+    },
+  );
+
+  it.each(["registration", "epoch", "state"] as const)(
+    "aborts and fails closed on %s callback throw or async return",
+    async (kind) => {
+      for (const asynchronous of [false, true]) {
+        const r = await rig();
+        const epoch = required(r.client.currentEpoch());
+        const before = r.store.maxOutboundSequence();
+        const broken = (() => {
+          if (asynchronous)
+            return Promise.reject(new Error("private callback detail"));
+          throw new Error("private callback detail");
+        }) as unknown as () => undefined;
+        if (kind === "epoch") {
+          expect(() => r.client.onEpoch(broken)).toThrow(
+            "CONNECTOR_COORDINATION_CALLBACK_FAILED",
+          );
+        } else if (kind === "registration") {
+          expect(() =>
+            r.client.publishSync(
+              { job_id: JOB_ID, attempt: 1, nonce: randomUUID() },
+              randomUUID(),
+              broken,
+            ),
+          ).toThrow("CONNECTOR_COORDINATION_CALLBACK_FAILED");
+          expect(r.store.maxOutboundSequence()).toBe(before + 1);
+          expect(r.store.outboundEvent(before + 1)?.acknowledgedAt).toBeNull();
+          expect(
+            r.fixture.clientMessages.some((m) => m.type === "job.sync"),
+          ).toBe(false);
+        } else {
+          r.client.onState(broken);
+          let next = false;
+          r.client.onState(() => {
+            next = true;
+          });
+          r.client.publishSync(
+            { job_id: JOB_ID, attempt: 1, nonce: randomUUID() },
+            randomUUID(),
+            () => undefined,
+          );
+          const sync = ConnectorClientMessageSchema.parse(
+            JSON.parse(required(r.store.outboundEvent(before + 1)).payload),
+          );
+          if (sync.type !== "job.sync") throw new Error("fixture sync missing");
+          const state = stateFor(sync, r.fixture.nextServerSequence++);
+          r.fixture.send(required([...r.fixture.sockets][0]), state);
+          await waitFor(() => epoch.signal.aborted);
+          expect(next).toBe(false);
+          expect(r.store.inboundMessage(state.message_id)?.delivered).toBe(
+            false,
+          );
+        }
+        expect(epoch.signal.aborted).toBe(true);
+        expect(r.client.currentEpoch()).toBeUndefined();
+        expect(await r.outcome).toBe("CONNECTOR_COORDINATION_CALLBACK_FAILED");
+      }
+    },
+  );
+
+  it("does not register or send when the SQLite sync transaction fails", async () => {
+    const r = await rig();
+    const db = new Database(join(r.directory, "state.sqlite"));
+    const before = r.store.maxOutboundSequence();
+    db.exec(
+      "CREATE TRIGGER reject_sync BEFORE INSERT ON outbound_events WHEN json_extract(NEW.payload, '$.type') = 'job.sync' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END",
+    );
+    let registered = false;
+    try {
+      expect(() =>
+        r.client.publishSync(
+          { job_id: JOB_ID, attempt: 1, nonce: randomUUID() },
+          randomUUID(),
+          () => {
+            registered = true;
+          },
+        ),
+      ).toThrow("STORE_OUTBOUND_WRITE_FAILED");
+      expect(registered).toBe(false);
+      expect(r.store.maxOutboundSequence()).toBe(before);
+      expect(r.fixture.clientMessages.some((m) => m.type === "job.sync")).toBe(
+        false,
+      );
+      expect(r.client.currentEpoch()).toBeUndefined();
+    } finally {
+      db.exec("DROP TRIGGER reject_sync");
+      db.close();
+    }
+  });
+
+  it.each(["close", "error", "abort"] as const)(
+    "revokes the captured epoch synchronously on %s and ignores old handlers",
+    async (path) => {
+      const r = await rig();
+      const old = required(r.client.currentEpoch());
+      const socket = required(r.sockets[0]);
+      const oldClose = required(socket.listeners("close")[0]);
+      if (path === "abort") r.controller.abort();
+      else if (path === "error")
+        socket.emit("error", new Error("private socket detail"));
+      else {
+        socket.terminate();
+        await waitFor(() => old.signal.aborted);
+      }
+      expect(old.signal.aborted).toBe(true);
+      expect(r.client.currentEpoch()).toBeUndefined();
+      if (path === "abort") return;
+      await waitFor(() => r.client.currentEpoch() !== undefined);
+      const fresh = required(r.client.currentEpoch());
+      expect(fresh).not.toBe(old);
+      Reflect.apply(oldClose, socket, [1000, Buffer.alloc(0)]);
+      expect(fresh.signal.aborted).toBe(false);
+      expect(r.client.currentEpoch()).toBe(fresh);
+      expect(old.signal.aborted).toBe(true);
+    },
+  );
+
+  it("recovers state with null epoch after loss between SQLite commit and callback", async () => {
+    const r = await rig();
+    const old = required(r.client.currentEpoch());
+    const deliveries: unknown[] = [];
+    r.client.onState((_message, delivery) => {
+      deliveries.push(delivery);
+    });
+    r.client.publishSync(
+      { job_id: JOB_ID, attempt: 1, nonce: randomUUID() },
+      randomUUID(),
+      () => undefined,
+    );
+    const sync = ConnectorClientMessageSchema.parse(
+      JSON.parse(
+        required(r.store.outboundEvent(r.store.maxOutboundSequence())).payload,
+      ),
+    );
+    if (sync.type !== "job.sync") throw new Error("fixture sync missing");
+    const state = stateFor(sync, r.fixture.nextServerSequence++);
+    const record = r.store.recordInbound.bind(r.store);
+    const hook = vi
+      .spyOn(r.store, "recordInbound")
+      .mockImplementation((...args) => {
+        const result = record(...args);
+        if (args[0] === state.message_id) {
+          hook.mockRestore();
+          required(r.sockets[0]).emit(
+            "error",
+            new Error("fixture disconnect after commit"),
+          );
+          expect(old.signal.aborted).toBe(true);
+          expect(deliveries).toEqual([]);
+        }
+        return result;
+      });
+    r.fixture.send(required([...r.fixture.sockets][0]), state);
+    await waitFor(() => deliveries.length === 1);
+    expect(deliveries).toEqual([{ epoch: null, recovered: true }]);
+    expect(r.client.currentEpoch()).not.toBe(old);
+    expect(r.store.inboundMessage(state.message_id)?.delivered).toBe(true);
+    r.fixture.send(required([...r.fixture.sockets][0]), state);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(deliveries).toHaveLength(1);
+  });
+
+  it("registers the committed normalized sync before actual send and delivers state separately", async () => {
+    const fixture = await startFixture();
+    fixture.capabilities.push("job-coordination-v1");
+    const { store } = makeStore();
+    const controller = new AbortController();
+    const client = makeClient(fixture, store, { requireJobCoordination: true });
+    let registered = false;
+    let stateCalls = 0;
+    let commandCalls = 0;
+    let request: import("./connector-client.js").PublishedSync | undefined;
+    client.onCommand(async () => {
+      commandCalls++;
+    });
+    const unsubscribe = client.onState((message, delivery) => {
+      expect(registered).toBe(true);
+      expect(delivery).toEqual({ epoch: request?.epoch, recovered: false });
+      expect(store.inboundMessage(message.message_id)?.delivered).toBe(false);
+      expect(store.coordinationReceipt(message.sequence)?.requestSequence).toBe(
+        request?.sequence,
+      );
+      expect(
+        store.outboundEvent(required(request).sequence)?.acknowledgedAt,
+      ).toBeNull();
+      stateCalls++;
+    });
+    const running = client.start(controller.signal);
+    try {
+      await waitFor(() => client.currentEpoch() !== undefined);
+      let subscribed = false;
+      client.onEpoch((epoch) => {
+        expect(epoch).toBe(client.currentEpoch());
+        subscribed = true;
+      })();
+      expect(subscribed).toBe(true);
+      const socket = required([...fixture.sockets][0]);
+      socket.on("message", (data) => {
+        const sync = ConnectorClientMessageSchema.parse(
+          JSON.parse(data.toString()),
+        );
+        if (sync.type !== "job.sync") return;
+        expect(registered).toBe(true);
+        fixture.send(socket, stateFor(sync, fixture.nextServerSequence++));
+      });
+      const result = client.publishSync(
+        { job_id: JOB_ID.toUpperCase(), attempt: 1, nonce: randomUUID() },
+        randomUUID(),
+        (persisted) => {
+          request = persisted;
+          expect(Object.isFrozen(persisted)).toBe(true);
+          expect(persisted.jobId).toBe(JOB_ID);
+          expect(
+            store.outboundEvent(persisted.sequence)?.expectedReceiptProfile,
+          ).toBe("job-coordination-v1");
+          expect(
+            fixture.clientMessages.some((m) => m.type === "job.sync"),
+          ).toBe(false);
+          registered = true;
+        },
+      );
+      expect(result).toBeUndefined();
+      expect(registered).toBe(true);
+      await waitFor(() => stateCalls === 1);
+      expect(commandCalls).toBe(0);
+      controller.abort();
+      expect(required(request).epoch.signal.aborted).toBe(true);
+      expect(client.currentEpoch()).toBeUndefined();
+    } finally {
+      unsubscribe();
+      controller.abort();
+      await running;
+      store.close();
+      await fixture.close();
+    }
+  });
+
+  it("tracks original profiles for offline business allocation and denies offline sync", async () => {
+    const fixture = await startFixture();
+    fixture.autoWelcome = false;
+    const { store } = makeStore();
+    const controller = new AbortController();
+    const client = makeClient(fixture, store, {
+      capabilities: ["job-coordination-v1"],
+    });
+    const running = client.start(controller.signal);
+    try {
+      await client.publish("job.event", jobEventPayload(), randomUUID());
+      expect(store.outboundEvent(2)?.expectedReceiptProfile).toBe(
+        "job-coordination-v1",
+      );
+      expect(() =>
+        client.publishSync(
+          { job_id: JOB_ID, attempt: 1, nonce: randomUUID() },
+          randomUUID(),
+          () => undefined,
+        ),
+      ).toThrow("CONNECTOR_COORDINATION_UNAVAILABLE");
+      expect(store.maxOutboundSequence()).toBe(2);
+      expect(store.activeHello()).not.toHaveProperty("expectedReceiptProfile");
+    } finally {
+      controller.abort();
+      await running;
+      store.close();
+      await fixture.close();
+    }
+  });
+
+  it("refuses generic sync without allocating a durable request", async () => {
+    const fixture = await startFixture();
+    fixture.autoWelcome = false;
+    const { store } = makeStore();
+    const controller = new AbortController();
+    const client = makeClient(fixture, store);
+    const running = client.start(controller.signal);
+    try {
+      const before = store.maxOutboundSequence();
+      await expect(
+        client.publish(
+          "job.sync",
+          {
+            job_id: JOB_ID,
+            attempt: 1,
+            nonce: randomUUID(),
+          },
+          randomUUID(),
+        ),
+      ).rejects.toThrow("CONNECTOR_SYNC_REQUIRES_TRACKED_ALLOCATION");
+      expect(store.maxOutboundSequence()).toBe(before);
+    } finally {
+      controller.abort();
+      await running;
+      store.close();
+      await fixture.close();
+    }
+  });
+
+  it("requires both echoes before recovering pending commands", async () => {
+    const fixture = await startFixture();
+    const { store } = makeStore();
+    const command = envelope("job.cancel", 1, {
+      job_id: JOB_ID,
+      attempt: 1,
+      job_revision: 2,
+      nonce: randomUUID(),
+      reason: "owner_request",
+    });
+    store.recordInbound(command.message_id, 1, JSON.stringify(command));
+    fixture.nextServerSequence = 2;
+    const controller = new AbortController();
+    const client = makeClient(fixture, store, { requireJobCoordination: true });
+    let called = false;
+    client.onCommand(async () => {
+      called = true;
+    });
+    const running = client.start(controller.signal);
+    const outcome = running.catch((error: Error) => error.message);
+    try {
+      await waitFor(() => fixture.clientMessages.length > 0);
+      await waitFor(() => called || fixture.sockets.size === 0);
+      expect(called).toBe(false);
+      expect(await outcome).toBe("CONNECTOR_INCOMPATIBLE_PEER");
+      expect(store.inboundMessage(command.message_id)?.delivered).toBe(false);
+    } finally {
+      controller.abort();
+      await outcome;
+      store.close();
+      await fixture.close();
+    }
+  });
 });
 
 describe("authenticated connector transport", () => {
