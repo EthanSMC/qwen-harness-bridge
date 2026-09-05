@@ -4,7 +4,7 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import { ToolCallId } from "@deepseek-ai/dsh-llm";
 import { createScope } from "@deepseek-ai/dsh-scope";
 import { ApprovalService } from "@deepseek-ai/dsh-user-approval";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   type ApprovalDecisionMessage,
   RemoteApprovalBroker,
@@ -33,6 +33,8 @@ function fixture() {
   Object.assign(agent, { ctx: createScope(root, agent).ctx.extend({ agent }) });
   const jobId = randomUUID();
   const lifetime = new AbortController();
+  const transport = new AbortController();
+  const release = vi.fn();
   let action: AnswererAction | undefined = {
     jobId,
     attempt: 1,
@@ -53,9 +55,9 @@ function fixture() {
       requestedRevision: 8,
       deadline: Date.now() + 60_000,
       approvalTimeoutSeconds: 60,
-      signal: lifetime.signal,
+      signal: transport.signal,
       isCurrent: () => true,
-      release() {},
+      release,
     }),
     publish: async (_type, payload) => {
       published = payload;
@@ -102,6 +104,9 @@ function fixture() {
     ready,
     decide,
     lifetime,
+    transport,
+    release,
+    broker,
     productId: () => published.approval_id,
     setAction: (value: AnswererAction | undefined) => {
       action = value;
@@ -117,6 +122,31 @@ function fixture() {
   };
 }
 describe("official approval service answerer integration", () => {
+  it.each(["transport loss", "broker disposal"])(
+    "returns and audits unavailable when release causes %s",
+    async (cause) => {
+      const f = fixture();
+      try {
+        f.release.mockImplementationOnce(() => {
+          if (cause === "transport loss") f.transport.abort();
+          else f.broker.dispose();
+        });
+        const pending = f.request();
+        await f.ready;
+        expect(f.decide()).toBe("accepted");
+        const outcome = await pending;
+        expect(f.lifetime.signal.aborted).toBe(false);
+        expect(f.release).toHaveBeenCalledTimes(1);
+        expect.soft(outcome).toBe("unavailable");
+        expect.soft(f.events[2]).toMatchObject({
+          type: "approval/decided",
+          data: { outcome: "unavailable" },
+        });
+      } finally {
+        f.dispose();
+      }
+    },
+  );
   it("rechecks the exact Agent scope before releasing a grant", async () => {
     const f = fixture();
     try {

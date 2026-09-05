@@ -66,6 +66,99 @@ function fixture() {
 }
 afterEach(() => vi.useRealTimers());
 describe("remote approval broker (deterministic authority and transport ports)", () => {
+  it("holds capacity and attempt fences through post-release validation", async () => {
+    const f = fixture();
+    const original = f.reserve();
+    let released = false;
+    const nested: Promise<string>[] = [];
+    f.reserve.mockReturnValueOnce({
+      ...original,
+      isCurrent: () => {
+        if (released) {
+          nested.push(f.broker.request(input));
+          nested.push(f.broker.request({ ...input, attempt: 33 }));
+        }
+        return true;
+      },
+    });
+    f.release.mockImplementationOnce(() => {
+      released = true;
+    });
+    const pending = Array.from({ length: 32 }, (_, i) =>
+      f.broker.request({ ...input, attempt: i + 1 }),
+    );
+    expect(f.broker.acceptDecision(f.decision())).toBe("accepted");
+    expect(await pending[0]).toBe("allowed-once");
+    expect(await Promise.all(nested)).toEqual(["unavailable", "unavailable"]);
+    expect(f.published).toHaveLength(32);
+    const next = f.broker.request(input);
+    expect(f.published).toHaveLength(33);
+    f.broker.dispose();
+    await Promise.all([...pending, next]);
+    expect(f.release).toHaveBeenCalledTimes(33);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it.each([
+    "loss",
+    "dispose",
+    "abort",
+    "stale",
+    "original deadline",
+    "decision deadline",
+    "release throw",
+    "validation throw",
+    "validation abort",
+  ])("finalizes after cleanup-time %s and frees admission", async (cause) => {
+    const f = fixture();
+    const caller = new AbortController();
+    const original = f.reserve();
+    let released = false;
+    f.reserve.mockReturnValue({
+      ...original,
+      isCurrent: () => {
+        if (released && cause === "validation throw")
+          throw new Error("lost authority");
+        if (released && cause === "validation abort") caller.abort();
+        return original.isCurrent();
+      },
+    });
+    f.release.mockImplementationOnce(() => {
+      released = true;
+      if (cause === "loss") f.invalidation.abort();
+      if (cause === "dispose") f.broker.dispose();
+      if (cause === "abort") caller.abort();
+      if (cause === "stale") f.stale();
+      if (cause === "original deadline") vi.setSystemTime(Date.now() + 60_000);
+      if (cause === "decision deadline") vi.setSystemTime(Date.now() + 1_000);
+      if (cause === "release throw") throw new Error("cleanup failed");
+    });
+    const pending = f.broker.request({ ...input, signal: caller.signal });
+    const decision = f.decision();
+    decision.expires_at = new Date(
+      Date.now() + (cause === "decision deadline" ? 1_000 : 120_000),
+    ).toISOString();
+    expect(f.broker.acceptDecision(decision)).toBe("accepted");
+    expect(await pending).toBe(
+      cause === "abort" || cause === "validation abort"
+        ? "cancelled"
+        : "unavailable",
+    );
+    expect(f.release).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+    if (cause !== "dispose") {
+      f.reserve.mockReturnValue({
+        ...original,
+        deadline: Date.now() + 60_000,
+        signal: new AbortController().signal,
+        isCurrent: () => true,
+      });
+      const next = f.broker.request(input);
+      expect(f.published).toHaveLength(2);
+      f.broker.dispose();
+      expect(await next).toBe("unavailable");
+      expect(f.release).toHaveBeenCalledTimes(2);
+    }
+  });
   it("admits another job only with its own valid reservation", async () => {
     const f = fixture();
     const first = f.broker.request(input);

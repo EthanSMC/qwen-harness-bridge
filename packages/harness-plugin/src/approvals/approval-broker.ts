@@ -37,7 +37,9 @@ export interface ApprovalBroker {
  * revision. Keep it bound through the decision. PluginStore cannot supply it.
  * signal must abort on socket loss, authority loss, or supersession; reconnect
  * must never revive it. isCurrent rechecks the same reservation synchronously.
- * release relinquishes resources, not the consumed server revision.
+ * release relinquishes resources, not the consumed server revision. The same
+ * signal, deadline and isCurrent authority remain meaningful after bookkeeping
+ * release for final grant validation; release may synchronously revoke them.
  */
 export type ApprovalReservation = Readonly<{
   requestedRevision: number;
@@ -89,132 +91,144 @@ export class RemoteApprovalBroker implements ApprovalBroker {
     this.#admissions.set(key, admission);
     let reservation: ApprovalReservation | undefined;
     try {
-      reservation = this.#options.reserve(input);
-      if (!reservation) return "unavailable";
-      const timeout = reservation.approvalTimeoutSeconds;
-      const deadline = Math.min(
-        Date.now() + timeout * 1_000,
-        reservation.deadline,
-      );
-      if (
-        !Number.isInteger(timeout) ||
-        timeout < 60 ||
-        timeout > 1800 ||
-        !Number.isFinite(deadline) ||
-        deadline <= Date.now() ||
-        reservation.signal.aborted ||
-        !reservation.isCurrent()
-      ) {
-        return "unavailable";
-      }
-      const payload = ApprovalRequestedPayloadSchema.parse({
-        approval_id: randomUUID(),
-        job_id: input.jobId,
-        attempt: input.attempt,
-        job_revision: reservation.requestedRevision,
-        action_summary: input.actionSummary,
-        impact_summary: input.impactSummary,
-        risk_class: input.riskClass,
-        action_fingerprint: input.fingerprint,
-        expires_at: new Date(deadline).toISOString(),
-      });
-      const authority = reservation;
-      let deliveryDeadline = deadline;
-      const outcome = await new Promise<ApprovalOutcome>((resolve) => {
-        let settled = false;
-        const callerAbort = () => settle("cancelled");
-        const invalidated = () => settle("unavailable");
-        const timer = setTimeout(
-          invalidated,
-          Math.max(0, deadline - Date.now()),
+      let outcome: ApprovalOutcome;
+      let deliveryDeadline = 0;
+      let releaseFailed = false;
+      try {
+        reservation = this.#options.reserve(input);
+        if (!reservation) return "unavailable";
+        const timeout = reservation.approvalTimeoutSeconds;
+        const deadline = Math.min(
+          Date.now() + timeout * 1_000,
+          reservation.deadline,
         );
-        const cleanup = () => {
-          clearTimeout(timer);
-          let failed = false;
-          for (const remove of [
-            () => input.signal?.removeEventListener("abort", callerAbort),
-            () => authority.signal.removeEventListener("abort", invalidated),
-          ]) {
-            try {
-              remove();
-            } catch {
-              failed = true;
-            }
-          }
-          return failed;
-        };
-        const settle = (
-          outcome: ApprovalOutcome,
-          decisionDeadline = deadline,
-        ) => {
-          if (settled) return;
-          settled = true;
-          deliveryDeadline = Math.min(deadline, decisionDeadline);
-          this.#waiters.delete(payload.approval_id);
-          resolve(cleanup() ? "unavailable" : outcome);
-        };
-        this.#waiters.set(payload.approval_id, {
-          payload,
-          deadline,
-          reservation: authority,
-          signal: input.signal,
-          settle,
-        });
-        try {
-          input.signal?.addEventListener("abort", callerAbort, { once: true });
-          if (settled) {
-            cleanup();
-            return;
-          }
-          authority.signal.addEventListener("abort", invalidated, {
-            once: true,
-          });
-          if (settled) {
-            cleanup();
-            return;
-          }
-          if (input.signal?.aborted) {
-            callerAbort();
-            return;
-          }
-          if (this.#disposed || authority.signal.aborted) {
-            invalidated();
-            return;
-          }
-          // Attach rejection handling immediately; never wait for publish before
-          // admitting abort/timeout. A slow outbox cannot extend authorization.
-          void Promise.resolve(
-            this.#options.publish(
-              "approval.requested",
-              payload,
-              payload.approval_id,
-            ),
-          ).catch(invalidated);
-        } catch {
-          invalidated();
+        if (
+          !Number.isInteger(timeout) ||
+          timeout < 60 ||
+          timeout > 1800 ||
+          !Number.isFinite(deadline) ||
+          deadline <= Date.now() ||
+          reservation.signal.aborted ||
+          !reservation.isCurrent()
+        ) {
+          return "unavailable";
         }
-      });
+        const payload = ApprovalRequestedPayloadSchema.parse({
+          approval_id: randomUUID(),
+          job_id: input.jobId,
+          attempt: input.attempt,
+          job_revision: reservation.requestedRevision,
+          action_summary: input.actionSummary,
+          impact_summary: input.impactSummary,
+          risk_class: input.riskClass,
+          action_fingerprint: input.fingerprint,
+          expires_at: new Date(deadline).toISOString(),
+        });
+        const authority = reservation;
+        deliveryDeadline = deadline;
+        outcome = await new Promise<ApprovalOutcome>((resolve) => {
+          let settled = false;
+          const callerAbort = () => settle("cancelled");
+          const invalidated = () => settle("unavailable");
+          const timer = setTimeout(
+            invalidated,
+            Math.max(0, deadline - Date.now()),
+          );
+          const cleanup = () => {
+            clearTimeout(timer);
+            let failed = false;
+            for (const remove of [
+              () => input.signal?.removeEventListener("abort", callerAbort),
+              () => authority.signal.removeEventListener("abort", invalidated),
+            ]) {
+              try {
+                remove();
+              } catch {
+                failed = true;
+              }
+            }
+            return failed;
+          };
+          const settle = (
+            outcome: ApprovalOutcome,
+            decisionDeadline = deadline,
+          ) => {
+            if (settled) return;
+            settled = true;
+            deliveryDeadline = Math.min(deadline, decisionDeadline);
+            this.#waiters.delete(payload.approval_id);
+            resolve(cleanup() ? "unavailable" : outcome);
+          };
+          this.#waiters.set(payload.approval_id, {
+            payload,
+            deadline,
+            reservation: authority,
+            signal: input.signal,
+            settle,
+          });
+          try {
+            input.signal?.addEventListener("abort", callerAbort, {
+              once: true,
+            });
+            if (settled) {
+              cleanup();
+              return;
+            }
+            authority.signal.addEventListener("abort", invalidated, {
+              once: true,
+            });
+            if (settled) {
+              cleanup();
+              return;
+            }
+            if (input.signal?.aborted) {
+              callerAbort();
+              return;
+            }
+            if (this.#disposed || authority.signal.aborted) {
+              invalidated();
+              return;
+            }
+            // Attach rejection handling immediately; never wait for publish before
+            // admitting abort/timeout. A slow outbox cannot extend authorization.
+            void Promise.resolve(
+              this.#options.publish(
+                "approval.requested",
+                payload,
+                payload.approval_id,
+              ),
+            ).catch(invalidated);
+          } catch {
+            invalidated();
+          }
+        });
+      } finally {
+        try {
+          reservation?.release();
+        } catch {
+          releaseFailed = true;
+        }
+      }
+      // Keep admission through cleanup and the last provider callback. Read
+      // monotonic lifetime state afterward: isCurrent itself may revoke it.
+      const current =
+        outcome === "allowed-once" && !releaseFailed
+          ? reservation.isCurrent()
+          : false;
       if (input.signal?.aborted) return "cancelled";
       if (
         outcome === "allowed-once" &&
-        (this.#disposed ||
-          Date.now() >= deliveryDeadline ||
-          authority.signal.aborted ||
-          !authority.isCurrent())
+        (!current ||
+          this.#disposed ||
+          reservation.signal.aborted ||
+          Date.now() >= deliveryDeadline)
       )
         return "unavailable";
       return outcome;
     } catch {
-      return "unavailable";
+      return input.signal?.aborted ? "cancelled" : "unavailable";
     } finally {
-      try {
-        reservation?.release();
-      } catch {
-        /* Release errors do not change the decision; always free the local slot. */
-      } finally {
-        if (this.#admissions.get(key) === admission)
-          this.#admissions.delete(key);
-      }
+      if (this.#admissions.get(key) === admission) this.#admissions.delete(key);
     }
   }
 
