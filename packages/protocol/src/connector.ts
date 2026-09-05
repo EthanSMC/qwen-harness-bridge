@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { RepositoryIdSchema } from "./job.js";
+import { JobStatusSchema, RepositoryIdSchema } from "./job.js";
 
 const UuidSchema = z
   .string()
@@ -206,6 +206,78 @@ const VersionSchema = boundedUtf8Text(32);
 const EventTypeSchema = boundedUtf8Text(64);
 const SourceSchema = boundedUtf8Text(32);
 const ReasonSchema = boundedUtf8Text(400);
+export const JOB_COORDINATION_CAPABILITY = "job-coordination-v1";
+
+const CoordinationAttemptSchema = PositiveIntegerSchema.max(2147483647);
+const CoordinationRevisionSchema = NonNegativeIntegerSchema.max(2147483647);
+
+export const JobSyncPayloadSchema = z
+  .object({
+    job_id: UuidSchema,
+    attempt: CoordinationAttemptSchema,
+    nonce: UuidSchema,
+  })
+  .strict();
+
+export const JobStatePayloadSchema = z
+  .object({
+    job_id: UuidSchema,
+    repository_id: RepositoryIdSchema,
+    mode: z.enum(["normal", "read_only"]),
+    requested_attempt: CoordinationAttemptSchema,
+    current_attempt: CoordinationRevisionSchema,
+    status: JobStatusSchema,
+    job_revision: CoordinationRevisionSchema,
+    cancel_revision: CoordinationRevisionSchema.nullable(),
+    lease_id: UuidSchema.nullable(),
+    lease_expires_at: Rfc3339TimestampSchema.nullable(),
+    expires_at: Rfc3339TimestampSchema,
+    observed_at: Rfc3339TimestampSchema,
+    state_valid_until: Rfc3339TimestampSchema,
+    request_message_id: UuidSchema,
+    request_sequence: PositiveIntegerSchema,
+    nonce: UuidSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      value.cancel_revision !== null &&
+      value.cancel_revision > value.job_revision
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["cancel_revision"],
+        message: "cancel_revision must not exceed job_revision",
+      });
+    }
+    if ((value.lease_id === null) !== (value.lease_expires_at === null)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["lease_expires_at"],
+        message: "lease_id and lease_expires_at must be null together",
+      });
+    }
+    const observed = parseRfc3339Instant(value.observed_at);
+    const validUntil = parseRfc3339Instant(value.state_valid_until);
+    if (
+      observed !== null &&
+      validUntil !== null &&
+      (validUntil.wholeSeconds - observed.wholeSeconds !== 2 ||
+        validUntil.fraction.replace(/0+$/, "") !==
+          observed.fraction.replace(/0+$/, ""))
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["state_valid_until"],
+        message:
+          "state_valid_until must be exactly two seconds after observed_at",
+      });
+    }
+  });
+
+export type JobSyncPayload = z.infer<typeof JobSyncPayloadSchema>;
+export type JobStatePayload = z.infer<typeof JobStatePayloadSchema>;
+
 const ActionFingerprintSchema = z
   .string()
   .regex(/^sha256:[0-9a-f]{64}$/, "Invalid SHA-256 action fingerprint");

@@ -312,6 +312,20 @@ If redispatch replaces an expired offer, a queued original claim may be consumed
 
 Identity binding, rejection rollback, lease bounds, tombstone restoration, compatibility behavior and required interoperability evidence are specified in [ADR 0001](../../adr/0001-durable-connector-receipts.md). This negotiated correction implements durable recovery without renumbering or silently dropping allocated messages.
 
+### 9.2 Negotiated job coordination authority
+
+The composed stable plugin requires `job-coordination-v1` together with `durable-receipts-v1`, plus a fresh authenticated state exchange in the actual current socket epoch. Add client `job.sync` and server `job.state` only for this profile; legacy peers keep their existing shapes. A pinned old hello without this capability is explicitly incompatible and retained, not silently rewritten. A replayed welcome is not proof that a rolled-back server supports the profile.
+
+`job.sync` binds job, requested attempt and a fresh nonce. `job.state` returns only repository alias, server mode, actual status/attempt/revision, cancellation-transition revision, lease/job deadlines, immutable observation/validity times and exact request identity. It contains no raw request, local path, Harness identity or credentials. The snapshot and a separate ordinary receipt ACK commit with request consumption in one PostgreSQL transaction. State alone never acknowledges a client prefix. Duplicate recovery preserves the original payload and its two-second validity; it cannot reread current state or grant authority to a new waiter.
+
+Fresh admission binds the exact persisted request and live epoch, uses a two-second monotonic waiter, one-second conservative skew allowance, and rejects wall-clock discontinuities. At most 32 waiters, one per job, may exist. Initial Agent creation requires confirmed running state, exact attempt/lease/repository/mode, and valid initial-start lease/job deadlines. Started recovery uses the same persisted SessionId beyond the dispatch lease; ambiguous initial execution history fails closed rather than launching a second request. ACKs remain consumption evidence, never execution permission.
+
+Hold the per-job publication barrier before approval-state synchronization and through revision reservation and durable approval enqueue. While approval is pending, ordinary redacted progress is bounded to 32 events and 16 KiB per attempt; overflow revokes and takes the fixed failure/unavailable path. Terminal/cancel revokes before its separate arbitration path. Approval has separate immutable wire and monotonic deadlines; reconnection never revives an ended approval or action.
+
+Store nullable `jobs.cancel_revision` atomically only when the server enters cancelling; later progress may change current revision but not this cancellation provenance. The additive checked migration leaves legacy rows null, with no automatic backfill or inference from event labels. New-profile cancellation without proven provenance is unavailable. Rollback retains the column and data. Only precisely enumerated authenticated stale business conflicts may receive consumed no-effect rejection plus ACK; authorization, identity, sequence, unknown-message and database failures are not broadly consumed.
+
+[ADR 0005](../../adr/0005-negotiated-job-coordination.md) defines the exact payload fields and bounds, precision-preserving validity checks, deadline adapter, conflict categories, migration, replay, integration evidence and rollback. Payload schemas may be implemented first without enabling new traffic; both endpoint handlers, capability gates, real persistence/transport tests and complete plugin integration remain mandatory before release.
+
 ## 10. Job and approval model
 
 ### 10.1 Public job states

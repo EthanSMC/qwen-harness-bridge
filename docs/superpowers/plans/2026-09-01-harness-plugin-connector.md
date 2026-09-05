@@ -370,6 +370,8 @@ git commit -m "feat(connector): bridge approvals and cancellation fail closed"
 
 ## Task 6: Plugin Composition, Redaction, and End-to-End Recovery
 
+**Integration correction:** [ADR 0005](../../adr/0005-negotiated-job-coordination.md) and Spec9.2 are binding before implementing command coordination. Implement strict state payload schemas, additive server-only cancellation provenance, negotiated transactional state/receipt handling, and live-epoch transport/deadline/publication coordination before Agent admission. Payload-only commits must not activate the new capability or message handlers. Legacy missing provenance remains explicitly unavailable with retained data. Independently reviewable internal slices remain on this Task's single Issue/branch/PR; disjoint workers may run in parallel, with commits and shared-file integration serialized. Complete native ownership/tool/terminal integration, bounded projection before durable enqueue, teardown and the end-to-end gate remain required; no schema or component slice completes Task6 by itself.
+
 **Files:**
 - Create: `packages/harness-plugin/src/redaction/redact-event.ts`
 - Create: `packages/harness-plugin/src/runtime/job-command-coordinator.ts`
