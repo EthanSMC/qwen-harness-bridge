@@ -449,6 +449,13 @@ export class SqlitePluginStore implements CoordinatingPluginStore {
         replacement.coordinationRequestSequence,
         true,
       );
+      // Completion belongs to the proven state sequence, not its renewable
+      // outer identity. Read it before mutation and transfer it atomically.
+      const original =
+        receipt ?? this.coordinationReceipt(replacement.sequence);
+      const preserveCompletion =
+        original?.responseType === "job.state" &&
+        this.inboundMessage(current.message_id)?.delivered === true;
       const updated = this.database
         .prepare(
           `UPDATE inbound_messages
@@ -471,6 +478,14 @@ export class SqlitePluginStore implements CoordinatingPluginStore {
           `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.messageId}`,
         );
       this.insertCoordinationReceipt(receipt);
+      if (preserveCompletion) {
+        this.database
+          .prepare("INSERT INTO metadata (key, value) VALUES (?, ?)")
+          .run(
+            `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.messageId}`,
+            String(replacement.sequence),
+          );
+      }
     });
     try {
       write.immediate();

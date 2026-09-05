@@ -770,10 +770,10 @@ export class DurableConnectorClient implements CoordinatingConnectorClient {
     if (!this.#welcomeReceived) return;
     await this.#completeInbound(
       message,
-      existing?.delivered ?? false,
+      this.#options.store.inboundMessage(message.message_id)?.delivered ??
+        false,
       context,
       false,
-      replacement && existingAtSequence?.delivered === true,
     );
   }
 
@@ -947,11 +947,10 @@ export class DurableConnectorClient implements CoordinatingConnectorClient {
     delivered: boolean,
     context: SocketEpoch,
     recovered: boolean,
-    suppressState = false,
   ): Promise<void> {
     if (!this.#canComplete(context)) return;
     if (!delivered) {
-      if (message.type === "job.state" && !suppressState) {
+      if (message.type === "job.state") {
         if (!context.eligible) return;
         const receipt = this.#coordinationStore().coordinationReceipt(
           message.sequence,

@@ -970,6 +970,143 @@ describe("negotiated transport epochs", () => {
     expect(calls).toBe(1);
   });
 
+  it.each(["state-restoration", "first-tombstone", "state-tombstone"] as const)(
+    "retains completion after committed replacement and disk restart: %s",
+    async (boundary) => {
+      let now = Date.now();
+      const r = await rig({ now: () => new Date(now) });
+      const sync = syncRequest(r);
+      const state = stateFor(sync, r.fixture.nextServerSequence++);
+      const peer = required([...r.fixture.sockets][0]);
+      let calls = 0;
+      r.client.onState(() => {
+        calls++;
+      });
+      if (boundary !== "first-tombstone") {
+        r.fixture.send(peer, state);
+        await waitFor(
+          () => r.store.inboundMessage(state.message_id)?.delivered === true,
+        );
+        now += 61_000;
+      }
+      const tombstone = envelope(
+        "protocol.error",
+        state.sequence,
+        {
+          code: "MESSAGE_EXPIRED",
+          message: "A Connector message expired before delivery.",
+        },
+        sync.correlation_id,
+        new Date(now),
+      );
+      const restored = {
+        ...state,
+        message_id: randomUUID(),
+        sent_at: new Date(now).toISOString(),
+        expires_at: new Date(now + 60_000).toISOString(),
+      };
+      const replacement = boundary === "state-tombstone" ? tombstone : restored;
+      if (boundary !== "state-tombstone") {
+        r.fixture.send(peer, tombstone);
+        await waitFor(
+          () =>
+            r.store.inboundMessage(tombstone.message_id)?.delivered === true,
+        );
+      }
+      const previousEvidence = r.store.coordinationReceipt(state.sequence);
+      const replace = r.store.replaceInbound.bind(r.store);
+      let committed = false;
+      vi.spyOn(r.store, "replaceInbound").mockImplementation((input) => {
+        const outboundSequence = r.store.maxOutboundSequence();
+        replace(input);
+        if (input.messageId === replacement.message_id) {
+          expect(r.store.maxOutboundSequence()).toBe(outboundSequence);
+          committed = true;
+          r.controller.abort();
+        }
+      });
+      r.fixture.send(peer, replacement);
+      await waitFor(() => committed);
+      await r.outcome;
+      const receipt = r.store.coordinationReceipt(state.sequence);
+      expect(r.store.inboundMessage(replacement.message_id)?.delivered).toBe(
+        true,
+      );
+      if (previousEvidence !== undefined)
+        expect(receipt).toEqual(previousEvidence);
+      expect(receipt?.requestMessageId).toBe(sync.message_id);
+      r.store.close();
+      const reopened = new SqlitePluginStore(join(r.directory, "state.sqlite"));
+      const controller = new AbortController();
+      r.fixture.sendWelcome = (socket, hello) => {
+        const sequence = r.fixture.nextServerSequence++;
+        r.fixture.send(
+          socket,
+          envelope(
+            "connector.welcome",
+            sequence,
+            {
+              connector_id: CONNECTOR_ID,
+              capabilities: r.fixture.capabilities,
+              server_sequence: sequence,
+              replay_from:
+                ((hello.payload as JsonRecord).last_server_sequence as number) +
+                1,
+            },
+            hello.correlation_id as ReturnType<typeof randomUUID>,
+            new Date(now),
+          ),
+        );
+      };
+      const client = makeClient(r.fixture, reopened, {
+        requireJobCoordination: true,
+        now: () => new Date(now),
+      });
+      client.onState(() => {
+        calls++;
+      });
+      const outcome = client.start(controller.signal);
+      try {
+        await waitFor(() => client.currentEpoch() !== undefined);
+        // A subsequent ordinary ACK fences recovery and replacement intake.
+        const duplicatePeer = required([...r.fixture.sockets][0]);
+        r.fixture.send(duplicatePeer, replacement);
+        if (boundary === "state-tombstone")
+          r.fixture.send(duplicatePeer, restored);
+        expect(
+          reopened.outboundEvent(sync.sequence)?.acknowledgedAt,
+        ).toBeNull();
+        r.fixture.send(
+          duplicatePeer,
+          envelope(
+            "ack",
+            r.fixture.nextServerSequence++,
+            { sequence: sync.sequence },
+            sync.correlation_id,
+            new Date(now),
+          ),
+        );
+        await waitFor(
+          () => reopened.outboundEvent(sync.sequence)?.acknowledgedAt !== null,
+        );
+        expect(reopened.inboundMessage(restored.message_id)?.delivered).toBe(
+          true,
+        );
+        expect(calls).toBe(boundary === "first-tombstone" ? 0 : 1);
+        expect(reopened.coordinationReceipt(state.sequence)).toEqual(receipt);
+        expect(
+          reopened
+            .pendingInboundMessages()
+            .some((row) => row.sequence === state.sequence),
+        ).toBe(false);
+      } finally {
+        controller.abort();
+        await outcome;
+        reopened.close();
+      }
+    },
+  );
+
   it("establishes first tombstone evidence only from the exactly bound original", async () => {
     const r = await rig();
     const sync = syncRequest(r);

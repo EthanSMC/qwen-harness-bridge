@@ -652,7 +652,7 @@ describe("immutable coordination receipts", () => {
     );
     store.replaceInbound({ ...restore, body: reordered, ...evidence });
     expect(store.coordinationReceipt(1)).toEqual(receipt);
-    expect(store.inboundMessage(coordinationJob)?.delivered).toBe(false);
+    expect(store.inboundMessage(coordinationJob)?.delivered).toBe(true);
     expect(store.recordInbound(coordinationJob, 1, reordered, evidence)).toBe(
       "duplicate",
     );
@@ -699,7 +699,157 @@ describe("immutable coordination receipts", () => {
     }
     store.replaceInbound(replacement);
     expect(store.coordinationReceipt(1)?.requestSequence).toBe(1);
+    expect(store.inboundMessage(coordinationJob)?.delivered).toBe(true);
     database.close();
+    store.close();
+  });
+
+  it.each(["delivered", "missing", "wrong-sequence"])(
+    "preserves only valid state completion across repeated replacement and reopen: %s",
+    (marker) => {
+      const path = makeDatabasePath();
+      let store = new SqlitePluginStore(path);
+      const database = new Database(path);
+      store.enqueueEvent(coordinationRequest());
+      const original = JSON.stringify(coordinationResponse());
+      const tombstone = JSON.stringify(expiryResponse());
+      store.recordInbound(coordinationJob, 1, original, evidence);
+      if (marker !== "missing") {
+        database
+          .prepare("INSERT INTO metadata (key, value) VALUES (?, ?)")
+          .run(
+            `inbound-delivered:${coordinationJob}`,
+            marker === "delivered" ? "1" : "2",
+          );
+      }
+      const receipt = store.coordinationReceipt(1);
+      for (let round = 0; round < 3; round++) {
+        for (const restoring of [false, true]) {
+          store.replaceInbound({
+            previousMessageId: restoring ? coordinationNonce : coordinationJob,
+            previousBody: restoring ? tombstone : original,
+            messageId: restoring ? coordinationJob : coordinationNonce,
+            sequence: 1,
+            body: restoring ? original : tombstone,
+            ...(restoring ? evidence : {}),
+          });
+          store.close();
+          store = new SqlitePluginStore(path);
+          expect(
+            store.inboundMessage(
+              restoring ? coordinationJob : coordinationNonce,
+            )?.delivered,
+          ).toBe(marker === "delivered");
+          expect(store.pendingInboundMessages()).toHaveLength(
+            marker === "delivered" ? 0 : 1,
+          );
+          expect(store.coordinationReceipt(1)).toEqual(receipt);
+        }
+      }
+      database.close();
+      store.close();
+    },
+  );
+
+  it("rolls back state replacement when completion transfer fails after row mutation", () => {
+    const path = makeDatabasePath();
+    const store = new SqlitePluginStore(path);
+    const database = new Database(path);
+    store.enqueueEvent(coordinationRequest());
+    const original = JSON.stringify(coordinationResponse());
+    store.recordInbound(coordinationJob, 1, original, evidence);
+    store.markInboundDelivered(coordinationJob);
+    database.exec(
+      `CREATE TRIGGER fail_transfer BEFORE INSERT ON metadata WHEN NEW.key = 'inbound-delivered:${coordinationNonce}' BEGIN SELECT RAISE(ABORT, 'fixture'); END`,
+    );
+    const before = databaseSnapshot(database);
+    expect(() =>
+      store.replaceInbound({
+        previousMessageId: coordinationJob,
+        previousBody: original,
+        messageId: coordinationNonce,
+        sequence: 1,
+        body: JSON.stringify(expiryResponse()),
+      }),
+    ).toThrow("STORE_INBOUND_WRITE_FAILED");
+    expect(databaseSnapshot(database)).toEqual(before);
+    database.close();
+    store.close();
+  });
+
+  it.each(["original", "candidate", "proof", "cas"])(
+    "does not transfer completion or mutate evidence after invalid %s",
+    (fault) => {
+      const path = makeDatabasePath();
+      const store = new SqlitePluginStore(path);
+      const database = new Database(path);
+      store.enqueueEvent(coordinationRequest());
+      let original = JSON.stringify(coordinationResponse());
+      store.recordInbound(coordinationJob, 1, original, evidence);
+      store.markInboundDelivered(coordinationJob);
+      if (fault === "original") {
+        original = JSON.stringify(
+          coordinationResponse({ ...coordinationState, job_revision: 9 }),
+        );
+        database
+          .prepare("UPDATE inbound_messages SET body = ? WHERE sequence = 1")
+          .run(original);
+      }
+      if (fault === "proof")
+        database
+          .prepare(
+            "UPDATE metadata SET value = '{}' WHERE key = 'inbound-coordination-receipt:1'",
+          )
+          .run();
+      const before = databaseSnapshot(database);
+      expect(() =>
+        store.replaceInbound({
+          previousMessageId: coordinationJob,
+          previousBody: fault === "cas" ? "wrong" : original,
+          messageId: coordinationNonce,
+          sequence: 1,
+          body:
+            fault === "candidate"
+              ? JSON.stringify(
+                  coordinationResponse(
+                    { ...coordinationState, job_revision: 9 },
+                    "job.state",
+                    coordinationNonce,
+                  ),
+                )
+              : JSON.stringify(expiryResponse()),
+          ...(fault === "candidate" ? evidence : {}),
+        }),
+      ).toThrow();
+      expect(databaseSnapshot(database)).toEqual(before);
+      expect(store.inboundMessage(coordinationNonce)).toBeUndefined();
+      database.close();
+      store.close();
+    },
+  );
+
+  it("does not transfer completion for proven ordinary error receipts", () => {
+    const store = new SqlitePluginStore(makeDatabasePath());
+    store.enqueueEvent(coordinationRequest());
+    const original = JSON.stringify(
+      coordinationResponse(
+        {
+          code: "JOB_AUTHORITY_UNAVAILABLE",
+          message: "The job authority is unavailable.",
+        },
+        "protocol.error",
+      ),
+    );
+    store.recordInbound(coordinationJob, 1, original, evidence);
+    store.markInboundDelivered(coordinationJob);
+    store.replaceInbound({
+      previousMessageId: coordinationJob,
+      previousBody: original,
+      messageId: coordinationNonce,
+      sequence: 1,
+      body: JSON.stringify(expiryResponse()),
+    });
+    expect(store.inboundMessage(coordinationNonce)?.delivered).toBe(false);
     store.close();
   });
 
