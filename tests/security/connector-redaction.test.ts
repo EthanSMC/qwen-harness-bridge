@@ -16,6 +16,101 @@ import {
 
 describe("connector public projection", () => {
   it.each([
+    "export BUILD_ENDPOINT=$(printf syntheticprivatevalue)",
+    "export build_endpoint=$(printf syntheticprivatevalue)",
+    "export Build_Endpoint=$'synthetic\\' privatevalue'",
+    "export BUILD_ENDPOINT=$'synthetic\\' privatevalue'",
+    "Before x=`printf syntheticprivatevalue` after",
+    // biome-ignore lint/suspicious/noTemplateCurlyInString: synthetic shell syntax must remain literal data.
+    "Before x=${synthetic:-private value} after",
+    "Before x=$((synthetic + 1)) after",
+    "Before x=(synthetic privatevalue) after",
+    'Before x="synthetic privatevalue',
+    "Before x='synthetic privatevalue",
+    "Before x=synthetic\\",
+  ])(
+    "N3 falls back for unsupported or unclosed assignment values in both fields: %s",
+    (value) => {
+      const output = redactEvent(
+        {
+          summary: value,
+          artifacts: [
+            {
+              name: value,
+              media_type: "text/plain",
+              url: "https://example.test/report",
+            },
+          ],
+        },
+        { ...options, secrets: [] },
+      );
+      expect(output.summary).toBe("[redacted]");
+      expect(output.artifacts?.[0].name).toBe("[redacted]");
+    },
+  );
+  it("N3 preserves supported complete words and sanitized removed URL components", () => {
+    const value = "Before x='synthetic'private\\ value after";
+    const url = "https://example.test/report?x=$(synthetic)#x=$'synthetic'";
+    const output = redactEvent(
+      {
+        summary: value,
+        artifacts: [{ name: value, media_type: "text/plain", url }],
+      },
+      options,
+    );
+    expect(output.summary).toBe("Before [redacted] after");
+    expect(output.artifacts?.[0].name).toBe("Before [redacted] after");
+    expect(output.artifacts?.[0].url).toBe("https://example.test/report");
+    expect(redactEvent({ summary: `See ${url}` }, options).summary).toBe(
+      "See https://example.test/report",
+    );
+  });
+  it("N3 validates retained URL syntax and inspects complex suffixes before truncation", () => {
+    for (const url of [
+      "https://example.test/x=$(synthetic)",
+      "https://example.test/%24%7Bsynthetic%7D",
+      "https://example.test/`synthetic`",
+    ]) {
+      rejected({
+        summary: "Done",
+        artifacts: [{ name: "Report", media_type: "text/plain", url }],
+      });
+      expect(redactEvent({ summary: `See ${url}` }, options).summary).toBe(
+        "See [redacted]",
+      );
+    }
+    const value = `${"Safe prose ".repeat(60)}x=$(printf syntheticprivatevalue)`;
+    const output = redactEvent(
+      {
+        summary: value,
+        artifacts: [
+          {
+            name: value,
+            media_type: "text/plain",
+            url: "https://example.test/report",
+          },
+        ],
+      },
+      options,
+    );
+    expect(output.summary).toBe("[redacted]");
+    expect(output.artifacts?.[0].name).toBe("[redacted]");
+  });
+  it("N3 strips encoded complex URL components without inspecting them as assignments", () => {
+    const url =
+      "https://x%3D%24%28synthetic%29@example.test/report?x=%24%7Bsynthetic%7D#x=%60synthetic%60";
+    const output = redactEvent(
+      {
+        summary: `See ${url}`,
+        artifacts: [{ name: `See ${url}`, media_type: "text/plain", url }],
+      },
+      options,
+    );
+    expect(output.summary).toBe("See https://example.test/report");
+    expect(output.artifacts?.[0].name).toBe("See https://example.test/report");
+    expect(output.artifacts?.[0].url).toBe("https://example.test/report");
+  });
+  it.each([
     ["export build_endpoint=syntheticprivatevalue", "[redacted]"],
     ["export Build_Endpoint='synthetic private value'", "[redacted]"],
     ["Updated x=syntheticvalue safely", "Updated [redacted] safely"],

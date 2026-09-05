@@ -34,11 +34,57 @@ const credentials =
 const privateText =
   /[\r\n\u2028\u2029]|```|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:const|let|var|function|class|interface|import|def|return|throw)\s+\w+|#include\s*<|=>|\w\s*\([^\n]*\)\s*;|\b(?:tool\s*)?arguments?\s*[:=]|^\s*[[{]/i;
 const environmentAssignment =
-  /(?<![\w])(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:"(?:\\.|[^"\\])*"|'[^']*'|\\.|[^\s;'"\\])*/g;
+  /(?<![\w])(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*/g;
 const structuredBody =
   /\{\s*(?:["'}]|[\w-]+\s*:)|\[\s*(?:["'[\]{}]|-?\d|true\b|false\b|null\b)/u;
 const invalidFilename = /[\u2028\u2029\\]|^[A-Za-z]:|^~|^file:/u;
 type Replacement = { start: number; end: number; value: string };
+
+// Delimit only simple literal words. Unsupported syntax is never interpreted:
+// null asks the caller to redact the whole bounded original human field.
+function assignmentSpans(
+  raw: string,
+  insideUrl: (start: number, end: number) => boolean,
+): Replacement[] | null {
+  const pattern = new RegExp(environmentAssignment);
+  const spans: Replacement[] = [];
+  for (
+    let match = pattern.exec(raw);
+    match !== null;
+    match = pattern.exec(raw)
+  ) {
+    let cursor = pattern.lastIndex;
+    if (insideUrl(match.index, cursor)) continue;
+    let quote: "'" | '"' | null = null;
+    while (cursor < raw.length) {
+      const char = raw[cursor];
+      if (quote === "'") {
+        if (char === "'") quote = null;
+        cursor++;
+        continue;
+      }
+      if (char === "\\") {
+        if (cursor + 1 >= raw.length) return null;
+        cursor += 2;
+        continue;
+      }
+      if (char === "$" || char === "`") return null;
+      if (quote === '"') {
+        if (char === '"') quote = null;
+        cursor++;
+        continue;
+      }
+      if (char === "'" || char === '"') quote = char;
+      else if (/[(){}[\]<>|&]/u.test(char)) return null;
+      else if (/\s|;/u.test(char)) break;
+      cursor++;
+    }
+    if (quote !== null) return null;
+    spans.push({ start: match.index, end: cursor, value: "[redacted]" });
+    pattern.lastIndex = cursor;
+  }
+  return spans;
+}
 
 function record(
   value: unknown,
@@ -200,6 +246,7 @@ export function redactEvent(
         privateText.test(decoded) ||
         decoded.search(environmentAssignment) !== -1 ||
         structuredBody.test(decoded) ||
+        /[$`]/u.test(decoded) ||
         hasSecret(normalized) ||
         hasSecret(decoded) ||
         decoded.replace(credentials, "[redacted]") !== decoded ||
@@ -239,12 +286,11 @@ export function redactEvent(
       return path;
     };
     const human = (raw: string): string => {
-      if (privateText.test(raw) || structuredBody.test(raw))
-        return "[redacted]";
+      if (/[\r\n\u2028\u2029]/u.test(raw)) return "[redacted]";
       const replacements: Replacement[] = [];
       const urls: Replacement[] = [];
       const tokens =
-        /https?:\/\/[^\s<>"']+|(?<![\w/])(?:file:\/\/|~\/|[A-Za-z]:[\\/]|\\\\|\/)[^\s<>"']*/gi;
+        /https?:\/\/[^\s<>]+|(?<![\w/])(?:file:\/\/|~\/|[A-Za-z]:[\\/]|\\\\|\/)[^\s<>"']*/gi;
       for (const match of raw.matchAll(tokens)) {
         const token = match[0];
         const replacement = {
@@ -274,6 +320,15 @@ export function redactEvent(
         }
         replacements.push(replacement);
       }
+      // Inspect original non-URL slices, never rewritten text. Removed URL
+      // components may contain shell-like data; retained components were checked.
+      let originalCursor = 0;
+      for (const url of [...urls, { start: raw.length, end: raw.length }]) {
+        const original = raw.slice(originalCursor, url.start);
+        if (privateText.test(original) || structuredBody.test(original))
+          return "[redacted]";
+        originalCursor = url.end;
+      }
       // A secret solely inside stripped URL components must not invalidate the
       // safe URL. Retained components were checked above in all spellings.
       const insideUrl = (start: number, end: number): boolean => {
@@ -286,11 +341,10 @@ export function redactEvent(
         }
         return low > 0 && end <= urls[low - 1].end;
       };
-      for (const pattern of [
-        credentials,
-        environmentAssignment,
-        secretPattern,
-      ]) {
+      const assignments = assignmentSpans(raw, insideUrl);
+      if (assignments === null) return "[redacted]";
+      replacements.push(...assignments);
+      for (const pattern of [credentials, secretPattern]) {
         if (!pattern) continue;
         for (const match of raw.matchAll(pattern)) {
           const end =
