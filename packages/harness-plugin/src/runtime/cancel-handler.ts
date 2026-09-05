@@ -44,6 +44,9 @@ export type CancelHandlerOptions = Readonly<{
 export class CancelHandler {
   readonly #options: CancelHandlerOptions;
   readonly #tasks = new WeakMap<CancellationOwner, Promise<CancelOutcome>>();
+  // Retain effect history, not a cached outcome: persistence/drain can recover.
+  readonly #issued = new WeakSet<CancellationOwner>();
+  readonly #uncertain = new WeakSet<CancellationOwner>();
   constructor(options: CancelHandlerOptions) {
     this.#options = options;
   }
@@ -70,7 +73,9 @@ export class CancelHandler {
       const existing = this.#tasks.get(owner);
       if (existing) return existing;
       if (owner.hasTerminal()) return "terminal";
-      if (owner.agent.status !== "running") return "ignored";
+      if (this.#uncertain.has(owner)) return "unavailable";
+      const retry = this.#issued.has(owner);
+      if (owner.agent.status !== (retry ? "idle" : "running")) return "ignored";
       // Install the single-flight task before invoking any reentrant Agent or
       // abort listener. Only the first command can invoke cancel for this owner.
       let resolve!: (outcome: CancelOutcome) => void;
@@ -78,22 +83,40 @@ export class CancelHandler {
         resolve = done;
       });
       this.#tasks.set(owner, task);
-      void this.#cancel(owner).then(resolve, () => resolve("unavailable"));
+      const finish = (outcome: CancelOutcome) => {
+        this.#tasks.delete(owner);
+        resolve(outcome);
+      };
+      void this.#cancel(owner, retry, Date.parse(parsed.data.expires_at)).then(
+        finish,
+        () => finish("unavailable"),
+      );
       return task;
     } catch {
       return "unavailable";
     }
   }
 
-  async #cancel(owner: CancellationOwner): Promise<CancelOutcome> {
-    try {
-      owner.agent.cancel({ kind: "user" });
-    } finally {
-      owner.approval?.abort();
+  async #cancel(
+    owner: CancellationOwner,
+    retry: boolean,
+    expiresAt: number,
+  ): Promise<CancelOutcome> {
+    if (!retry) {
+      // A throwing cancel may already have issued an effect. Never repeat it or
+      // infer successful cancellation from later idle alone.
+      this.#uncertain.add(owner);
+      try {
+        owner.agent.cancel({ kind: "user" });
+        this.#issued.add(owner);
+        this.#uncertain.delete(owner);
+      } finally {
+        owner.approval?.abort();
+      }
     }
     await owner.agent.whenIdle();
     await owner.drainTerminals();
-    if (!owner.isCurrent()) return "ignored";
+    if (!owner.isCurrent() || Date.now() >= expiresAt) return "ignored";
     return (await owner.commitCancelled()) ? "cancelled" : "terminal";
   }
 }

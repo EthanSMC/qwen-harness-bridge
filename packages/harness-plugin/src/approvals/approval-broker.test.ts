@@ -66,6 +66,236 @@ function fixture() {
 }
 afterEach(() => vi.useRealTimers());
 describe("remote approval broker (deterministic authority and transport ports)", () => {
+  it("admits another job only with its own valid reservation", async () => {
+    const f = fixture();
+    const first = f.broker.request(input);
+    const other = { ...input, jobId: randomUUID() };
+    const reservation = f.reserve();
+    f.reserve.mockReturnValueOnce({ ...reservation, isCurrent: () => false });
+    expect(await f.broker.request(other)).toBe("unavailable");
+    expect(f.published).toHaveLength(1);
+    const second = f.broker.request(other);
+    expect(f.published).toHaveLength(2);
+    expect(f.published[1].job_id).toBe(other.jobId);
+    f.broker.dispose();
+    expect(await Promise.all([first, second])).toEqual([
+      "unavailable",
+      "unavailable",
+    ]);
+    expect(f.release).toHaveBeenCalledTimes(3);
+  });
+  it.each([
+    "invalid input",
+    "invalid reservation",
+    "missing",
+    "reserve throw",
+    "abort",
+    "timeout",
+    "reject",
+    "loss",
+    "stale",
+    "publish throw",
+    "publish reject",
+    "release throw",
+  ])("releases admission exactly once after %s", async (cause) => {
+    const f = fixture();
+    const original = f.reserve();
+    const abort = new AbortController();
+    if (cause === "invalid reservation")
+      f.reserve.mockReturnValueOnce({ ...original, approvalTimeoutSeconds: 0 });
+    if (cause === "missing")
+      f.reserve.mockReturnValueOnce(undefined as unknown as typeof original);
+    if (cause === "reserve throw")
+      f.reserve.mockImplementationOnce(() => {
+        throw new Error("offline");
+      });
+    if (cause === "publish throw")
+      f.publish.mockImplementationOnce(() => {
+        throw new Error("offline");
+      });
+    if (cause === "publish reject")
+      f.publish.mockRejectedValueOnce(new Error("offline"));
+    if (cause === "release throw")
+      f.release.mockImplementationOnce(() => {
+        throw new Error("offline");
+      });
+    const first = f.broker.request({
+      ...input,
+      signal: abort.signal,
+      fingerprint: cause === "invalid input" ? "bad" : input.fingerprint,
+    });
+    if (cause === "abort") abort.abort();
+    if (cause === "timeout") await vi.advanceTimersByTimeAsync(60_000);
+    if (cause === "loss") f.invalidation.abort();
+    if (cause === "stale") {
+      f.stale();
+      f.broker.acceptDecision(f.decision());
+    }
+    if (cause === "reject" || cause === "release throw") {
+      const decision = f.decision();
+      decision.payload.decision = "reject";
+      f.broker.acceptDecision(decision);
+    }
+    expect(await first).toBe(
+      cause === "abort"
+        ? "cancelled"
+        : cause === "reject" || cause === "release throw"
+          ? "rejected"
+          : "unavailable",
+    );
+    expect(f.release).toHaveBeenCalledTimes(
+      cause === "missing" || cause === "reserve throw" ? 0 : 1,
+    );
+    expect(vi.getTimerCount()).toBe(0);
+    const releases = f.release.mock.calls.length;
+    f.reserve.mockReturnValue({
+      ...original,
+      deadline: Date.now() + 60_000,
+      signal: new AbortController().signal,
+      isCurrent: () => true,
+    });
+    const count = f.published.length;
+    const next = f.broker.request(input);
+    expect(f.published).toHaveLength(count + 1);
+    f.broker.dispose();
+    expect(await next).toBe("unavailable");
+    expect(f.release).toHaveBeenCalledTimes(releases + 1);
+  });
+  it.each(["throw", "abort"])(
+    "cleans a waiter after listener registration %s without publishing",
+    async (cause) => {
+      const f = fixture();
+      const signal = f.invalidation.signal;
+      const add = signal.addEventListener.bind(signal);
+      vi.spyOn(signal, "addEventListener").mockImplementationOnce(
+        (type, listener, options) => {
+          add(type, listener, options);
+          if (cause === "throw") throw new Error("listener setup failed");
+          f.invalidation.abort();
+        },
+      );
+      expect(await f.broker.request(input)).toBe("unavailable");
+      expect(f.published).toHaveLength(0);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(f.release).toHaveBeenCalledTimes(1);
+      f.broker.dispose();
+      expect(f.release).toHaveBeenCalledTimes(1);
+    },
+  );
+  it("keeps reentrant listener cleanup fenced and resolves despite removal error", async () => {
+    const f = fixture();
+    const signal = f.invalidation.signal;
+    const remove = signal.removeEventListener.bind(signal);
+    let nested: Promise<string> | undefined;
+    vi.spyOn(signal, "removeEventListener").mockImplementationOnce(
+      (type, listener, options) => {
+        remove(type, listener, options);
+        nested = f.broker.request(input);
+        throw new Error("cleanup failed");
+      },
+    );
+    const pending = f.broker.request(input);
+    f.broker.acceptDecision(f.decision());
+    expect(vi.getTimerCount()).toBe(0);
+    expect(f.published).toHaveLength(1);
+    expect(await nested).toBe("unavailable");
+    expect(await pending).toBe("unavailable");
+    expect(f.release).toHaveBeenCalledTimes(1);
+  });
+  it("late failed publication cannot release a replacement admission", async () => {
+    const f = fixture();
+    let reject!: (error: Error) => void;
+    f.publish.mockImplementationOnce((_type, payload) => {
+      f.published.push(payload);
+      return new Promise<void>((_resolve, fail) => {
+        reject = fail;
+      });
+    });
+    const first = f.broker.request(input);
+    f.broker.acceptDecision(f.decision());
+    expect(await first).toBe("allowed-once");
+    const next = f.broker.request(input);
+    reject(new Error("late failure"));
+    await Promise.resolve();
+    expect(await f.broker.request(input)).toBe("unavailable");
+    expect(f.published).toHaveLength(2);
+    expect(f.release).toHaveBeenCalledTimes(1);
+    f.broker.dispose();
+    await next;
+    expect(f.release).toHaveBeenCalledTimes(2);
+  });
+  it("admits 32 lifetimes and rejects capacity+1 through accepted delivery", async () => {
+    const f = fixture();
+    const pending = Array.from({ length: 32 }, (_, i) =>
+      f.broker.request({ ...input, attempt: i + 1 }),
+    );
+    const excess = f.broker.request({ ...input, attempt: 33 });
+    expect(f.published).toHaveLength(32);
+    expect(await excess).toBe("unavailable");
+    expect(f.broker.acceptDecision(f.decision())).toBe("accepted");
+    const overlap = f.broker.request({ ...input, attempt: 33 });
+    expect(f.published).toHaveLength(32);
+    expect(await overlap).toBe("unavailable");
+    expect(await pending[0]).toBe("allowed-once");
+    const replacement = f.broker.request({ ...input, attempt: 33 });
+    expect(f.published).toHaveLength(33);
+    f.broker.dispose();
+    await Promise.all([...pending, replacement]);
+    expect(f.release).toHaveBeenCalledTimes(33);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it("rejects same-attempt overlap until accepted delivery and cleanup finish", async () => {
+    const f = fixture();
+    const first = f.broker.request(input);
+    const duplicate = f.broker.request(input);
+    expect(f.published).toHaveLength(1);
+    expect(await duplicate).toBe("unavailable");
+    expect(f.broker.acceptDecision(f.decision())).toBe("accepted");
+    const delivering = f.broker.request(input);
+    expect(f.published).toHaveLength(1);
+    expect(await delivering).toBe("unavailable");
+    expect(await first).toBe("allowed-once");
+    const next = f.broker.request(input);
+    expect(f.published).toHaveLength(2);
+    f.broker.dispose();
+    expect(await next).toBe("unavailable");
+    expect(f.release).toHaveBeenCalledTimes(2);
+  });
+  it.each(["reserve", "publish", "release"])(
+    "holds the attempt slot during reentrant %s",
+    async (phase) => {
+      const f = fixture();
+      let nested: Promise<string> | undefined;
+      const reenter = () => {
+        nested = f.broker.request(input);
+      };
+      if (phase === "reserve") {
+        const reservation = f.reserve();
+        f.reserve.mockImplementationOnce(() => {
+          reenter();
+          return reservation;
+        });
+      }
+      if (phase === "publish")
+        f.publish.mockImplementationOnce((_type, payload) => {
+          f.published.push(payload);
+          reenter();
+          return Promise.resolve();
+        });
+      if (phase === "release") f.release.mockImplementationOnce(reenter);
+      const first = f.broker.request(input);
+      if (phase !== "release") expect(f.published).toHaveLength(1);
+      expect(f.broker.acceptDecision(f.decision())).toBe("accepted");
+      expect(await first).toBe("allowed-once");
+      expect(f.published).toHaveLength(1);
+      expect(await nested).toBe("unavailable");
+      expect(f.published).toHaveLength(1);
+      const next = f.broker.request(input);
+      expect(f.published).toHaveLength(2);
+      f.broker.dispose();
+      await next;
+    },
+  );
   it("does not deliver a grant after its decision envelope expires", async () => {
     const f = fixture();
     const pending = f.broker.request(input);

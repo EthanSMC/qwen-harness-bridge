@@ -69,6 +69,8 @@ type Waiter = {
 export class RemoteApprovalBroker implements ApprovalBroker {
   readonly #options: ApprovalBrokerOptions;
   readonly #waiters = new Map<string, Waiter>();
+  // Includes reservation acquisition, decision delivery and release callbacks.
+  readonly #admissions = new Map<string, object>();
   #disposed = false;
   constructor(options: ApprovalBrokerOptions) {
     this.#options = options;
@@ -80,6 +82,11 @@ export class RemoteApprovalBroker implements ApprovalBroker {
     if (input.riskClass === "denied") return "rejected";
     if (this.#disposed || input.riskClass !== "approval_required")
       return "unavailable";
+    const key = JSON.stringify([input.jobId, input.attempt]);
+    if (this.#admissions.size >= 32 || this.#admissions.has(key))
+      return "unavailable";
+    const admission = {};
+    this.#admissions.set(key, admission);
     let reservation: ApprovalReservation | undefined;
     try {
       reservation = this.#options.reserve(input);
@@ -121,6 +128,21 @@ export class RemoteApprovalBroker implements ApprovalBroker {
           invalidated,
           Math.max(0, deadline - Date.now()),
         );
+        const cleanup = () => {
+          clearTimeout(timer);
+          let failed = false;
+          for (const remove of [
+            () => input.signal?.removeEventListener("abort", callerAbort),
+            () => authority.signal.removeEventListener("abort", invalidated),
+          ]) {
+            try {
+              remove();
+            } catch {
+              failed = true;
+            }
+          }
+          return failed;
+        };
         const settle = (
           outcome: ApprovalOutcome,
           decisionDeadline = deadline,
@@ -129,10 +151,7 @@ export class RemoteApprovalBroker implements ApprovalBroker {
           settled = true;
           deliveryDeadline = Math.min(deadline, decisionDeadline);
           this.#waiters.delete(payload.approval_id);
-          clearTimeout(timer);
-          input.signal?.removeEventListener("abort", callerAbort);
-          authority.signal.removeEventListener("abort", invalidated);
-          resolve(outcome);
+          resolve(cleanup() ? "unavailable" : outcome);
         };
         this.#waiters.set(payload.approval_id, {
           payload,
@@ -141,17 +160,27 @@ export class RemoteApprovalBroker implements ApprovalBroker {
           signal: input.signal,
           settle,
         });
-        input.signal?.addEventListener("abort", callerAbort, { once: true });
-        authority.signal.addEventListener("abort", invalidated, { once: true });
-        if (input.signal?.aborted) {
-          callerAbort();
-          return;
-        }
-        if (this.#disposed || authority.signal.aborted) {
-          invalidated();
-          return;
-        }
         try {
+          input.signal?.addEventListener("abort", callerAbort, { once: true });
+          if (settled) {
+            cleanup();
+            return;
+          }
+          authority.signal.addEventListener("abort", invalidated, {
+            once: true,
+          });
+          if (settled) {
+            cleanup();
+            return;
+          }
+          if (input.signal?.aborted) {
+            callerAbort();
+            return;
+          }
+          if (this.#disposed || authority.signal.aborted) {
+            invalidated();
+            return;
+          }
           // Attach rejection handling immediately; never wait for publish before
           // admitting abort/timeout. A slow outbox cannot extend authorization.
           void Promise.resolve(
@@ -181,7 +210,10 @@ export class RemoteApprovalBroker implements ApprovalBroker {
       try {
         reservation?.release();
       } catch {
-        /* Release failures cannot grant or strand an approval. */
+        /* Release errors do not change the decision; always free the local slot. */
+      } finally {
+        if (this.#admissions.get(key) === admission)
+          this.#admissions.delete(key);
       }
     }
   }

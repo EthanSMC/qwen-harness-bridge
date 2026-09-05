@@ -81,6 +81,136 @@ function fixture() {
   };
 }
 describe("cancellation with a typed Agent boundary and shared terminal sink", () => {
+  it("does not persist an expired command after drain, but accepts a fresh retry", async () => {
+    const f = fixture();
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      f.owner.drainTerminals = async () => {
+        clock.mockReturnValue(now + 61_000);
+      };
+      f.idle();
+      expect(await f.handler.handle(f.command)).toBe("ignored");
+      expect(f.events).toEqual([]);
+      Object.assign(f.agent, { status: "idle" });
+      f.command.expires_at = new Date(now + 120_000).toISOString();
+      expect(await f.handler.handle(f.command)).toBe("cancelled");
+      expect(f.cancel).toHaveBeenCalledTimes(1);
+      expect(f.events).toEqual(["job.cancelled"]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  it("never repeats an ambiguous throwing cancel, but observes a later terminal", async () => {
+    const f = fixture();
+    f.cancel.mockImplementationOnce(() => {
+      throw new Error("ambiguous effect");
+    });
+    expect(await f.handler.handle(f.command)).toBe("unavailable");
+    Object.assign(f.agent, { status: "idle" });
+    expect(await f.handler.handle(f.command)).toBe("unavailable");
+    expect(f.cancel).toHaveBeenCalledTimes(1);
+    expect(f.events).toEqual([]);
+    f.complete("job.failed");
+    expect(await f.handler.handle(f.command)).toBe("terminal");
+  });
+  it("coalesces synchronous reentrant cancellation effects", async () => {
+    const f = fixture();
+    let nested: Promise<string> | undefined;
+    f.cancel.mockImplementationOnce(() => {
+      nested = f.handler.handle(f.command);
+    });
+    f.idle();
+    expect(await f.handler.handle(f.command)).toBe("cancelled");
+    expect(await nested).toBe("cancelled");
+    expect(f.cancel).toHaveBeenCalledTimes(1);
+    expect(f.events).toEqual(["job.cancelled"]);
+  });
+  it.each(["commit", "drain", "idle"])(
+    "retries transient %s failure on the same idle owner once",
+    async (phase) => {
+      const f = fixture();
+      const commit = f.owner.commitCancelled;
+      const commits = vi.fn(commit);
+      f.owner.commitCancelled = commits;
+      if (phase === "commit")
+        commits.mockImplementationOnce(() => {
+          throw new Error("offline");
+        });
+      if (phase === "drain")
+        f.owner.drainTerminals = vi
+          .fn()
+          .mockRejectedValueOnce(new Error("offline"))
+          .mockResolvedValue(undefined);
+      if (phase === "idle")
+        Object.assign(f.agent, {
+          whenIdle: vi
+            .fn()
+            .mockRejectedValueOnce(new Error("offline"))
+            .mockResolvedValue(undefined),
+        });
+      const first = f.handler.handle(f.command);
+      Object.assign(f.agent, { status: "idle" });
+      f.idle();
+      expect(await first).toBe("unavailable");
+      expect(f.events).toEqual([]);
+      expect(
+        await Promise.all([
+          f.handler.handle(f.command),
+          f.handler.handle(f.command),
+        ]),
+      ).toEqual(["cancelled", "cancelled"]);
+      expect(f.cancel).toHaveBeenCalledTimes(1);
+      expect(commits).toHaveBeenCalledTimes(phase === "commit" ? 2 : 1);
+      expect(f.events).toEqual(["job.cancelled"]);
+    },
+  );
+  it.each(["job.succeeded", "job.failed"])(
+    "observes later %s after persistence failure",
+    async (terminal) => {
+      const f = fixture();
+      f.owner.commitCancelled = vi.fn(() => {
+        throw new Error("offline");
+      });
+      f.idle();
+      expect(await f.handler.handle(f.command)).toBe("unavailable");
+      f.complete(terminal);
+      expect(await f.handler.handle(f.command)).toBe("terminal");
+      expect(f.cancel).toHaveBeenCalledTimes(1);
+      expect(f.owner.commitCancelled).toHaveBeenCalledTimes(1);
+      expect(f.events).toEqual([terminal]);
+    },
+  );
+  it.each([
+    "expired",
+    "stale",
+    "revision",
+    "attempt",
+    "changed owner",
+    "new activity",
+  ])("fences %s retry after persistence failure", async (cause) => {
+    const f = fixture();
+    const commit = vi.fn(() => {
+      throw new Error("offline");
+    });
+    f.owner.commitCancelled = commit;
+    f.idle();
+    expect(await f.handler.handle(f.command)).toBe("unavailable");
+    Object.assign(f.agent, {
+      status: cause === "new activity" ? "running" : "idle",
+    });
+    if (cause === "expired") f.command.expires_at = f.command.sent_at;
+    if (cause === "stale") f.stale();
+    if (cause === "revision") f.command.payload.job_revision++;
+    if (cause === "attempt") f.command.payload.attempt++;
+    if (cause === "changed owner")
+      f.resolveOwner.mockImplementation(
+        () => undefined as unknown as CancellationOwner,
+      );
+    expect(await f.handler.handle(f.command)).toBe("ignored");
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(f.cancel).toHaveBeenCalledTimes(1);
+  });
   it("cancels a real broker wait before the shared sink commits cancellation", async () => {
     const f = fixture();
     const lifetime = new AbortController();
