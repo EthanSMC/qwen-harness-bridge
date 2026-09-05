@@ -32,8 +32,9 @@ const controls = /\p{Cc}/u;
 const credentials =
   /\b(?:bearer|basic)\s+\S+|["']?(?:access[_-]?tokens?|api[_-]?keys?|authorization|client[_-]?secrets?|cookies?|credentials?|passwords?|passwd|secrets?|tokens?)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)|\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9]{12,}|xox[baprs]-[A-Za-z0-9-]{12,})\b|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gi;
 const privateText =
-  /[\r\n\u2028\u2029]|```|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:const|let|var|function|class|interface|import|def|return|throw)\s+\w+|#include\s*<|=>|\w\s*\([^\n]*\)\s*;|\b(?:tool\s*)?arguments?\s*[:=]|\b(?:home|node_env|path|pwd|shell|temp|tmp|tmpdir|user)\s*=|^\s*[[{]/i;
-const environmentAssignment = /\b[A-Z][A-Z0-9_]{1,}\s*=/;
+  /[\r\n\u2028\u2029]|```|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:const|let|var|function|class|interface|import|def|return|throw)\s+\w+|#include\s*<|=>|\w\s*\([^\n]*\)\s*;|\b(?:tool\s*)?arguments?\s*[:=]|^\s*[[{]/i;
+const environmentAssignment =
+  /(?<![\w])(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:"(?:\\.|[^"\\])*"|'[^']*'|\\.|[^\s;'"\\])*/g;
 const structuredBody =
   /\{\s*(?:["'}]|[\w-]+\s*:)|\[\s*(?:["'[\]{}]|-?\d|true\b|false\b|null\b)/u;
 const invalidFilename = /[\u2028\u2029\\]|^[A-Za-z]:|^~|^file:/u;
@@ -163,13 +164,14 @@ export function redactEvent(
       if (size > 65536 || inspected > 2 * 1024 * 1024) return reject();
       return value;
     };
-    // Literal alternatives, longest first at each original input position.
+    // Lookahead visits starts inside earlier matches too. Capture only the
+    // longest literal at each original position; rendering unions overlaps.
     // At most 64 alternatives / 262144 literal bytes; no nested quantifiers.
     const secretPattern = orderedSecrets.length
       ? new RegExp(
-          orderedSecrets
+          `(?=(${orderedSecrets
             .map((secret) => secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-            .join("|"),
+            .join("|")}))`,
           "g",
         )
       : null;
@@ -196,7 +198,7 @@ export function redactEvent(
         bytes(normalized) > 500 ||
         controls.test(decoded) ||
         privateText.test(decoded) ||
-        environmentAssignment.test(decoded) ||
+        decoded.search(environmentAssignment) !== -1 ||
         structuredBody.test(decoded) ||
         hasSecret(normalized) ||
         hasSecret(decoded) ||
@@ -237,11 +239,7 @@ export function redactEvent(
       return path;
     };
     const human = (raw: string): string => {
-      if (
-        privateText.test(raw) ||
-        environmentAssignment.test(raw) ||
-        structuredBody.test(raw)
-      )
+      if (privateText.test(raw) || structuredBody.test(raw))
         return "[redacted]";
       const replacements: Replacement[] = [];
       const urls: Replacement[] = [];
@@ -288,10 +286,16 @@ export function redactEvent(
         }
         return low > 0 && end <= urls[low - 1].end;
       };
-      for (const pattern of [credentials, secretPattern]) {
+      for (const pattern of [
+        credentials,
+        environmentAssignment,
+        secretPattern,
+      ]) {
         if (!pattern) continue;
         for (const match of raw.matchAll(pattern)) {
-          const end = match.index + match[0].length;
+          const end =
+            match.index +
+            (pattern === secretPattern ? match[1] : match[0]).length;
           if (!insideUrl(match.index, end))
             replacements.push({ start: match.index, end, value: "[redacted]" });
         }

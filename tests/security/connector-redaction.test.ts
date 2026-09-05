@@ -15,6 +15,80 @@ import {
 } from "../../packages/harness-plugin/src/redaction/redact-event.js";
 
 describe("connector public projection", () => {
+  it.each([
+    ["export build_endpoint=syntheticprivatevalue", "[redacted]"],
+    ["export Build_Endpoint='synthetic private value'", "[redacted]"],
+    ["Updated x=syntheticvalue safely", "Updated [redacted] safely"],
+    ["Updated _=syntheticvalue safely", "Updated [redacted] safely"],
+    ["Updated _Build=syntheticvalue safely", "Updated [redacted] safely"],
+    [
+      "Updated build_endpoint='synthetic'private safely",
+      "Updated [redacted] safely",
+    ],
+    ["Updated x=synthetic\\ private safely", "Updated [redacted] safely"],
+    ["Failed token=syntheticcredential", "Failed [redacted]"],
+    ["export BUILD_ENDPOINT=syntheticprivatevalue", "[redacted]"],
+  ])(
+    "N1 removes case-independent assignments in both human fields: %s",
+    (value, expected) => {
+      const output = redactEvent(
+        {
+          summary: value,
+          artifacts: [
+            {
+              name: value,
+              media_type: "text/plain",
+              url: "https://example.test/report",
+            },
+          ],
+        },
+        { ...options, secrets: [] },
+      );
+      expect(output.summary).toBe(expected);
+      expect(output.artifacts?.[0].name).toBe(expected);
+    },
+  );
+  it("N1 preserves sanitized URLs with assignments only in stripped components", () => {
+    const url =
+      "https://example.test/report?BUILD_ENDPOINT=syntheticprivatevalue&home=synthetic#x=synthetic";
+    const output = redactEvent(
+      {
+        summary: `See ${url}`,
+        artifacts: [{ name: `See ${url}`, media_type: "text/plain", url }],
+      },
+      options,
+    );
+    expect(output.summary).toBe("See https://example.test/report");
+    expect(output.artifacts?.[0].name).toBe("See https://example.test/report");
+    expect(output.artifacts?.[0].url).toBe("https://example.test/report");
+  });
+  it.each([
+    ["abcdef", ["abc", "bcdef"], "[redacted]"],
+    ["abcdef", ["bcdef", "abc"], "[redacted]"],
+    ["abcdefgh", ["abc", "cde", "efgh"], "[redacted]"],
+    ["abcdef", ["abc", "def"], "[redacted][redacted]"],
+    ["abcdef", ["ab", "abc"], "[redacted]def"],
+    ["Useful ordinary prose", ["abc", "bcdef"], "Useful ordinary prose"],
+  ] as const)(
+    "N2 unions overlapping original secrets in both human fields: %s / %j",
+    (value, secrets, expected) => {
+      const output = redactEvent(
+        {
+          summary: value,
+          artifacts: [
+            {
+              name: value,
+              media_type: "text/plain",
+              url: "https://example.test/report",
+            },
+          ],
+        },
+        { ...options, secrets },
+      );
+      expect(output.summary).toBe(expected);
+      expect(output.artifacts?.[0].name).toBe(expected);
+    },
+  );
   it("redacts source expressions and preserves ordinary URL prose", () => {
     for (const summary of [
       "synthetic.call({ value: 1 });",
