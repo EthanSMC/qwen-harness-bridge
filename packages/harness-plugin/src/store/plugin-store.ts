@@ -157,7 +157,16 @@ const canonicalPayload = (payload: object): string =>
   );
 
 const parseResponse = (messageId: string, sequence: number, body: string) => {
-  const parsed = ConnectorServerMessageSchema.parse(JSON.parse(body));
+  const decoded = JSON.parse(body);
+  const parsed = ConnectorServerMessageSchema.parse(decoded);
+  // Coordination evidence must not acquire exact fixed-error semantics through
+  // the shared legacy schema's trimming. Compare decoded scalars, not JSON bytes.
+  if (
+    parsed.type === "protocol.error" &&
+    (decoded.payload.code !== parsed.payload.code ||
+      decoded.payload.message !== parsed.payload.message)
+  )
+    throw new Error();
   if (parsed.message_id !== messageId || parsed.sequence !== sequence)
     throw new Error();
   return parsed;

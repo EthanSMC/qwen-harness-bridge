@@ -83,6 +83,308 @@ const expiryResponse = () =>
   );
 const evidence = { coordinationRequestSequence: 1 };
 
+describe("coordination raw fixed-error exactness", () => {
+  const unavailable = {
+    code: "JOB_AUTHORITY_UNAVAILABLE",
+    message: "The job authority is unavailable.",
+  };
+  const whitespace = [" ", "\t", "\r\n"];
+
+  it("rejects padded descriptor payloads and duplicate evidence with unchanged snapshots", () => {
+    const path = makeDatabasePath();
+    const store = new SqlitePluginStore(path);
+    const database = new Database(path);
+    try {
+      store.enqueueEvent(coordinationRequest());
+      const body = JSON.stringify(
+        coordinationResponse(unavailable, "protocol.error"),
+      );
+      store.recordInbound(coordinationJob, 1, body, evidence);
+      store.markInboundDelivered(coordinationJob);
+      const receipt = store.coordinationReceipt(1);
+      for (const field of ["code", "message"] as const) {
+        const padded = { ...unavailable, [field]: `\t${unavailable[field]}\n` };
+        const before = databaseSnapshot(database);
+        expect(() =>
+          store.recordInbound(
+            coordinationJob,
+            1,
+            JSON.stringify(coordinationResponse(padded, "protocol.error")),
+            evidence,
+          ),
+        ).toThrow("STORE_INBOUND_WRITE_FAILED");
+        expect(databaseSnapshot(database)).toEqual(before);
+        database
+          .prepare(
+            "UPDATE metadata SET value = ? WHERE key = 'inbound-coordination-receipt:1'",
+          )
+          .run(
+            JSON.stringify({
+              ...receipt,
+              responsePayloadJson: JSON.stringify(padded),
+            }),
+          );
+        const corrupt = databaseSnapshot(database);
+        expect(() => store.coordinationReceipt(1)).toThrow(
+          "STORE_COORDINATION_INVALID",
+        );
+        expect(() =>
+          store.recordInbound(coordinationJob, 1, body, evidence),
+        ).toThrow("STORE_INBOUND_WRITE_FAILED");
+        expect(databaseSnapshot(database)).toEqual(corrupt);
+        database
+          .prepare(
+            "UPDATE metadata SET value = ? WHERE key = 'inbound-coordination-receipt:1'",
+          )
+          .run(JSON.stringify(receipt));
+      }
+    } finally {
+      database.close();
+      store.close();
+    }
+  });
+
+  it.each([
+    "job.sync",
+    "job.claim",
+    "job.event",
+    "approval.requested",
+    "job.cancelled",
+  ])("rejects padded raw disposition fields for %s without effects", (type) => {
+    const path = makeDatabasePath();
+    const store = new SqlitePluginStore(path);
+    const database = new Database(path);
+    try {
+      const job = { job_id: coordinationJob, attempt: 1 };
+      const payload =
+        type === "job.sync"
+          ? { ...job, nonce: coordinationNonce }
+          : type === "job.claim"
+            ? { ...job, lease_id: coordinationNonce }
+            : type === "job.event"
+              ? {
+                  ...job,
+                  event_type: "progress",
+                  payload: {},
+                  source: "harness",
+                }
+              : type === "job.cancelled"
+                ? { ...job, reason: "cancelled" }
+                : {
+                    ...job,
+                    approval_id: coordinationNonce,
+                    job_revision: 1,
+                    action_summary: "Run tests",
+                    impact_summary: "Test output",
+                    risk_class: "low",
+                    action_fingerprint: `sha256:${"a".repeat(64)}`,
+                    expires_at: "2026-09-05T12:01:00Z",
+                  };
+      store.enqueueEvent({
+        ...coordinationRequest(),
+        payload: JSON.stringify({ ...coordinationEnvelope, type, payload }),
+      });
+      const dispositions =
+        type === "job.sync"
+          ? [unavailable]
+          : [
+              {
+                code:
+                  type === "job.claim" ? "CLAIM_REJECTED" : "EVENT_REJECTED",
+                message: "The job authority has changed.",
+              },
+              {
+                code:
+                  type === "job.claim" ? "CLAIM_REJECTED" : "EVENT_REJECTED",
+                message: "The job business limit has been reached.",
+              },
+            ];
+      const before = databaseSnapshot(database);
+      for (const disposition of dispositions) {
+        for (const field of ["code", "message"] as const) {
+          for (const padding of whitespace) {
+            for (const value of [
+              padding + disposition[field],
+              disposition[field] + padding,
+            ]) {
+              const body = JSON.stringify(
+                coordinationResponse(
+                  { ...disposition, [field]: value },
+                  "protocol.error",
+                ),
+              );
+              expect(() =>
+                store.recordInbound(coordinationJob, 1, body, evidence),
+              ).toThrow("STORE_INBOUND_WRITE_FAILED");
+              expect(databaseSnapshot(database)).toEqual(before);
+            }
+          }
+        }
+      }
+      const exact = JSON.stringify(
+        coordinationResponse(dispositions[0], "protocol.error"),
+      );
+      expect(store.recordInbound(coordinationJob, 1, exact, evidence)).toBe(
+        "new",
+      );
+      expect(store.inboundMessage(coordinationJob)?.body).toBe(exact);
+    } finally {
+      database.close();
+      store.close();
+    }
+  });
+
+  for (const field of ["code", "message"] as const) {
+    it.each([
+      "candidate-original",
+      "candidate-placeholder",
+      "first-placeholder",
+      "retained-original",
+      "retained-placeholder",
+    ])(
+      `rejects inexact raw ${field} in %s recovery without effects`,
+      (route) => {
+        const path = makeDatabasePath();
+        const store = new SqlitePluginStore(path);
+        const database = new Database(path);
+        try {
+          store.enqueueEvent(coordinationRequest());
+          const original = JSON.stringify(
+            coordinationResponse(unavailable, "protocol.error"),
+          );
+          const expiry = expiryResponse();
+          const exactPlaceholder = JSON.stringify(expiry);
+          const paddedPlaceholder = JSON.stringify({
+            ...expiry,
+            payload: {
+              ...(expiry.payload as typeof unavailable),
+              [field]: `\t${(expiry.payload as typeof unavailable)[field]} `,
+            },
+          });
+          const paddedOriginal = JSON.stringify(
+            coordinationResponse(
+              { ...unavailable, [field]: ` ${unavailable[field]}\n` },
+              "protocol.error",
+            ),
+          );
+          if (route === "first-placeholder") {
+            // Legacy history is retained verbatim but cannot establish evidence later.
+            store.recordInbound(coordinationNonce, 1, paddedPlaceholder);
+            store.markInboundDelivered(coordinationNonce);
+          } else {
+            store.recordInbound(coordinationJob, 1, original, evidence);
+            if (route === "retained-placeholder") {
+              store.replaceInbound({
+                previousMessageId: coordinationJob,
+                previousBody: original,
+                messageId: coordinationNonce,
+                sequence: 1,
+                body: exactPlaceholder,
+              });
+              database
+                .prepare(
+                  "UPDATE inbound_messages SET body = ? WHERE sequence = 1",
+                )
+                .run(paddedPlaceholder);
+              store.markInboundDelivered(coordinationNonce);
+            } else {
+              if (route === "retained-original")
+                database
+                  .prepare(
+                    "UPDATE inbound_messages SET body = ? WHERE sequence = 1",
+                  )
+                  .run(paddedOriginal);
+              store.markInboundDelivered(coordinationJob);
+            }
+          }
+          const before = databaseSnapshot(database);
+          if (
+            route === "retained-original" ||
+            route === "retained-placeholder"
+          ) {
+            expect(() => store.coordinationReceipt(1)).toThrow(
+              "STORE_COORDINATION_INVALID",
+            );
+            const id =
+              route === "retained-original"
+                ? coordinationJob
+                : coordinationNonce;
+            const body =
+              route === "retained-original"
+                ? paddedOriginal
+                : paddedPlaceholder;
+            expect(() => store.recordInbound(id, 1, body, evidence)).toThrow(
+              "STORE_INBOUND_WRITE_FAILED",
+            );
+          } else if (route === "first-placeholder") {
+            expect(store.coordinationReceipt(1)).toBeUndefined();
+            expect(() =>
+              store.replaceInbound({
+                previousMessageId: coordinationNonce,
+                previousBody: paddedPlaceholder,
+                messageId: coordinationJob,
+                sequence: 1,
+                body: original,
+                ...evidence,
+              }),
+            ).toThrow("STORE_INBOUND_WRITE_FAILED");
+          } else {
+            const body =
+              route === "candidate-original"
+                ? JSON.stringify({
+                    ...JSON.parse(paddedOriginal),
+                    message_id: coordinationNonce,
+                  })
+                : paddedPlaceholder;
+            expect(() =>
+              store.replaceInbound({
+                previousMessageId: coordinationJob,
+                previousBody: original,
+                messageId: coordinationNonce,
+                sequence: 1,
+                body,
+                ...(route === "candidate-original" ? evidence : {}),
+              }),
+            ).toThrow("STORE_INBOUND_WRITE_FAILED");
+          }
+          expect(databaseSnapshot(database)).toEqual(before);
+        } finally {
+          database.close();
+          store.close();
+        }
+      },
+    );
+  }
+
+  it("accepts decoded exact strings with JSON formatting, escapes and UUID normalization", () => {
+    const store = new SqlitePluginStore(makeDatabasePath());
+    try {
+      const lower = "abcdefab-abcd-4abc-8abc-abcdefabcdef";
+      const upper = lower.toUpperCase();
+      store.enqueueEvent(coordinationRequest());
+      const body = JSON.stringify(
+        {
+          ...coordinationResponse(
+            { message: unavailable.message, code: unavailable.code },
+            "protocol.error",
+          ),
+          message_id: upper,
+        },
+        null,
+        2,
+      ).replace("The job", "\\u0054he job");
+      expect(store.recordInbound(lower, 1, body, evidence)).toBe("new");
+      expect(store.inboundMessage(lower)?.body).toBe(body);
+      expect(store.coordinationReceipt(1)?.responsePayloadJson).toBe(
+        JSON.stringify(unavailable),
+      );
+      expect(store.recordInbound(lower, 1, body, evidence)).toBe("duplicate");
+    } finally {
+      store.close();
+    }
+  });
+});
+
 describe("immutable coordination receipts", () => {
   it("rejects malformed supplied evidence instead of using the legacy overload", () => {
     const store = new SqlitePluginStore(makeDatabasePath());
