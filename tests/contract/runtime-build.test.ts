@@ -1789,6 +1789,70 @@ describe("release runtime build contract", () => {
     expect(controlPlane).not.toMatch(/(?:uid|gid|mode):/);
   });
 
+  it("provisions mandatory native ripgrep before the Linux repository gate and fails closed", () => {
+    const runtimeJob = yamlMappingBlock(
+      read(".github/workflows/runtime.yml"),
+      "jobs",
+      "runtime",
+    );
+    expect(runtimeJob).toMatch(/runs-on:\s*ubuntu-latest/);
+    const name = "Install native test prerequisites";
+    const step = workflowStep(runtimeJob, name);
+    expect(workflowStepIndex(runtimeJob, name)).toBeLessThan(
+      workflowStepIndex(runtimeJob, "Build and start runtime"),
+    );
+    expect(step).toMatch(/shell:\s*bash/);
+    expect(step).not.toMatch(/continue-on-error:|\bif:/);
+    const script = workflowRunScript(step);
+    expect(spawnSync("bash", ["-n"], { input: script }).status).toBe(0);
+    // Substitute only the external package manager and native executable:
+    // execute the workflow's actual shell control flow without local installs.
+    for (const failure of ["none", "update", "install", "rg"] as const) {
+      const result = spawnSync(
+        "bash",
+        [
+          "-c",
+          `
+installed=no
+sudo() {
+  case "$*" in
+    "apt-get update")
+      printf 'update\\n'
+      [ "$FAILURE" != update ] || return 41 ;;
+    "apt-get install --yes --no-install-recommends ripgrep")
+      printf 'install\\n'
+      [ "$FAILURE" != install ] || return 42
+      installed=yes ;;
+    *) return 90 ;;
+  esac
+}
+rg() {
+  [ "$installed" = yes ] && [ "$*" = --version ] || return 91
+  printf 'rg\\n'
+  [ "$FAILURE" != rg ] || return 43
+}
+${script}
+printf 'prerequisites-ready\\n'
+`,
+        ],
+        { encoding: "utf8", env: { ...process.env, FAILURE: failure } },
+      );
+      expect(result.status, failure).toBe(
+        { none: 0, update: 41, install: 42, rg: 43 }[failure],
+      );
+      if (failure === "none") {
+        expect(result.stdout).toMatch(
+          /update\ninstall\n(?:rg\n)+prerequisites-ready\n$/,
+        );
+      } else {
+        expect(result.stdout).not.toContain("prerequisites-ready");
+        if (failure === "update")
+          expect(result.stdout).not.toContain("install");
+        if (failure === "install") expect(result.stdout).not.toContain("rg");
+      }
+    }
+  });
+
   it("has an executable PR Docker gate with evidence and unconditional cleanup", () => {
     const workflow = read(".github/workflows/runtime.yml");
     const runbook = read("docs/runbooks/control-plane-local.md");

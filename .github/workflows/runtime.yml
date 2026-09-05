@@ -29,6 +29,15 @@ jobs:
         with:
           version: 10.15.1
 
+      - name: Install native test prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ripgrep
+          command -v rg
+          rg --version
+
       - name: Generate ephemeral runtime material
         shell: bash
         run: |
