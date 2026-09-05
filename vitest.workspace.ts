@@ -32,4 +32,10 @@ export default defineWorkspace([
       ],
     },
   },
+  {
+    test: {
+      name: "security",
+      include: ["tests/security/local-policy.test.ts"],
+    },
+  },
 ]);

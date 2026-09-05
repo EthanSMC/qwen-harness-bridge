@@ -201,6 +201,12 @@ V1 policy classes are:
 
 An approval can move an `approval_required` action to executable, but it can never override `denied`.
 
+### 7.5.1 Command and search-domain enforcement
+
+All admitted command forms, including approval-required administration, validate command-specific argument roles and canonical path/resource boundaries before approval. Explicit destructive semantics survive supported package-script forwarding. Unknown forms cannot use a raw-argument approval fallback. Credential/environment extraction remains denied even when another effect requires approval.
+
+Ordinary safe repository-wide source search remains automatic. Ripgrep inspection uses its admitted candidate-file domain, preserving ignore/hidden/glob/type/depth and explicit-operand semantics; ignored dependency or VCS entries do not consume the selected-file budget. A policy-owned helper may use the registered ripgrep executable in bounded, filename-only, no-shell/no-config enumeration mode, with at most 10,000 candidates, 2 MiB output and 2 seconds elapsed time. It must not execute the requested content search, read pattern files, invoke preprocessors or expose raw filename/error output. Configuration/environment ambiguity, helper failure and selected protected/outside-root paths fail closed. Revalidate at execution; a caller-provided file list cannot grant authority. Native recursive search needs an explicit trusted concrete file scope, not an unverified parent directory. [ADR 0002](../../adr/0002-policy-command-and-search-domains.md) defines the correction and its interoperability evidence.
+
 ## 8. Public MCP contract
 
 All tools use JSON Schema, return bounded JSON, and target a two-second server budget so the complete Qwen path remains below three seconds.
