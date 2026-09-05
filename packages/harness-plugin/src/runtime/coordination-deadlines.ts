@@ -25,6 +25,15 @@ export type CoordinationTiming = Readonly<{
 
 const finite = (sample: CoordinationClockSample): boolean =>
   Number.isFinite(sample.wallTimeMs) && Number.isFinite(sample.monotonicTimeMs);
+// Read only the two clock scalars, once each, including inherited/accessor fields.
+// Validation, arithmetic and retention must all use this same captured pair.
+const captureClock = (
+  sample: CoordinationClockSample,
+): CoordinationClockSample =>
+  Object.freeze({
+    wallTimeMs: sample.wallTimeMs,
+    monotonicTimeMs: sample.monotonicTimeMs,
+  });
 const abs = (n: bigint): bigint => (n < 0n ? -n : n);
 const min = (a: bigint, b: bigint): bigint => (a < b ? a : b);
 
@@ -85,9 +94,11 @@ function stableOffset(
  */
 export function admitCoordinationTiming(
   state: JobStatePayload,
-  sent: CoordinationClockSample,
-  received: CoordinationClockSample,
+  sentInput: CoordinationClockSample,
+  receivedInput: CoordinationClockSample,
 ): CoordinationTiming | undefined {
+  const sent = captureClock(sentInput);
+  const received = captureClock(receivedInput);
   const parsed = JobStatePayloadSchema.safeParse(state);
   if (!parsed.success || !finite(sent) || !finite(received)) return undefined;
   const data = parsed.data;
@@ -138,8 +149,8 @@ export function admitCoordinationTiming(
   )
     return undefined;
   return Object.freeze({
-    sent: Object.freeze({ ...sent }),
-    received: Object.freeze({ ...received }),
+    sent,
+    received,
     snapshotDeadlineMonotonicMs,
     jobDeadlineMonotonicMs,
     leaseDeadlineMonotonicMs,
@@ -193,9 +204,10 @@ export function approvalCoordinationDeadlines(
  */
 export function isCoordinationTimingCurrent(
   timing: CoordinationTiming,
-  now: CoordinationClockSample,
+  nowInput: CoordinationClockSample,
   requirements: Readonly<{ snapshot: boolean; lease: boolean }>,
 ): boolean {
+  const now = captureClock(nowInput);
   return (
     finite(now) &&
     now.monotonicTimeMs >= timing.received.monotonicTimeMs &&

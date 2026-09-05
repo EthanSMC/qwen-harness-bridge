@@ -42,6 +42,129 @@ function admit(patch: Partial<JobStatePayload> = {}) {
 }
 
 describe("coordination deadlines", () => {
+  it.each(["prototype", "non-enumerable"])(
+    "retains explicit scalar snapshots for %s samples",
+    (kind) => {
+      const sample = (values: typeof sent) => {
+        const fields = {
+          get wallTimeMs() {
+            return values.wallTimeMs;
+          },
+          get monotonicTimeMs() {
+            return values.monotonicTimeMs;
+          },
+        };
+        return kind === "prototype"
+          ? Object.create(fields)
+          : Object.defineProperties(
+              {},
+              {
+                wallTimeMs: { value: values.wallTimeMs },
+                monotonicTimeMs: { value: values.monotonicTimeMs },
+              },
+            );
+      };
+      const timing = admitCoordinationTiming(
+        state,
+        sample(sent),
+        sample(received),
+      );
+      if (!timing) throw new Error("Expected admission");
+      expect(approvalCoordinationDeadlines(timing, 60)).toEqual({
+        wireDeadlineMs: 60100,
+        monotonicDeadlineMs: 70100,
+      });
+      expect(isCoordinationTimingCurrent(timing, received, initial)).toBe(true);
+      for (const [snapshot, values] of [
+        [timing.sent, sent],
+        [timing.received, received],
+      ]) {
+        expect(snapshot).toEqual(values);
+        expect(Reflect.ownKeys(snapshot)).toEqual([
+          "wallTimeMs",
+          "monotonicTimeMs",
+        ]);
+        expect(Object.isFrozen(snapshot)).toBe(true);
+      }
+    },
+  );
+  it("omits unrelated properties without reading or freezing caller metadata", () => {
+    const metadata = { value: 1 };
+    let extraReads = 0;
+    const enrich = (values: typeof sent) => ({
+      ...values,
+      metadata,
+      get unrelated() {
+        extraReads++;
+        return metadata;
+      },
+    });
+    const send = enrich(sent);
+    const receive = enrich(received);
+    const timing = admitCoordinationTiming(state, send, receive);
+    if (!timing) throw new Error("Expected admission");
+    expect(extraReads).toBe(0);
+    expect(Reflect.ownKeys(timing.sent)).toEqual([
+      "wallTimeMs",
+      "monotonicTimeMs",
+    ]);
+    expect(Reflect.ownKeys(timing.received)).toEqual([
+      "wallTimeMs",
+      "monotonicTimeMs",
+    ]);
+    expect(Object.isFrozen(send)).toBe(false);
+    expect(Object.isFrozen(receive)).toBe(false);
+    expect(Object.isFrozen(metadata)).toBe(false);
+    metadata.value = 2;
+    expect(approvalCoordinationDeadlines(timing, 60)?.wireDeadlineMs).toBe(
+      60100,
+    );
+  });
+  it("reads each admission scalar once and retains that validated pair", () => {
+    const counts = [0, 0, 0, 0];
+    const sample = (values: typeof sent, index: number) => ({
+      get wallTimeMs() {
+        return ++counts[index] === 1 ? values.wallTimeMs : NaN;
+      },
+      get monotonicTimeMs() {
+        return ++counts[index + 1] === 1 ? values.monotonicTimeMs : NaN;
+      },
+    });
+    const timing = admitCoordinationTiming(
+      state,
+      sample(sent, 0),
+      sample(received, 2),
+    );
+    expect(counts).toEqual([1, 1, 1, 1]);
+    if (!timing) throw new Error("Expected admission");
+    expect(timing.sent).toEqual(sent);
+    expect(timing.received).toEqual(received);
+    expect(timing.snapshotDeadlineMonotonicMs).toBe(11000);
+    expect(approvalCoordinationDeadlines(timing, 60)).toEqual({
+      wireDeadlineMs: 60100,
+      monotonicDeadlineMs: 70100,
+    });
+  });
+  it.each([true, false])(
+    "uses one currentness pair with finite first values: %s",
+    (valid) => {
+      let wallReads = 0;
+      let monotonicReads = 0;
+      const now = {
+        get wallTimeMs() {
+          return ++wallReads === 1 ? (valid ? 100 : NaN) : 100;
+        },
+        get monotonicTimeMs() {
+          return ++monotonicReads === 1 ? 10100 : Infinity;
+        },
+        get unrelated() {
+          throw new Error("Must not read unrelated getter");
+        },
+      };
+      expect(isCoordinationTimingCurrent(admit(), now, initial)).toBe(valid);
+      expect([wallReads, monotonicReads]).toEqual([1, 1]);
+    },
+  );
   it("floors negative wire and monotonic deadlines toward minus infinity", () => {
     const timing = admitCoordinationTiming(
       {
