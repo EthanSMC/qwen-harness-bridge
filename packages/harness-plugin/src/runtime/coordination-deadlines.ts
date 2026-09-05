@@ -88,6 +88,30 @@ function stableOffset(
   );
 }
 
+/** Remaining duration from the original send pair, never an absolute timestamp.
+ * The caller must settle/latch failures; this stateless check grants no authority.
+ */
+export function coordinationWaiterRemainingMs(
+  sentInput: CoordinationClockSample,
+  nowInput: CoordinationClockSample,
+): number | undefined {
+  const sent = captureClock(sentInput);
+  const now = captureClock(nowInput);
+  if (!finite(sent) || !finite(now)) return undefined;
+  const scale = 10n ** 1074n;
+  const elapsed =
+    clockUnits(now.monotonicTimeMs, scale) -
+    clockUnits(sent.monotonicTimeMs, scale);
+  if (
+    elapsed < 0n ||
+    elapsed >= 2000n * scale ||
+    !stableOffset(sent, now, scale)
+  )
+    return undefined;
+  const remaining = floorDeadline(2000n * scale - elapsed, scale);
+  return remaining !== undefined && remaining > 0 ? remaining : undefined;
+}
+
 /** Pure timing admission only: request, epoch, owner and action checks belong to
  * the coordinator. Capture sent at original allocation; never reset it on replay.
  * Monotonic values and the internal arithmetic record must never be serialized.

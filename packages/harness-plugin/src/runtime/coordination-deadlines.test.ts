@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   admitCoordinationTiming,
   approvalCoordinationDeadlines,
+  coordinationWaiterRemainingMs,
   isCoordinationTimingCurrent,
 } from "./coordination-deadlines.js";
 
@@ -40,6 +41,200 @@ function admit(patch: Partial<JobStatePayload> = {}) {
   if (!timing) throw new Error("Expected admission");
   return timing;
 }
+
+describe("coordination waiter remaining time", () => {
+  const pair = (monotonicTimeMs: number, wallTimeMs = monotonicTimeMs) => ({
+    wallTimeMs,
+    monotonicTimeMs,
+  });
+
+  it.each([
+    [0, 2000],
+    [1, 1999],
+    [1999, 1],
+    [0.25, 1999],
+    [1.75, 1998],
+    [1999.5, undefined],
+    [2000, undefined],
+    [2000 + 2 ** -42, undefined],
+    [-Number.MIN_VALUE, undefined],
+    [-1, undefined],
+  ])("bounds and floors elapsed %s to %s", (elapsed, expected) => {
+    expect(coordinationWaiterRemainingMs(pair(0), pair(elapsed))).toBe(
+      expected,
+    );
+  });
+
+  it.each([
+    [0, 2000],
+    [1000, 2000],
+    [-1000, 2000],
+    [1000 + 2 ** -43, undefined],
+    [-1000 - 2 ** -43, undefined],
+    [5000, undefined],
+    [-5000, undefined],
+  ])("checks original offset drift %s", (wall, expected) => {
+    expect(coordinationWaiterRemainingMs(pair(0), pair(0, wall))).toBe(
+      expected,
+    );
+  });
+
+  it("measures drift from the original pair without remembering failure", () => {
+    const original = pair(100, 500);
+    expect(coordinationWaiterRemainingMs(original, pair(200, 1600))).toBe(1900);
+    expect(
+      coordinationWaiterRemainingMs(original, pair(300, 1700.25)),
+    ).toBeUndefined();
+    expect(coordinationWaiterRemainingMs(original, pair(300, 700))).toBe(1800);
+  });
+
+  it.each([NaN, Infinity, -Infinity])(
+    "rejects every nonfinite field: %s",
+    (value) => {
+      for (const field of ["wallTimeMs", "monotonicTimeMs"] as const) {
+        expect(
+          coordinationWaiterRemainingMs(
+            { ...pair(0), [field]: value },
+            pair(0),
+          ),
+        ).toBeUndefined();
+        expect(
+          coordinationWaiterRemainingMs(pair(0), {
+            ...pair(0),
+            [field]: value,
+          }),
+        ).toBeUndefined();
+      }
+    },
+  );
+
+  it("returns a duration for huge finite origins without overflow", () => {
+    for (const value of [Number.MAX_VALUE, -Number.MAX_VALUE]) {
+      expect(coordinationWaiterRemainingMs(pair(value), pair(value))).toBe(
+        2000,
+      );
+      expect(
+        coordinationWaiterRemainingMs(pair(value, -value), pair(value, -value)),
+      ).toBe(2000);
+    }
+    expect(
+      coordinationWaiterRemainingMs(
+        pair(Number.MAX_VALUE / 2),
+        pair(Number.MAX_VALUE),
+      ),
+    ).toBeUndefined();
+    expect(
+      coordinationWaiterRemainingMs(
+        pair(Number.MAX_VALUE),
+        pair(Number.MAX_VALUE / 2),
+      ),
+    ).toBeUndefined();
+    expect(
+      coordinationWaiterRemainingMs(
+        pair(0, Number.MAX_VALUE),
+        pair(0, Number.MAX_VALUE / 2),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("accepts negative and fractional origins without flooring absolute time", () => {
+    expect(coordinationWaiterRemainingMs(pair(-3000), pair(-1001))).toBe(1);
+    expect(coordinationWaiterRemainingMs(pair(-0.25), pair(0.25))).toBe(1999);
+  });
+
+  it("preserves subnormal elapsed across integer remainder boundaries", () => {
+    expect(coordinationWaiterRemainingMs(pair(0), pair(Number.MIN_VALUE))).toBe(
+      1999,
+    );
+    expect(
+      coordinationWaiterRemainingMs(pair(-Number.MIN_VALUE), pair(1999)),
+    ).toBeUndefined();
+    expect(
+      coordinationWaiterRemainingMs(pair(Number.MIN_VALUE), pair(1999)),
+    ).toBe(1);
+    expect(
+      coordinationWaiterRemainingMs(pair(0), pair(2000 - 2 ** -42)),
+    ).toBeUndefined();
+  });
+
+  it.each([-1, 1])(
+    "preserves subnormal offset excess in direction %s",
+    (sign) => {
+      expect(
+        coordinationWaiterRemainingMs(
+          pair(0, -sign * Number.MIN_VALUE),
+          pair(0, sign * 1000),
+        ),
+      ).toBeUndefined();
+      expect(
+        coordinationWaiterRemainingMs(
+          pair(0, sign * Number.MIN_VALUE),
+          pair(0, sign * 1000),
+        ),
+      ).toBe(2000);
+    },
+  );
+
+  it.each(["prototype", "non-enumerable"])(
+    "captures %s clock fields",
+    (kind) => {
+      const sample = (value: number) => {
+        const fields = {
+          get wallTimeMs() {
+            return value;
+          },
+          get monotonicTimeMs() {
+            return value;
+          },
+        };
+        return kind === "prototype"
+          ? Object.create(fields)
+          : Object.defineProperties(
+              {},
+              {
+                wallTimeMs: { value },
+                monotonicTimeMs: { value },
+              },
+            );
+      };
+      expect(coordinationWaiterRemainingMs(sample(0), sample(1))).toBe(1999);
+    },
+  );
+
+  it.each([true, false])(
+    "captures all four scalars once even when valid is %s",
+    (valid) => {
+      const counts = [0, 0, 0, 0];
+      const metadata = { value: 1 };
+      const sample = (index: number, value: number) => ({
+        get wallTimeMs() {
+          return ++counts[index] === 1 && (valid || index !== 0) ? value : NaN;
+        },
+        get monotonicTimeMs() {
+          return ++counts[index + 1] === 1 ? value : Infinity;
+        },
+        metadata,
+        get unrelated() {
+          throw new Error("Must not read unrelated getter");
+        },
+      });
+      const original = sample(0, 0);
+      const now = sample(2, 1);
+      const before = [original, now].map(Object.getOwnPropertyDescriptors);
+      expect(coordinationWaiterRemainingMs(original, now)).toBe(
+        valid ? 1999 : undefined,
+      );
+      expect(counts).toEqual([1, 1, 1, 1]);
+      expect([original, now].map(Object.getOwnPropertyDescriptors)).toEqual(
+        before,
+      );
+      for (const input of [original, now, metadata])
+        expect(Object.isFrozen(input)).toBe(false);
+      metadata.value = 2;
+      expect(metadata.value).toBe(2);
+    },
+  );
+});
 
 describe("coordination deadlines", () => {
   it.each(["prototype", "non-enumerable"])(
