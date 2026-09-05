@@ -931,6 +931,13 @@ export class JobRepository {
           "The job revision is stale",
         );
       }
+      if (current.revision === 2_147_483_647) {
+        throw new JobRepositoryError(
+          "REVISION_CONFLICT",
+          "The job revision is exhausted",
+        );
+      }
+      const nextRevision = current.revision + 1;
 
       const immediate =
         current.status === "queued" || current.status === "dispatched";
@@ -941,7 +948,7 @@ export class JobRepository {
         .set({
           status: nextStatus,
           currentStage: nextStatus,
-          revision: sql`${jobs.revision} + 1`,
+          revision: nextRevision,
           updatedAt: sql`now()`,
           ...(immediate
             ? {
@@ -949,7 +956,7 @@ export class JobRepository {
                 requestDeleteAt: sql`coalesce(${jobs.requestDeleteAt}, now() + interval '24 hours')`,
                 unreadTerminal: true,
               }
-            : {}),
+            : { cancelRevision: nextRevision }),
         })
         .where(
           and(

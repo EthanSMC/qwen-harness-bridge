@@ -15,6 +15,13 @@
       "when": 1788244364352,
       "tag": "0002_result_acknowledgement",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788609600000,
+      "tag": "0003_cancel_revision",
+      "breakpoints": true
     }
   ]
 }

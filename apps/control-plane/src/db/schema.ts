@@ -169,6 +169,7 @@ export const jobs = pgTable(
       .notNull()
       .default("queued"),
     revision: integer("revision").notNull().default(0),
+    cancelRevision: integer("cancel_revision"),
     attempt: integer("attempt").notNull().default(0),
     leaseId: uuid("lease_id"),
     leaseExpiresAt: timestamp("lease_expires_at", dateTimestamp),
@@ -203,6 +204,10 @@ export const jobs = pgTable(
     ),
     index("jobs_expiry_idx").on(table.status, table.expiresAt),
     check("jobs_revision_nonnegative_check", sql`${table.revision} >= 0`),
+    check(
+      "jobs_cancel_revision_check",
+      sql`${table.cancelRevision} is null or (${table.cancelRevision} >= 0 and ${table.cancelRevision} <= ${table.revision})`,
+    ),
     check("jobs_attempt_nonnegative_check", sql`${table.attempt} >= 0`),
     check(
       "jobs_request_delete_after_terminal_check",
