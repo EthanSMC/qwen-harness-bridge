@@ -1001,7 +1001,7 @@ export class ConnectorGateway {
               !(await sendStored(
                 connection,
                 replay,
-                false,
+                accepted.duplicate,
                 generation,
                 deadline,
               ))
