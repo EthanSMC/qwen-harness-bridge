@@ -35,6 +35,9 @@ function fixture() {
   const lifetime = new AbortController();
   const transport = new AbortController();
   const release = vi.fn();
+  let combinedSignal: AbortSignal | undefined;
+  const lookups = { owner: 0, action: 0 };
+  let finalLookup: (kind: "owner" | "action") => void = () => {};
   let action: AnswererAction | undefined = {
     jobId,
     attempt: 1,
@@ -51,14 +54,17 @@ function fixture() {
     publishReady = resolve;
   });
   const broker = new RemoteApprovalBroker({
-    reserve: () => ({
-      requestedRevision: 8,
-      deadline: Date.now() + 60_000,
-      approvalTimeoutSeconds: 60,
-      signal: transport.signal,
-      isCurrent: () => true,
-      release,
-    }),
+    reserve: (input) => {
+      combinedSignal = input.signal;
+      return {
+        requestedRevision: 8,
+        deadline: Date.now() + 60_000,
+        approvalTimeoutSeconds: 60,
+        signal: transport.signal,
+        isCurrent: () => true,
+        release,
+      };
+    },
     publish: async (_type, payload) => {
       published = payload;
       publishReady();
@@ -66,9 +72,14 @@ function fixture() {
   });
   const unregister = registerAnswerer(root, {
     broker,
-    findOwner: (id) => (id === "owned" ? agent : undefined),
-    resolveAction: (owner, callId) =>
-      owner === agent && callId === "call" ? action : undefined,
+    findOwner: (id) => {
+      if (++lookups.owner === 2) finalLookup("owner");
+      return id === "owned" ? agent : undefined;
+    },
+    resolveAction: (owner, callId) => {
+      if (++lookups.action === 2) finalLookup("action");
+      return owner === agent && callId === "call" ? action : undefined;
+    },
   });
   const request = (overrides = {}) =>
     approval.request({
@@ -107,6 +118,12 @@ function fixture() {
     transport,
     release,
     broker,
+    unregister,
+    lookups,
+    combinedSignal: () => combinedSignal,
+    onFinalLookup: (callback: typeof finalLookup) => {
+      finalLookup = callback;
+    },
     productId: () => published.approval_id,
     setAction: (value: AnswererAction | undefined) => {
       action = value;
@@ -122,6 +139,67 @@ function fixture() {
   };
 }
 describe("official approval service answerer integration", () => {
+  describe.each(["owner", "action"] as const)("final %s lookup", (boundary) => {
+    it.each([
+      ["registration disposal", "unavailable"],
+      ["caller abort", "cancelled"],
+      ["action revocation", "unavailable"],
+      ["scope loss", "unavailable"],
+      ["exception", "unavailable"],
+      ["abort then throw", "cancelled"],
+    ] as const)("returns and audits %s safely", async (cause, expected) => {
+      const f = fixture();
+      const caller = new AbortController();
+      const original = f.getAction();
+      let invoked = false;
+      try {
+        f.onFinalLookup((kind) => {
+          if (kind !== boundary) return;
+          invoked = true;
+          if (cause === "registration disposal") f.unregister();
+          if (cause === "caller abort" || cause === "abort then throw")
+            caller.abort();
+          if (cause === "action revocation") f.lifetime.abort();
+          if (cause === "scope loss") Object.assign(f.agent, { ctx: f.root });
+          if (cause === "exception" || cause === "abort then throw")
+            throw new Error("lookup failed");
+        });
+        const pending = f.request({ signal: caller.signal });
+        await f.ready;
+        expect(f.combinedSignal()).not.toBe(original.signal);
+        expect(f.combinedSignal()).not.toBe(f.transport.signal);
+        expect(f.combinedSignal()).not.toBe(caller.signal);
+        expect(f.decide()).toBe("accepted");
+        const outcome = await pending;
+        expect(invoked).toBe(true);
+        expect(f.lookups[boundary]).toBe(2);
+        expect(f.getAction()).toBe(original);
+        expect(f.transport.signal.aborted).toBe(false);
+        expect(original.signal.aborted).toBe(cause === "action revocation");
+        expect(f.combinedSignal()?.aborted).toBe(
+          [
+            "registration disposal",
+            "caller abort",
+            "action revocation",
+            "abort then throw",
+          ].includes(cause),
+        );
+        expect(f.release).toHaveBeenCalledTimes(1);
+        expect(f.events.map((event) => event.type)).toEqual([
+          "turn/start",
+          "approval/asked",
+          "approval/decided",
+        ]);
+        expect(f.events[2].data).toMatchObject({
+          id: (f.events[1].data as { id: string }).id,
+        });
+        expect.soft(outcome).toBe(expected);
+        expect.soft(f.events[2].data).toMatchObject({ outcome: expected });
+      } finally {
+        f.dispose();
+      }
+    });
+  });
   it.each(["transport loss", "broker disposal"])(
     "returns and audits unavailable when release causes %s",
     async (cause) => {

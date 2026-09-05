@@ -9,7 +9,10 @@ import type { ApprovalBroker } from "./approval-broker.js";
  * callId. Task 6 must populate it from local tool execution, not approval reason
  * or cloud data, and reclassify on every lookup. Retain denied monotonically.
  * The signal withdraws this execution on cancellation, ownership loss or action
- * replacement; it cannot be reused for another execution. Existing policy guard
+ * replacement; invalidation is monotonic and it cannot be reused for another
+ * execution. Lookups may synchronously revoke lifetimes, including registration
+ * teardown, but must not revive previously withdrawn ownership or action authority.
+ * Existing policy guard
  * remains the final per-execution one-use proof and path reclassification gate. */
 export type AnswererAction = Readonly<{
   jobId: string;
@@ -71,16 +74,22 @@ export function registerAnswerer(
           riskClass: action.classification,
           signal,
         });
+        const currentOwner = options.findOwner(String(owner.id));
+        const current =
+          outcome === "allowed-once" && currentOwner === owner
+            ? options.resolveAction(owner, req.callId)
+            : undefined;
+        // All registry callbacks finish before passive validation. A later lookup
+        // could revoke even a previously checked registration or scope lifetime.
         if (req.signal?.aborted) return "cancelled";
         if (
           signal.aborted ||
-          options.findOwner(String(owner.id)) !== owner ||
+          currentOwner !== owner ||
           owner.ctx.agent !== owner ||
           scopeOf(owner.ctx) !== owner
         )
           return "unavailable";
         if (outcome !== "allowed-once") return outcome;
-        const current = options.resolveAction(owner, req.callId);
         if (
           current?.classification !== "approval_required" ||
           current.signal !== action.signal ||
@@ -93,7 +102,7 @@ export function registerAnswerer(
           return "unavailable";
         return "allowed-once";
       } catch {
-        return "unavailable";
+        return req.signal?.aborted ? "cancelled" : "unavailable";
       }
     },
     { prepend: true },
