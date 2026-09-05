@@ -56,6 +56,170 @@ describe("connector public projection", () => {
       expect(Object.hasOwn(error as object, "cause")).toBe(false);
     }
   };
+  it.each([
+    'Request failed: {"token":"syntheticcredential"}',
+    'Report {"password":"syntheticcredential"}',
+    'Result: {"synthetic":"body"}',
+    'Result: ["synthetic", "body"]',
+  ])("F1 redacts embedded bodies in summary and artifact name: %s", (value) => {
+    const output = redactEvent(
+      {
+        summary: value,
+        artifacts: [
+          {
+            name: value,
+            media_type: "text/plain",
+            url: "https://example.test/report",
+          },
+        ],
+      },
+      options,
+    );
+    expect(output.summary).toBe("[redacted]");
+    expect(output.artifacts?.[0].name).toBe("[redacted]");
+  });
+  it.each([
+    ["Failed token=syntheticcredential", "token", "Failed [redacted]"],
+    ["Failed Bearer syntheticcredential", "Bearer", "Failed [redacted]"],
+    ["first\nsecond", "\n", "[redacted]"],
+  ])(
+    "F2 detects original private constructs in both human fields: %s",
+    (value, secret, expected) => {
+      const output = redactEvent(
+        {
+          summary: value,
+          artifacts: [
+            {
+              name: value,
+              media_type: "text/plain",
+              url: "https://example.test/report",
+            },
+          ],
+        },
+        { ...options, secrets: [secret] },
+      );
+      expect(output.summary).toBe(expected);
+      expect(output.artifacts?.[0].name).toBe(expected);
+    },
+  );
+  it.each(["dir\\name", "line\u2028name", "line\u2029name"])(
+    "F3 rejects canonical symlink filename characters: %s",
+    (name) => {
+      mkdirSync(join(root, name));
+      symlinkSync(join(root, name), join(root, "slash-alias"));
+      rejected({ summary: "Done", changed_files: ["slash-alias/deleted.ts"] });
+    },
+  );
+  it("F4 rejects secrets in original retained URL components before normalization", () => {
+    rejected(
+      {
+        summary: "Done",
+        artifacts: [
+          {
+            name: "Report",
+            media_type: "text/plain",
+            url: "https://SYNTHETICSECRET.example.test/report",
+          },
+        ],
+      },
+      { ...options, secrets: ["SYNTHETICSECRET"] },
+    );
+  });
+  it("F4 keeps useful URLs when secrets occur only in removed components", () => {
+    const url =
+      "https://SYNTHETICSECRET:SYNTHETICSECRET@example.test/report?q=SYNTHETICSECRET#SYNTHETICSECRET";
+    const output = redactEvent(
+      {
+        summary: `See ${url}`,
+        artifacts: [{ name: "Report", media_type: "text/plain", url }],
+      },
+      { ...options, secrets: ["SYNTHETICSECRET"] },
+    );
+    expect(output.summary).toBe("See https://example.test/report");
+    expect(output.artifacts?.[0].url).toBe("https://example.test/report");
+  });
+  it("F5 gives canonical repository paths precedence over their home prefix", () => {
+    const repositoryRoot = join(root, "repository");
+    mkdirSync(repositoryRoot);
+    mkdirSync(join(repositoryRoot, "src"));
+    writeFileSync(join(repositoryRoot, "src/file.ts"), "");
+    symlinkSync(join(repositoryRoot, "src"), join(repositoryRoot, "alias"));
+    expect(
+      redactEvent(
+        { summary: `Updated ${repositoryRoot}/alias/file.ts` },
+        { repositoryRoot, homeDirectory: root },
+      ).summary,
+    ).toBe("Updated src/file.ts");
+  });
+  it("F6 never rescans generated markers with sixteen duplicate short secrets", () => {
+    expect(
+      redactEvent(
+        { summary: "Done" },
+        { ...options, secrets: Array(16).fill("e") },
+      ).summary,
+    ).toBe("Don[redacted]");
+  });
+  it("F6 handles all sixty-four duplicate and overlapping secrets within the text bound", () => {
+    expect(
+      redactEvent(
+        { summary: "Done" },
+        { ...options, secrets: Array(64).fill("e") },
+      ).summary,
+    ).toBe("Don[redacted]");
+    expect(
+      redactEvent(
+        { summary: "abc Done" },
+        {
+          ...options,
+          secrets: ["a", "ab", "abc", "[redacted]", ...Array(60).fill("e")],
+        },
+      ).summary,
+    ).toBe("[redacted] Don[redacted]");
+    expect(
+      redactEvent(
+        { summary: "e".repeat(65536) },
+        { ...options, secrets: Array(64).fill("e") },
+      ).summary,
+    ).toBe("[redacted]".repeat(50));
+  });
+  it("F1 removes quoted credential assignments without discarding safe prose", () => {
+    const value = 'Failed "token":"syntheticcredential"';
+    const output = redactEvent(
+      {
+        summary: value,
+        artifacts: [
+          {
+            name: value,
+            media_type: "text/plain",
+            url: "https://example.test/report",
+          },
+        ],
+      },
+      options,
+    );
+    expect(output.summary).toBe("Failed [redacted]");
+    expect(output.artifacts?.[0].name).toBe("Failed [redacted]");
+  });
+  it("F4 inspects retained paths before dot-segment and percent normalization", () => {
+    for (const url of [
+      "https://example.test/SYNTHETICSECRET/../report",
+      "https://example.test/%53YNTHETICSECRET",
+    ]) {
+      rejected(
+        {
+          summary: "Done",
+          artifacts: [{ name: "Report", media_type: "text/plain", url }],
+        },
+        { ...options, secrets: ["SYNTHETICSECRET"] },
+      );
+      expect(
+        redactEvent(
+          { summary: `See ${url}` },
+          { ...options, secrets: ["SYNTHETICSECRET"] },
+        ).summary,
+      ).toBe("See [redacted]");
+    }
+  });
   it("preserves useful public fields and canonical deleted paths with isolated output", () => {
     const input = {
       summary: `Updated ${root}/src/file.ts`,

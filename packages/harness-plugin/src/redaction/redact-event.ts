@@ -30,9 +30,14 @@ const reject = (): never => {
 const bytes = (value: string): number => Buffer.byteLength(value, "utf8");
 const controls = /\p{Cc}/u;
 const credentials =
-  /\b(?:bearer|basic)\s+\S+|(?:access[_-]?tokens?|api[_-]?keys?|authorization|client[_-]?secrets?|cookies?|credentials?|passwords?|passwd|secrets?|tokens?)\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)|\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9]{12,}|xox[baprs]-[A-Za-z0-9-]{12,})\b|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gi;
+  /\b(?:bearer|basic)\s+\S+|["']?(?:access[_-]?tokens?|api[_-]?keys?|authorization|client[_-]?secrets?|cookies?|credentials?|passwords?|passwd|secrets?|tokens?)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)|\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9]{12,}|xox[baprs]-[A-Za-z0-9-]{12,})\b|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gi;
 const privateText =
-  /[\r\n\u2028\u2029]|```|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:const|let|var|function|class|interface|import|def|return|throw)\s+\w+|#include\s*<|=>|\w\s*\([^\n]*\)\s*;|\b(?:tool\s*)?arguments?\s*[:=]|\b[A-Z][A-Z0-9_]{1,}\s*=|\b(?:home|node_env|path|pwd|shell|temp|tmp|tmpdir|user)\s*=|^\s*[[{]/i;
+  /[\r\n\u2028\u2029]|```|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:const|let|var|function|class|interface|import|def|return|throw)\s+\w+|#include\s*<|=>|\w\s*\([^\n]*\)\s*;|\b(?:tool\s*)?arguments?\s*[:=]|\b(?:home|node_env|path|pwd|shell|temp|tmp|tmpdir|user)\s*=|^\s*[[{]/i;
+const environmentAssignment = /\b[A-Z][A-Z0-9_]{1,}\s*=/;
+const structuredBody =
+  /\{\s*(?:["'}]|[\w-]+\s*:)|\[\s*(?:["'[\]{}]|-?\d|true\b|false\b|null\b)/u;
+const invalidFilename = /[\u2028\u2029\\]|^[A-Za-z]:|^~|^file:/u;
+type Replacement = { start: number; end: number; value: string };
 
 function record(
   value: unknown,
@@ -93,14 +98,36 @@ function array(value: unknown, max: number): unknown[] {
   }
   return result;
 }
-function truncate(value: string): string {
+function render(raw: string, replacements: Replacement[]): string {
+  replacements.sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged: Replacement[] = [];
+  for (const next of replacements) {
+    const previous = merged.at(-1);
+    if (previous && next.start < previous.end) {
+      previous.end = Math.max(previous.end, next.end);
+      previous.value = "[redacted]";
+    } else merged.push({ ...next });
+  }
+  // Inspection is complete. Only rendering is truncated; generated values are
+  // never fed back to any detector or secret matcher.
   let result = "";
   let length = 0;
-  for (const point of value) {
-    length += bytes(point);
+  const append = (value: string): void => {
+    for (const point of value) {
+      const safe = controls.test(point) ? " " : point;
+      length += bytes(safe);
+      if (length > 500) break;
+      result += safe;
+    }
+  };
+  let cursor = 0;
+  for (const replacement of merged) {
     if (length > 500) break;
-    result += point;
+    append(raw.slice(cursor, replacement.start));
+    if (length <= 500) append(replacement.value);
+    cursor = replacement.end;
   }
+  if (length <= 500) append(raw.slice(cursor));
   return result.trim() || "[redacted]";
 }
 
@@ -125,7 +152,7 @@ export function redactEvent(
       )
     )
       return reject();
-    const orderedSecrets = (secrets as string[]).sort(
+    const orderedSecrets = [...new Set(secrets as string[])].sort(
       (a, b) => b.length - a.length,
     );
     let inspected = 0;
@@ -136,13 +163,27 @@ export function redactEvent(
       if (size > 65536 || inspected > 2 * 1024 * 1024) return reject();
       return value;
     };
-    const explicit = (value: string): string => {
-      for (const secret of orderedSecrets)
-        value = value.split(secret).join("[redacted]");
-      return value;
-    };
+    // Literal alternatives, longest first at each original input position.
+    // At most 64 alternatives / 262144 literal bytes; no nested quantifiers.
+    const secretPattern = orderedSecrets.length
+      ? new RegExp(
+          orderedSecrets
+            .map((secret) => secret.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+            .join("|"),
+          "g",
+        )
+      : null;
+    const hasSecret = (value: string): boolean =>
+      orderedSecrets.some((secret) => value.includes(secret));
     const safeUrl = (value: string): string => {
       if (controls.test(value) || !/^https?:\/\/[^\s]+$/i.test(value))
+        return reject();
+      // Preserve original authority/path spelling before URL lowercases hosts,
+      // removes dot segments, or otherwise canonicalizes retained components.
+      const original = /^https?:\/\/([^/?#]+)([^?#]*)/i.exec(value);
+      if (!original || value.includes("\\")) return reject();
+      const retained = `${original[1].slice(original[1].lastIndexOf("@") + 1)}${original[2]}`;
+      if (hasSecret(retained) || hasSecret(decodeURIComponent(retained)))
         return reject();
       const url = new URL(value);
       url.username = "";
@@ -155,7 +196,10 @@ export function redactEvent(
         bytes(normalized) > 500 ||
         controls.test(decoded) ||
         privateText.test(decoded) ||
-        explicit(decoded) !== decoded ||
+        environmentAssignment.test(decoded) ||
+        structuredBody.test(decoded) ||
+        hasSecret(normalized) ||
+        hasSecret(decoded) ||
         decoded.replace(credentials, "[redacted]") !== decoded ||
         /(?:\/Users\/|\/home\/|~\/)/i.test(decoded)
       )
@@ -166,20 +210,22 @@ export function redactEvent(
       if (
         !value ||
         controls.test(value) ||
-        /[\u2028\u2029\\]|^[A-Za-z]:|^~|^file:/u.test(value) ||
-        explicit(value) !== value ||
+        invalidFilename.test(value) ||
+        hasSecret(value) ||
         value.replace(credentials, "[redacted]") !== value
       )
         return reject();
       const path = relative(
         root,
         canonicalizePath(root, value, { basePath: root }),
-      ).replaceAll("\\", "/");
+      );
       if (
         !path ||
         bytes(path) > 500 ||
         controls.test(path) ||
-        explicit(path) !== path
+        invalidFilename.test(path) ||
+        hasSecret(path) ||
+        path.replace(credentials, "[redacted]") !== path
       )
         return reject();
       if (
@@ -191,39 +237,66 @@ export function redactEvent(
       return path;
     };
     const human = (raw: string): string => {
-      let value = explicit(raw);
-      if (privateText.test(value)) return "[redacted]";
-      value = value.replace(/https?:\/\/[^\s<>"']+/gi, (url) => {
-        try {
-          return safeUrl(url);
-        } catch {
-          return "[redacted]";
-        }
-      });
-      value = value.replace(credentials, "[redacted]");
-      value = value.replace(
-        /https?:\/\/[^\s<>"']+|(?<![\w/])(?:file:\/\/|~\/|[A-Za-z]:[\\/]|\\\\|\/)[^\s<>"']*/g,
-        (path) => {
-          // URL paths were already normalized above.
-          if (/^https?:\/\//.test(path)) return path;
-          if (
-            path === options.homeDirectory ||
-            path.startsWith(`${options.homeDirectory}/`) ||
-            path.startsWith("~/")
-          )
-            return "[home]";
-          if (path.startsWith(`${root}/`)) {
-            try {
-              return file(path);
-            } catch {
-              return "[redacted]";
-            }
+      if (
+        privateText.test(raw) ||
+        environmentAssignment.test(raw) ||
+        structuredBody.test(raw)
+      )
+        return "[redacted]";
+      const replacements: Replacement[] = [];
+      const urls: Replacement[] = [];
+      const tokens =
+        /https?:\/\/[^\s<>"']+|(?<![\w/])(?:file:\/\/|~\/|[A-Za-z]:[\\/]|\\\\|\/)[^\s<>"']*/gi;
+      for (const match of raw.matchAll(tokens)) {
+        const token = match[0];
+        const replacement = {
+          start: match.index,
+          end: match.index + token.length,
+          value: "[redacted]",
+        };
+        if (/^https?:\/\//i.test(token)) {
+          try {
+            replacement.value = safeUrl(token);
+          } catch {
+            /* fixed marker */
           }
-          return "[redacted]";
-        },
-      );
-      value = value.replace(/\p{Cc}/gu, " ");
-      return truncate(value);
+          urls.push(replacement);
+        } else {
+          // Try canonical containment before the broader home prefix.
+          try {
+            replacement.value = file(token);
+          } catch {
+            if (
+              token === options.homeDirectory ||
+              token.startsWith(`${options.homeDirectory}/`) ||
+              token.startsWith("~/")
+            )
+              replacement.value = "[home]";
+          }
+        }
+        replacements.push(replacement);
+      }
+      // A secret solely inside stripped URL components must not invalidate the
+      // safe URL. Retained components were checked above in all spellings.
+      const insideUrl = (start: number, end: number): boolean => {
+        let low = 0,
+          high = urls.length;
+        while (low < high) {
+          const middle = Math.floor((low + high) / 2);
+          if (urls[middle].start <= start) low = middle + 1;
+          else high = middle;
+        }
+        return low > 0 && end <= urls[low - 1].end;
+      };
+      for (const pattern of [credentials, secretPattern]) {
+        if (!pattern) continue;
+        for (const match of raw.matchAll(pattern)) {
+          const end = match.index + match[0].length;
+          if (!insideUrl(match.index, end))
+            replacements.push({ start: match.index, end, value: "[redacted]" });
+        }
+      }
+      return render(raw, replacements);
     };
     const fields = record(
       input,
@@ -239,7 +312,7 @@ export function redactEvent(
     } = { summary: human(text(fields.summary)) };
     if (Object.hasOwn(fields, "stage")) {
       const stage = text(fields.stage);
-      if (!/^[a-z][a-z0-9._-]{0,63}$/.test(stage) || explicit(stage) !== stage)
+      if (!/^[a-z][a-z0-9._-]{0,63}$/.test(stage) || hasSecret(stage))
         return reject();
       output.stage = stage;
     }
@@ -282,7 +355,7 @@ export function redactEvent(
           !/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i.test(
             media_type,
           ) ||
-          explicit(media_type) !== media_type
+          hasSecret(media_type)
         )
           return reject();
         return { name, media_type, url: safeUrl(text(artifact.url)) };
