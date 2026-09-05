@@ -3572,10 +3572,11 @@ describe("PostgreSQL Connector outbox", () => {
       },
       { sentAt: now },
     );
-    const accepted = store.acceptClientMessage(raceIdentity, event, now);
     let cancelled: Promise<unknown> | undefined;
     try {
       await locksHeld;
+      // Establish both gates before the event can reach its trigger.
+      const accepted = store.acceptClientMessage(raceIdentity, event, now);
       await waitForAdvisoryWaiters(lockKeys, 1);
       cancelled = repository.cancelAtomically({
         ownerId: OWNER_ID,
