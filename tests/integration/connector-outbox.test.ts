@@ -374,6 +374,723 @@ afterAll(async () => {
 });
 
 describe("PostgreSQL Connector outbox", () => {
+  it("cannot manufacture original-offer proof through a client-authored dispatch audit lookalike", async () => {
+    const owner = await insertConnector();
+    const replacement = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1"],
+      }),
+    );
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "running",
+      await expiryAfter(60_000),
+      1,
+      crypto.randomUUID(),
+      await expiryAfter(30_000),
+    );
+    const leaseId = crypto.randomUUID();
+    const repositoryId = (
+      await database.query("SELECT repository_id FROM jobs WHERE id = $1", [
+        job.jobId,
+      ])
+    ).rows[0]?.repository_id;
+    try {
+      await store.acceptClientMessage(
+        owner,
+        envelope("job.event", 2, {
+          job_id: job.jobId,
+          attempt: 1,
+          event_type: "job.dispatched",
+          source: "control-plane",
+          payload: {
+            owner_id: owner.ownerId,
+            connector_id: owner.connectorId,
+            repository_id: repositoryId,
+            attempt: 1,
+            lease_id: leaseId,
+            lease_expires_at: new Date(Date.now() - 1_000).toISOString(),
+          },
+        }),
+      );
+      expect(
+        (
+          await database.query(
+            "SELECT payload FROM job_events WHERE job_id = $1 AND event_type = 'job.dispatched'",
+            [job.jobId],
+          )
+        ).rows,
+      ).toEqual([{ payload: {} }]);
+      await database.query(
+        "UPDATE jobs SET connector_id = $1, status = 'dispatched' WHERE id = $2",
+        [replacement.connectorId, job.jobId],
+      );
+      const before = (
+        await database.query("SELECT * FROM jobs WHERE id = $1", [job.jobId])
+      ).rows;
+      await expect(
+        store.acceptClientMessage(
+          owner,
+          envelope("job.claim", 3, {
+            job_id: job.jobId,
+            attempt: 1,
+            lease_id: leaseId,
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "CLAIM_REJECTED" });
+      await expectClientCursor(owner.connectorId, 2);
+      expect(
+        (await database.query("SELECT * FROM jobs WHERE id = $1", [job.jobId]))
+          .rows,
+      ).toEqual(before);
+    } finally {
+      await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    }
+  });
+
+  it.each([
+    "valid",
+    "missing-deadline",
+    "invalid-deadline",
+    "live-deadline",
+    "owner",
+    "connector",
+    "repository",
+    "attempt",
+    "lease",
+    "job",
+    "source",
+    "legacy",
+  ])(
+    "requires complete authoritative expired-offer evidence after reassignment: %s",
+    async (variant) => {
+      const owner = await insertConnector();
+      const replacement = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 1, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 0,
+          ...(variant === "legacy"
+            ? {}
+            : { capabilities: ["durable-receipts-v1"] }),
+        }),
+      );
+      const leaseId = crypto.randomUUID();
+      const job = await insertConnectedJob(
+        replacement.connectorId,
+        "dispatched",
+        await expiryAfter(60_000),
+        0,
+        crypto.randomUUID(),
+        await expiryAfter(30_000),
+      );
+      const repositoryId = (
+        await database.query("SELECT repository_id FROM jobs WHERE id = $1", [
+          job.jobId,
+        ])
+      ).rows[0]?.repository_id;
+      // A bounded historical audit fixture; the gateway regression separately
+      // proves real dispatch authorship, tombstoning and elapsed lease time.
+      const proof: Record<string, unknown> = {
+        owner_id: owner.ownerId,
+        connector_id: owner.connectorId,
+        repository_id: repositoryId,
+        attempt: 1,
+        lease_id: leaseId,
+        lease_expires_at: new Date(Date.now() - 1_000).toISOString(),
+      };
+      if (variant === "missing-deadline") delete proof.lease_expires_at;
+      if (variant === "invalid-deadline")
+        proof.lease_expires_at = "not-a-deadline";
+      if (variant === "live-deadline")
+        proof.lease_expires_at = new Date(Date.now() + 30_000).toISOString();
+      if (variant === "owner") proof.owner_id = "another-owner";
+      if (variant === "connector") proof.connector_id = replacement.connectorId;
+      if (variant === "repository") proof.repository_id = "another-repository";
+      if (variant === "attempt") proof.attempt = 2;
+      if (variant === "lease") proof.lease_id = crypto.randomUUID();
+      await database.query(
+        "INSERT INTO job_events (job_id, sequence, event_type, source, payload) VALUES ($1, 1, 'job.dispatched', $2, $3::jsonb)",
+        [
+          job.jobId,
+          variant === "source" ? "connector" : "control-plane",
+          JSON.stringify(proof),
+        ],
+      );
+      const claim = envelope("job.claim", 2, {
+        job_id: variant === "job" ? crypto.randomUUID() : job.jobId,
+        attempt: 1,
+        lease_id: leaseId,
+      });
+      const snapshot = async () => ({
+        jobs: (
+          await database.query("SELECT * FROM jobs WHERE id = $1", [job.jobId])
+        ).rows,
+        audit: (
+          await database.query(
+            "SELECT * FROM job_events WHERE job_id = $1 ORDER BY sequence",
+            [job.jobId],
+          )
+        ).rows,
+      });
+      const before = await snapshot();
+      try {
+        if (variant === "valid") {
+          const result = await store.acceptClientMessage(owner, claim);
+          expect(result.replay[0]).toMatchObject({
+            type: "protocol.error",
+            payload: { code: "CLAIM_REJECTED" },
+            correlationId: claim.correlation_id,
+          });
+          expect(result.response).toMatchObject({
+            type: "ack",
+            payload: { sequence: 2 },
+            correlationId: claim.correlation_id,
+          });
+          await expectClientCursor(owner.connectorId, 2);
+        } else {
+          await expect(
+            store.acceptClientMessage(owner, claim),
+          ).rejects.toMatchObject({ code: "CLAIM_REJECTED" });
+          await expectClientCursor(owner.connectorId, 1);
+          expect(
+            (
+              await database.query(
+                "SELECT id FROM connector_messages WHERE connector_id = $1 AND message_id = $2",
+                [owner.connectorId, claim.message_id],
+              )
+            ).rows,
+          ).toEqual([]);
+        }
+        expect(await snapshot()).toEqual(before);
+      } finally {
+        await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+      }
+    },
+  );
+
+  it.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])(
+    "uses the stored receipt profile for expired heartbeat replay (durable=%s, current=%s)",
+    async (durable, current) => {
+      const owner = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 1, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 0,
+          ...(durable ? { capabilities: ["durable-receipts-v1"] } : {}),
+        }),
+      );
+      const expiresAt = await expiryAfter(500);
+      const heartbeat = envelope("connector.heartbeat", 2, {}, { expiresAt });
+      const accepted = await store.acceptClientMessage(owner, heartbeat);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 3, {
+          connector_id: owner.connectorId,
+          last_client_sequence: 2,
+          last_server_sequence: 2,
+          ...(current ? { capabilities: ["durable-receipts-v1"] } : {}),
+        }),
+      );
+      await database.query(
+        "UPDATE connector_messages SET expires_at = clock_timestamp() - interval '1 second' WHERE connector_id = $1 AND direction = 'server' AND sequence = 2",
+        [owner.connectorId],
+      );
+      await store.pendingServerMessages(owner, 0);
+      await database.query(
+        "UPDATE connectors SET health = 'stale', last_heartbeat_at = clock_timestamp() - interval '1 minute' WHERE id = $1",
+        [owner.connectorId],
+      );
+      const snapshot = async () => ({
+        connector: (
+          await database.query("SELECT * FROM connectors WHERE id = $1", [
+            owner.connectorId,
+          ])
+        ).rows,
+        messages: (
+          await database.query(
+            "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY direction, sequence",
+            [owner.connectorId],
+          )
+        ).rows,
+      });
+      const before = await snapshot();
+      await database.query(
+        "SELECT pg_sleep_until($1::timestamptz + interval '25 milliseconds')",
+        [expiresAt],
+      );
+      if (durable) {
+        const replay = await store.acceptClientMessage(owner, heartbeat);
+        expect(replay).toMatchObject({
+          duplicate: true,
+          response: {
+            type: "ack",
+            sequence: 2,
+            payload: { sequence: 2 },
+            correlationId: heartbeat.correlation_id,
+          },
+        });
+        expect(replay.response?.messageId).not.toBe(
+          accepted.response?.messageId,
+        );
+        expect((await snapshot()).connector).toEqual(before.connector);
+      } else {
+        await expect(
+          store.acceptClientMessage(owner, heartbeat),
+        ).rejects.toMatchObject({ code: "CLIENT_REPLAY_MISMATCH" });
+        expect(await snapshot()).toEqual(before);
+      }
+    },
+  );
+
+  it("keeps approval payload expiry immutable when an offline delivery lease is renewed", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1"],
+      }),
+    );
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "running",
+      await expiryAfter(60_000),
+      1,
+      null,
+      null,
+    );
+    const approvalId = crypto.randomUUID();
+    const message = envelope(
+      "approval.requested",
+      2,
+      {
+        approval_id: approvalId,
+        job_id: job.jobId,
+        attempt: 1,
+        job_revision: 1,
+        action_summary: "Run tests",
+        impact_summary: "Test execution",
+        risk_class: "approval_required",
+        action_fingerprint: `sha256:${"a".repeat(64)}`,
+        expires_at: new Date(Date.now() - 60_000).toISOString(),
+      },
+      {
+        sentAt: new Date(Date.now() - 120_000),
+        expiresAt: new Date(Date.now() + 50_000),
+      },
+    );
+    const accepted = await store.acceptClientMessage(owner, message);
+    expect(accepted.replay[0]?.payload.code).toBe("EVENT_REJECTED");
+    expect(accepted.response?.payload).toEqual({ sequence: 2 });
+    expect(
+      (
+        await database.query("SELECT id FROM approvals WHERE id = $1", [
+          approvalId,
+        ])
+      ).rows,
+    ).toHaveLength(0);
+    expect(
+      (
+        await database.query(
+          "SELECT revision, status FROM jobs WHERE id = $1",
+          [job.jobId],
+        )
+      ).rows,
+    ).toEqual([{ revision: 0, status: "running" }]);
+    expect(
+      (
+        await store.acceptClientMessage(
+          owner,
+          envelope("connector.heartbeat", 3, {}),
+        )
+      ).response?.payload,
+    ).toEqual({ sequence: 3 });
+    await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+  });
+  it("does not consume unknown database failures in the negotiated business savepoint", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1"],
+      }),
+    );
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "running",
+      await expiryAfter(60_000),
+      1,
+      null,
+      null,
+    );
+    const suffix = crypto.randomUUID().replaceAll("-", "");
+    const fn = `receipt_failure_${suffix}`;
+    await database.query(
+      `CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.job_id = '${job.jobId}'::uuid THEN RAISE EXCEPTION 'fixture failure' USING ERRCODE = 'XX000'; END IF; RETURN NEW; END $$; CREATE TRIGGER ${fn} BEFORE INSERT ON job_events FOR EACH ROW EXECUTE FUNCTION ${fn}();`,
+    );
+    try {
+      await expect(
+        store.acceptClientMessage(
+          owner,
+          envelope("job.event", 2, {
+            job_id: job.jobId,
+            attempt: 1,
+            event_type: "progress",
+            payload: { stage: "testing" },
+            source: "harness",
+          }),
+        ),
+      ).rejects.toThrow();
+      expect(
+        (
+          await database.query("SELECT revision FROM jobs WHERE id = $1", [
+            job.jobId,
+          ])
+        ).rows,
+      ).toEqual([{ revision: 0 }]);
+      expect(
+        (
+          await database.query(
+            "SELECT last_client_sequence FROM connectors WHERE id = $1",
+            [owner.connectorId],
+          )
+        ).rows[0]?.last_client_sequence,
+      ).toBe("1");
+      expect(
+        (
+          await database.query(
+            "SELECT sequence FROM connector_messages WHERE connector_id = $1 AND direction = 'client'",
+            [owner.connectorId],
+          )
+        ).rows,
+      ).toEqual([{ sequence: "1" }]);
+    } finally {
+      await database.query(
+        `DROP TRIGGER ${fn} ON job_events; DROP FUNCTION ${fn}();`,
+      );
+      await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    }
+    expect(
+      (
+        await store.acceptClientMessage(
+          owner,
+          envelope("connector.heartbeat", 2, {}),
+        )
+      ).response?.payload,
+    ).toEqual({ sequence: 2 });
+  });
+  it("binds renewal and response semantics to each receipt across capability changes", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const legacy = envelope("connector.hello", 1, {
+      connector_id: owner.connectorId,
+      last_server_sequence: 0,
+    });
+    const legacyWelcome = await store.acceptClientMessage(owner, legacy);
+    expect(legacyWelcome.response?.payload).not.toHaveProperty("capabilities");
+    const capable = envelope("connector.hello", 2, {
+      connector_id: owner.connectorId,
+      last_client_sequence: 1,
+      last_server_sequence: 1,
+      capabilities: ["durable-receipts-v1"],
+    });
+    await store.acceptClientMessage(owner, capable);
+    await expect(
+      store.acceptClientMessage(owner, {
+        ...legacy,
+        expires_at: new Date(Date.now() + 45_000).toISOString(),
+      }),
+    ).rejects.toMatchObject({ code: "CLIENT_REPLAY_MISMATCH" });
+    expect((await store.acceptClientMessage(owner, legacy)).response).toEqual(
+      legacyWelcome.response,
+    );
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 3, {
+        connector_id: owner.connectorId,
+        last_client_sequence: 2,
+        last_server_sequence: 2,
+      }),
+    );
+    expect(
+      (
+        await store.acceptClientMessage(owner, {
+          ...capable,
+          expires_at: new Date(Date.now() + 45_000).toISOString(),
+        })
+      ).response?.payload.capabilities,
+    ).toEqual(["durable-receipts-v1"]);
+    expect(
+      (
+        await store.acceptClientMessage(
+          owner,
+          envelope("ack", 4, { sequence: 1 }),
+        )
+      ).response,
+    ).toBeNull();
+  });
+
+  it("rolls back partial negotiated business writes before committing an expired receipt", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1"],
+      }),
+    );
+    const expiry = await expiryAfter(500);
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "running",
+      expiry,
+      1,
+      null,
+      null,
+    );
+    const event = envelope("job.event", 2, {
+      job_id: job.jobId,
+      attempt: 1,
+      event_type: "progress",
+      payload: { stage: "testing" },
+      source: "harness",
+    });
+    const gate = await createWriteBoundaryGate("job_events", expiry);
+    try {
+      const accepted = store.acceptClientMessage(owner, event);
+      await gate.waitUntilBlocked();
+      await gate.releaseAtExpiry();
+      const result = await accepted;
+      expect(result.replay[0]?.payload.code).toBe("EVENT_REJECTED");
+      expect(result.response?.payload).toEqual({ sequence: 2 });
+      expect(
+        (
+          await database.query(
+            "SELECT revision, status FROM jobs WHERE id = $1",
+            [job.jobId],
+          )
+        ).rows,
+      ).toEqual([{ revision: 0, status: "running" }]);
+      expect(
+        (
+          await database.query(
+            "SELECT id FROM job_events WHERE job_id = $1 AND source = 'harness'",
+            [job.jobId],
+          )
+        ).rows,
+      ).toHaveLength(0);
+    } finally {
+      await gate.dispose();
+    }
+    await expect(
+      store.acceptClientMessage(
+        owner,
+        envelope("job.event", 3, {
+          ...event.payload,
+          job_id: crypto.randomUUID(),
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "EVENT_REJECTED" });
+    expect(
+      (
+        await database.query(
+          "SELECT last_client_sequence FROM connectors WHERE id = $1",
+          [owner.connectorId],
+        )
+      ).rows[0]?.last_client_sequence,
+    ).toBe("2");
+    await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+  });
+  it("negotiates durable receipts, renews only delivery expiry, and receipts client ACKs", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const hello = envelope(
+      "connector.hello",
+      1,
+      {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1"],
+      },
+      {
+        sentAt: new Date(Date.now() - 120_000),
+        expiresAt: new Date(Date.now() + 50_000),
+      },
+    );
+    const welcome = await store.acceptClientMessage(owner, hello);
+    expect(welcome.response?.payload.capabilities).toEqual([
+      "durable-receipts-v1",
+    ]);
+    const renewed = {
+      ...hello,
+      expires_at: new Date(Date.now() + 55_000).toISOString(),
+    };
+    expect((await store.acceptClientMessage(owner, renewed)).duplicate).toBe(
+      true,
+    );
+    for (const modified of [
+      { ...renewed, message_id: crypto.randomUUID() },
+      { ...renewed, sequence: 2 },
+      { ...renewed, correlation_id: crypto.randomUUID() },
+      { ...renewed, sent_at: renewed.sent_at.replace("Z", "0001Z") },
+      {
+        ...renewed,
+        payload: {
+          ...renewed.payload,
+          capabilities: ["durable-receipts-v1", "changed"],
+        },
+      },
+    ]) {
+      await expect(
+        store.acceptClientMessage(owner, modified),
+      ).rejects.toMatchObject({ code: "CLIENT_REPLAY_MISMATCH" });
+    }
+    await expect(
+      store.acceptClientMessage(owner, {
+        ...renewed,
+        sent_at: new Date(Date.now() - 119_000).toISOString(),
+      }),
+    ).rejects.toMatchObject({ code: "CLIENT_REPLAY_MISMATCH" });
+    if (welcome.response === null) throw new Error("fixture welcome missing");
+    const ack = envelope("ack", 2, { sequence: welcome.response.sequence });
+    const receipt = await store.acceptClientMessage(owner, ack);
+    expect(receipt.response).toMatchObject({
+      type: "ack",
+      payload: { sequence: 2 },
+      correlationId: ack.correlation_id,
+    });
+    expect((await store.acceptClientMessage(owner, ack)).response).toEqual(
+      receipt.response,
+    );
+    await expect(
+      store.acceptClientMessage(
+        owner,
+        envelope(
+          "connector.heartbeat",
+          3,
+          {},
+          {
+            expiresAt: new Date(Date.now() + 120_000),
+          },
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "CLIENT_REPLAY_MISMATCH" });
+  });
+
+  it("consumes an authorized expired claim without business effects and replays outcome before ACK", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1"],
+      }),
+    );
+    const leaseId = crypto.randomUUID();
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "dispatched",
+      new Date(Date.now() + 60_000),
+      0,
+      leaseId,
+      new Date(Date.now() - 1_000),
+    );
+    const claim = envelope("job.claim", 2, {
+      job_id: job.jobId,
+      attempt: 1,
+      lease_id: leaseId,
+    });
+    const result = await store.acceptClientMessage(owner, claim);
+    expect(result.replay).toHaveLength(1);
+    expect(result.replay[0]).toMatchObject({
+      type: "protocol.error",
+      payload: { code: "CLAIM_REJECTED" },
+      correlationId: claim.correlation_id,
+    });
+    expect(result.response).toMatchObject({
+      type: "ack",
+      payload: { sequence: 2 },
+      correlationId: claim.correlation_id,
+    });
+    expect((result.replay[0]?.sequence ?? 0) + 1).toBe(
+      result.response?.sequence,
+    );
+    const rows = await database.query(
+      "SELECT status, attempt, revision FROM jobs WHERE id = $1",
+      [job.jobId],
+    );
+    expect(rows.rows).toEqual([
+      { status: "dispatched", attempt: 0, revision: 0 },
+    ]);
+    expect(
+      (
+        await database.query(
+          "SELECT id FROM job_events WHERE job_id = $1 AND source = 'connector'",
+          [job.jobId],
+        )
+      ).rows,
+    ).toHaveLength(0);
+    const duplicate = await store.acceptClientMessage(owner, claim);
+    expect(duplicate).toEqual({ ...result, duplicate: true });
+    await database.query(
+      "UPDATE connector_messages SET expires_at = clock_timestamp() - interval '1 second' WHERE connector_id = $1 AND direction = 'server' AND sequence > 1",
+      [owner.connectorId],
+    );
+    await store.pendingServerMessages(owner, 1);
+    const restored = await store.acceptClientMessage(owner, claim);
+    expect(
+      restored.replay.map(({ type, sequence, payload }) => ({
+        type,
+        sequence,
+        payload,
+      })),
+    ).toEqual(
+      result.replay.map(({ type, sequence, payload }) => ({
+        type,
+        sequence,
+        payload,
+      })),
+    );
+    expect(restored.response).toMatchObject({
+      type: "ack",
+      sequence: result.response?.sequence,
+      payload: { sequence: 2 },
+      correlationId: claim.correlation_id,
+    });
+    expect(
+      (
+        await store.acceptClientMessage(
+          owner,
+          envelope("connector.heartbeat", 3, {}),
+        )
+      ).response?.payload,
+    ).toEqual({ sequence: 3 });
+    await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+  });
   it("looks up only the stored Connector credential identity", async () => {
     const store = new PostgresConnectorStore(database.client);
     await expect(store.findByCredentialId(CREDENTIAL_ID)).resolves.toEqual({
@@ -456,7 +1173,7 @@ describe("PostgreSQL Connector outbox", () => {
       "Dispatch expiry lock",
     );
     const callerNow = new Date();
-    const expiresAt = await expiryAfter(250);
+    const expiresAt = await expiryAfter(2_000);
     await database.query("UPDATE jobs SET expires_at = $1 WHERE id = $2", [
       expiresAt,
       job.jobId,
@@ -792,6 +1509,83 @@ describe("PostgreSQL Connector outbox", () => {
     await expectStoreError(
       store.acceptClientMessage(identity, gap),
       "CLIENT_SEQUENCE_GAP",
+    );
+  });
+
+  it("replays an exact expired negotiated client message without reapplying it", async () => {
+    const testIdentity = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const expiresAt = await expiryAfter(250);
+    const sentAt = new Date(Date.parse(String(expiresAt)) - 60_000);
+    const hello = envelope(
+      "connector.hello",
+      1,
+      {
+        connector_id: testIdentity.connectorId,
+        connector_version: "integration-1.0",
+        capabilities: ["tests", "durable-receipts-v1"],
+        last_server_sequence: 0,
+        last_client_sequence: 0,
+      },
+      {
+        sentAt,
+        expiresAt,
+      },
+    );
+    const accepted = await store.acceptClientMessage(testIdentity, hello);
+    if (accepted.response === null) throw new Error("expected a welcome");
+    await database.query(
+      "UPDATE connector_messages SET expires_at = now() - interval '1 second' WHERE message_id = $1",
+      [accepted.response.messageId],
+    );
+    await database.query(
+      "SELECT pg_sleep_until($1::timestamptz + interval '25 milliseconds')",
+      [expiresAt],
+    );
+
+    const replayed = await store.acceptClientMessage(testIdentity, hello);
+    if (replayed.response === null) throw new Error("expected replay response");
+    expect(replayed).toMatchObject({
+      duplicate: true,
+      response: {
+        sequence: accepted.response.sequence,
+        type: "connector.welcome",
+        payload: accepted.response.payload,
+      },
+    });
+    expect(replayed.response.messageId).not.toBe(accepted.response.messageId);
+    await expectClientCursor(testIdentity.connectorId, 1);
+    await expect(
+      database.query<{ client_count: string; server_count: string }>(
+        `SELECT count(*) FILTER (WHERE direction = 'client')::text AS client_count,
+                count(*) FILTER (WHERE direction = 'server')::text AS server_count
+           FROM connector_messages
+          WHERE connector_id = $1`,
+        [testIdentity.connectorId],
+      ),
+    ).resolves.toMatchObject({
+      rows: [{ client_count: "1", server_count: "1" }],
+    });
+
+    await expectStoreError(
+      store.acceptClientMessage(testIdentity, {
+        ...hello,
+        correlation_id: crypto.randomUUID(),
+      }),
+      "CLIENT_REPLAY_MISMATCH",
+    );
+    const freshExpired = envelope(
+      "connector.heartbeat",
+      2,
+      {},
+      {
+        sentAt,
+        expiresAt,
+      },
+    );
+    await expectStoreError(
+      store.acceptClientMessage(testIdentity, freshExpired),
+      "CLIENT_REPLAY_MISMATCH",
     );
   });
 

@@ -1,9 +1,17 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import * as https from "node:https";
 import { type AddressInfo, Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type Duplex, PassThrough } from "node:stream";
 import { connect as connectTls } from "node:tls";
+import {
+  type ConnectorClientMessage,
+  ConnectorClientMessageSchema,
+  ConnectorServerMessageSchema,
+} from "@qhb/protocol";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { hashConnectorCredential } from "../../apps/control-plane/src/connector/auth.js";
 import { createConnectorGateway } from "../../apps/control-plane/src/connector/gateway.js";
@@ -12,6 +20,13 @@ import { createConnectorSessionService } from "../../apps/control-plane/src/conn
 import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js";
 import { Aes256GcmEncryptor } from "../../apps/control-plane/src/domain/job-coordinator.js";
 import { createApp } from "../../apps/control-plane/src/http/app.js";
+import WebSocket from "../../packages/harness-plugin/node_modules/ws/index.js";
+import { SqlitePluginStore } from "../../packages/harness-plugin/src/store/plugin-store.js";
+import {
+  buildConnectorHello,
+  type ConnectorClientOptions,
+  createConnectorClient,
+} from "../../packages/harness-plugin/src/transport/connector-client.js";
 import {
   type ConnectorCredentials,
   FakeConnector,
@@ -455,11 +470,822 @@ beforeAll(async () => {
   await db.start();
 });
 
+const harnessClient = (
+  app: Awaited<ReturnType<typeof startApp>>,
+  credentials: ConnectorCredentials,
+  store: SqlitePluginStore,
+  options: Partial<ConnectorClientOptions> = {},
+) => {
+  const address = app.server.address() as AddressInfo;
+  return createConnectorClient({
+    connectorId: credentials.connector_id,
+    controlPlaneUrl: `wss://127.0.0.1:${address.port}/connector/v1`,
+    store,
+    bootstrapCredentialProvider: async () => credentials.credential_secret,
+    sessionTokenClient: {
+      exchange: async () => {
+        const session = await FakeConnector.exchangeSession(app, credentials);
+        return {
+          token: session.token,
+          expiresAt: new Date(Date.now() + 900_000).toISOString(),
+        };
+      },
+    },
+    webSocketFactory: (url, config) =>
+      new WebSocket(url, { ...config, ca: LOCALHOST_TLS.cert }),
+    reconnectDelay: () => 10_000,
+    ...options,
+  });
+};
+
+const rejectClaimOverTls = async (
+  app: Awaited<ReturnType<typeof startApp>>,
+  credentials: ConnectorCredentials,
+  hello: ConnectorClientMessage,
+  claim: ConnectorClientMessage,
+): Promise<void> => {
+  const session = await FakeConnector.exchangeSession(app, credentials);
+  const address = app.server.address() as AddressInfo;
+  const socket = new WebSocket(`wss://127.0.0.1:${address.port}/connector/v1`, {
+    headers: { authorization: `Bearer ${session.token}` },
+    ca: LOCALHOST_TLS.cert,
+  });
+  const received: ReturnType<typeof ConnectorServerMessageSchema.parse>[] = [];
+  let welcomed = false;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("fixture rejection timed out")),
+        2_000,
+      );
+      socket.once("open", () => socket.send(JSON.stringify(hello)));
+      socket.on("message", (data) => {
+        try {
+          const message = ConnectorServerMessageSchema.parse(
+            JSON.parse(String(data)),
+          );
+          received.push(message);
+          if (
+            !welcomed &&
+            message.type === "connector.welcome" &&
+            message.correlation_id === hello.correlation_id
+          ) {
+            expect(message.payload.capabilities).toContain(
+              "durable-receipts-v1",
+            );
+            welcomed = true;
+            socket.send(JSON.stringify(claim));
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
+      socket.once("close", () => resolve());
+      socket.once("error", reject);
+    });
+    expect(welcomed).toBe(true);
+    expect(received.at(-1)).toMatchObject({
+      type: "protocol.error",
+      payload: { code: "CLAIM_REJECTED" },
+    });
+    expect(
+      received.some(
+        (message) =>
+          message.type === "ack" &&
+          message.correlation_id === claim.correlation_id,
+      ),
+    ).toBe(false);
+  } finally {
+    clearTimeout(timeout);
+    socket.terminate();
+  }
+};
+
 afterAll(async () => {
   await db.stop();
 });
 
 describe("Connector gateway authentication and handshake", () => {
+  it("receipts unseen original claims after normal gateway redispatch to the same or another connector", async () => {
+    const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(67));
+    const app = await startApp(5_000, cipher);
+    try {
+      const outcomes = await Promise.allSettled(
+        [false, true].map(async (reassign) => {
+          const ownerId = `redispatch-owner-${crypto.randomUUID()}`;
+          const original = await seedConnector(db);
+          const replacement = reassign ? await seedConnector(db) : original;
+          const stranger = await seedConnector(db);
+          await db.query(
+            "INSERT INTO owners (id, display_name) VALUES ($1, 'Redispatch fixture')",
+            [ownerId],
+          );
+          await db.query(
+            "UPDATE connectors SET owner_id = $1 WHERE id = ANY($2::uuid[])",
+            [
+              ownerId,
+              [
+                original.connector_id,
+                replacement.connector_id,
+                stranger.connector_id,
+              ],
+            ],
+          );
+          const repositoryId = `redispatch-${crypto.randomUUID()}`;
+          await db.query(
+            "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path) VALUES ($1, $2, 'Redispatch fixture', '/redacted')",
+            [repositoryId, ownerId],
+          );
+          const job = await new JobRepository(db.client).createIdempotent({
+            ownerId,
+            repositoryId,
+            clientRequestId: crypto.randomUUID(),
+            requestCiphertext: cipher.encrypt("Redispatch regression"),
+            requestDigest: "fixture",
+          });
+          const identity = {
+            ownerId,
+            connectorId: original.connector_id,
+            protocolVersion: "1.0",
+          } as const;
+          const server = new PostgresConnectorStore(db.client);
+          const hello = buildConnectorHello({
+            connectorId: original.connector_id,
+            sequence: 1,
+            lastServerSequence: 0,
+            correlationId: crypto.randomUUID(),
+            now: new Date(),
+            capabilities: ["durable-receipts-v1"],
+          });
+          await server.acceptClientMessage(identity, hello);
+          const offer = await server.dispatchNext(identity);
+          if (offer === null) throw new Error("fixture offer missing");
+          expect(offer.payload.job_id).toBe(job.jobId);
+          const claim = ConnectorClientMessageSchema.parse({
+            ...hello,
+            type: "job.claim",
+            sequence: 2,
+            message_id: crypto.randomUUID(),
+            correlation_id: crypto.randomUUID(),
+            payload: {
+              job_id: job.jobId,
+              attempt: 1,
+              lease_id: offer.payload.lease_id,
+            },
+          });
+          const heartbeat = ConnectorClientMessageSchema.parse({
+            ...hello,
+            type: "connector.heartbeat",
+            sequence: 3,
+            message_id: crypto.randomUUID(),
+            correlation_id: crypto.randomUUID(),
+            payload: {},
+          });
+          const path = join(
+            mkdtempSync(join(tmpdir(), "qhb-redispatch-")),
+            "state.sqlite",
+          );
+          const local = new SqlitePluginStore(path);
+          for (const message of [hello, claim, heartbeat])
+            local.enqueueEvent(
+              {
+                messageId: message.message_id,
+                sequence: message.sequence,
+                payload: JSON.stringify(message),
+              },
+              message.type === "connector.hello",
+            );
+          const runs: Array<{
+            controller: AbortController;
+            running: Promise<void>;
+          }> = [];
+          const otherStores: SqlitePluginStore[] = [];
+          try {
+            // Real elapsed lease time: neither job deadlines nor authoritative
+            // evidence are rewritten to simulate a redispatch.
+            await db.query(
+              "SELECT pg_sleep_until($1::timestamptz + interval '25 milliseconds')",
+              [offer.expiresAt],
+            );
+            const tombstone = (
+              await server.pendingServerMessages(identity, 0)
+            ).find((row) => row.sequence === offer.sequence);
+            expect(tombstone).toMatchObject({
+              type: "protocol.error",
+              payload: { code: "MESSAGE_EXPIRED" },
+            });
+            expect(tombstone?.payload).not.toHaveProperty("lease_id");
+
+            if (reassign) {
+              const other = new SqlitePluginStore(
+                join(
+                  mkdtempSync(join(tmpdir(), "qhb-redispatch-other-")),
+                  "state.sqlite",
+                ),
+              );
+              otherStores.push(other);
+              const controller = new AbortController();
+              runs.push({
+                controller,
+                running: harnessClient(app, replacement, other).start(
+                  controller.signal,
+                ),
+              });
+              await vi.waitFor(async () =>
+                expect(
+                  (
+                    await db.query(
+                      "SELECT connector_id FROM jobs WHERE id = $1",
+                      [job.jobId],
+                    )
+                  ).rows[0]?.connector_id,
+                ).toBe(replacement.connector_id),
+              );
+            }
+            const received: Record<string, unknown>[] = [];
+            const wires: Record<string, unknown>[] = [];
+            const controller = new AbortController();
+            const client = harnessClient(app, original, local, {
+              webSocketFactory: (url, options) => {
+                const socket = new WebSocket(url, {
+                  ...options,
+                  ca: LOCALHOST_TLS.cert,
+                });
+                socket.on("message", (data) =>
+                  received.push(JSON.parse(String(data))),
+                );
+                const send = socket.send.bind(socket);
+                socket.send = ((data: string) => {
+                  wires.push(JSON.parse(data));
+                  send(data);
+                }) as typeof socket.send;
+                return socket;
+              },
+            });
+            runs.push({ controller, running: client.start(controller.signal) });
+            await vi.waitFor(async () => {
+              const row = (
+                await db.query("SELECT lease_id FROM jobs WHERE id = $1", [
+                  job.jobId,
+                ])
+              ).rows[0];
+              expect(row?.lease_id).not.toBe(offer.payload.lease_id);
+            });
+            await vi.waitFor(
+              () =>
+                expect(local.provenClientSequence()).toBeGreaterThanOrEqual(3),
+              { timeout: 3_000 },
+            );
+            const current = (
+              await db.query(
+                "SELECT connector_id, lease_id, status, attempt, revision FROM jobs WHERE id = $1",
+                [job.jobId],
+              )
+            ).rows;
+            expect(current).toEqual([
+              {
+                connector_id: replacement.connector_id,
+                lease_id: expect.any(String),
+                status: "dispatched",
+                attempt: 0,
+                revision: 2,
+              },
+            ]);
+            expect(
+              (
+                await db.query(
+                  "SELECT e.created_at <= m.created_at AS redispatched_first FROM job_events e JOIN connector_messages m ON m.connector_id = $2 AND m.direction = 'client' AND m.message_id = $3 WHERE e.job_id = $1 AND e.event_type = 'job.redispatched' AND e.source = 'control-plane'",
+                  [job.jobId, identity.connectorId, claim.message_id],
+                )
+              ).rows,
+            ).toEqual([{ redispatched_first: true }]);
+            expect(
+              received.filter(
+                (message) => message.correlation_id === claim.correlation_id,
+              ),
+            ).toMatchObject([
+              { type: "protocol.error", payload: { code: "CLAIM_REJECTED" } },
+              { type: "ack", payload: { sequence: 2 } },
+            ]);
+            const { expires_at: _expiry, ...immutable } = claim;
+            expect(
+              wires.find((message) => message.message_id === claim.message_id),
+            ).toMatchObject(immutable);
+            expect(
+              (
+                await db.query(
+                  "SELECT id FROM job_events WHERE job_id = $1 AND source = 'connector'",
+                  [job.jobId],
+                )
+              ).rows,
+            ).toEqual([]);
+            // The audit must retain the complete original tuple after the wire
+            // offer became a tombstone and the current connector/lease changed.
+            const audit = (
+              await db.query(
+                "SELECT payload FROM job_events WHERE job_id = $1 AND event_type = 'job.dispatched' AND source = 'control-plane'",
+                [job.jobId],
+              )
+            ).rows[0]?.payload;
+            expect(audit).toMatchObject({
+              owner_id: ownerId,
+              connector_id: original.connector_id,
+              repository_id: repositoryId,
+              attempt: 1,
+              lease_id: offer.payload.lease_id,
+              lease_expires_at: offer.expiresAt.toISOString(),
+            });
+
+            for (const run of runs) run.controller.abort();
+            await Promise.all(runs.map((run) => run.running));
+            const strangerHello = buildConnectorHello({
+              connectorId: stranger.connector_id,
+              sequence: 1,
+              lastServerSequence: 0,
+              correlationId: crypto.randomUUID(),
+              now: new Date(),
+              capabilities: ["durable-receipts-v1"],
+            });
+            await rejectClaimOverTls(app, stranger, strangerHello, {
+              ...claim,
+              message_id: crypto.randomUUID(),
+              correlation_id: crypto.randomUUID(),
+            });
+            const outsider = await seedConnector(db);
+            await rejectClaimOverTls(
+              app,
+              outsider,
+              buildConnectorHello({
+                connectorId: outsider.connector_id,
+                sequence: 1,
+                lastServerSequence: 0,
+                correlationId: crypto.randomUUID(),
+                now: new Date(),
+                capabilities: ["durable-receipts-v1"],
+              }),
+              {
+                ...claim,
+                message_id: crypto.randomUUID(),
+                correlation_id: crypto.randomUUID(),
+              },
+            );
+            expect(
+              (
+                await db.query(
+                  "SELECT last_client_sequence FROM connectors WHERE id = $1",
+                  [outsider.connector_id],
+                )
+              ).rows[0]?.last_client_sequence,
+            ).toBe("1");
+            await expect(
+              server.acceptClientMessage(
+                { ...identity, ownerId: OWNER_ID },
+                claim,
+              ),
+            ).rejects.toMatchObject({ code: "AUTHORIZATION_FAILED" });
+            const cursor = Number(
+              (
+                await db.query(
+                  "SELECT last_client_sequence FROM connectors WHERE id = $1",
+                  [identity.connectorId],
+                )
+              ).rows[0]?.last_client_sequence,
+            );
+            if (claim.type !== "job.claim")
+              throw new Error("fixture claim missing");
+            for (const payload of [
+              { ...claim.payload, lease_id: crypto.randomUUID() },
+              { ...claim.payload, attempt: 2 },
+              { ...claim.payload, job_id: crypto.randomUUID() },
+            ]) {
+              await rejectClaimOverTls(app, original, hello, {
+                ...claim,
+                sequence: cursor + 1,
+                message_id: crypto.randomUUID(),
+                correlation_id: crypto.randomUUID(),
+                payload,
+              });
+            }
+            expect(
+              (
+                await db.query(
+                  "SELECT last_client_sequence FROM connectors WHERE id = $1",
+                  [identity.connectorId],
+                )
+              ).rows[0]?.last_client_sequence,
+            ).toBe(String(cursor));
+            expect(
+              (
+                await db.query(
+                  "SELECT last_client_sequence FROM connectors WHERE id = $1",
+                  [stranger.connector_id],
+                )
+              ).rows[0]?.last_client_sequence,
+            ).toBe("1");
+            expect(
+              (
+                await db.query(
+                  "SELECT connector_id, lease_id, status, attempt, revision FROM jobs WHERE id = $1",
+                  [job.jobId],
+                )
+              ).rows,
+            ).toEqual(current);
+          } finally {
+            for (const run of runs) run.controller.abort();
+            await Promise.all(runs.map((run) => run.running));
+            local.close();
+            for (const other of otherStores) other.close();
+          }
+        }),
+      );
+      // Await both cleanup paths even when one regression fails.
+      for (const outcome of outcomes) {
+        if (outcome.status === "rejected") throw outcome.reason;
+      }
+    } finally {
+      await app.close();
+    }
+  }, 45_000);
+
+  it("retains a client ACK aborted after socket send before PostgreSQL receipt and recovers after restart", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const directory = mkdtempSync(join(tmpdir(), "qhb-receipt-abort-"));
+    const path = join(directory, "state.sqlite");
+    let store = new SqlitePluginStore(path);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let waiting = false;
+    const original = PostgresConnectorStore.prototype.acceptClientMessage;
+    const spy = vi
+      .spyOn(PostgresConnectorStore.prototype, "acceptClientMessage")
+      .mockImplementation(async function (identity, message, now) {
+        if (
+          identity.connectorId === credentials.connector_id &&
+          message.type === "ack" &&
+          !waiting
+        ) {
+          waiting = true;
+          await gate;
+        }
+        return original.call(this, identity, message, now);
+      });
+    const controller = new AbortController();
+    const running = harnessClient(app, credentials, store).start(
+      controller.signal,
+    );
+    try {
+      await vi.waitFor(() => expect(waiting).toBe(true));
+      controller.abort();
+      await running;
+      expect(store.pendingEvents(0).map((row) => row.sequence)).toEqual([2]);
+      expect(store.provenClientSequence()).toBe(1);
+      expect(
+        (
+          await db.query(
+            "SELECT last_client_sequence FROM connectors WHERE id = $1",
+            [credentials.connector_id],
+          )
+        ).rows[0]?.last_client_sequence,
+      ).toBe("1");
+      release();
+      await vi.waitFor(async () =>
+        expect(
+          (
+            await db.query(
+              "SELECT last_client_sequence FROM connectors WHERE id = $1",
+              [credentials.connector_id],
+            )
+          ).rows[0]?.last_client_sequence,
+        ).toBe("2"),
+      );
+      spy.mockRestore();
+      store.close();
+      store = new SqlitePluginStore(path);
+      const resumed = new AbortController();
+      const resumedRun = harnessClient(app, credentials, store).start(
+        resumed.signal,
+      );
+      try {
+        await vi.waitFor(() =>
+          expect(store.provenClientSequence()).toBeGreaterThanOrEqual(2),
+        );
+      } finally {
+        resumed.abort();
+        await resumedRun;
+      }
+      expect(store.activeHello()?.sequence).toBe(1);
+    } finally {
+      release();
+      controller.abort();
+      await running;
+      spy.mockRestore();
+      store.close();
+      await app.close();
+    }
+  });
+
+  it("restores a lost product ACK from a real replay tombstone after durable restart", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const directory = mkdtempSync(join(tmpdir(), "qhb-ack-restore-"));
+    const path = join(directory, "state.sqlite");
+    let store = new SqlitePluginStore(path);
+    const repositoryId = `restore-${crypto.randomUUID()}`;
+    await db.query(
+      "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, enabled) VALUES ($1, $2, 'Restore fixture', '/redacted', false)",
+      [repositoryId, OWNER_ID],
+    );
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      clientRequestId: crypto.randomUUID(),
+      repositoryId,
+      requestCiphertext: "fixture",
+      requestDigest: "fixture",
+    });
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1 WHERE id = $2",
+      [credentials.connector_id, job.jobId],
+    );
+    let lostSequence = 0;
+    const correlation = crypto.randomUUID();
+    const first = harnessClient(app, credentials, store, {
+      webSocketFactory: (url, options) => {
+        const socket = new WebSocket(url, {
+          ...options,
+          ca: LOCALHOST_TLS.cert,
+        });
+        const emit = socket.emit.bind(socket);
+        socket.emit = ((event: string | symbol, ...args: unknown[]) => {
+          if (event === "message") {
+            const message = JSON.parse(String(args[0]));
+            if (
+              message.type === "ack" &&
+              message.correlation_id === correlation
+            ) {
+              lostSequence = message.sequence;
+              socket.close();
+              return true;
+            }
+          }
+          return emit(event, ...args);
+        }) as typeof socket.emit;
+        return socket;
+      },
+    });
+    const controller = new AbortController();
+    const running = first.start(controller.signal);
+    try {
+      await vi.waitFor(() =>
+        expect(store.provenClientSequence()).toBeGreaterThanOrEqual(2),
+      );
+      await first.publish(
+        "job.event",
+        {
+          job_id: job.jobId,
+          attempt: 1,
+          event_type: "progress",
+          payload: { stage: "testing" },
+          source: "harness",
+        },
+        correlation,
+      );
+      await vi.waitFor(() => expect(lostSequence).toBeGreaterThan(0));
+      controller.abort();
+      await running;
+      const pending = store
+        .pendingEvents(0)
+        .find((row) => JSON.parse(row.payload).correlation_id === correlation);
+      if (pending === undefined)
+        throw new Error("fixture pending product missing");
+      await db.query(
+        "UPDATE connector_messages SET expires_at = clock_timestamp() - interval '1 second' WHERE connector_id = $1 AND direction = 'server' AND sequence = $2",
+        [credentials.connector_id, lostSequence],
+      );
+      store.close();
+      store = new SqlitePluginStore(path);
+      const observed: string[] = [];
+      const resumed = new AbortController();
+      const resumedRun = harnessClient(app, credentials, store, {
+        webSocketFactory: (url, options) => {
+          const socket = new WebSocket(url, {
+            ...options,
+            ca: LOCALHOST_TLS.cert,
+          });
+          socket.on("message", (data) => {
+            const message = JSON.parse(String(data));
+            if (message.sequence === lostSequence) observed.push(message.type);
+          });
+          return socket;
+        },
+      }).start(resumed.signal);
+      try {
+        await vi.waitFor(
+          () =>
+            expect(store.provenClientSequence()).toBeGreaterThanOrEqual(
+              pending.sequence,
+            ),
+          { timeout: 5_000 },
+        );
+      } finally {
+        resumed.abort();
+        await resumedRun;
+      }
+      expect(observed).toEqual(["protocol.error", "ack"]);
+      expect(store.inboundMessageBySequence(lostSequence)?.delivered).toBe(
+        true,
+      );
+      expect(
+        JSON.parse(store.inboundMessageBySequence(lostSequence)?.body ?? "{}")
+          .type,
+      ).toBe("ack");
+      expect(
+        (
+          await db.query(
+            "SELECT id FROM job_events WHERE job_id = $1 AND source = 'harness'",
+            [job.jobId],
+          )
+        ).rows,
+      ).toHaveLength(1);
+    } finally {
+      controller.abort();
+      await running;
+      store.close();
+      await app.close();
+    }
+  }, 15_000);
+  it("drains 130 expired unreceived ACKs through both durable endpoints without overflowing admission", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const directory = mkdtempSync(join(tmpdir(), "qhb-durable-endpoints-"));
+    const local = new SqlitePluginStore(join(directory, "state.sqlite"));
+    const old = new Date(Date.now() - 120_000);
+    const hello = buildConnectorHello({
+      connectorId: credentials.connector_id,
+      sequence: 1,
+      lastServerSequence: 0,
+      correlationId: crypto.randomUUID(),
+      now: old,
+      capabilities: ["durable-receipts-v1"],
+    });
+    local.enqueueEvent(
+      {
+        messageId: hello.message_id,
+        sequence: 1,
+        payload: JSON.stringify(hello),
+      },
+      true,
+    );
+    for (let sequence = 2; sequence <= 131; sequence++) {
+      const ack = ConnectorClientMessageSchema.parse({
+        ...hello,
+        type: "ack",
+        sequence,
+        message_id: crypto.randomUUID(),
+        correlation_id: crypto.randomUUID(),
+        payload: { sequence: 1 },
+      });
+      local.enqueueEvent({
+        messageId: ack.message_id,
+        sequence,
+        payload: JSON.stringify(ack),
+      });
+    }
+    const repositoryId = `expired-${crypto.randomUUID()}`;
+    await db.query(
+      "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, enabled) VALUES ($1, $2, 'Expired fixture', '/redacted', false)",
+      [repositoryId, OWNER_ID],
+    );
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      clientRequestId: crypto.randomUUID(),
+      repositoryId,
+      requestCiphertext: "fixture",
+      requestDigest: "fixture",
+    });
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1, expires_at = clock_timestamp() - interval '1 minute' WHERE id = $2",
+      [credentials.connector_id, job.jobId],
+    );
+    const product = ConnectorClientMessageSchema.parse({
+      ...hello,
+      sequence: 132,
+      message_id: crypto.randomUUID(),
+      correlation_id: crypto.randomUUID(),
+      type: "job.event",
+      payload: {
+        job_id: job.jobId,
+        attempt: 1,
+        event_type: "progress",
+        payload: { stage: "testing" },
+        source: "harness",
+      },
+    });
+    const heartbeat = ConnectorClientMessageSchema.parse({
+      ...hello,
+      sequence: 133,
+      message_id: crypto.randomUUID(),
+      correlation_id: crypto.randomUUID(),
+      type: "connector.heartbeat",
+      payload: {},
+    });
+    for (const message of [product, heartbeat])
+      local.enqueueEvent({
+        messageId: message.message_id,
+        sequence: message.sequence,
+        payload: JSON.stringify(message),
+      });
+    const address = app.server.address() as AddressInfo;
+    const closes: number[] = [];
+    const wires: Record<string, unknown>[] = [];
+    const client = createConnectorClient({
+      connectorId: credentials.connector_id,
+      controlPlaneUrl: `wss://127.0.0.1:${address.port}/connector/v1`,
+      store: local,
+      bootstrapCredentialProvider: async () => credentials.credential_secret,
+      sessionTokenClient: {
+        exchange: async () => {
+          const session = await FakeConnector.exchangeSession(app, credentials);
+          return {
+            token: session.token,
+            expiresAt: new Date(Date.now() + 900_000).toISOString(),
+          };
+        },
+      },
+      webSocketFactory: (url, options) => {
+        const socket = new WebSocket(url, {
+          ...options,
+          ca: LOCALHOST_TLS.cert,
+        });
+        const send = socket.send.bind(socket);
+        socket.send = ((data: string) => {
+          wires.push(JSON.parse(data));
+          send(data);
+        }) as typeof socket.send;
+        socket.on("close", (code: number) => closes.push(code));
+        return socket;
+      },
+      reconnectDelay: () => 10,
+    });
+    const controller = new AbortController();
+    const running = client.start(controller.signal);
+    try {
+      await vi.waitFor(
+        () => expect(local.provenClientSequence()).toBeGreaterThanOrEqual(133),
+        { timeout: 10_000 },
+      );
+      expect(closes).not.toContain(1013);
+      expect(wires.filter((m) => m.type === "connector.hello")).toHaveLength(1);
+      expect(wires[0]).toMatchObject({
+        message_id: hello.message_id,
+        sequence: 1,
+        sent_at: hello.sent_at,
+      });
+      expect(Date.parse(String(wires[0]?.expires_at))).toBeGreaterThan(
+        Date.parse(hello.expires_at),
+      );
+      const receipts = await db.query<{ count: string }>(
+        "SELECT count(*) FROM connector_messages WHERE connector_id = $1 AND direction = 'client'",
+        [credentials.connector_id],
+      );
+      expect(Number(receipts.rows[0]?.count)).toBeGreaterThanOrEqual(131);
+      const outcomes = await db.query(
+        "SELECT type, payload FROM connector_messages WHERE connector_id = $1 AND direction = 'server' AND correlation_id = $2 ORDER BY sequence",
+        [credentials.connector_id, product.correlation_id],
+      );
+      expect(outcomes.rows).toMatchObject([
+        { type: "protocol.error", payload: { code: "EVENT_REJECTED" } },
+        { type: "ack", payload: { sequence: 132 } },
+      ]);
+      expect(
+        (
+          await db.query(
+            "SELECT id FROM job_events WHERE job_id = $1 AND source = 'harness'",
+            [job.jobId],
+          )
+        ).rows,
+      ).toHaveLength(0);
+      expect(
+        (
+          await db.query("SELECT status, revision FROM jobs WHERE id = $1", [
+            job.jobId,
+          ])
+        ).rows[0],
+      ).toMatchObject({ status: "running", revision: 0 });
+    } finally {
+      controller.abort();
+      await running;
+      local.close();
+      await app.close();
+    }
+    const reopened = new SqlitePluginStore(join(directory, "state.sqlite"));
+    expect(reopened.provenClientSequence()).toBeGreaterThanOrEqual(131);
+    expect(reopened.activeHello()?.messageId).toBe(hello.message_id);
+    reopened.close();
+  }, 15_000);
   it("contains synchronous Upgrade construction failures without an unhandled rejection", async () => {
     const server = https.createServer(LOCALHOST_TLS);
     const signingKey = "gateway-upgrade-failure-signing-key-fixture";

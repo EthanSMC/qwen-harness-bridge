@@ -28,12 +28,34 @@ export type StoredOutboundEvent = Readonly<{
   acknowledgedAt: string | null;
 }>;
 
+export type StoredInboundMessage = Readonly<{
+  messageId: string;
+  sequence: number;
+  body: string;
+  delivered: boolean;
+}>;
+
+export type InboundReplacement = Readonly<{
+  previousMessageId: string;
+  previousBody: string;
+  messageId: string;
+  sequence: number;
+  body: string;
+}>;
+
 export interface PluginStore {
   recordInbound(
     messageId: string,
     sequence: number,
     body: string,
   ): "new" | "duplicate";
+  maxInboundSequence(): number;
+  inboundMessage(messageId: string): StoredInboundMessage | undefined;
+  inboundMessageBySequence(sequence: number): StoredInboundMessage | undefined;
+  replaceInbound(replacement: InboundReplacement): void;
+  pendingInboundMessages(): StoredInboundMessage[];
+  markInboundDelivered(messageId: string): void;
+  markInboundExpired(messageId: string): void;
   mapJob(input: {
     jobId: string;
     attempt: number;
@@ -42,7 +64,13 @@ export interface PluginStore {
   }): void;
   findJob(jobId: string): LocalJobMapping | undefined;
   listNonterminalJobs(): readonly LocalJobMapping[];
-  enqueueEvent(event: OutboundEventInput): void;
+  maxOutboundSequence(): number;
+  enqueueEvent(event: OutboundEventInput, pinHello?: boolean): void;
+  activeHello(): StoredOutboundEvent | undefined;
+  outboundEvent(sequence: number): StoredOutboundEvent | undefined;
+  renewDelivery(sequence: number, expiresAt: string): StoredOutboundEvent;
+  provenClientSequence(): number;
+  acknowledgeThrough(sequence: number, correlationId: string): void;
   pendingEvents(afterSequence: number): StoredOutboundEvent[];
   acknowledgeEvent(messageId: string): void;
   close(): void;
@@ -77,6 +105,7 @@ class StoreError extends Error {
 }
 
 const now = (): string => new Date().toISOString();
+const INBOUND_DELIVERED_METADATA_PREFIX = "inbound-delivered:";
 
 const assertNonEmpty = (value: string, code: string): void => {
   if (typeof value !== "string" || value.length === 0) {
@@ -249,6 +278,144 @@ export class SqlitePluginStore implements PluginStore {
     }
   }
 
+  maxInboundSequence(): number {
+    this.assertOpen();
+    const row = this.database
+      .prepare("SELECT MAX(sequence) AS sequence FROM inbound_messages")
+      .get() as { sequence: number | null };
+    return row.sequence ?? 0;
+  }
+
+  inboundMessage(messageId: string): StoredInboundMessage | undefined {
+    this.assertOpen();
+    assertNonEmpty(messageId, "STORE_MESSAGE_ID_REQUIRED");
+    const row = this.database
+      .prepare(
+        `SELECT message_id, sequence, body
+         FROM inbound_messages WHERE message_id = ?`,
+      )
+      .get(messageId) as InboundRow | undefined;
+    if (row === undefined) return undefined;
+    const delivery = this.database
+      .prepare("SELECT value FROM metadata WHERE key = ?")
+      .get(`${INBOUND_DELIVERED_METADATA_PREFIX}${messageId}`) as
+      | { value: string }
+      | undefined;
+    return {
+      messageId: row.message_id,
+      sequence: row.sequence,
+      body: row.body,
+      delivered: delivery?.value === String(row.sequence),
+    };
+  }
+
+  inboundMessageBySequence(sequence: number): StoredInboundMessage | undefined {
+    this.assertOpen();
+    assertPositiveInteger(sequence, "STORE_SEQUENCE_INVALID");
+    const row = this.database
+      .prepare("SELECT message_id FROM inbound_messages WHERE sequence = ?")
+      .get(sequence) as { message_id: string } | undefined;
+    return row === undefined ? undefined : this.inboundMessage(row.message_id);
+  }
+
+  replaceInbound(replacement: InboundReplacement): void {
+    this.assertOpen();
+    assertNonEmpty(replacement.previousMessageId, "STORE_MESSAGE_ID_REQUIRED");
+    assertNonEmpty(replacement.previousBody, "STORE_MESSAGE_BODY_REQUIRED");
+    assertNonEmpty(replacement.messageId, "STORE_MESSAGE_ID_REQUIRED");
+    assertPositiveInteger(replacement.sequence, "STORE_SEQUENCE_INVALID");
+    assertNonEmpty(replacement.body, "STORE_MESSAGE_BODY_REQUIRED");
+
+    const write = this.database.transaction(() => {
+      const current = this.database
+        .prepare(
+          `SELECT message_id, sequence, body
+           FROM inbound_messages WHERE sequence = ?`,
+        )
+        .get(replacement.sequence) as InboundRow | undefined;
+      const byReplacementId = this.database
+        .prepare("SELECT sequence FROM inbound_messages WHERE message_id = ?")
+        .get(replacement.messageId) as { sequence: number } | undefined;
+      if (
+        current?.message_id !== replacement.previousMessageId ||
+        current.body !== replacement.previousBody ||
+        byReplacementId !== undefined
+      ) {
+        throw new StoreInboundConflictError();
+      }
+      const updated = this.database
+        .prepare(
+          `UPDATE inbound_messages
+           SET message_id = ?, body = ?, received_at = ?
+           WHERE sequence = ? AND message_id = ? AND body = ?`,
+        )
+        .run(
+          replacement.messageId,
+          replacement.body,
+          now(),
+          replacement.sequence,
+          replacement.previousMessageId,
+          replacement.previousBody,
+        );
+      if (updated.changes !== 1) throw new StoreInboundConflictError();
+      this.database
+        .prepare("DELETE FROM metadata WHERE key IN (?, ?)")
+        .run(
+          `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.previousMessageId}`,
+          `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.messageId}`,
+        );
+    });
+    try {
+      write.immediate();
+    } catch (error) {
+      if (error instanceof StoreInboundConflictError) throw error;
+      throw new StoreError("STORE_INBOUND_WRITE_FAILED");
+    }
+  }
+
+  pendingInboundMessages(): StoredInboundMessage[] {
+    this.assertOpen();
+    const rows = this.database
+      .prepare(
+        `SELECT inbound.message_id, inbound.sequence, inbound.body
+         FROM inbound_messages AS inbound
+         WHERE NOT EXISTS (
+           SELECT 1 FROM metadata
+           WHERE key = ? || inbound.message_id
+             AND value = CAST(inbound.sequence AS TEXT)
+         )
+         ORDER BY inbound.sequence ASC`,
+      )
+      .all(INBOUND_DELIVERED_METADATA_PREFIX) as InboundRow[];
+    return rows.map((row) => ({
+      messageId: row.message_id,
+      sequence: row.sequence,
+      body: row.body,
+      delivered: false,
+    }));
+  }
+
+  markInboundDelivered(messageId: string): void {
+    this.assertOpen();
+    assertNonEmpty(messageId, "STORE_MESSAGE_ID_REQUIRED");
+    const write = this.database.transaction(() => {
+      const row = this.database
+        .prepare("SELECT sequence FROM inbound_messages WHERE message_id = ?")
+        .get(messageId) as { sequence: number } | undefined;
+      if (row === undefined) throw new StoreError("STORE_INBOUND_MISSING");
+      this.database
+        .prepare(
+          `INSERT INTO metadata (key, value) VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        )
+        .run(
+          `${INBOUND_DELIVERED_METADATA_PREFIX}${messageId}`,
+          String(row.sequence),
+        );
+    });
+    write.immediate();
+  }
+
   mapJob(input: {
     jobId: string;
     attempt: number;
@@ -346,7 +513,17 @@ export class SqlitePluginStore implements PluginStore {
     }
   }
 
-  enqueueEvent(event: OutboundEventInput): void {
+  maxOutboundSequence(): number {
+    this.assertOpen();
+    const row = this.database
+      .prepare("SELECT MAX(sequence) AS sequence FROM outbound_events")
+      .get() as { sequence: number | null };
+    const sequence = row.sequence ?? 0;
+    assertNonNegativeInteger(sequence, "STORE_SEQUENCE_INVALID");
+    return sequence;
+  }
+
+  enqueueEvent(event: OutboundEventInput, pinHello = false): void {
     this.assertOpen();
     assertNonEmpty(event.messageId, "STORE_MESSAGE_ID_REQUIRED");
     assertPositiveInteger(event.sequence, "STORE_SEQUENCE_INVALID");
@@ -389,8 +566,123 @@ export class SqlitePluginStore implements PluginStore {
            VALUES (?, ?, ?, ?, ?, ?)`,
         )
         .run(event.messageId, event.sequence, event.payload, 0, null, now());
+      if (pinHello) {
+        const previous = this.activeHello();
+        if (
+          JSON.parse(event.payload).type !== "connector.hello" ||
+          (previous !== undefined &&
+            this.provenClientSequence() !== event.sequence - 1)
+        ) {
+          throw new StoreError("STORE_HELLO_NOT_PROVEN");
+        }
+        this.database
+          .prepare(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES ('transport-hello', ?)",
+          )
+          .run(String(event.sequence));
+      }
     });
     write();
+  }
+
+  outboundEvent(sequence: number): StoredOutboundEvent | undefined {
+    assertPositiveInteger(sequence, "STORE_SEQUENCE_INVALID");
+    const row = this.database
+      .prepare(
+        "SELECT message_id, sequence, payload_json, attempts, acknowledged_at FROM outbound_events WHERE sequence = ?",
+      )
+      .get(sequence) as EventRow | undefined;
+    return row === undefined
+      ? undefined
+      : {
+          messageId: row.message_id,
+          sequence: row.sequence,
+          payload: row.payload_json,
+          attempts: row.attempts,
+          acknowledgedAt: row.acknowledged_at,
+        };
+  }
+
+  activeHello(): StoredOutboundEvent | undefined {
+    const row = this.database
+      .prepare("SELECT value FROM metadata WHERE key = 'transport-hello'")
+      .get() as { value: string } | undefined;
+    if (row === undefined) return undefined;
+    const hello = this.outboundEvent(Number(row.value));
+    if (
+      hello === undefined ||
+      JSON.parse(hello.payload).type !== "connector.hello"
+    )
+      throw new StoreError("STORE_HELLO_INVALID");
+    return hello;
+  }
+
+  provenClientSequence(): number {
+    const row = this.database
+      .prepare(
+        "SELECT value FROM metadata WHERE key = 'transport-proven-prefix'",
+      )
+      .get() as { value: string } | undefined;
+    const value = row === undefined ? 0 : Number(row.value);
+    assertNonNegativeInteger(value, "STORE_SEQUENCE_INVALID");
+    if (value > this.maxOutboundSequence())
+      throw new StoreError("STORE_RECEIPT_INVALID");
+    return value;
+  }
+
+  acknowledgeThrough(sequence: number, correlationId: string): void {
+    this.database.transaction(() => {
+      const stored = this.outboundEvent(sequence);
+      if (stored === undefined) throw new StoreError("STORE_RECEIPT_INVALID");
+      const message = JSON.parse(stored.payload);
+      if (
+        message.sequence !== sequence ||
+        message.correlation_id !== correlationId
+      )
+        throw new StoreError("STORE_RECEIPT_INVALID");
+      const prefix = Math.max(sequence, this.provenClientSequence());
+      this.database
+        .prepare(
+          "INSERT OR REPLACE INTO metadata(key, value) VALUES ('transport-proven-prefix', ?)",
+        )
+        .run(String(prefix));
+      this.database
+        .prepare(
+          "UPDATE outbound_events SET acknowledged_at = COALESCE(acknowledged_at, ?) WHERE sequence <= ?",
+        )
+        .run(now(), prefix);
+    })();
+  }
+
+  renewDelivery(sequence: number, expiresAt: string): StoredOutboundEvent {
+    return this.database.transaction(() => {
+      const stored = this.outboundEvent(sequence);
+      if (stored === undefined) throw new StoreError("STORE_DELIVERY_MISSING");
+      const message = JSON.parse(stored.payload);
+      if (
+        !Number.isFinite(Date.parse(expiresAt)) ||
+        Date.parse(expiresAt) <= Date.parse(message.sent_at)
+      )
+        throw new StoreError("STORE_DELIVERY_INVALID");
+      const payload = JSON.stringify({ ...message, expires_at: expiresAt });
+      this.database
+        .prepare(
+          "UPDATE outbound_events SET payload_json = ? WHERE sequence = ?",
+        )
+        .run(payload, sequence);
+      return { ...stored, payload };
+    })();
+  }
+
+  markInboundExpired(messageId: string): void {
+    this.database.transaction(() => {
+      this.database
+        .prepare(
+          "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, 'expired')",
+        )
+        .run(`inbound-disposition:${messageId}`);
+      this.markInboundDelivered(messageId);
+    })();
   }
 
   pendingEvents(afterSequence: number): StoredOutboundEvent[] {

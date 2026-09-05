@@ -48,6 +48,45 @@ afterEach(() => {
 });
 
 describe("SQLite Harness plugin store", () => {
+  it("persists a proven prefix separately from its pinned reconnect hello", () => {
+    const path = makeDatabasePath();
+    const store = new SqlitePluginStore(path);
+    const hello = {
+      ...event(1),
+      payload: JSON.stringify({
+        sequence: 1,
+        type: "connector.hello",
+        correlation_id: "hello",
+      }),
+    };
+    store.enqueueEvent(hello, true);
+    store.enqueueEvent({
+      ...event(2),
+      payload: JSON.stringify({ sequence: 2, correlation_id: "event" }),
+    });
+    expect(() => store.acknowledgeThrough(2, "wrong")).toThrow();
+    expect(store.provenClientSequence()).toBe(0);
+    store.acknowledgeThrough(2, "event");
+    expect(store.pendingEvents(0)).toEqual([]);
+    expect(store.activeHello()?.messageId).toBe(hello.messageId);
+    store.close();
+    const reopened = new SqlitePluginStore(path);
+    expect(reopened.provenClientSequence()).toBe(2);
+    expect(reopened.activeHello()?.messageId).toBe(hello.messageId);
+    reopened.enqueueEvent(
+      {
+        ...event(3),
+        payload: JSON.stringify({
+          sequence: 3,
+          type: "connector.hello",
+          correlation_id: "next",
+        }),
+      },
+      true,
+    );
+    expect(reopened.activeHello()?.sequence).toBe(3);
+    reopened.close();
+  });
   it("creates an atomic WAL schema with the expected durable tables", () => {
     const databasePath = makeDatabasePath();
     const store = new SqlitePluginStore(databasePath);
@@ -226,6 +265,101 @@ describe("SQLite Harness plugin store", () => {
     const reopened = new SqlitePluginStore(databasePath);
     expect(reopened.recordInbound("message-1", 1, "body")).toBe("duplicate");
     reopened.close();
+  });
+
+  it("restores the maximum durable inbound sequence after reopen", () => {
+    const databasePath = makeDatabasePath();
+    const first = new SqlitePluginStore(databasePath);
+
+    expect(first.maxInboundSequence()).toBe(0);
+    first.recordInbound("message-1", 1, "body-1");
+    first.recordInbound("message-2", 2, "body-2");
+    expect(first.maxInboundSequence()).toBe(2);
+    first.close();
+
+    const reopened = new SqlitePluginStore(databasePath);
+    expect(reopened.maxInboundSequence()).toBe(2);
+    reopened.close();
+  });
+
+  it("persists completed inbound delivery while leaving unfinished receipts retryable", () => {
+    const databasePath = makeDatabasePath();
+    const first = new SqlitePluginStore(databasePath);
+    first.recordInbound("message-1", 1, "body-1");
+    first.recordInbound("message-2", 2, "body-2");
+
+    expect(first.inboundMessage("message-1")).toEqual({
+      messageId: "message-1",
+      sequence: 1,
+      body: "body-1",
+      delivered: false,
+    });
+    expect(
+      first.pendingInboundMessages().map(({ messageId }) => messageId),
+    ).toEqual(["message-1", "message-2"]);
+    first.markInboundDelivered("message-1");
+    first.markInboundDelivered("message-1");
+    expect(first.inboundMessage("message-1")?.delivered).toBe(true);
+    first.close();
+
+    const reopened = new SqlitePluginStore(databasePath);
+    expect(
+      reopened.pendingInboundMessages().map(({ messageId }) => messageId),
+    ).toEqual(["message-2"]);
+    expect(reopened.inboundMessage("message-1")?.delivered).toBe(true);
+    reopened.close();
+  });
+
+  it("transactionally replaces one inbound identity at the same sequence", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    store.recordInbound("old-message", 1, "old-body");
+    store.markInboundDelivered("old-message");
+
+    expect(store.inboundMessageBySequence(1)?.messageId).toBe("old-message");
+    store.replaceInbound({
+      previousMessageId: "old-message",
+      previousBody: "old-body",
+      messageId: "replacement-message",
+      sequence: 1,
+      body: "replacement-body",
+    });
+
+    expect(store.inboundMessage("old-message")).toBeUndefined();
+    expect(store.inboundMessageBySequence(1)).toEqual({
+      messageId: "replacement-message",
+      sequence: 1,
+      body: "replacement-body",
+      delivered: false,
+    });
+    expect(store.pendingInboundMessages()).toEqual([
+      {
+        messageId: "replacement-message",
+        sequence: 1,
+        body: "replacement-body",
+        delivered: false,
+      },
+    ]);
+    const audit = new Database(databasePath, { readonly: true });
+    expect(
+      audit
+        .prepare("SELECT value FROM metadata WHERE key = ?")
+        .get("inbound-delivered:old-message"),
+    ).toBeUndefined();
+    audit.close();
+    expect(() =>
+      store.replaceInbound({
+        previousMessageId: "old-message",
+        previousBody: "old-body",
+        messageId: "attacker-message",
+        sequence: 1,
+        body: "attacker-body",
+      }),
+    ).toThrowError(StoreInboundConflictError);
+    expect(store.inboundMessageBySequence(1)?.messageId).toBe(
+      "replacement-message",
+    );
+    store.close();
   });
 
   it("rejects reused inbound IDs unless sequence and body match exactly", () => {
@@ -472,6 +606,53 @@ describe("SQLite Harness plugin store", () => {
     );
     reopened.close();
     expect(existsSync(databasePath)).toBe(true);
+  });
+
+  it("reports the durable maximum outbound sequence across acknowledged and pending rows", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+
+    expect(store.maxOutboundSequence()).toBe(0);
+    store.enqueueEvent(event(7, "pending-event"));
+    store.enqueueEvent(event(11, "acknowledged-event"));
+    store.acknowledgeEvent("acknowledged-event");
+    expect(store.maxOutboundSequence()).toBe(11);
+    store.close();
+
+    const reopened = new SqlitePluginStore(databasePath);
+    expect(reopened.maxOutboundSequence()).toBe(11);
+    expect(reopened.pendingEvents(0)).toMatchObject([
+      { messageId: "pending-event", sequence: 7 },
+    ]);
+    reopened.close();
+  });
+
+  it("rejects an unsafe durable outbound sequence", () => {
+    const databasePath = makeDatabasePath();
+    const store = new SqlitePluginStore(databasePath);
+    store.close();
+    const database = new Database(databasePath);
+    database
+      .prepare(
+        `INSERT INTO outbound_events
+          (message_id, sequence, payload_json, attempts, acknowledged_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        "unsafe-event",
+        Number.MAX_SAFE_INTEGER + 1,
+        "{}",
+        0,
+        "2026-09-05T00:00:00.000Z",
+        "2026-09-05T00:00:00.000Z",
+      );
+    database.close();
+
+    const reopened = new SqlitePluginStore(databasePath);
+    expect(() => reopened.maxOutboundSequence()).toThrow(
+      "STORE_SEQUENCE_INVALID",
+    );
+    reopened.close();
   });
 
   it("always initializes outbound delivery state instead of accepting forged state", () => {
