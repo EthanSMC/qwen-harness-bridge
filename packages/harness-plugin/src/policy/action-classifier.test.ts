@@ -209,7 +209,7 @@ describe("classifyAction", () => {
   });
 
   it.each([
-    ["matched ripgrep search", "search", "rg", ["needle", "src"]],
+    ["matched ripgrep search", "search", actualRipgrep, ["needle", "src"]],
     ["matched grep search", "grep", "grep", ["needle", "src"]],
     ["pnpm test", "test", "pnpm", ["test", "--runInBand"]],
     ["npm test", "test", "npm", ["test", "--", "unit"]],
@@ -221,10 +221,14 @@ describe("classifyAction", () => {
     "classifies coherent %s identity and argv as automatic",
     (_label, toolName, executable, argv) => {
       const fixture = makeFixture();
+      const options = trustedOptions(fixture);
+      if (executable === actualRipgrep) {
+        options.trustedExecutables.rg = actualRipgrep;
+      }
 
       const decision = classifyAction(
         makeAction(fixture, { toolName, executable, argv }),
-        trustedOptions(fixture),
+        options,
       );
 
       expect(decision.classification).toBe("automatic");

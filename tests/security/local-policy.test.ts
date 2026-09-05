@@ -253,9 +253,10 @@ describe("accepted complete-range findings", () => {
     ["--regexp=.", "src"],
   ])("preserves option-like and attached regex data %j", (...argv) => {
     const f = commandFixture();
+    f.options.trustedExecutables.rg = actualRipgrep;
     const action = makeAction(f, {
       toolName: "search",
-      executable: "rg",
+      executable: actualRipgrep,
       argv,
     });
     expect(classifyAction(action, f.options).classification).toBe("automatic");
