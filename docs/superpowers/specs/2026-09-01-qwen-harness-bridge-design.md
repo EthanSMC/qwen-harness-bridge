@@ -420,6 +420,7 @@ Internal errors carry correlation IDs in logs but not verbose stack traces on th
 
 - Full terminal output, environment, source content, and secrets never enter cloud events.
 - Connector uses field-level and pattern-based redaction before upload.
+- Connector public event projection is limited to summary, stage, relative changed-file names, test counters and artifact metadata. Summaries are capped at 500 UTF-8 bytes; changed-file lists at 50 validated entries, with the shared 16-KiB payload bound retained. Only the exact top-level changed_files string array receives the 50-item exception to the generic 32-item limit. Malformed structured fields reject, and raw tool arguments/source are omitted. [ADR 0004](../../adr/0004-connector-event-projection.md) specifies validation, compatibility and the required integration capability gate.
 - Original task request is encrypted at rest only while needed for offline dispatch and is deleted 24 hours after terminal completion.
 - Cloud retains bounded redacted summaries for 30 days.
 - Structured logs prohibit credential values, RTC tokens, raw audio, and full prompt/result bodies.

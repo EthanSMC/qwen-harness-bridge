@@ -275,6 +275,21 @@ const SafeEventPayloadSchema = z
     }
 
     const activeObjects = new Set<object>();
+    const changedFilesDescriptor = Object.getOwnPropertyDescriptor(
+      payload,
+      "changed_files",
+    );
+    if (
+      changedFilesDescriptor &&
+      (!changedFilesDescriptor.enumerable ||
+        !("value" in changedFilesDescriptor))
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["changed_files"],
+        message: "Root changed_files must be an enumerable data property",
+      });
+    }
     let estimatedBytes = 0;
     let payloadTooLarge = false;
 
@@ -323,6 +338,12 @@ const SafeEventPayloadSchema = z
         ) {
           addIssue(path, "Event payload contains a restricted field");
         }
+      }
+
+      const rootChangedFiles = path.length === 1 && path[0] === "changed_files";
+      if (rootChangedFiles && !Array.isArray(value)) {
+        addIssue(path, "Root changed_files must be a string array");
+        return;
       }
 
       if (typeof value === "string") {
@@ -378,10 +399,19 @@ const SafeEventPayloadSchema = z
 
       if (Array.isArray(value)) {
         addStructuralBytes(1);
-        if (value.length > MAX_EVENT_PAYLOAD_ITEMS) {
+        if (
+          rootChangedFiles &&
+          (Object.getPrototypeOf(value) !== Array.prototype ||
+            Object.getOwnPropertySymbols(value).length > 0 ||
+            Object.getOwnPropertyNames(value).length !== value.length + 1)
+        ) {
+          addIssue(path, "Root changed_files must be a plain dense array");
+        }
+        const itemLimit = rootChangedFiles ? 50 : MAX_EVENT_PAYLOAD_ITEMS;
+        if (value.length > itemLimit) {
           addIssue(path, "Event payload array is too large");
         }
-        const itemCount = Math.min(value.length, MAX_EVENT_PAYLOAD_ITEMS);
+        const itemCount = Math.min(value.length, itemLimit);
         for (let index = 0; index < itemCount; index += 1) {
           if (index > 0) {
             addStructuralBytes(1);
@@ -393,6 +423,15 @@ const SafeEventPayloadSchema = z
           if (descriptor === undefined || !("value" in descriptor)) {
             addIssue([...path, index], "Event payload arrays must be dense");
             continue;
+          }
+          if (
+            rootChangedFiles &&
+            (!descriptor.enumerable || typeof descriptor.value !== "string")
+          ) {
+            addIssue(
+              [...path, index],
+              "Root changed_files entries must be strings",
+            );
           }
           visit(descriptor.value, [...path, index], depth + 1);
         }

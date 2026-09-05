@@ -35,7 +35,10 @@ export default defineWorkspace([
   {
     test: {
       name: "security",
-      include: ["tests/security/local-policy.test.ts"],
+      include: [
+        "tests/security/local-policy.test.ts",
+        "tests/security/connector-redaction.test.ts",
+      ],
     },
   },
 ]);
