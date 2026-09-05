@@ -1,5 +1,10 @@
 import { readFileSync } from "node:fs";
+import {
+  ConnectorClientMessageSchema,
+  ConnectorServerMessageSchema,
+} from "@qhb/protocol";
 import Database from "better-sqlite3";
+import { z } from "zod";
 
 const SCHEMA_SQL = readFileSync(
   new URL("./schema.sql", import.meta.url),
@@ -15,12 +20,14 @@ export type LocalJobMapping = Readonly<{
 }>;
 
 export type OutboundEventInput = Readonly<{
+  expectedReceiptProfile?: "job-coordination-v1";
   messageId: string;
   sequence: number;
   payload: string;
 }>;
 
 export type StoredOutboundEvent = Readonly<{
+  expectedReceiptProfile?: "job-coordination-v1";
   messageId: string;
   sequence: number;
   payload: string;
@@ -36,6 +43,7 @@ export type StoredInboundMessage = Readonly<{
 }>;
 
 export type InboundReplacement = Readonly<{
+  coordinationRequestSequence?: number;
   previousMessageId: string;
   previousBody: string;
   messageId: string;
@@ -48,6 +56,7 @@ export interface PluginStore {
     messageId: string,
     sequence: number,
     body: string,
+    evidence?: Readonly<{ coordinationRequestSequence: number }>,
   ): "new" | "duplicate";
   maxInboundSequence(): number;
   inboundMessage(messageId: string): StoredInboundMessage | undefined;
@@ -74,6 +83,35 @@ export interface PluginStore {
   pendingEvents(afterSequence: number): StoredOutboundEvent[];
   acknowledgeEvent(messageId: string): void;
   close(): void;
+}
+
+const CoordinationReceiptSchema = z
+  .object({
+    expectedReceiptProfile: z.literal("job-coordination-v1"),
+    requestSequence: z.number().int().positive().safe(),
+    requestMessageId: z.string(),
+    requestCorrelationId: z.string(),
+    requestType: z.enum([
+      "job.sync",
+      "job.claim",
+      "job.event",
+      "approval.requested",
+      "job.cancelled",
+    ]),
+    responseSequence: z.number().int().positive().safe(),
+    responseCorrelationId: z.string(),
+    responseType: z.enum(["job.state", "protocol.error"]),
+    responsePayloadJson: z.string(),
+  })
+  .strict();
+
+export type StoredCoordinationReceipt = Readonly<
+  z.infer<typeof CoordinationReceiptSchema>
+>;
+
+export interface CoordinatingPluginStore extends PluginStore {
+  coordinationReceipt(sequence: number): StoredCoordinationReceipt | undefined;
+  coordinationRequest(correlationId: string): StoredOutboundEvent | undefined;
 }
 
 export class StoreSequenceError extends Error {
@@ -106,6 +144,42 @@ class StoreError extends Error {
 
 const now = (): string => new Date().toISOString();
 const INBOUND_DELIVERED_METADATA_PREFIX = "inbound-delivered:";
+const OUTBOUND_PROFILE_PREFIX = "outbound-receipt-profile:";
+const COORDINATION_PROFILE = "job-coordination-v1";
+const INBOUND_RECEIPT_PREFIX = "inbound-coordination-receipt:";
+
+// Strict state and error payloads contain only scalar fields.
+const canonicalPayload = (payload: object): string =>
+  JSON.stringify(
+    Object.fromEntries(
+      Object.entries(payload).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    ),
+  );
+
+const parseResponse = (messageId: string, sequence: number, body: string) => {
+  const parsed = ConnectorServerMessageSchema.parse(JSON.parse(body));
+  if (parsed.message_id !== messageId || parsed.sequence !== sequence)
+    throw new Error();
+  return parsed;
+};
+
+const isExpiryPlaceholder = (
+  response: ReturnType<typeof parseResponse>,
+): boolean =>
+  response.type === "protocol.error" &&
+  response.payload.code === "MESSAGE_EXPIRED" &&
+  response.payload.message === "A Connector message expired before delivery.";
+
+const parseRequest = (event: OutboundEventInput) => {
+  const parsed = ConnectorClientMessageSchema.parse(JSON.parse(event.payload));
+  if (
+    parsed.message_id !== event.messageId ||
+    parsed.sequence !== event.sequence
+  ) {
+    throw new StoreError("STORE_COORDINATION_INVALID");
+  }
+  return parsed;
+};
 
 const assertNonEmpty = (value: string, code: string): void => {
   if (typeof value !== "string" || value.length === 0) {
@@ -184,7 +258,7 @@ const schemaMatches = (database: Database.Database): boolean =>
   JSON.stringify(schemaObjects(database)) ===
   JSON.stringify(EXPECTED_SCHEMA_OBJECTS);
 
-export class SqlitePluginStore implements PluginStore {
+export class SqlitePluginStore implements CoordinatingPluginStore {
   #database: Database.Database | null = null;
   #closed = false;
 
@@ -232,6 +306,7 @@ export class SqlitePluginStore implements PluginStore {
     messageId: string,
     sequence: number,
     body: string,
+    evidence?: Readonly<{ coordinationRequestSequence: number }>,
   ): "new" | "duplicate" {
     this.assertOpen();
     assertNonEmpty(messageId, "STORE_MESSAGE_ID_REQUIRED");
@@ -239,6 +314,20 @@ export class SqlitePluginStore implements PluginStore {
     assertNonEmpty(body, "STORE_MESSAGE_BODY_REQUIRED");
 
     const write = this.database.transaction((): "new" | "duplicate" => {
+      if (evidence !== undefined) {
+        z.object({
+          coordinationRequestSequence: z.number().int().positive().safe(),
+        })
+          .strict()
+          .parse(evidence);
+      }
+      const receipt = this.prepareCoordinationReceipt(
+        messageId,
+        sequence,
+        body,
+        evidence?.coordinationRequestSequence,
+        false,
+      );
       const byMessage = this.database
         .prepare(
           `SELECT message_id, sequence, body
@@ -267,6 +356,7 @@ export class SqlitePluginStore implements PluginStore {
            VALUES (?, ?, ?, ?)`,
         )
         .run(messageId, sequence, body, now());
+      this.insertCoordinationReceipt(receipt);
       return "new";
     });
 
@@ -343,6 +433,13 @@ export class SqlitePluginStore implements PluginStore {
       ) {
         throw new StoreInboundConflictError();
       }
+      const receipt = this.prepareCoordinationReceipt(
+        replacement.messageId,
+        replacement.sequence,
+        replacement.body,
+        replacement.coordinationRequestSequence,
+        true,
+      );
       const updated = this.database
         .prepare(
           `UPDATE inbound_messages
@@ -364,6 +461,7 @@ export class SqlitePluginStore implements PluginStore {
           `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.previousMessageId}`,
           `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.messageId}`,
         );
+      this.insertCoordinationReceipt(receipt);
     });
     try {
       write.immediate();
@@ -371,6 +469,148 @@ export class SqlitePluginStore implements PluginStore {
       if (error instanceof StoreInboundConflictError) throw error;
       throw new StoreError("STORE_INBOUND_WRITE_FAILED");
     }
+  }
+
+  private createCoordinationReceipt(
+    requestSequence: number,
+    response: ReturnType<typeof parseResponse>,
+  ): StoredCoordinationReceipt {
+    assertPositiveInteger(requestSequence, "STORE_COORDINATION_INVALID");
+    const stored = this.outboundEvent(requestSequence);
+    if (stored?.expectedReceiptProfile !== COORDINATION_PROFILE)
+      throw new Error();
+    const request = parseRequest(stored);
+    if (request.correlation_id !== response.correlation_id) throw new Error();
+    if (response.type === "job.state") {
+      if (
+        request.type !== "job.sync" ||
+        response.payload.job_id !== request.payload.job_id ||
+        response.payload.requested_attempt !== request.payload.attempt ||
+        response.payload.request_message_id !== request.message_id ||
+        response.payload.request_sequence !== request.sequence ||
+        response.payload.nonce !== request.payload.nonce
+      )
+        throw new Error();
+    } else if (response.type === "protocol.error") {
+      const { code, message } = response.payload;
+      const conflict =
+        message === "The job authority has changed." ||
+        message === "The job business limit has been reached.";
+      const valid =
+        request.type === "job.sync"
+          ? code === "JOB_AUTHORITY_UNAVAILABLE" &&
+            message === "The job authority is unavailable."
+          : request.type === "job.claim"
+            ? code === "CLAIM_REJECTED" && conflict
+            : ["job.event", "approval.requested", "job.cancelled"].includes(
+                request.type,
+              ) &&
+              code === "EVENT_REJECTED" &&
+              conflict;
+      if (!valid) throw new Error();
+    } else throw new Error();
+    return CoordinationReceiptSchema.parse({
+      expectedReceiptProfile: COORDINATION_PROFILE,
+      requestSequence: request.sequence,
+      requestMessageId: request.message_id,
+      requestCorrelationId: request.correlation_id,
+      requestType: request.type,
+      responseSequence: response.sequence,
+      responseCorrelationId: response.correlation_id,
+      responseType: response.type,
+      responsePayloadJson: canonicalPayload(response.payload),
+    });
+  }
+
+  coordinationReceipt(sequence: number): StoredCoordinationReceipt | undefined {
+    this.assertOpen();
+    assertPositiveInteger(sequence, "STORE_SEQUENCE_INVALID");
+    try {
+      const metadata = this.database
+        .prepare("SELECT value FROM metadata WHERE key = ?")
+        .get(`${INBOUND_RECEIPT_PREFIX}${sequence}`) as
+        | { value: string }
+        | undefined;
+      if (metadata === undefined) return undefined;
+      const receipt = CoordinationReceiptSchema.parse(
+        JSON.parse(metadata.value),
+      );
+      const inbound = this.inboundMessageBySequence(sequence);
+      if (inbound === undefined || receipt.responseSequence !== sequence)
+        throw new Error();
+      const current = parseResponse(inbound.messageId, sequence, inbound.body);
+      // Revalidate the retained original even when the current row is a tombstone.
+      const original = ConnectorServerMessageSchema.parse({
+        ...current,
+        type: receipt.responseType,
+        payload: JSON.parse(receipt.responsePayloadJson),
+      });
+      const validated = this.createCoordinationReceipt(
+        receipt.requestSequence,
+        original,
+      );
+      if (JSON.stringify(validated) !== JSON.stringify(receipt))
+        throw new Error();
+      if (
+        !isExpiryPlaceholder(current) &&
+        (current.type !== receipt.responseType ||
+          canonicalPayload(current.payload) !== receipt.responsePayloadJson)
+      )
+        throw new Error();
+      return Object.freeze(receipt);
+    } catch {
+      throw new StoreError("STORE_COORDINATION_INVALID");
+    }
+  }
+
+  private prepareCoordinationReceipt(
+    messageId: string,
+    sequence: number,
+    body: string,
+    requestSequence: number | undefined,
+    replacing: boolean,
+  ): StoredCoordinationReceipt | undefined {
+    const original = this.coordinationReceipt(sequence);
+    if (original === undefined && requestSequence === undefined)
+      return undefined;
+    const response = parseResponse(messageId, sequence, body);
+    if (requestSequence === undefined) {
+      if (
+        !isExpiryPlaceholder(response) ||
+        response.correlation_id !== original?.responseCorrelationId
+      )
+        throw new Error();
+      return undefined;
+    }
+    const candidate = this.createCoordinationReceipt(requestSequence, response);
+    if (original !== undefined) {
+      if (JSON.stringify(candidate) !== JSON.stringify(original))
+        throw new Error();
+      return undefined;
+    }
+    const current = this.inboundMessageBySequence(sequence);
+    if (current !== undefined) {
+      const previous = parseResponse(current.messageId, sequence, current.body);
+      if (
+        !replacing ||
+        !isExpiryPlaceholder(previous) ||
+        previous.correlation_id !== response.correlation_id
+      )
+        throw new Error();
+    }
+    return candidate;
+  }
+
+  private insertCoordinationReceipt(
+    receipt: StoredCoordinationReceipt | undefined,
+  ): void {
+    if (receipt === undefined) return;
+    this.database
+      .prepare("INSERT INTO metadata (key, value) VALUES (?, ?)")
+      .run(
+        `${INBOUND_RECEIPT_PREFIX}${receipt.responseSequence}`,
+        JSON.stringify(receipt),
+      );
   }
 
   pendingInboundMessages(): StoredInboundMessage[] {
@@ -535,6 +775,15 @@ export class SqlitePluginStore implements PluginStore {
     } catch {
       throw new StoreError("STORE_PAYLOAD_INVALID");
     }
+    if (event.expectedReceiptProfile !== undefined) {
+      try {
+        if (event.expectedReceiptProfile !== COORDINATION_PROFILE)
+          throw new Error();
+        parseRequest(event);
+      } catch {
+        throw new StoreError("STORE_COORDINATION_INVALID");
+      }
+    }
     const write = this.database.transaction(() => {
       const byMessage = this.database
         .prepare(
@@ -545,7 +794,9 @@ export class SqlitePluginStore implements PluginStore {
       if (byMessage !== undefined) {
         if (
           byMessage.sequence === event.sequence &&
-          byMessage.payload_json === event.payload
+          byMessage.payload_json === event.payload &&
+          this.storedEvent(byMessage).expectedReceiptProfile ===
+            event.expectedReceiptProfile
         ) {
           return;
         }
@@ -581,8 +832,22 @@ export class SqlitePluginStore implements PluginStore {
           )
           .run(String(event.sequence));
       }
+      if (event.expectedReceiptProfile !== undefined) {
+        this.database
+          .prepare("INSERT INTO metadata (key, value) VALUES (?, ?)")
+          .run(
+            `${OUTBOUND_PROFILE_PREFIX}${event.sequence}`,
+            event.expectedReceiptProfile,
+          );
+      }
     });
-    write();
+    try {
+      write();
+    } catch (error) {
+      if (error instanceof StoreError || error instanceof StoreSequenceError)
+        throw error;
+      throw new StoreError("STORE_OUTBOUND_WRITE_FAILED");
+    }
   }
 
   outboundEvent(sequence: number): StoredOutboundEvent | undefined {
@@ -592,15 +857,55 @@ export class SqlitePluginStore implements PluginStore {
         "SELECT message_id, sequence, payload_json, attempts, acknowledged_at FROM outbound_events WHERE sequence = ?",
       )
       .get(sequence) as EventRow | undefined;
-    return row === undefined
-      ? undefined
-      : {
-          messageId: row.message_id,
-          sequence: row.sequence,
-          payload: row.payload_json,
-          attempts: row.attempts,
-          acknowledgedAt: row.acknowledged_at,
-        };
+    return row === undefined ? undefined : this.storedEvent(row);
+  }
+
+  private storedEvent(row: EventRow): StoredOutboundEvent {
+    const metadata = this.database
+      .prepare("SELECT value FROM metadata WHERE key = ?")
+      .get(`${OUTBOUND_PROFILE_PREFIX}${row.sequence}`) as
+      | { value: string }
+      | undefined;
+    const stored: StoredOutboundEvent = {
+      messageId: row.message_id,
+      sequence: row.sequence,
+      payload: row.payload_json,
+      attempts: row.attempts,
+      acknowledgedAt: row.acknowledged_at,
+      ...(metadata === undefined
+        ? {}
+        : { expectedReceiptProfile: COORDINATION_PROFILE }),
+    };
+    if (metadata !== undefined) {
+      try {
+        if (metadata.value !== COORDINATION_PROFILE) throw new Error();
+        parseRequest(stored);
+      } catch {
+        throw new StoreError("STORE_COORDINATION_INVALID");
+      }
+    }
+    return stored;
+  }
+
+  coordinationRequest(correlationId: string): StoredOutboundEvent | undefined {
+    this.assertOpen();
+    assertNonEmpty(correlationId, "STORE_COORDINATION_INVALID");
+    try {
+      const rows = this.database
+        .prepare(
+          `SELECT message_id, sequence, payload_json, attempts, acknowledged_at
+         FROM outbound_events WHERE json_extract(payload_json, '$.correlation_id') = ? LIMIT 2`,
+        )
+        .all(correlationId) as EventRow[];
+      if (rows.length > 1) throw new Error();
+      const row = rows[0];
+      if (row === undefined) return undefined;
+      const stored = this.storedEvent(row);
+      parseRequest(stored);
+      return stored.expectedReceiptProfile === undefined ? undefined : stored;
+    } catch {
+      throw new StoreError("STORE_COORDINATION_INVALID");
+    }
   }
 
   activeHello(): StoredOutboundEvent | undefined {
@@ -665,6 +970,13 @@ export class SqlitePluginStore implements PluginStore {
       )
         throw new StoreError("STORE_DELIVERY_INVALID");
       const payload = JSON.stringify({ ...message, expires_at: expiresAt });
+      if (stored.expectedReceiptProfile !== undefined) {
+        try {
+          parseRequest({ ...stored, payload });
+        } catch {
+          throw new StoreError("STORE_DELIVERY_INVALID");
+        }
+      }
       this.database
         .prepare(
           "UPDATE outbound_events SET payload_json = ? WHERE sequence = ?",
@@ -706,13 +1018,9 @@ export class SqlitePluginStore implements PluginStore {
       );
       for (const row of rows) update.run(row.message_id);
 
-      return rows.map((row) => ({
-        messageId: row.message_id,
-        sequence: row.sequence,
-        payload: row.payload_json,
-        attempts: row.attempts + 1,
-        acknowledgedAt: row.acknowledged_at,
-      }));
+      return rows.map((row) =>
+        this.storedEvent({ ...row, attempts: row.attempts + 1 }),
+      );
     });
     return read();
   }
