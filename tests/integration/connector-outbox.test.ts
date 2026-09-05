@@ -374,6 +374,1494 @@ afterAll(async () => {
 });
 
 describe("PostgreSQL Connector outbox", () => {
+  it("retains cancelled-before-claim precedence without incrementing an exhausted attempt", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+      }),
+    );
+    const lease = crypto.randomUUID();
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "dispatched",
+      new Date(Date.now() + 600_000),
+      2147483647,
+      lease,
+      new Date(Date.now() + 30_000),
+    );
+    await database.query("UPDATE jobs SET status = 'cancelled' WHERE id = $1", [
+      job.jobId,
+    ]);
+    const before = await database.query("SELECT * FROM jobs WHERE id = $1", [
+      job.jobId,
+    ]);
+    const accepted = await store.acceptClientMessage(
+      owner,
+      envelope("job.claim", 2, {
+        job_id: job.jobId,
+        attempt: 2147483648,
+        lease_id: lease,
+      }),
+    );
+    expect(accepted.replay[0]?.payload).toEqual({
+      code: "CLAIM_REJECTED",
+      message: "The offered job was cancelled before it was claimed.",
+    });
+    expect(accepted.response?.payload).toEqual({ sequence: 2 });
+    expect(
+      await database.query("SELECT * FROM jobs WHERE id = $1", [job.jobId]),
+    ).toEqual(before);
+    await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+  });
+
+  it("hard denies a guessed exhausted claim before deadline consumption", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+      }),
+    );
+    const lease = crypto.randomUUID();
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "dispatched",
+      new Date(Date.now() - 1000),
+      2147483647,
+      lease,
+      new Date(Date.now() - 1000),
+    );
+    const snapshot = async () => ({
+      job: await database.query("SELECT * FROM jobs WHERE id = $1", [
+        job.jobId,
+      ]),
+      connector: await database.query(
+        "SELECT * FROM connectors WHERE id = $1",
+        [owner.connectorId],
+      ),
+      messages: await database.query(
+        "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY direction, sequence",
+        [owner.connectorId],
+      ),
+      events: await database.query(
+        "SELECT * FROM job_events WHERE job_id = $1",
+        [job.jobId],
+      ),
+    });
+    const before = await snapshot();
+    await expect(
+      store.acceptClientMessage(
+        owner,
+        envelope("job.claim", 2, {
+          job_id: job.jobId,
+          attempt: 1,
+          lease_id: lease,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "CLAIM_REJECTED" });
+    expect(await snapshot()).toEqual(before);
+    await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+  });
+
+  it.each(["proven", "unproven", "legacy"])(
+    "guards historical offered attempt exhaustion without forged consumption: %s",
+    async (kind) => {
+      const owner = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 1, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 0,
+          capabilities:
+            kind === "legacy"
+              ? ["durable-receipts-v1"]
+              : ["durable-receipts-v1", "job-coordination-v1"],
+        }),
+      );
+      await createJob();
+      const offer = await store.dispatchNext(owner);
+      if (!offer) throw new Error("missing dispatch");
+      const jobId = String(offer.payload.job_id);
+      await database.query(
+        "UPDATE jobs SET attempt = 2147483647 WHERE id = $1",
+        [jobId],
+      );
+      // Model a retained offer made before the explicit pre-overflow guard.
+      if (kind !== "unproven")
+        await database.query(
+          "UPDATE job_events SET payload = jsonb_set(payload, '{attempt}', '2147483648') WHERE job_id = $1 AND event_type = 'job.dispatched'",
+          [jobId],
+        );
+      const request = envelope("job.claim", 2, {
+        job_id: jobId,
+        attempt: 2147483648,
+        lease_id: String(offer.payload.lease_id),
+      });
+      const snapshot = async () => ({
+        job: await database.query("SELECT * FROM jobs WHERE id = $1", [jobId]),
+        events: await database.query(
+          "SELECT * FROM job_events WHERE job_id = $1",
+          [jobId],
+        ),
+        connector: await database.query(
+          "SELECT * FROM connectors WHERE id = $1",
+          [owner.connectorId],
+        ),
+        messages: await database.query(
+          "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY direction, sequence",
+          [owner.connectorId],
+        ),
+      });
+      const before = await snapshot();
+      if (kind === "proven") {
+        const accepted = await store.acceptClientMessage(owner, request);
+        expect(accepted.replay[0]?.payload).toEqual({
+          code: "CLAIM_REJECTED",
+          message: "The job business limit has been reached.",
+        });
+        expect(accepted.response?.payload).toEqual({ sequence: 2 });
+        expect((await snapshot()).job).toEqual(before.job);
+        expect((await snapshot()).events).toEqual(before.events);
+      } else {
+        await expect(
+          store.acceptClientMessage(owner, request),
+        ).rejects.toMatchObject({
+          code: "CLAIM_REJECTED",
+          message: "The job business limit has been reached.",
+        });
+        expect(await snapshot()).toEqual(before);
+      }
+      await database.query("DELETE FROM jobs WHERE id = $1", [jobId]);
+    },
+  );
+
+  it("hard fails an unexpected zero-row dispatch without storing an offer", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const job = await createJob();
+    const fn = `dispatch_zero_${crypto.randomUUID().replaceAll("-", "")}`;
+    await database.query(
+      `CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = '${job.jobId}'::uuid THEN RETURN NULL; END IF; RETURN NEW; END $$; CREATE TRIGGER ${fn} BEFORE UPDATE ON jobs FOR EACH ROW EXECUTE FUNCTION ${fn}();`,
+    );
+    try {
+      const snapshot = async () => ({
+        job: await database.query("SELECT * FROM jobs WHERE id = $1", [
+          job.jobId,
+        ]),
+        connector: await database.query(
+          "SELECT * FROM connectors WHERE id = $1",
+          [owner.connectorId],
+        ),
+        events: await database.query(
+          "SELECT * FROM job_events WHERE job_id = $1",
+          [job.jobId],
+        ),
+        messages: await database.query(
+          "SELECT * FROM connector_messages WHERE connector_id = $1",
+          [owner.connectorId],
+        ),
+      });
+      const before = await snapshot();
+      await expect(store.dispatchNext(owner)).rejects.toMatchObject({
+        code: "INTERNAL",
+      });
+      expect(await snapshot()).toEqual(before);
+    } finally {
+      await database.query(
+        `DROP TRIGGER ${fn} ON jobs; DROP FUNCTION ${fn}();`,
+      );
+      await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    }
+  });
+
+  it("hard guards unsafe next client sequence before receipt insertion", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await database.query(
+      "UPDATE connectors SET last_client_sequence = $1 WHERE id = $2",
+      [Number.MAX_SAFE_INTEGER, owner.connectorId],
+    );
+    const before = await database.query(
+      "SELECT * FROM connectors WHERE id = $1",
+      [owner.connectorId],
+    );
+    await expect(
+      store.acceptClientMessage(
+        owner,
+        uncheckedEnvelope(
+          "connector.heartbeat",
+          Number.MAX_SAFE_INTEGER + 1,
+          {},
+        ),
+      ),
+    ).rejects.toMatchObject({ code: "INTERNAL" });
+    expect(
+      await database.query("SELECT * FROM connectors WHERE id = $1", [
+        owner.connectorId,
+      ]),
+    ).toEqual(before);
+    expect(
+      (
+        await database.query(
+          "SELECT * FROM connector_messages WHERE connector_id = $1",
+          [owner.connectorId],
+        )
+      ).rows,
+    ).toEqual([]);
+  });
+
+  it.each(["job.event", "job.cancelled"] as const)(
+    "preserves legitimate terminal repeats at the revision limit: %s",
+    async (type) => {
+      const owner = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 1, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 0,
+          capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+        }),
+      );
+      const job = await insertConnectedJob(
+        owner.connectorId,
+        "running",
+        new Date(Date.now() - 1000),
+        1,
+        null,
+        null,
+      );
+      await database.query(
+        "UPDATE jobs SET status = 'failed', revision = 2147483647 WHERE id = $1",
+        [job.jobId],
+      );
+      const before = await database.query("SELECT * FROM jobs WHERE id = $1", [
+        job.jobId,
+      ]);
+      const request =
+        type === "job.event"
+          ? envelope(type, 2, {
+              job_id: job.jobId,
+              attempt: 1,
+              event_type: "job.succeeded",
+              payload: { summary: "Finished" },
+              source: "connector",
+            })
+          : envelope(type, 2, {
+              job_id: job.jobId,
+              attempt: 1,
+              reason: "Cancelled",
+            });
+      const accepted = await store.acceptClientMessage(owner, request);
+      expect(accepted.replay).toEqual([]);
+      expect(accepted.response).toMatchObject({
+        type: "ack",
+        payload: { sequence: 2 },
+      });
+      expect(
+        await database.query("SELECT * FROM jobs WHERE id = $1", [job.jobId]),
+      ).toEqual(before);
+      expect(
+        (
+          await database.query("SELECT * FROM job_events WHERE job_id = $1", [
+            job.jobId,
+          ])
+        ).rows,
+      ).toHaveLength(1);
+      await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    },
+  );
+
+  it.each(["XX000", "23505"])(
+    "keeps unexpected business storage errors hard under coordination: %s",
+    async (code) => {
+      const owner = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 1, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 0,
+          capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+        }),
+      );
+      const job = await insertConnectedJob(
+        owner.connectorId,
+        "running",
+        new Date(Date.now() + 600_000),
+        1,
+        null,
+        null,
+      );
+      const fn = `coordination_error_${crypto.randomUUID().replaceAll("-", "")}`;
+      await database.query(
+        `CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.job_id = '${job.jobId}'::uuid THEN RAISE EXCEPTION 'fixture failure' USING ERRCODE = '${code}'; END IF; RETURN NEW; END $$; CREATE TRIGGER ${fn} BEFORE INSERT ON job_events FOR EACH ROW EXECUTE FUNCTION ${fn}();`,
+      );
+      try {
+        const snapshot = async () => ({
+          job: await database.query("SELECT * FROM jobs WHERE id = $1", [
+            job.jobId,
+          ]),
+          events: await database.query(
+            "SELECT * FROM job_events WHERE job_id = $1",
+            [job.jobId],
+          ),
+          connector: await database.query(
+            "SELECT * FROM connectors WHERE id = $1",
+            [owner.connectorId],
+          ),
+          messages: await database.query(
+            "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY direction, sequence",
+            [owner.connectorId],
+          ),
+        });
+        const before = await snapshot();
+        await expect(
+          store.acceptClientMessage(
+            owner,
+            envelope("job.event", 2, {
+              job_id: job.jobId,
+              attempt: 1,
+              event_type: "progress",
+              payload: { stage: "Checking" },
+              source: "connector",
+            }),
+          ),
+        ).rejects.toBeDefined();
+        expect(await snapshot()).toEqual(before);
+      } finally {
+        await database.query(
+          `DROP TRIGGER ${fn} ON job_events; DROP FUNCTION ${fn}();`,
+        );
+        await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+      }
+    },
+  );
+
+  it("observes the committed row after waiting for the actual job lock", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+      }),
+    );
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "running",
+      new Date(Date.now() + 600_000),
+      1,
+      null,
+      null,
+    );
+    let ready!: () => void;
+    let release!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const writer = database.client.transaction(async (tx) => {
+      await tx.execute(
+        drizzleSql`UPDATE jobs SET revision = 9 WHERE id = ${job.jobId}`,
+      );
+      ready();
+      await released;
+    });
+    await locked;
+    const observing = store.acceptClientMessage(
+      owner,
+      envelope("job.sync", 2, {
+        job_id: job.jobId,
+        attempt: 1,
+        nonce: crypto.randomUUID(),
+      }),
+    );
+    try {
+      await waitForRowLockWaiter("jobs");
+      release();
+      await writer;
+      const observed = await observing;
+      expect(observed.replay[0]?.payload.job_revision).toBe(9);
+    } finally {
+      release();
+      await Promise.allSettled([writer, observing]);
+      await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    }
+  });
+
+  it.each([
+    "missing",
+    "missing-job",
+    "cross-owner",
+    "source",
+    "owner",
+    "connector",
+    "repository",
+    "attempt",
+    "lease",
+    "deadline",
+    "ambiguous",
+  ])(
+    "hard denies unproven historical sync with full no-effect snapshots: %s",
+    async (fault) => {
+      const owner = await insertConnector();
+      const replacement = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 1, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 0,
+          capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+        }),
+      );
+      const job = await insertConnectedJob(
+        replacement.connectorId,
+        "running",
+        new Date(Date.now() + 600_000),
+        1,
+        null,
+        null,
+      );
+      const proof: Record<string, unknown> = {
+        owner_id: OWNER_ID,
+        connector_id: owner.connectorId,
+        repository_id: (
+          await database.query("SELECT repository_id FROM jobs WHERE id = $1", [
+            job.jobId,
+          ])
+        ).rows[0]?.repository_id,
+        attempt: 1,
+        lease_id: crypto.randomUUID(),
+        lease_expires_at: new Date().toISOString(),
+      };
+      if (fault === "owner") proof.owner_id = "wrong-owner";
+      if (fault === "connector") proof.connector_id = replacement.connectorId;
+      if (fault === "repository") proof.repository_id = "wrong-repository";
+      if (fault === "attempt") proof.attempt = "1";
+      if (fault === "lease") proof.lease_id = "invalid";
+      if (fault === "deadline") proof.lease_expires_at = "invalid";
+      if (fault !== "missing")
+        await database.query(
+          "INSERT INTO job_events (job_id, sequence, event_type, payload, source) VALUES ($1, 1, 'job.dispatched', $2::jsonb, $3)",
+          [
+            job.jobId,
+            JSON.stringify(proof),
+            fault === "source" ? "connector" : "control-plane",
+          ],
+        );
+      if (fault === "ambiguous")
+        await database.query(
+          "INSERT INTO job_events (job_id, sequence, event_type, payload, source) VALUES ($1, 2, 'job.redispatched', $2::jsonb, 'control-plane')",
+          [
+            job.jobId,
+            JSON.stringify({ ...proof, lease_id: crypto.randomUUID() }),
+          ],
+        );
+      let requester = owner;
+      if (fault === "cross-owner") {
+        const otherOwner = `coordination-other-${crypto.randomUUID()}`;
+        await database.query("INSERT INTO owners (id) VALUES ($1)", [
+          otherOwner,
+        ]);
+        await database.query(
+          "UPDATE connectors SET owner_id = $1 WHERE id = $2",
+          [otherOwner, owner.connectorId],
+        );
+        requester = { ...owner, ownerId: otherOwner };
+      }
+      const snapshot = async () => ({
+        job: await database.query("SELECT * FROM jobs WHERE id = $1", [
+          job.jobId,
+        ]),
+        events: await database.query(
+          "SELECT * FROM job_events WHERE job_id = $1 ORDER BY sequence",
+          [job.jobId],
+        ),
+        connectors: await database.query(
+          "SELECT * FROM connectors WHERE id = $1",
+          [owner.connectorId],
+        ),
+        messages: await database.query(
+          "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY direction, sequence",
+          [owner.connectorId],
+        ),
+      });
+      const before = await snapshot();
+      await expect(
+        store.acceptClientMessage(
+          requester,
+          envelope("job.sync", 2, {
+            job_id: fault === "missing-job" ? crypto.randomUUID() : job.jobId,
+            attempt: 1,
+            nonce: crypto.randomUUID(),
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "AUTHORIZATION_FAILED" });
+      expect(await snapshot()).toEqual(before);
+      await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    },
+  );
+
+  it.each(["valid", "wrong-lease", "wrong-attempt", "missing-proof"])(
+    "requires exact real offer proof for a claim status conflict: %s",
+    async (kind) => {
+      const owner = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 1, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 0,
+          capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+        }),
+      );
+      await createJob();
+      const offer = await store.dispatchNext(owner);
+      if (!offer) throw new Error("missing dispatch");
+      const jobId = String(offer.payload.job_id);
+      await database.query(
+        "UPDATE jobs SET status = 'failed', attempt = 1 WHERE id = $1",
+        [jobId],
+      );
+      if (kind === "missing-proof")
+        await database.query("DELETE FROM job_events WHERE job_id = $1", [
+          jobId,
+        ]);
+      const request = envelope("job.claim", 2, {
+        job_id: jobId,
+        attempt: kind === "wrong-attempt" ? 2 : 1,
+        lease_id:
+          kind === "wrong-lease"
+            ? crypto.randomUUID()
+            : String(offer.payload.lease_id),
+      });
+      const snapshot = async () => ({
+        job: await database.query("SELECT * FROM jobs WHERE id = $1", [jobId]),
+        events: await database.query(
+          "SELECT * FROM job_events WHERE job_id = $1",
+          [jobId],
+        ),
+        connector: await database.query(
+          "SELECT * FROM connectors WHERE id = $1",
+          [owner.connectorId],
+        ),
+        messages: await database.query(
+          "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY direction, sequence",
+          [owner.connectorId],
+        ),
+      });
+      const before = await snapshot();
+      if (kind === "valid") {
+        const accepted = await store.acceptClientMessage(owner, request);
+        expect(accepted.replay[0]?.payload).toEqual({
+          code: "CLAIM_REJECTED",
+          message: "The job authority has changed.",
+        });
+        expect(accepted.response?.payload).toEqual({ sequence: 2 });
+        expect((await snapshot()).job).toEqual(before.job);
+        expect((await snapshot()).events).toEqual(before.events);
+        const state = await store.acceptClientMessage(
+          owner,
+          envelope("job.sync", 3, {
+            job_id: jobId,
+            attempt: 1,
+            nonce: crypto.randomUUID(),
+          }),
+        );
+        expect(state.replay[0]?.payload.status).toBe("failed");
+      } else {
+        await expect(
+          store.acceptClientMessage(owner, request),
+        ).rejects.toMatchObject({ code: "CLAIM_REJECTED" });
+        expect(await snapshot()).toEqual(before);
+      }
+      await database.query("DELETE FROM jobs WHERE id = $1", [jobId]);
+    },
+  );
+
+  it.each(["ack-insert", "ack-metadata", "client-cursor"])(
+    "rolls back the whole sync transaction at %s failure",
+    async (boundary) => {
+      const owner = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 1, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 0,
+          capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+        }),
+      );
+      const job = await insertConnectedJob(
+        owner.connectorId,
+        "running",
+        new Date(Date.now() + 600_000),
+        1,
+        null,
+        null,
+      );
+      const fn = `sync_failure_${crypto.randomUUID().replaceAll("-", "")}`;
+      const table =
+        boundary === "client-cursor" ? "connectors" : "connector_messages";
+      const condition =
+        boundary === "client-cursor"
+          ? `NEW.id = '${owner.connectorId}'::uuid AND NEW.last_client_sequence = 2`
+          : `NEW.connector_id = '${owner.connectorId}'::uuid AND ${boundary === "ack-insert" ? "NEW.direction = 'server' AND NEW.type = 'ack'" : "NEW.direction = 'client' AND NEW.payload ? '__qhb_receipt_ack'"}`;
+      await database.query(
+        `CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF ${condition} THEN ${boundary === "client-cursor" ? "RETURN NULL" : "RAISE EXCEPTION 'fixture failure' USING ERRCODE = 'XX000'"}; END IF; RETURN NEW; END $$; CREATE TRIGGER ${fn} BEFORE ${boundary === "ack-insert" ? "INSERT" : "UPDATE"} ON ${table} FOR EACH ROW EXECUTE FUNCTION ${fn}();`,
+      );
+      try {
+        const snapshot = async () => ({
+          connector: await database.query(
+            "SELECT * FROM connectors WHERE id = $1",
+            [owner.connectorId],
+          ),
+          messages: await database.query(
+            "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY direction, sequence",
+            [owner.connectorId],
+          ),
+          job: await database.query("SELECT * FROM jobs WHERE id = $1", [
+            job.jobId,
+          ]),
+          events: await database.query(
+            "SELECT * FROM job_events WHERE job_id = $1",
+            [job.jobId],
+          ),
+          approvals: await database.query(
+            "SELECT * FROM approvals WHERE job_id = $1",
+            [job.jobId],
+          ),
+        });
+        const before = await snapshot();
+        await expect(
+          store.acceptClientMessage(
+            owner,
+            envelope("job.sync", 2, {
+              job_id: job.jobId,
+              attempt: 1,
+              nonce: crypto.randomUUID(),
+            }),
+          ),
+        ).rejects.toBeDefined();
+        expect(await snapshot()).toEqual(before);
+      } finally {
+        await database.query(
+          `DROP TRIGGER ${fn} ON ${table}; DROP FUNCTION ${fn}();`,
+        );
+        await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "renews only delivery for immutable expired state (tombstone=%s)",
+    async (tombstone) => {
+      const owner = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 1, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 0,
+          capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+        }),
+      );
+      const job = await insertConnectedJob(
+        owner.connectorId,
+        "running",
+        new Date(Date.now() - 1000),
+        1,
+        null,
+        null,
+      );
+      const sync = envelope("job.sync", 2, {
+        job_id: job.jobId,
+        attempt: 2,
+        nonce: crypto.randomUUID(),
+      });
+      const original = await store.acceptClientMessage(owner, sync);
+      await database.query(
+        "UPDATE connector_messages SET expires_at = clock_timestamp() - interval '1 second' WHERE connector_id = $1 AND direction = 'server' AND sequence > 1",
+        [owner.connectorId],
+      );
+      if (tombstone) {
+        const pending = await store.pendingServerMessages(owner, 1);
+        expect(pending.map((row) => row.type)).toEqual([
+          "protocol.error",
+          "protocol.error",
+        ]);
+        expect(pending.map((row) => row.payload.code)).toEqual([
+          "MESSAGE_EXPIRED",
+          "MESSAGE_EXPIRED",
+        ]);
+      }
+      await database.query(
+        "UPDATE jobs SET status = 'expired', revision = 8, connector_id = NULL WHERE id = $1",
+        [job.jobId],
+      );
+      const restored = await store.acceptClientMessage(owner, sync);
+      expect(restored.replay[0]?.payload).toEqual(original.replay[0]?.payload);
+      expect(restored.response?.payload).toEqual({ sequence: 2 });
+      expect(restored.replay[0]?.messageId).not.toBe(
+        original.replay[0]?.messageId,
+      );
+      expect(restored.response?.messageId).not.toBe(
+        original.response?.messageId,
+      );
+      expect(restored.replay[0]?.sequence).toBe(original.replay[0]?.sequence);
+      await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    },
+  );
+
+  it("observes actual cancellation provenance after later progress and preserves legacy null", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+      }),
+    );
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "running",
+      new Date(Date.now() + 600_000),
+      1,
+      null,
+      null,
+    );
+    await new JobRepository(database.client).cancelAtomically({
+      ownerId: OWNER_ID,
+      jobId: job.jobId,
+      expectedRevision: 0,
+    });
+    await store.acceptClientMessage(
+      owner,
+      envelope("job.event", 2, {
+        job_id: job.jobId,
+        attempt: 1,
+        event_type: "progress",
+        payload: { stage: "Draining" },
+        source: "connector",
+      }),
+    );
+    const observed = await store.acceptClientMessage(
+      owner,
+      envelope("job.sync", 3, {
+        job_id: job.jobId,
+        attempt: 1,
+        nonce: crypto.randomUUID(),
+      }),
+    );
+    expect(observed.replay[0]?.payload).toMatchObject({
+      status: "cancelling",
+      job_revision: 2,
+      cancel_revision: 1,
+    });
+    await database.query(
+      "UPDATE jobs SET cancel_revision = NULL WHERE id = $1",
+      [job.jobId],
+    );
+    const legacy = await store.acceptClientMessage(
+      owner,
+      envelope("job.sync", 4, {
+        job_id: job.jobId,
+        attempt: 1,
+        nonce: crypto.randomUUID(),
+      }),
+    );
+    expect(legacy.replay[0]?.payload).toMatchObject({
+      status: "cancelling",
+      job_revision: 2,
+      cancel_revision: null,
+    });
+    await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+  });
+
+  it.each(["claim", "event", "approval", "cancelled"] as const)(
+    "consumes authorized 32-bit revision exhaustion without business effects: %s",
+    async (kind) => {
+      const owner = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 1, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 0,
+          capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+        }),
+      );
+      await createJob();
+      const offer = await store.dispatchNext(owner);
+      if (!offer) throw new Error("expected dispatch");
+      const jobId = String(offer.payload.job_id);
+      await database.query(
+        "UPDATE jobs SET revision = 2147483647, status = $1::job_status, attempt = $2 WHERE id = $3",
+        [
+          kind === "claim"
+            ? "dispatched"
+            : kind === "cancelled"
+              ? "cancelling"
+              : "running",
+          kind === "claim" ? 0 : 1,
+          jobId,
+        ],
+      );
+      const request =
+        kind === "claim"
+          ? envelope("job.claim", 2, {
+              job_id: jobId,
+              attempt: 1,
+              lease_id: String(offer.payload.lease_id),
+            })
+          : kind === "event"
+            ? envelope("job.event", 2, {
+                job_id: jobId,
+                attempt: 1,
+                event_type: "progress",
+                payload: { stage: "Checking" },
+                source: "connector",
+              })
+            : kind === "cancelled"
+              ? envelope("job.cancelled", 2, {
+                  job_id: jobId,
+                  attempt: 1,
+                  reason: "Cancelled",
+                })
+              : envelope("approval.requested", 2, {
+                  job_id: jobId,
+                  attempt: 1,
+                  job_revision: 2147483648,
+                  approval_id: crypto.randomUUID(),
+                  action_summary: "Run checks",
+                  impact_summary: "Checks only",
+                  risk_class: "low",
+                  action_fingerprint: `sha256:${"b".repeat(64)}`,
+                  expires_at: new Date(Date.now() + 30_000).toISOString(),
+                });
+      const snapshot = async () => ({
+        jobs: await database.query("SELECT * FROM jobs WHERE id = $1", [jobId]),
+        events: await database.query(
+          "SELECT * FROM job_events WHERE job_id = $1 ORDER BY sequence",
+          [jobId],
+        ),
+        approvals: await database.query(
+          "SELECT * FROM approvals WHERE job_id = $1",
+          [jobId],
+        ),
+      });
+      const before = await snapshot();
+      const accepted = await store.acceptClientMessage(owner, request);
+      expect(accepted.replay[0]).toMatchObject({
+        type: "protocol.error",
+        payload: {
+          code: kind === "claim" ? "CLAIM_REJECTED" : "EVENT_REJECTED",
+          message: "The job business limit has been reached.",
+        },
+      });
+      expect(accepted.response).toMatchObject({
+        type: "ack",
+        payload: { sequence: 2 },
+      });
+      expect(await snapshot()).toEqual(before);
+      expect(await store.acceptClientMessage(owner, request)).toEqual({
+        ...accepted,
+        duplicate: true,
+      });
+      await database.query("DELETE FROM jobs WHERE id = $1", [jobId]);
+    },
+  );
+
+  it.each(["revision", "attempt"])(
+    "hard guards dispatch %s exhaustion before any write",
+    async (field) => {
+      const owner = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      const job = await createJob();
+      await database.query(
+        field === "revision"
+          ? "UPDATE jobs SET revision = 2147483647 WHERE id = $1"
+          : "UPDATE jobs SET attempt = 2147483647 WHERE id = $1",
+        [job.jobId],
+      );
+      const snapshot = async () => ({
+        job: await database.query("SELECT * FROM jobs WHERE id = $1", [
+          job.jobId,
+        ]),
+        connector: await database.query(
+          "SELECT * FROM connectors WHERE id = $1",
+          [owner.connectorId],
+        ),
+        messages: await database.query(
+          "SELECT * FROM connector_messages WHERE connector_id = $1",
+          [owner.connectorId],
+        ),
+        events: await database.query(
+          "SELECT * FROM job_events WHERE job_id = $1",
+          [job.jobId],
+        ),
+      });
+      const before = await snapshot();
+      await expect(store.dispatchNext(owner)).rejects.toMatchObject({
+        code: "CLAIM_REJECTED",
+        message: "The job business limit has been reached.",
+      });
+      expect(await snapshot()).toEqual(before);
+      await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    },
+  );
+
+  it("uses real retained dispatch proof for historical sync without disclosing replacement state", async () => {
+    const owner = await insertConnector();
+    const replacement = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+      }),
+    );
+    await createJob();
+    const offer = await store.dispatchNext(owner);
+    if (!offer) throw new Error("expected real dispatch");
+    const jobId = String(offer.payload.job_id);
+    const attempt = Number(offer.payload.attempt);
+    await database.query(
+      "UPDATE jobs SET connector_id = $1, revision = revision + 1 WHERE id = $2",
+      [replacement.connectorId, jobId],
+    );
+    const before = await database.query("SELECT * FROM jobs WHERE id = $1", [
+      jobId,
+    ]);
+    const sync = envelope("job.sync", 2, {
+      job_id: jobId,
+      attempt,
+      nonce: crypto.randomUUID(),
+    });
+    const accepted = await store.acceptClientMessage(owner, sync);
+    expect(
+      accepted.replay.map((row) => ({ type: row.type, payload: row.payload })),
+    ).toEqual([
+      {
+        type: "protocol.error",
+        payload: {
+          code: "JOB_AUTHORITY_UNAVAILABLE",
+          message: "The job authority is unavailable.",
+        },
+      },
+    ]);
+    expect(accepted.response).toMatchObject({
+      type: "ack",
+      payload: { sequence: 2 },
+    });
+    expect(
+      await database.query("SELECT * FROM jobs WHERE id = $1", [jobId]),
+    ).toEqual(before);
+    expect(await store.acceptClientMessage(owner, sync)).toEqual({
+      ...accepted,
+      duplicate: true,
+    });
+    await database.query(
+      "UPDATE job_events SET payload = payload - 'owner_id' WHERE job_id = $1 AND event_type = 'job.dispatched'",
+      [jobId],
+    );
+    await expect(
+      store.acceptClientMessage(
+        owner,
+        envelope("job.sync", 3, {
+          job_id: jobId,
+          attempt,
+          nonce: crypto.randomUUID(),
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "AUTHORIZATION_FAILED" });
+    await database.query("DELETE FROM jobs WHERE id = $1", [jobId]);
+  });
+
+  for (const capabilities of [
+    [],
+    ["durable-receipts-v1"],
+    ["durable-receipts-v1", "job-coordination-v1"],
+  ]) {
+    it.each([
+      ["approval-status", "approval.requested", "queued", 1, 0],
+      ["approval-attempt", "approval.requested", "running", 2, 0],
+      ["approval-revision", "approval.requested", "running", 1, 4],
+      ["event-attempt", "job.event", "running", 2, 0],
+      ["event-unclaimed", "job.event", "queued", 1, 0],
+      ["event-terminal-progress", "job.event", "succeeded", 1, 0],
+      ["event-transition", "job.event", "cancelling", 1, 0],
+      ["cancel-attempt", "job.cancelled", "cancelling", 2, 0],
+      ["cancel-status", "job.cancelled", "running", 1, 0],
+    ] as const)(
+      `classifies %s with ${capabilities.length} negotiated profiles`,
+      async (_category, type, status, attempt, revision) => {
+        const owner = await insertConnector();
+        const store = new PostgresConnectorStore(database.client);
+        await store.acceptClientMessage(
+          owner,
+          envelope("connector.hello", 1, {
+            connector_id: owner.connectorId,
+            last_server_sequence: 0,
+            capabilities,
+          }),
+        );
+        const job = await insertConnectedJob(
+          owner.connectorId,
+          "running",
+          new Date(Date.now() + 600_000),
+          1,
+          null,
+          null,
+        );
+        await database.query(
+          "UPDATE jobs SET status = $1::job_status, revision = $2 WHERE id = $3",
+          [status, revision, job.jobId],
+        );
+        const payload =
+          type === "approval.requested"
+            ? {
+                job_id: job.jobId,
+                attempt,
+                job_revision: 1,
+                approval_id: crypto.randomUUID(),
+                action_summary: "Run checks",
+                impact_summary: "Checks only",
+                risk_class: "low",
+                action_fingerprint: `sha256:${"a".repeat(64)}`,
+                expires_at: new Date(Date.now() + 30_000).toISOString(),
+              }
+            : type === "job.event"
+              ? {
+                  job_id: job.jobId,
+                  attempt,
+                  event_type: "progress",
+                  payload: { status: "running" },
+                  source: "connector",
+                }
+              : { job_id: job.jobId, attempt, reason: "Cancelled" };
+        const before = await database.query(
+          "SELECT * FROM jobs WHERE id = $1",
+          [job.jobId],
+        );
+        const request = envelope(type, 2, payload);
+        if (capabilities.length < 2) {
+          const receipt = await database.query(
+            "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY direction, sequence",
+            [owner.connectorId],
+          );
+          const connector = await database.query(
+            "SELECT * FROM connectors WHERE id = $1",
+            [owner.connectorId],
+          );
+          await expect(
+            store.acceptClientMessage(owner, request),
+          ).rejects.toMatchObject({ code: "EVENT_REJECTED" });
+          expect(
+            await database.query(
+              "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY direction, sequence",
+              [owner.connectorId],
+            ),
+          ).toEqual(receipt);
+          expect(
+            await database.query("SELECT * FROM connectors WHERE id = $1", [
+              owner.connectorId,
+            ]),
+          ).toEqual(connector);
+          expect(
+            await database.query("SELECT * FROM jobs WHERE id = $1", [
+              job.jobId,
+            ]),
+          ).toEqual(before);
+          await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+          return;
+        }
+        const accepted = await store.acceptClientMessage(owner, request);
+        expect(accepted.replay[0]).toMatchObject({
+          type: "protocol.error",
+          payload: {
+            code: "EVENT_REJECTED",
+            message: "The job authority has changed.",
+          },
+        });
+        expect(accepted.response).toMatchObject({
+          type: "ack",
+          payload: { sequence: 2 },
+        });
+        expect(
+          await database.query("SELECT * FROM jobs WHERE id = $1", [job.jobId]),
+        ).toEqual(before);
+        expect(
+          (
+            await database.query("SELECT * FROM job_events WHERE job_id = $1", [
+              job.jobId,
+            ])
+          ).rows,
+        ).toEqual([]);
+        expect(
+          (
+            await database.query("SELECT * FROM approvals WHERE job_id = $1", [
+              job.jobId,
+            ])
+          ).rows,
+        ).toEqual([]);
+        const state = await store.acceptClientMessage(
+          owner,
+          envelope("job.sync", 3, {
+            job_id: job.jobId,
+            attempt: 1,
+            nonce: crypto.randomUUID(),
+          }),
+        );
+        expect(state.replay[0]?.payload).toMatchObject({
+          status,
+          current_attempt: 1,
+          job_revision: revision,
+        });
+        expect(await store.acceptClientMessage(owner, request)).toEqual({
+          ...accepted,
+          duplicate: true,
+        });
+        await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+      },
+    );
+  }
+
+  it.each([
+    "nonce",
+    "request",
+    "job-binding",
+    "attempt-binding",
+    "request-id",
+    "profile",
+    "missing-profile",
+    "pair",
+    "state-as-ack",
+    "correlation",
+    "missing-correlation",
+    "sequence",
+    "ack-order",
+    "ack-payload",
+    "ack-correlation",
+    "unknown-replacement",
+    "tombstone-message",
+  ])("rejects corrupt coordination replay atomically: %s", async (fault) => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+      }),
+    );
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "running",
+      new Date(Date.now() + 600_000),
+      1,
+      null,
+      null,
+    );
+    const sync = envelope("job.sync", 2, {
+      job_id: job.jobId,
+      attempt: 1,
+      nonce: crypto.randomUUID(),
+    });
+    await store.acceptClientMessage(owner, sync);
+    const saved = await database.query<{ payload: Record<string, unknown> }>(
+      "SELECT payload FROM connector_messages WHERE message_id = $1",
+      [sync.message_id],
+    );
+    const metadata = saved.rows[0]?.payload;
+    if (!metadata) throw new Error("missing receipt");
+    const original = metadata.__qhb_original_response as {
+      type: string;
+      payload: Record<string, unknown>;
+      sequence: number;
+      correlation_id: string;
+    };
+    if (fault === "nonce") original.payload.nonce = crypto.randomUUID();
+    if (fault === "request") original.payload.request_sequence = 1;
+    if (fault === "job-binding") original.payload.job_id = crypto.randomUUID();
+    if (fault === "attempt-binding") original.payload.requested_attempt = 2;
+    if (fault === "request-id")
+      original.payload.request_message_id = crypto.randomUUID();
+    if (
+      [
+        "nonce",
+        "request",
+        "job-binding",
+        "attempt-binding",
+        "request-id",
+      ].includes(fault)
+    )
+      await database.query(
+        "UPDATE connector_messages SET payload = $1::jsonb WHERE connector_id = $2 AND direction = 'server' AND sequence = $3",
+        [
+          JSON.stringify(original.payload),
+          owner.connectorId,
+          original.sequence,
+        ],
+      );
+    if (fault === "profile") metadata.__qhb_coordination_profile = "unknown";
+    if (fault === "missing-profile") delete metadata.__qhb_coordination_profile;
+    if (fault === "pair") delete metadata.__qhb_receipt_ack;
+    if (fault === "state-as-ack")
+      metadata.__qhb_original_response = metadata.__qhb_receipt_ack;
+    if (fault === "correlation") original.correlation_id = crypto.randomUUID();
+    if (fault === "missing-correlation")
+      Reflect.deleteProperty(original, "correlation_id");
+    if (fault === "sequence") original.sequence += 1;
+    const ack = metadata.__qhb_receipt_ack as {
+      sequence: number;
+      payload: Record<string, unknown>;
+      correlation_id: string;
+    };
+    if (fault === "ack-order") ack.sequence = original.sequence;
+    if (fault === "ack-payload") ack.payload.sequence = 1;
+    if (fault === "ack-correlation") ack.correlation_id = crypto.randomUUID();
+    await database.query(
+      "UPDATE connector_messages SET payload = $1::jsonb WHERE message_id = $2",
+      [JSON.stringify(metadata), sync.message_id],
+    );
+    if (fault === "tombstone-message")
+      await database.query(
+        "UPDATE connector_messages SET type = 'protocol.error', payload = $1::jsonb WHERE connector_id = $2 AND direction = 'server' AND sequence = $3",
+        [
+          JSON.stringify({
+            code: "MESSAGE_EXPIRED",
+            message: "not the server tombstone",
+          }),
+          owner.connectorId,
+          original.sequence,
+        ],
+      );
+    if (fault === "unknown-replacement")
+      await database.query(
+        "UPDATE connector_messages SET type = 'protocol.error', payload = $1::jsonb WHERE connector_id = $2 AND direction = 'server' AND sequence = $3",
+        [
+          JSON.stringify({ code: "UNKNOWN", message: "Unknown replacement" }),
+          owner.connectorId,
+          original.sequence,
+        ],
+      );
+    const snapshot = async () => ({
+      connector: await database.query(
+        "SELECT * FROM connectors WHERE id = $1",
+        [owner.connectorId],
+      ),
+      messages: await database.query(
+        "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY direction, sequence",
+        [owner.connectorId],
+      ),
+      job: await database.query("SELECT * FROM jobs WHERE id = $1", [
+        job.jobId,
+      ]),
+    });
+    const before = await snapshot();
+    await expect(store.acceptClientMessage(owner, sync)).rejects.toBeDefined();
+    expect(await snapshot()).toEqual(before);
+    await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+  });
+
+  it.each([
+    [
+      ["durable-receipts-v1", "job-coordination-v1"],
+      ["durable-receipts-v1", "job-coordination-v1"],
+    ],
+    [["durable-receipts-v1"], ["durable-receipts-v1"]],
+    [["job-coordination-v1"], undefined],
+    [[], undefined],
+  ])(
+    "negotiates coordination only with both profiles: %j",
+    async (capabilities, expected) => {
+      const owner = await insertConnector();
+      const store = new PostgresConnectorStore(database.client);
+      const hello = envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities,
+      });
+      const accepted = await store.acceptClientMessage(owner, hello);
+      expect(accepted.response?.payload.capabilities).toEqual(expected);
+      await store.acceptClientMessage(
+        owner,
+        envelope("connector.hello", 2, {
+          connector_id: owner.connectorId,
+          last_server_sequence: 1,
+        }),
+      );
+      expect((await store.acceptClientMessage(owner, hello)).response).toEqual(
+        accepted.response,
+      );
+      const saved = await database.query(
+        "SELECT capabilities FROM connectors WHERE id = $1",
+        [owner.connectorId],
+      );
+      expect(saved.rows[0]?.capabilities).toEqual([]);
+    },
+  );
+
+  it("observes a locked read-only running row with immutable state then separate ACK", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    await store.acceptClientMessage(
+      owner,
+      envelope("connector.hello", 1, {
+        connector_id: owner.connectorId,
+        last_server_sequence: 0,
+        capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+      }),
+    );
+    const lease = crypto.randomUUID();
+    const job = await insertConnectedJob(
+      owner.connectorId,
+      "dispatched",
+      new Date(Date.now() + 600_000),
+      0,
+      lease,
+      new Date(Date.now() + 30_000),
+    );
+    await database.query("UPDATE jobs SET mode = 'read_only' WHERE id = $1", [
+      job.jobId,
+    ]);
+    await store.acceptClientMessage(
+      owner,
+      envelope("job.claim", 2, {
+        job_id: job.jobId,
+        attempt: 1,
+        lease_id: lease,
+      }),
+    );
+    const before = await database.query(
+      "SELECT to_jsonb(jobs) AS job FROM jobs WHERE id = $1",
+      [job.jobId],
+    );
+    const events = await database.query(
+      "SELECT * FROM job_events WHERE job_id = $1 ORDER BY sequence",
+      [job.jobId],
+    );
+    const sync = envelope("job.sync", 3, {
+      job_id: job.jobId,
+      attempt: 9,
+      nonce: crypto.randomUUID(),
+    });
+    const started = Date.now();
+    const accepted = await store.acceptClientMessage(
+      owner,
+      sync,
+      new Date("2099-01-01T00:00:00Z"),
+    );
+    expect(accepted.replay).toHaveLength(1);
+    const state = accepted.replay[0];
+    expect(state).toMatchObject({
+      type: "job.state",
+      correlationId: sync.correlation_id,
+      payload: {
+        job_id: job.jobId,
+        mode: "read_only",
+        requested_attempt: 9,
+        current_attempt: 1,
+        status: "running",
+        job_revision: 1,
+        cancel_revision: null,
+        lease_id: lease,
+        request_message_id: sync.message_id,
+        request_sequence: 3,
+        nonce: sync.payload.nonce,
+      },
+    });
+    expect(accepted.response).toMatchObject({
+      type: "ack",
+      sequence: (state?.sequence ?? -10) + 1,
+      payload: { sequence: 3 },
+    });
+    const observed = Date.parse(String(state?.payload.observed_at));
+    expect(observed).toBeGreaterThanOrEqual(started - 1000);
+    expect(observed).toBeLessThanOrEqual(Date.now() + 1000);
+    expect(
+      Date.parse(String(state?.payload.state_valid_until)) - observed,
+    ).toBe(2000);
+    expect(
+      await database.query(
+        "SELECT to_jsonb(jobs) AS job FROM jobs WHERE id = $1",
+        [job.jobId],
+      ),
+    ).toEqual(before);
+    expect(
+      await database.query(
+        "SELECT * FROM job_events WHERE job_id = $1 ORDER BY sequence",
+        [job.jobId],
+      ),
+    ).toEqual(events);
+    await database.query(
+      "UPDATE jobs SET revision = 8, connector_id = NULL WHERE id = $1",
+      [job.jobId],
+    );
+    await database.query(
+      "UPDATE connectors SET capabilities = '[]' WHERE id = $1",
+      [owner.connectorId],
+    );
+    expect(await store.acceptClientMessage(owner, sync)).toEqual({
+      ...accepted,
+      duplicate: true,
+    });
+    await database.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+  });
+
+  it("hard denies a nonnegotiated sync without consuming its sequence", async () => {
+    const owner = await insertConnector();
+    const store = new PostgresConnectorStore(database.client);
+    const before = await database.query(
+      "SELECT * FROM connectors WHERE id = $1",
+      [owner.connectorId],
+    );
+    await expect(
+      store.acceptClientMessage(
+        owner,
+        envelope("job.sync", 1, {
+          job_id: crypto.randomUUID(),
+          attempt: 1,
+          nonce: crypto.randomUUID(),
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "AUTHORIZATION_FAILED" });
+    expect(
+      await database.query("SELECT * FROM connectors WHERE id = $1", [
+        owner.connectorId,
+      ]),
+    ).toEqual(before);
+    expect(
+      (
+        await database.query(
+          "SELECT * FROM connector_messages WHERE connector_id = $1",
+          [owner.connectorId],
+        )
+      ).rows,
+    ).toEqual([]);
+  });
+
   it("cannot manufacture original-offer proof through a client-authored dispatch audit lookalike", async () => {
     const owner = await insertConnector();
     const replacement = await insertConnector();

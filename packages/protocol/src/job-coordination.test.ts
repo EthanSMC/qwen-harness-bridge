@@ -291,7 +291,7 @@ describe("job coordination payload validation", () => {
   );
 });
 
-describe("payload exports do not activate legacy traffic", () => {
+describe("negotiated coordination envelopes", () => {
   const envelope = {
     protocol_version: "1.0",
     message_id: job,
@@ -300,22 +300,45 @@ describe("payload exports do not activate legacy traffic", () => {
     expires_at: "2026-09-05T12:01:00Z",
     correlation_id: nonce,
   };
-  it("all legacy envelope unions reject job.sync and job.state", () => {
-    for (const schema of [
-      ConnectorClientMessageSchema,
-      ConnectorServerMessageSchema,
-      ConnectorEnvelopeSchema,
-      EnvelopeSchema,
-    ]) {
+  it("accepts sync only clientward and state only serverward", () => {
+    for (const schema of [ConnectorEnvelopeSchema, EnvelopeSchema]) {
       expect(
         schema.safeParse({ ...envelope, type: "job.sync", payload: sync })
           .success,
-      ).toBe(false);
+      ).toBe(true);
       expect(
         schema.safeParse({ ...envelope, type: "job.state", payload: state })
           .success,
-      ).toBe(false);
+      ).toBe(true);
     }
+    expect(
+      ConnectorClientMessageSchema.safeParse({
+        ...envelope,
+        type: "job.sync",
+        payload: sync,
+      }).success,
+    ).toBe(true);
+    expect(
+      ConnectorServerMessageSchema.safeParse({
+        ...envelope,
+        type: "job.state",
+        payload: state,
+      }).success,
+    ).toBe(true);
+    expect(
+      ConnectorServerMessageSchema.safeParse({
+        ...envelope,
+        type: "job.sync",
+        payload: sync,
+      }).success,
+    ).toBe(false);
+    expect(
+      ConnectorClientMessageSchema.safeParse({
+        ...envelope,
+        type: "job.state",
+        payload: state,
+      }).success,
+    ).toBe(false);
   });
   it("preserves legacy attempt bounds and optional capability behavior", () => {
     expect(
@@ -344,4 +367,23 @@ describe("payload exports do not activate legacy traffic", () => {
       }).success,
     ).toBe(true);
   });
+  it.each([
+    ["job.sync", sync, ConnectorClientMessageSchema],
+    ["job.state", state, ConnectorServerMessageSchema],
+  ] as const)(
+    "checks outer identity, expiry and strict shape for %s",
+    (type, payload, schema) => {
+      const valid = { ...envelope, type, payload };
+      for (const invalid of [
+        { ...valid, message_id: "invalid" },
+        { ...valid, correlation_id: "invalid" },
+        { ...valid, sequence: 0 },
+        { ...valid, protocol_version: "2.0" },
+        { ...valid, expires_at: envelope.sent_at },
+        { ...valid, expires_at: "2026-09-05T11:59:59Z" },
+        { ...valid, payload: { ...payload, request: "unapproved field" } },
+      ])
+        expect(schema.safeParse(invalid).success).toBe(false);
+    },
+  );
 });

@@ -567,6 +567,198 @@ afterAll(async () => {
 });
 
 describe("Connector gateway authentication and handshake", () => {
+  it("orders negotiated stale-business then immutable state and ordinary ACK over actual TLS and reconnect", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const repositoryId = `coordination-${crypto.randomUUID()}`;
+    await db.query(
+      "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, allowed_action_classes) VALUES ($1, $2, 'Coordination', '/private/redacted', '[]')",
+      [repositoryId, OWNER_ID],
+    );
+    const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(67));
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      repositoryId,
+      clientRequestId: crypto.randomUUID(),
+      requestCiphertext: cipher.encrypt("Coordination fixture"),
+      requestDigest: "fixture",
+    });
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1, revision = 7, mode = 'read_only' WHERE id = $2",
+      [credentials.connector_id, job.jobId],
+    );
+    const sockets: WebSocket[] = [];
+    const openPeer = async () => {
+      const session = await FakeConnector.exchangeSession(app, credentials);
+      const address = app.server.address() as AddressInfo;
+      const socket = new WebSocket(
+        `wss://127.0.0.1:${address.port}/connector/v1`,
+        {
+          headers: { authorization: `Bearer ${session.token}` },
+          ca: LOCALHOST_TLS.cert,
+        },
+      );
+      sockets.push(socket);
+      const received: ReturnType<typeof ConnectorServerMessageSchema.parse>[] =
+        [];
+      socket.on("message", (data) =>
+        received.push(
+          ConnectorServerMessageSchema.parse(JSON.parse(String(data))),
+        ),
+      );
+      await new Promise<void>((resolve, reject) => {
+        socket.once("open", resolve);
+        socket.once("error", reject);
+      });
+      return {
+        socket,
+        received,
+        async count(n: number) {
+          await vi.waitFor(
+            () => expect(received.length).toBeGreaterThanOrEqual(n),
+            { timeout: 2000, interval: 10 },
+          );
+        },
+      };
+    };
+    try {
+      const peer = await openPeer();
+      const hello = buildConnectorHello({
+        connectorId: credentials.connector_id,
+        sequence: 1,
+        lastServerSequence: 0,
+        correlationId: crypto.randomUUID(),
+        now: new Date(),
+        capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+      });
+      peer.socket.send(JSON.stringify(hello));
+      await peer.count(1);
+      expect(peer.received[0]).toMatchObject({
+        type: "connector.welcome",
+        payload: {
+          capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+        },
+      });
+      const stale = ConnectorClientMessageSchema.parse({
+        ...hello,
+        message_id: crypto.randomUUID(),
+        correlation_id: crypto.randomUUID(),
+        sequence: 2,
+        type: "approval.requested",
+        payload: {
+          job_id: job.jobId,
+          attempt: 1,
+          job_revision: 1,
+          approval_id: crypto.randomUUID(),
+          action_summary: "Run checks",
+          impact_summary: "Checks only",
+          risk_class: "low",
+          action_fingerprint: `sha256:${"a".repeat(64)}`,
+          expires_at: new Date(Date.now() + 30_000).toISOString(),
+        },
+      });
+      peer.socket.send(JSON.stringify(stale));
+      await peer.count(3);
+      expect(peer.received[1]).toMatchObject({
+        type: "protocol.error",
+        payload: {
+          code: "EVENT_REJECTED",
+          message: "The job authority has changed.",
+        },
+      });
+      expect(peer.received[2]).toMatchObject({
+        type: "ack",
+        payload: { sequence: 2 },
+      });
+      const sync = ConnectorClientMessageSchema.parse({
+        ...hello,
+        message_id: crypto.randomUUID(),
+        correlation_id: crypto.randomUUID(),
+        sequence: 3,
+        type: "job.sync",
+        payload: { job_id: job.jobId, attempt: 1, nonce: crypto.randomUUID() },
+      });
+      peer.socket.send(JSON.stringify(sync));
+      await peer.count(5);
+      expect(peer.received.map((message) => message.sequence)).toEqual([
+        1, 2, 3, 4, 5,
+      ]);
+      expect(peer.received[3]).toMatchObject({
+        type: "job.state",
+        payload: {
+          mode: "read_only",
+          job_revision: 7,
+          request_message_id: sync.message_id,
+        },
+      });
+      expect(peer.received[4]).toMatchObject({
+        type: "ack",
+        payload: { sequence: 3 },
+      });
+      peer.socket.terminate();
+      await db.query(
+        "UPDATE jobs SET revision = 8, mode = 'normal', connector_id = NULL WHERE id = $1",
+        [job.jobId],
+      );
+      const reconnect = await openPeer();
+      reconnect.socket.send(
+        JSON.stringify(
+          buildConnectorHello({
+            connectorId: credentials.connector_id,
+            sequence: 4,
+            lastClientSequence: 3,
+            lastServerSequence: 5,
+            correlationId: crypto.randomUUID(),
+            now: new Date(),
+            capabilities: ["durable-receipts-v1"],
+          }),
+        ),
+      );
+      await reconnect.count(1);
+      expect(reconnect.received[0]).toMatchObject({
+        sequence: 6,
+        type: "connector.welcome",
+        payload: { capabilities: ["durable-receipts-v1"] },
+      });
+      reconnect.socket.send(JSON.stringify(sync));
+      await reconnect.count(3);
+      expect(reconnect.received.slice(1)).toEqual(peer.received.slice(3));
+    } finally {
+      for (const socket of sockets) socket.terminate();
+      await app.close();
+      await db.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    }
+  });
+
+  it("refuses legacy sync over actual TLS without an ordinary receipt or sequence consumption", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp();
+    const peer = await FakeConnector.connect(app, credentials);
+    try {
+      await peer.send("job.sync", {
+        job_id: crypto.randomUUID(),
+        attempt: 1,
+        nonce: crypto.randomUUID(),
+      });
+      expect(await peer.next("protocol.error")).toMatchObject({
+        payload: { code: "AUTHORIZATION_FAILED" },
+      });
+      expect(
+        peer.wireReceived.some(
+          (message) => message.type === "job.state" || message.type === "ack",
+        ),
+      ).toBe(false);
+      const cursor = await db.query(
+        "SELECT last_client_sequence FROM connectors WHERE id = $1",
+        [credentials.connector_id],
+      );
+      expect(Number(cursor.rows[0]?.last_client_sequence)).toBe(1);
+    } finally {
+      await peer.disconnectWithoutAck();
+      await app.close();
+    }
+  });
+
   it("receipts unseen original claims after normal gateway redispatch to the same or another connector", async () => {
     const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(67));
     const app = await startApp(5_000, cipher);

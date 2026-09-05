@@ -733,6 +733,8 @@ const ConnectorHeartbeatMessageSchema = envelope(
   ConnectorHeartbeatPayloadSchema,
 );
 const JobClaimMessageSchema = envelope("job.claim", JobClaimPayloadSchema);
+const JobSyncMessageSchema = envelope("job.sync", JobSyncPayloadSchema);
+const JobStateMessageSchema = envelope("job.state", JobStatePayloadSchema);
 const JobEventMessageSchema = envelope("job.event", JobEventPayloadSchema);
 const ApprovalRequestedMessageSchema = envelope(
   "approval.requested",
@@ -766,6 +768,7 @@ export const ConnectorClientMessageSchema = enforceEnvelopeConstraints(
     ConnectorHelloMessageSchema,
     ConnectorHeartbeatMessageSchema,
     JobClaimMessageSchema,
+    JobSyncMessageSchema,
     JobEventMessageSchema,
     ApprovalRequestedMessageSchema,
     JobCancelledMessageSchema,
@@ -776,6 +779,7 @@ export const ConnectorClientMessageSchema = enforceEnvelopeConstraints(
 export const ConnectorServerMessageSchema = enforceEnvelopeConstraints(
   z.discriminatedUnion("type", [
     ConnectorWelcomeMessageSchema,
+    JobStateMessageSchema,
     JobOfferMessageSchema,
     JobCancelMessageSchema,
     ApprovalDecisionMessageSchema,
@@ -789,10 +793,12 @@ export const EnvelopeSchema = enforceEnvelopeConstraints(
     ConnectorHelloMessageSchema,
     ConnectorHeartbeatMessageSchema,
     JobClaimMessageSchema,
+    JobSyncMessageSchema,
     JobEventMessageSchema,
     ApprovalRequestedMessageSchema,
     JobCancelledMessageSchema,
     ConnectorWelcomeMessageSchema,
+    JobStateMessageSchema,
     JobOfferMessageSchema,
     JobCancelMessageSchema,
     ApprovalDecisionMessageSchema,
