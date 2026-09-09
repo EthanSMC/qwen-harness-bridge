@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   admitCoordinationTiming,
   approvalCoordinationDeadlines,
+  cancellationCoordinationDeadline,
   coordinationWaiterRemainingMs,
   isCoordinationTimingCurrent,
 } from "./coordination-deadlines.js";
@@ -31,6 +32,65 @@ const received = { wallTimeMs: 100, monotonicTimeMs: 10100 };
 const initial = { snapshot: true, lease: true };
 const started = { snapshot: true, lease: false };
 const ongoing = { snapshot: false, lease: false };
+
+describe("original cancellation command deadlines", () => {
+  // m0=10000, observed=0: endpoint = 9000 + command milliseconds.
+  it.each([
+    ["1970-01-01T00:00:05Z", 14000],
+    ["1970-01-01T01:00:05+01:00", 14000],
+    ["1970-01-01T02:00:00Z", 3609000],
+    ["1970-01-01T00:00:05.123456Z", 14123],
+    ["1970-01-01T00:00:01.100Z", undefined],
+    ["1970-01-01T00:00:01Z", undefined],
+    ["1970-02-30T00:00:05Z", undefined],
+    ["not a date", undefined],
+  ])("converts %s without refunding original elapsed time", (expiry, want) => {
+    expect(cancellationCoordinationDeadline(admit(), expiry)).toBe(want);
+  });
+  it("increases decimal precision before flooring rather than truncating a negative delta", () => {
+    const expiry = `1970-01-01T00:00:04.${"9".repeat(1100)}Z`;
+    expect(cancellationCoordinationDeadline(admit(), expiry)).toBe(13999);
+  });
+  it("retains exact binary64 send fractions", () => {
+    const timing = admitCoordinationTiming(
+      state,
+      { wallTimeMs: 0, monotonicTimeMs: 10000.25 },
+      { wallTimeMs: 100, monotonicTimeMs: 10100.25 },
+    );
+    expect(timing).toBeDefined();
+    if (!timing) throw new Error();
+    // 10000.25 + 5000.749999 - 1000 = 14000.999999, floored.
+    expect(
+      cancellationCoordinationDeadline(
+        timing,
+        "1970-01-01T00:00:05.000749999Z",
+      ),
+    ).toBe(14000);
+  });
+  it("safely rejects invalid timing and nonstring expiry", () => {
+    expect(
+      cancellationCoordinationDeadline(null as never, "1970-01-01T00:00:05Z"),
+    ).toBeUndefined();
+    expect(
+      cancellationCoordinationDeadline(admit(), null as never),
+    ).toBeUndefined();
+  });
+  it.each(["wall", "elapsed", "endpoint"])(
+    "rejects invalid %s timing rather than deriving a command grant",
+    (field) => {
+      const timing = admit();
+      const malformed =
+        field === "wall"
+          ? { ...timing, received: { ...timing.received, wallTimeMs: NaN } }
+          : field === "elapsed"
+            ? { ...timing, sent: { ...timing.sent, monotonicTimeMs: 20000 } }
+            : { ...timing, jobDeadlineMonotonicMs: Infinity };
+      expect(
+        cancellationCoordinationDeadline(malformed, "1970-01-01T00:00:05Z"),
+      ).toBeUndefined();
+    },
+  );
+});
 function admit(patch: Partial<JobStatePayload> = {}) {
   const timing = admitCoordinationTiming(
     { ...state, ...patch },

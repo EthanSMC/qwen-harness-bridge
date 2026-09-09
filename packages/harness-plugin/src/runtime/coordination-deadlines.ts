@@ -10,6 +10,50 @@ export type CoordinationClockSample = Readonly<{
 }>;
 
 const exact = Symbol("coordination timing arithmetic");
+/** Clamp an original cancellation command to the original conservative job
+ * endpoint, preserving both exact timestamp fractions and binary64 clocks.
+ * This is arithmetic only; it neither issues nor refreshes authority.
+ */
+export function cancellationCoordinationDeadline(
+  timing: CoordinationTiming,
+  commandExpiresAt: string,
+): number | undefined {
+  try {
+    const key = rfc3339InstantKey(commandExpiresAt);
+    if (key === null) return undefined;
+    const original = timing[exact];
+    const sent = captureClock(timing.sent);
+    const received = captureClock(timing.received);
+    if (
+      !finite(sent) ||
+      !finite(received) ||
+      coordinationWaiterRemainingMs(sent, received) === undefined ||
+      typeof original.scale !== "bigint" ||
+      original.scale <= 0n ||
+      !Number.isSafeInteger(timing.jobDeadlineMonotonicMs) ||
+      !Number.isSafeInteger(timing.snapshotDeadlineMonotonicMs) ||
+      timing.snapshotDeadlineMonotonicMs <= received.monotonicTimeMs ||
+      floorDeadline(original.jobEndpoint, original.scale) !==
+        timing.jobDeadlineMonotonicMs
+    )
+      return undefined;
+    const digits = Math.max(
+      original.scale.toString().length - 1,
+      key.length - key.indexOf(".") - 1,
+    );
+    const scale = 10n ** BigInt(digits);
+    const multiplier = scale / original.scale;
+    const job = original.jobEndpoint * multiplier;
+    const command =
+      job + instantUnits(key, digits) - original.remoteJobExpiry * multiplier;
+    const deadline = floorDeadline(min(job, command), scale);
+    return deadline !== undefined && deadline > received.monotonicTimeMs
+      ? deadline
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
 export type CoordinationTiming = Readonly<{
   sent: CoordinationClockSample;
   received: CoordinationClockSample;
