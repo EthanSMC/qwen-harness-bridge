@@ -8,7 +8,7 @@ import {
   type JobCancelMessage,
 } from "./cancel-handler.js";
 
-function fixture() {
+function fixture(beforeCancel?: (owner: CancellationOwner) => undefined) {
   const command: JobCancelMessage = {
     protocol_version: "1.0",
     message_id: randomUUID(),
@@ -57,8 +57,9 @@ function fixture() {
       return true;
     },
   };
-  const resolveOwner = vi.fn(() => owner);
-  const handler = new CancelHandler({ resolveOwner });
+  const resolveOwner = vi.fn((_command: JobCancelMessage) => owner);
+  const options = { resolveOwner, beforeCancel };
+  const handler = new CancelHandler(options);
   return {
     command,
     handler,
@@ -81,6 +82,207 @@ function fixture() {
   };
 }
 describe("cancellation with a typed Agent boundary and shared terminal sink", () => {
+  it("keeps the original command identity when the hook mutates the resolved command and owner", async () => {
+    let resolved!: JobCancelMessage;
+    const f = fixture(() => {
+      resolved.payload.job_revision++;
+      Object.assign(f.owner, { revision: resolved.payload.job_revision });
+      return undefined;
+    });
+    f.resolveOwner.mockImplementation((command) => {
+      resolved = command;
+      return f.owner;
+    });
+    f.idle();
+    expect(await f.handler.handle(f.command)).toBe("ignored");
+    expect(f.cancel).not.toHaveBeenCalled();
+    expect(f.approval.signal.aborted).toBe(false);
+    expect(f.events).toEqual([]);
+  });
+  it("rejects a returned reentrant task without a dependency cycle", async () => {
+    let nested: Promise<string> | undefined;
+    const hook = () => {
+      nested = f.handler.handle(f.command);
+      return nested;
+    };
+    const f = fixture(
+      hook as unknown as (owner: CancellationOwner) => undefined,
+    );
+    expect(await f.handler.handle(f.command)).toBe("unavailable");
+    expect(await nested).toBe("unavailable");
+    expect(f.cancel).not.toHaveBeenCalled();
+    expect(f.approval.signal.aborted).toBe(false);
+    expect(f.events).toEqual([]);
+  });
+  it("runs the fence once before effects and joins synchronous reentry through drain", async () => {
+    const order: string[] = [];
+    let nested: Promise<string> | undefined;
+    const hook = vi.fn(() => {
+      order.push("fence");
+      nested = f.handler.handle(f.command);
+      return undefined;
+    });
+    const f = fixture(hook);
+    f.cancel.mockImplementation(() => {
+      order.push("cancel");
+    });
+    f.approval.signal.addEventListener("abort", () => {
+      order.push("abort");
+    });
+    let drain!: () => void;
+    f.owner.drainTerminals = () =>
+      new Promise<void>((resolve) => {
+        drain = resolve;
+      });
+    const pending = f.handler.handle(f.command);
+    expect(order).toEqual(["fence", "cancel", "abort"]);
+    expect(hook).toHaveBeenCalledExactlyOnceWith(f.owner);
+    expect(f.events).toEqual([]);
+    f.idle();
+    await Promise.resolve();
+    expect(f.events).toEqual([]);
+    drain();
+    expect(await pending).toBe("cancelled");
+    expect(await nested).toBe("cancelled");
+    expect(f.cancel).toHaveBeenCalledTimes(1);
+    expect(f.events).toEqual(["job.cancelled"]);
+  });
+  it.each([
+    "revoked",
+    "expired",
+    "job",
+    "attempt",
+    "revision",
+    "agent",
+    "idle",
+    "success",
+    "failure",
+  ])("rechecks %s after the fence without arming an effect", async (cause) => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+    const replacementCancel = vi.fn();
+    const f = fixture(() => {
+      if (cause === "revoked") f.stale();
+      if (cause === "expired") clock.mockReturnValue(now + 61_000);
+      if (cause === "job") Object.assign(f.owner, { jobId: randomUUID() });
+      if (cause === "attempt") Object.assign(f.owner, { attempt: 2 });
+      if (cause === "revision") Object.assign(f.owner, { revision: 9 });
+      if (cause === "agent")
+        Object.assign(f.owner, {
+          agent: { ...f.agent, cancel: replacementCancel },
+        });
+      if (cause === "idle") Object.assign(f.agent, { status: "idle" });
+      if (cause === "success") f.complete("job.succeeded");
+      if (cause === "failure") f.complete("job.failed");
+      return undefined;
+    });
+    try {
+      f.idle();
+      const terminal = cause === "success" || cause === "failure";
+      expect(await f.handler.handle(f.command)).toBe(
+        terminal ? "terminal" : "ignored",
+      );
+      Object.assign(f.agent, { status: "running" });
+      await Promise.resolve();
+      expect(f.cancel).not.toHaveBeenCalled();
+      expect(replacementCancel).not.toHaveBeenCalled();
+      expect(f.approval.signal.aborted).toBe(false);
+      expect(f.events).toEqual(
+        terminal ? [cause === "success" ? "job.succeeded" : "job.failed"] : [],
+      );
+    } finally {
+      clock.mockRestore();
+    }
+  });
+  it.each([
+    "throw",
+    "data",
+    "resolved",
+    "rejected",
+    "pending",
+    "current throws",
+    "terminal throws",
+    "status throws",
+  ])(
+    "sanitizes %s fence failure without effects or late permission",
+    async (cause) => {
+      let complete!: () => void;
+      const hook = () => {
+        if (cause === "throw") throw new Error("private dependency payload");
+        if (cause === "data") return false;
+        if (cause === "resolved") return Promise.resolve();
+        if (cause === "rejected")
+          return Promise.reject(new Error("private dependency payload"));
+        if (cause === "pending")
+          return new Promise<void>((resolve) => {
+            complete = resolve;
+          });
+        if (cause === "current throws")
+          f.owner.isCurrent = () => {
+            throw new Error("private dependency payload");
+          };
+        if (cause === "terminal throws")
+          f.owner.hasTerminal = () => {
+            throw new Error("private dependency payload");
+          };
+        if (cause === "status throws")
+          Object.defineProperty(f.agent, "status", {
+            get() {
+              throw new Error("private dependency payload");
+            },
+          });
+        return undefined;
+      };
+      // Deliberately violate the trusted synchronous contract at runtime.
+      const f = fixture(hook as (owner: CancellationOwner) => undefined);
+      f.idle();
+      expect(await f.handler.handle(f.command)).toBe("unavailable");
+      complete?.();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(f.cancel).not.toHaveBeenCalled();
+      expect(f.approval.signal.aborted).toBe(false);
+      expect(f.events).toEqual([]);
+    },
+  );
+  it("retries a failed fence, then skips it on issued cancellation persistence retry", async () => {
+    const hook = vi
+      .fn((): undefined => undefined)
+      .mockImplementationOnce(() => {
+        throw new Error("private hook payload");
+      });
+    const f = fixture(hook);
+    const commit = vi.fn(f.owner.commitCancelled).mockImplementationOnce(() => {
+      throw new Error("private storage payload");
+    });
+    const abort = vi.spyOn(f.approval, "abort");
+    f.owner.commitCancelled = commit;
+    f.idle();
+    expect(await f.handler.handle(f.command)).toBe("unavailable");
+    expect(f.cancel).not.toHaveBeenCalled();
+    expect(f.approval.signal.aborted).toBe(false);
+    expect(await f.handler.handle(f.command)).toBe("unavailable");
+    Object.assign(f.agent, { status: "idle" });
+    expect(await f.handler.handle(f.command)).toBe("cancelled");
+    expect(hook).toHaveBeenCalledTimes(2);
+    expect(f.cancel).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenCalledTimes(2);
+    expect(f.events).toEqual(["job.cancelled"]);
+  });
+  it("does not retry a failed fence after revocation", async () => {
+    const hook = vi.fn((): undefined => {
+      f.stale();
+      throw new Error("private payload");
+    });
+    const f = fixture(hook);
+    f.idle();
+    expect(await f.handler.handle(f.command)).toBe("unavailable");
+    expect(await f.handler.handle(f.command)).toBe("ignored");
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect(f.cancel).not.toHaveBeenCalled();
+    expect(f.approval.signal.aborted).toBe(false);
+    expect(f.events).toEqual([]);
+  });
   it("does not persist an expired command after drain, but accepts a fresh retry", async () => {
     const f = fixture();
     const now = Date.now();

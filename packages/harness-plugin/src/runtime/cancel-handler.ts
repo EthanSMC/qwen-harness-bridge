@@ -39,6 +39,8 @@ export type CancellationOwner = {
 };
 export type CancelHandlerOptions = Readonly<{
   resolveOwner(command: JobCancelMessage): CancellationOwner | undefined;
+  /** Trusted synchronous coordinator fence; asynchronous preparation is invalid. */
+  beforeCancel?(owner: CancellationOwner): undefined;
 }>;
 
 export class CancelHandler {
@@ -60,14 +62,20 @@ export class CancelHandler {
     )
       return "ignored";
     try {
+      const {
+        job_id: jobId,
+        attempt,
+        job_revision: revision,
+      } = parsed.data.payload;
+      const expiresAt = Date.parse(parsed.data.expires_at);
       const owner = this.#options.resolveOwner(parsed.data);
       if (
         !owner ||
-        owner.jobId !== parsed.data.payload.job_id ||
-        owner.attempt !== parsed.data.payload.attempt ||
-        owner.revision !== parsed.data.payload.job_revision ||
+        owner.jobId !== jobId ||
+        owner.attempt !== attempt ||
+        owner.revision !== revision ||
         !owner.isCurrent() ||
-        Date.parse(parsed.data.expires_at) <= Date.now()
+        expiresAt <= Date.now()
       )
         return "ignored";
       const existing = this.#tasks.get(owner);
@@ -75,7 +83,8 @@ export class CancelHandler {
       if (owner.hasTerminal()) return "terminal";
       if (this.#uncertain.has(owner)) return "unavailable";
       const retry = this.#issued.has(owner);
-      if (owner.agent.status !== (retry ? "idle" : "running")) return "ignored";
+      const agent = owner.agent;
+      if (agent.status !== (retry ? "idle" : "running")) return "ignored";
       // Install the single-flight task before invoking any reentrant Agent or
       // abort listener. Only the first command can invoke cancel for this owner.
       let resolve!: (outcome: CancelOutcome) => void;
@@ -87,10 +96,11 @@ export class CancelHandler {
         this.#tasks.delete(owner);
         resolve(outcome);
       };
-      void this.#cancel(owner, retry, Date.parse(parsed.data.expires_at)).then(
-        finish,
-        () => finish("unavailable"),
-      );
+      void this.#cancel(owner, agent, retry, expiresAt, {
+        jobId,
+        attempt,
+        revision,
+      }).then(finish, () => finish("unavailable"));
       return task;
     } catch {
       return "unavailable";
@@ -99,22 +109,42 @@ export class CancelHandler {
 
   async #cancel(
     owner: CancellationOwner,
+    agent: Agent,
     retry: boolean,
     expiresAt: number,
+    identity: Pick<CancellationOwner, "jobId" | "attempt" | "revision">,
   ): Promise<CancelOutcome> {
     if (!retry) {
+      const result: unknown = this.#options.beforeCancel?.(owner);
+      if (result !== undefined) {
+        // Reject asynchronous hooks immediately. Observe native rejection only;
+        // settlement cannot resume cancellation or create a dependency cycle.
+        if (result instanceof Promise) void result.catch(() => {});
+        return "unavailable";
+      }
+      if (
+        owner.jobId !== identity.jobId ||
+        owner.attempt !== identity.attempt ||
+        owner.revision !== identity.revision ||
+        owner.agent !== agent ||
+        !owner.isCurrent() ||
+        Date.now() >= expiresAt
+      )
+        return "ignored";
+      if (owner.hasTerminal()) return "terminal";
+      if (agent.status !== "running") return "ignored";
       // A throwing cancel may already have issued an effect. Never repeat it or
       // infer successful cancellation from later idle alone.
       this.#uncertain.add(owner);
       try {
-        owner.agent.cancel({ kind: "user" });
+        agent.cancel({ kind: "user" });
         this.#issued.add(owner);
         this.#uncertain.delete(owner);
       } finally {
         owner.approval?.abort();
       }
     }
-    await owner.agent.whenIdle();
+    await agent.whenIdle();
     await owner.drainTerminals();
     if (!owner.isCurrent() || Date.now() >= expiresAt) return "ignored";
     return (await owner.commitCancelled()) ? "cancelled" : "terminal";
