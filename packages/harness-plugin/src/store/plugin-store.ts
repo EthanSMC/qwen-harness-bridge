@@ -361,11 +361,27 @@ export class SqlitePluginStore implements OwnedIntentPluginStore {
   }
 
   private readOwnedIntents(): OwnedIntent[] {
+    // TEXT affinity still permits BLOBs. Check storage classes before any
+    // namespace predicate can hide a malformed key or coerce a value.
+    if (
+      this.database
+        .prepare(
+          "SELECT 1 FROM metadata WHERE typeof(key) <> 'text' OR typeof(value) <> 'text' LIMIT 1",
+        )
+        .get() !== undefined
+    )
+      throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
     const rows = this.database
       .prepare(
         "SELECT key, value FROM metadata WHERE key GLOB 'owned-intent-*' OR key GLOB 'owned-active-*' OR key GLOB 'owned-generation-*' ORDER BY key",
       )
       .all() as { key: string; value: string }[];
+    if (
+      !z
+        .array(z.object({ key: z.string(), value: z.string() }).strict())
+        .safeParse(rows).success
+    )
+      throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
     const metadata = new Map(rows.map((row) => [row.key, row.value]));
     const records: OwnedIntent[] = [];
     const consumed = new Set<string>();
@@ -1013,10 +1029,21 @@ export class SqlitePluginStore implements OwnedIntentPluginStore {
     status: string;
   }): void {
     this.assertOpen();
-    assertNonEmpty(input.jobId, "STORE_JOB_ID_REQUIRED");
-    assertPositiveInteger(input.attempt, "STORE_ATTEMPT_INVALID");
-    assertNonEmpty(input.sessionId, "STORE_SESSION_ID_REQUIRED");
-    assertNonEmpty(input.status, "STORE_STATUS_REQUIRED");
+    let captured: LocalJobMapping;
+    try {
+      captured = {
+        jobId: input.jobId,
+        attempt: input.attempt,
+        sessionId: input.sessionId,
+        status: input.status,
+      };
+    } catch {
+      throw new StoreError("STORE_MAPPING_INPUT_INVALID");
+    }
+    assertNonEmpty(captured.jobId, "STORE_JOB_ID_REQUIRED");
+    assertPositiveInteger(captured.attempt, "STORE_ATTEMPT_INVALID");
+    assertNonEmpty(captured.sessionId, "STORE_SESSION_ID_REQUIRED");
+    assertNonEmpty(captured.status, "STORE_STATUS_REQUIRED");
 
     const write = this.database.transaction(() => {
       // Legacy mappings cannot mutate or replace journal ownership. Validate
@@ -1031,8 +1058,8 @@ export class SqlitePluginStore implements OwnedIntentPluginStore {
       if (
         owned.some(
           (record) =>
-            record.owner.jobId === input.jobId.toLowerCase() ||
-            record.owner.sessionId === input.sessionId.toLowerCase(),
+            record.owner.jobId === captured.jobId.toLowerCase() ||
+            record.owner.sessionId === captured.sessionId.toLowerCase(),
         )
       )
         throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
@@ -1041,19 +1068,19 @@ export class SqlitePluginStore implements OwnedIntentPluginStore {
           `SELECT job_id, attempt, session_id, status
            FROM job_mappings WHERE job_id = ? AND attempt = ?`,
         )
-        .get(input.jobId, input.attempt) as JobRow | undefined;
+        .get(captured.jobId, captured.attempt) as JobRow | undefined;
       const bySession = this.database
         .prepare(
           `SELECT job_id, attempt, session_id, status
            FROM job_mappings WHERE session_id = ?`,
         )
-        .get(input.sessionId) as JobRow | undefined;
+        .get(captured.sessionId) as JobRow | undefined;
 
       if (
-        (byJob !== undefined && byJob.session_id !== input.sessionId) ||
+        (byJob !== undefined && byJob.session_id !== captured.sessionId) ||
         (bySession !== undefined &&
-          (bySession.job_id !== input.jobId ||
-            bySession.attempt !== input.attempt))
+          (bySession.job_id !== captured.jobId ||
+            bySession.attempt !== captured.attempt))
       ) {
         throw new StoreError("STORE_MAPPING_CONFLICT");
       }
@@ -1064,7 +1091,7 @@ export class SqlitePluginStore implements OwnedIntentPluginStore {
             `UPDATE job_mappings SET status = ?, updated_at = ?
              WHERE job_id = ? AND attempt = ?`,
           )
-          .run(input.status, now(), input.jobId, input.attempt);
+          .run(captured.status, now(), captured.jobId, captured.attempt);
         return;
       }
 
@@ -1074,7 +1101,13 @@ export class SqlitePluginStore implements OwnedIntentPluginStore {
             (job_id, attempt, session_id, status, updated_at)
            VALUES (?, ?, ?, ?, ?)`,
         )
-        .run(input.jobId, input.attempt, input.sessionId, input.status, now());
+        .run(
+          captured.jobId,
+          captured.attempt,
+          captured.sessionId,
+          captured.status,
+          now(),
+        );
     });
     write();
   }

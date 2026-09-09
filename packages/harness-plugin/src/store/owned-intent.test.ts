@@ -952,6 +952,221 @@ describe("durable initial-attempt journal", () => {
     },
   );
 
+  it.each([false, true])(
+    "I1 captures benign-then-owned getters once (existing=%s)",
+    (existing) => {
+      const { store, raw } = setup();
+      receipt(store);
+      const intent = store.prepareOwnedIntent(input());
+      const benign = {
+        jobId: id(2),
+        attempt: 1,
+        sessionId: id(42),
+        status: "failed",
+      };
+      if (existing) store.mapJob({ ...benign, status: "running" });
+      const protectedBefore = raw
+        .prepare("SELECT * FROM job_mappings WHERE job_id = ?")
+        .get(id(1));
+      const before = snapshot(raw);
+      const reads = { jobId: 0, attempt: 0, sessionId: 0, status: 0 };
+      store.mapJob({
+        get jobId() {
+          return ++reads.jobId <= 2 ? benign.jobId : id(1);
+        },
+        get sessionId() {
+          return ++reads.sessionId <= 2 ? benign.sessionId : id(41);
+        },
+        get attempt() {
+          reads.attempt++;
+          return 1;
+        },
+        get status() {
+          return ++reads.status === 1 ? benign.status : "succeeded";
+        },
+      });
+      expect(reads).toEqual({ jobId: 1, attempt: 1, sessionId: 1, status: 1 });
+      expect(
+        raw.prepare("SELECT * FROM job_mappings WHERE job_id = ?").get(id(1)),
+      ).toEqual(protectedBefore);
+      expect(store.ownedIntent(id(1), 1)).toEqual(intent);
+      expect(store.findJob(id(2))).toEqual(benign);
+      const after = snapshot(raw);
+      expect([after[0], after[2], after[3]]).toEqual([
+        before[0],
+        before[2],
+        before[3],
+      ]);
+      expect(
+        raw.prepare("SELECT count(*) AS count FROM job_mappings").get(),
+      ).toEqual({ count: 2 });
+    },
+  );
+
+  it("I1 rejects first-captured-owned then benign getters without writes", () => {
+    const { store, raw } = setup();
+    receipt(store);
+    store.prepareOwnedIntent(input());
+    const reads = { jobId: 0, sessionId: 0, attempt: 0, status: 0 };
+    const before = snapshot(raw);
+    expect(() =>
+      store.mapJob({
+        get jobId() {
+          return ++reads.jobId === 1 ? id(1) : id(2);
+        },
+        get sessionId() {
+          return ++reads.sessionId === 1 ? id(41) : id(42);
+        },
+        get attempt() {
+          return ++reads.attempt === 1 ? 1 : 2;
+        },
+        get status() {
+          return ++reads.status === 1 ? "failed" : "running";
+        },
+      }),
+    ).toThrow("OWNED_INTENT_CONFLICT");
+    expect(reads).toEqual({ jobId: 1, sessionId: 1, attempt: 1, status: 1 });
+    expect(snapshot(raw)).toEqual(before);
+  });
+
+  it.each(["jobId", "attempt", "sessionId", "status"])(
+    "I1 sanitizes throwing %s capture",
+    (field) => {
+      const { store, raw } = setup();
+      receipt(store);
+      store.prepareOwnedIntent(input());
+      const before = snapshot(raw);
+      const mapping = {
+        jobId: id(2),
+        attempt: 1,
+        sessionId: id(42),
+        status: "running",
+      };
+      Object.defineProperty(mapping, field, {
+        get() {
+          throw new Error("private getter diagnostic");
+        },
+      });
+      expect(() => store.mapJob(mapping)).toThrow(
+        "STORE_MAPPING_INPUT_INVALID",
+      );
+      expect(snapshot(raw)).toEqual(before);
+    },
+  );
+
+  it.each(["intent", "active", "generation"])(
+    "I2 detects orphan BLOB %s keys before namespace filtering",
+    (kind) => {
+      const { store, raw } = setup();
+      receipt(store);
+      const owner = {
+        jobId: id(99),
+        attempt: 1,
+        repositoryId: "example-repo",
+        sessionId: id(98),
+        ownerGeneration: id(51),
+      };
+      const blobKey = Buffer.from(
+        kind === "generation"
+          ? generationKey
+          : kind === "active"
+            ? `owned-active-v1:${id(99)}`
+            : `owned-intent-v1:${id(99)}:1`,
+      );
+      raw
+        .prepare("INSERT INTO metadata (key, value) VALUES (?, ?)")
+        .run(blobKey, JSON.stringify(owner));
+      expect(
+        raw
+          .prepare(
+            "SELECT typeof(key) AS keyType, typeof(value) AS valueType FROM metadata",
+          )
+          .get(),
+      ).toEqual({ keyType: "blob", valueType: "text" });
+      const before = snapshot(raw);
+      for (const operation of [
+        () => store.listOwnedIntents(),
+        () => store.ownedIntent(id(1), 1),
+        () => store.prepareOwnedIntent(input()),
+        () =>
+          store.mapJob({
+            jobId: id(2),
+            attempt: 1,
+            sessionId: id(42),
+            status: "running",
+          }),
+      ]) {
+        expect(operation).toThrow("OWNED_INTENT_CORRUPT");
+        expect(snapshot(raw)).toEqual(before);
+      }
+    },
+  );
+
+  it.each([key, activeKey, generationKey])(
+    "I2 detects BLOB values at %s without byte coercion",
+    (metadataKey) => {
+      const { store, raw } = setup();
+      receipt(store);
+      store.prepareOwnedIntent(input());
+      const original = raw
+        .prepare("SELECT value FROM metadata WHERE key = ?")
+        .get(metadataKey) as { value: string };
+      raw
+        .prepare("UPDATE metadata SET value = ? WHERE key = ?")
+        .run(Buffer.from(original.value), metadataKey);
+      expect(
+        raw
+          .prepare(
+            "SELECT typeof(value) AS valueType FROM metadata WHERE key = ?",
+          )
+          .get(metadataKey),
+      ).toEqual({ valueType: "blob" });
+      const before = snapshot(raw);
+      for (const operation of [
+        () => store.listOwnedIntents(),
+        () => store.ownedIntent(id(1), 1),
+        () => store.prepareOwnedIntent(input()),
+        () =>
+          store.mapJob({
+            jobId: id(2),
+            attempt: 1,
+            sessionId: id(42),
+            status: "running",
+          }),
+      ]) {
+        expect(operation).toThrow("OWNED_INTENT_CORRUPT");
+        expect(snapshot(raw)).toEqual(before);
+      }
+    },
+  );
+
+  it("I2 preserves valid legacy and unknown TEXT metadata", () => {
+    const { store, raw } = setup();
+    receipt(store);
+    store.markInboundDelivered(offer().message_id);
+    raw
+      .prepare("INSERT INTO metadata VALUES (?, ?)")
+      .run("unknown-text-extension", "not journal JSON");
+    const before = raw.prepare("SELECT * FROM metadata ORDER BY key").all();
+    expect(store.listOwnedIntents()).toEqual([]);
+    expect(store.ownedIntent(id(1), 1)).toBeUndefined();
+    store.mapJob({
+      jobId: id(2),
+      attempt: 1,
+      sessionId: id(42),
+      status: "running",
+    });
+    const intent = store.prepareOwnedIntent(input());
+    expect(store.listOwnedIntents()).toEqual([intent]);
+    expect(
+      raw
+        .prepare(
+          "SELECT * FROM metadata WHERE key NOT LIKE 'owned-%' ORDER BY key",
+        )
+        .all(),
+    ).toEqual(before);
+  });
+
   it("classifies malformed SQLite mapping values as corruption", () => {
     const { store, raw } = setup();
     receipt(store);
