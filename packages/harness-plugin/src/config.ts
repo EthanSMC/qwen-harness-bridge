@@ -12,6 +12,23 @@ const repositorySchema = z
   })
   .strict();
 
+const modelRouteIdentifierSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(256)
+  .refine((value) => {
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: Route identifiers must reject these control ranges.
+    return !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(value);
+  });
+
+const harnessModelSchema = z
+  .object({
+    provider: modelRouteIdentifierSchema,
+    model: modelRouteIdentifierSchema,
+  })
+  .strict();
+
 const pluginConfigSchema = z
   .object({
     connectorId: z.string().trim().min(1),
@@ -39,8 +56,14 @@ const pluginConfigSchema = z
     keychainAccount: z.string().trim().min(1),
     databasePath: z.string().trim().min(1),
     repositories: z.array(repositorySchema).min(1),
+    harnessModel: harnessModelSchema.optional(),
   })
-  .strict();
+  .strict()
+  .refine(
+    (value) => !("harnessModel" in value) || value.harnessModel !== undefined,
+  );
+
+export type HarnessModelRoute = Readonly<{ provider: string; model: string }>;
 
 export type PluginConfig = Readonly<{
   connectorId: string;
@@ -48,6 +71,7 @@ export type PluginConfig = Readonly<{
   keychainService: string;
   keychainAccount: string;
   databasePath: string;
+  harnessModel?: HarnessModelRoute;
   repositories: ReadonlyArray<
     Readonly<{
       id: string;
@@ -166,8 +190,13 @@ const canonicalDatabasePath = (databasePath: string): string => {
 };
 
 export function parsePluginConfig(input: string | unknown): PluginConfig {
-  const parsedInput = parseInput(input);
-  const parsed = pluginConfigSchema.safeParse(parsedInput);
+  let parsed: ReturnType<typeof pluginConfigSchema.safeParse>;
+  try {
+    // Zod captures each object field once and validates into detached output.
+    parsed = pluginConfigSchema.safeParse(parseInput(input));
+  } catch {
+    throw new ConfigValidationError("INVALID_PLUGIN_CONFIG");
+  }
   if (!parsed.success) {
     throw new ConfigValidationError("INVALID_PLUGIN_CONFIG");
   }
@@ -186,6 +215,9 @@ export function parsePluginConfig(input: string | unknown): PluginConfig {
     keychainService: parsed.data.keychainService,
     keychainAccount: parsed.data.keychainAccount,
     databasePath: canonicalDatabasePath(parsed.data.databasePath),
+    ...(parsed.data.harnessModel === undefined
+      ? {}
+      : { harnessModel: parsed.data.harnessModel }),
     repositories: parsed.data.repositories.map((repository) => ({
       id: repository.id,
       displayName: repository.displayName,
