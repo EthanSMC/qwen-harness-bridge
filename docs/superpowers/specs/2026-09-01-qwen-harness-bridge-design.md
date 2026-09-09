@@ -326,6 +326,8 @@ Store nullable `jobs.cancel_revision` atomically only when the server enters can
 
 [ADR 0005](../../adr/0005-negotiated-job-coordination.md) defines the exact payload fields and bounds, precision-preserving validity checks, deadline adapter, conflict categories, migration, replay, integration evidence and rollback. Payload schemas may be implemented first without enabling new traffic; both endpoint handlers, capability gates, real persistence/transport tests and complete plugin integration remain mandatory before release.
 
+[ADR 0006](../../adr/0006-local-attempt-journal.md) refines the local pre-factory intent and initial-input journal: immutable offer/session/message identity, exact CAS phases, monotonic unavailable state, no legacy backfill, and persistence before any native effect. A journal record is not execution authority or proof of a native flush. Atomic terminal integration and real session recovery remain mandatory before activation.
+
 ## 10. Job and approval model
 
 ### 10.1 Public job states

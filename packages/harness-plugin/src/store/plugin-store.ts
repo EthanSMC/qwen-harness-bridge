@@ -5,6 +5,30 @@ import {
 } from "@qhb/protocol";
 import Database from "better-sqlite3";
 import { z } from "zod";
+import {
+  activeOwnedKey,
+  captureOwned,
+  freezeOwned,
+  generationOwnedKey,
+  initialOwnedIntent,
+  OwnedAttemptSchema,
+  type OwnedIntent,
+  OwnedIntentError,
+  type OwnedIntentOwner,
+  OwnedIntentOwnerSchema,
+  OwnedIntentSchema,
+  type OwnedIntentTransition,
+  OwnedTransitionSchema,
+  OwnedVersionSchema,
+  ownedJson,
+  ownedKey,
+  type PrepareOwnedIntentInput,
+  PrepareOwnedIntentSchema,
+  parseOwnedRecord,
+} from "./owned-intent.js";
+
+export type { OwnedIntent, OwnedIntentOwner } from "./owned-intent.js";
+export { OwnedIntentError } from "./owned-intent.js";
 
 const SCHEMA_SQL = readFileSync(
   new URL("./schema.sql", import.meta.url),
@@ -112,6 +136,17 @@ export type StoredCoordinationReceipt = Readonly<
 export interface CoordinatingPluginStore extends PluginStore {
   coordinationReceipt(sequence: number): StoredCoordinationReceipt | undefined;
   coordinationRequest(correlationId: string): StoredOutboundEvent | undefined;
+}
+
+export interface OwnedIntentPluginStore extends CoordinatingPluginStore {
+  prepareOwnedIntent(input: PrepareOwnedIntentInput): OwnedIntent;
+  ownedIntent(jobId: string, attempt: number): OwnedIntent | undefined;
+  listOwnedIntents(): readonly OwnedIntent[];
+  advanceOwnedIntent(
+    owner: OwnedIntentOwner,
+    expectedVersion: number,
+    transition: OwnedIntentTransition,
+  ): OwnedIntent;
 }
 
 export class StoreSequenceError extends Error {
@@ -267,7 +302,7 @@ const schemaMatches = (database: Database.Database): boolean =>
   JSON.stringify(schemaObjects(database)) ===
   JSON.stringify(EXPECTED_SCHEMA_OBJECTS);
 
-export class SqlitePluginStore implements CoordinatingPluginStore {
+export class SqlitePluginStore implements OwnedIntentPluginStore {
   #database: Database.Database | null = null;
   #closed = false;
 
@@ -309,6 +344,297 @@ export class SqlitePluginStore implements CoordinatingPluginStore {
       if (error instanceof StoreError) throw error;
       throw new StoreError("STORE_INITIALIZATION_FAILED");
     }
+  }
+
+  // All journal reads and writes observe one database snapshot, and return only
+  // after an outermost commit. No callback is exposed to consumers.
+  private ownedTransaction<T>(operation: () => T): T {
+    try {
+      this.assertOpen();
+      if (this.database.inTransaction)
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      return this.database.transaction(operation).immediate();
+    } catch (error) {
+      if (error instanceof OwnedIntentError) throw error;
+      throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+    }
+  }
+
+  private readOwnedIntents(): OwnedIntent[] {
+    const rows = this.database
+      .prepare(
+        "SELECT key, value FROM metadata WHERE key GLOB 'owned-intent-*' OR key GLOB 'owned-active-*' OR key GLOB 'owned-generation-*' ORDER BY key",
+      )
+      .all() as { key: string; value: string }[];
+    const metadata = new Map(rows.map((row) => [row.key, row.value]));
+    const records: OwnedIntent[] = [];
+    const consumed = new Set<string>();
+    const mappings = this.database
+      .prepare("SELECT job_id, attempt, session_id, status FROM job_mappings")
+      .all() as JobRow[];
+    if (
+      !z
+        .array(
+          z
+            .object({
+              job_id: z.string().min(1),
+              attempt: z.number().int().positive().safe(),
+              session_id: z.string().min(1),
+              status: z.string().min(1),
+            })
+            .strict(),
+        )
+        .safeParse(mappings).success
+    )
+      throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+    for (const row of rows) {
+      if (!row.key.startsWith("owned-intent-v1:")) continue;
+      const value = parseOwnedRecord(OwnedIntentSchema, row.value);
+      const owner = value.owner;
+      if (row.key !== ownedKey(owner))
+        throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+      for (const index of [activeOwnedKey(owner), generationOwnedKey(owner)]) {
+        const body = metadata.get(index);
+        if (
+          body === undefined ||
+          consumed.has(index) ||
+          ownedJson(parseOwnedRecord(OwnedIntentOwnerSchema, body)) !==
+            ownedJson(owner)
+        )
+          throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+        consumed.add(index);
+      }
+      const matching = mappings.filter(
+        (mapping) =>
+          mapping.job_id.toLowerCase() === owner.jobId ||
+          mapping.session_id.toLowerCase() === owner.sessionId,
+      );
+      const mapping = matching[0];
+      if (
+        matching.length !== 1 ||
+        mapping === undefined ||
+        mapping.job_id !== owner.jobId ||
+        mapping.attempt !== owner.attempt ||
+        mapping.session_id !== owner.sessionId ||
+        mapping.status !== value.phase
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+      consumed.add(row.key);
+      records.push(freezeOwned(value));
+    }
+    if (
+      consumed.size !== rows.length ||
+      mappings.some(
+        (mapping) =>
+          ["prepared", "creating", "submitting", "started"].includes(
+            mapping.status,
+          ) &&
+          !records.some(
+            (record) =>
+              record.owner.jobId === mapping.job_id &&
+              record.owner.attempt === mapping.attempt,
+          ),
+      )
+    )
+      throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+    return records.sort((a, b) =>
+      a.owner.jobId < b.owner.jobId
+        ? -1
+        : a.owner.jobId > b.owner.jobId
+          ? 1
+          : a.owner.attempt - b.owner.attempt,
+    );
+  }
+
+  prepareOwnedIntent(input: PrepareOwnedIntentInput): OwnedIntent {
+    const captured = captureOwned(PrepareOwnedIntentSchema, input);
+    // The refinement above rejects other envelope types before any SQL work.
+    if (captured.offer.type !== "job.offer")
+      throw new OwnedIntentError("OWNED_INTENT_INVALID");
+    captureOwned(OwnedAttemptSchema, captured.offer.payload.attempt);
+    const candidate = initialOwnedIntent({
+      ...captured,
+      offer: captured.offer,
+    });
+    return this.ownedTransaction(() => {
+      const records = this.readOwnedIntents();
+      const existing = records.find(
+        (record) => ownedKey(record.owner) === ownedKey(candidate.owner),
+      );
+      if (existing !== undefined) {
+        const original = {
+          ...existing,
+          phase: "prepared",
+          version: 0,
+          mode: null,
+          startedEvidence: null,
+          unavailable: null,
+        };
+        if (ownedJson(original) !== ownedJson(candidate))
+          throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+        return existing;
+      }
+      const inbound = this.database
+        .prepare(
+          "SELECT body FROM inbound_messages WHERE message_id = ? AND sequence = ?",
+        )
+        .get(captured.offer.message_id, captured.offer.sequence) as
+        | { body: string }
+        | undefined;
+      if (inbound === undefined)
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      let stored: ReturnType<typeof ConnectorServerMessageSchema.parse>;
+      try {
+        stored = ConnectorServerMessageSchema.parse(JSON.parse(inbound.body));
+      } catch {
+        throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+      }
+      if (
+        stored.type !== "job.offer" ||
+        ownedJson(stored) !== ownedJson(captured.offer)
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      const value = initialOwnedIntent({ ...captured, offer: stored });
+      const owner = value.owner;
+      if (
+        records.some(
+          (record) =>
+            record.owner.jobId === owner.jobId ||
+            record.owner.ownerGeneration === owner.ownerGeneration,
+        ) ||
+        this.database
+          .prepare(
+            "SELECT 1 FROM job_mappings WHERE lower(job_id) = ? OR lower(session_id) = ?",
+          )
+          .get(owner.jobId, owner.sessionId) !== undefined
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      const serialized = ownedJson(value);
+      if (Buffer.byteLength(serialized, "utf8") > 16384)
+        throw new OwnedIntentError("OWNED_INTENT_INVALID");
+      const mapping = this.database
+        .prepare(
+          "INSERT INTO job_mappings (job_id, attempt, session_id, status, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(owner.jobId, owner.attempt, owner.sessionId, value.phase, now());
+      if (mapping.changes !== 1)
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      const insert = this.database.prepare(
+        "INSERT INTO metadata (key, value) VALUES (?, ?)",
+      );
+      for (const [key, body] of [
+        [ownedKey(owner), serialized],
+        [activeOwnedKey(owner), ownedJson(owner)],
+        [generationOwnedKey(owner), ownedJson(owner)],
+      ] as const) {
+        if (insert.run(key, body).changes !== 1)
+          throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      }
+      return freezeOwned(value);
+    });
+  }
+
+  ownedIntent(jobId: string, attempt: number): OwnedIntent | undefined {
+    const captured = captureOwned(
+      z
+        .object({
+          jobId: OwnedIntentOwnerSchema.shape.jobId,
+          attempt: OwnedAttemptSchema,
+        })
+        .strict(),
+      { jobId, attempt },
+    );
+    return this.ownedTransaction(() =>
+      this.readOwnedIntents().find(
+        (record) =>
+          record.owner.jobId === captured.jobId &&
+          record.owner.attempt === captured.attempt,
+      ),
+    );
+  }
+
+  listOwnedIntents(): readonly OwnedIntent[] {
+    return this.ownedTransaction(() => Object.freeze(this.readOwnedIntents()));
+  }
+
+  advanceOwnedIntent(
+    owner: OwnedIntentOwner,
+    expectedVersion: number,
+    transition: OwnedIntentTransition,
+  ): OwnedIntent {
+    const capturedOwner = captureOwned(OwnedIntentOwnerSchema, owner);
+    const version = captureOwned(OwnedVersionSchema, expectedVersion);
+    const next = captureOwned(OwnedTransitionSchema, transition);
+    return this.ownedTransaction(() => {
+      const current = this.readOwnedIntents().find(
+        (record) => ownedKey(record.owner) === ownedKey(capturedOwner),
+      );
+      if (
+        current === undefined ||
+        ownedJson(current.owner) !== ownedJson(capturedOwner) ||
+        current.version !== version
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      let updated: OwnedIntent;
+      if ("unavailable" in next) {
+        if (current.unavailable !== null) {
+          if (current.unavailable === next.unavailable) return current;
+          throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+        }
+        updated = { ...current, unavailable: next.unavailable };
+      } else {
+        if (current.unavailable !== null)
+          throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+        if (next.phase === "creating" && current.phase === "prepared")
+          updated = { ...current, phase: next.phase, mode: next.mode };
+        else if (next.phase === "submitting" && current.phase === "creating")
+          updated = { ...current, phase: next.phase };
+        else if (
+          next.phase === "started" &&
+          current.phase === "submitting" &&
+          next.evidence.sessionId === current.owner.sessionId &&
+          next.evidence.messageId === current.initialMessageId &&
+          next.evidence.requestDigest === current.requestDigest
+        ) {
+          // Identity validation only: the native adapter must independently
+          // verify own-session history and complete the actual persistence flush.
+          updated = {
+            ...current,
+            phase: next.phase,
+            startedEvidence: next.evidence,
+          };
+        } else throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      }
+      if (version === Number.MAX_SAFE_INTEGER)
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      updated = { ...updated, version: version + 1 };
+      const serialized = ownedJson(updated);
+      if (Buffer.byteLength(serialized, "utf8") > 16384)
+        throw new OwnedIntentError("OWNED_INTENT_INVALID");
+      const row = this.database
+        .prepare("SELECT value FROM metadata WHERE key = ?")
+        .get(ownedKey(capturedOwner)) as { value: string };
+      const changed = this.database
+        .prepare("UPDATE metadata SET value = ? WHERE key = ? AND value = ?")
+        .run(serialized, ownedKey(capturedOwner), row.value);
+      if (changed.changes !== 1)
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      const mapped = this.database
+        .prepare(
+          "UPDATE job_mappings SET status = ?, updated_at = ? WHERE job_id = ? AND attempt = ? AND session_id = ? AND status = ?",
+        )
+        .run(
+          updated.phase,
+          now(),
+          capturedOwner.jobId,
+          capturedOwner.attempt,
+          capturedOwner.sessionId,
+          current.phase,
+        );
+      if (mapped.changes !== 1)
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      return freezeOwned(updated);
+    });
   }
 
   recordInbound(
@@ -693,6 +1019,23 @@ export class SqlitePluginStore implements CoordinatingPluginStore {
     assertNonEmpty(input.status, "STORE_STATUS_REQUIRED");
 
     const write = this.database.transaction(() => {
+      // Legacy mappings cannot mutate or replace journal ownership. Validate
+      // every journal fact first so corrupt indexes cannot bypass this guard.
+      let owned: OwnedIntent[];
+      try {
+        owned = this.readOwnedIntents();
+      } catch (error) {
+        if (error instanceof OwnedIntentError) throw error;
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      }
+      if (
+        owned.some(
+          (record) =>
+            record.owner.jobId === input.jobId.toLowerCase() ||
+            record.owner.sessionId === input.sessionId.toLowerCase(),
+        )
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
       const byJob = this.database
         .prepare(
           `SELECT job_id, attempt, session_id, status
