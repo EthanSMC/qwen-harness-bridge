@@ -2,9 +2,13 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ConnectorServerMessage } from "@qhb/protocol";
+import {
+  ConnectorClientMessageSchema,
+  type ConnectorServerMessage,
+} from "@qhb/protocol";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
+import { OwnedIntentSchema } from "./owned-intent.js";
 import { SqlitePluginStore } from "./plugin-store.js";
 
 const id = (n: number) =>
@@ -69,6 +73,218 @@ const evidence = (
 });
 
 describe("durable initial-attempt journal", () => {
+  it.each(
+    [undefined, "job-coordination-v1"].flatMap((profile) =>
+      [
+        " progress.updated ",
+        "stage.changed\n",
+        "\ttool.started",
+        "tool.finished\u2028",
+      ].map((eventType) => ({
+        profile: profile as "job-coordination-v1" | undefined,
+        eventType,
+      })),
+    ),
+  )(
+    "fix2 I1 raw exact event $eventType profile $profile",
+    ({ profile, eventType }) => {
+      const { store, raw } = setup();
+      receipt(store);
+      store.prepareOwnedIntent(input());
+      const message = {
+        ...offer(),
+        type: "job.event",
+        message_id: id(90),
+        payload: {
+          job_id: id(1),
+          attempt: 1,
+          event_type: eventType,
+          source: "harness",
+          payload: { summary: "Progress" },
+        },
+      };
+      expect(ConnectorClientMessageSchema.safeParse(message).success).toBe(
+        true,
+      );
+      const before = snapshot(raw);
+      expect(() =>
+        store.enqueueEvent({
+          messageId: id(90),
+          sequence: 1,
+          expectedReceiptProfile: profile,
+          payload: JSON.stringify(message),
+        }),
+      ).toThrow();
+      expect(snapshot(raw)).toEqual(before);
+      const unowned = {
+        ...message,
+        payload: { ...message.payload, job_id: id(2) },
+      };
+      store.enqueueEvent({
+        messageId: id(90),
+        sequence: 1,
+        expectedReceiptProfile: profile,
+        payload: JSON.stringify(unowned),
+      });
+      expect(store.outboundEvent(1)?.payload).toBe(JSON.stringify(unowned));
+    },
+  );
+  it.each([undefined, "job-coordination-v1"] as const)(
+    "I1 preserves four owned progress names and unowned flexibility with profile %s",
+    (expectedReceiptProfile) => {
+      const { store } = setup();
+      receipt(store);
+      store.prepareOwnedIntent(input());
+      let sequence = 0;
+      for (const job_id of [id(1), id(2)]) {
+        for (const event_type of job_id === id(1)
+          ? [
+              "stage.changed",
+              "progress.updated",
+              "tool.started",
+              "tool.finished",
+            ]
+          : [
+              "succeeded",
+              "success",
+              "completed",
+              "job.succeeded",
+              "failed",
+              "failure",
+              "job.failed",
+              "cancelled",
+              "canceled",
+              "job.cancelled",
+              "JOB.SUCCEEDED",
+              " completed ",
+              "completed\n",
+              "unknown",
+            ]) {
+          const message = ConnectorClientMessageSchema.parse({
+            ...offer(),
+            type: "job.event",
+            message_id: id(100 + ++sequence),
+            sequence,
+            payload: {
+              job_id,
+              attempt: 1,
+              event_type,
+              source: "harness",
+              payload: {
+                summary: "Progress",
+                ...(job_id === id(2) ? { status: "failed" } : {}),
+              },
+            },
+          });
+          store.enqueueEvent({
+            messageId: message.message_id,
+            sequence,
+            expectedReceiptProfile,
+            payload: JSON.stringify(message),
+          });
+        }
+      }
+      expect(store.maxOutboundSequence()).toBe(sequence);
+    },
+  );
+  it.each([undefined, "job-coordination-v1"] as const)(
+    "I1 rejects owned generic aliases/status with profile %s",
+    (expectedReceiptProfile) => {
+      const { store, raw } = setup();
+      receipt(store);
+      store.prepareOwnedIntent(input());
+      const before = snapshot(raw);
+      const cases = [
+        "succeeded",
+        "success",
+        "completed",
+        "job.succeeded",
+        "failed",
+        "failure",
+        "job.failed",
+        "cancelled",
+        "canceled",
+        "job.cancelled",
+        "JOB.SUCCEEDED",
+        " completed ",
+        "completed\n",
+        "unknown",
+      ].map((event_type) => ({ event_type, payload: { summary: "Progress" } }));
+      for (const status of ["failed", "running", null, 0, false, {}])
+        cases.push({
+          event_type: "progress.updated",
+          payload: { summary: "Progress", status },
+        } as never);
+      for (const business of cases) {
+        const message = ConnectorClientMessageSchema.parse({
+          ...offer(),
+          type: "job.event",
+          message_id: id(90),
+          payload: {
+            job_id: id(1),
+            attempt: 1,
+            source: "harness",
+            ...business,
+          },
+        });
+        expect(
+          () =>
+            store.enqueueEvent({
+              messageId: id(90),
+              sequence: 1,
+              expectedReceiptProfile,
+              payload: JSON.stringify(message),
+            }),
+          business.event_type,
+        ).toThrow();
+        expect(snapshot(raw)).toEqual(before);
+      }
+    },
+  );
+  it("parses terminal intent evidence while the joined reader refuses an unlinked terminal", () => {
+    const { store, raw } = setup();
+    receipt(store);
+    const record = store.prepareOwnedIntent(input());
+    const terminal = { ...record, phase: "terminal", version: 1 };
+    expect(OwnedIntentSchema.safeParse(terminal).success).toBe(true);
+    raw
+      .prepare("UPDATE metadata SET value = ? WHERE key = ?")
+      .run(JSON.stringify(terminal), key);
+    expect(() => store.ownedIntent(record.owner.jobId, 1)).toThrow(
+      "OWNED_INTENT_CORRUPT",
+    );
+  });
+  it.each([undefined, "job-coordination-v1"] as const)(
+    "refuses generic owned terminal enqueue with profile %s",
+    (expectedReceiptProfile) => {
+      const { store, raw } = setup();
+      receipt(store);
+      store.prepareOwnedIntent(input());
+      const before = snapshot(raw);
+      expect(() =>
+        store.enqueueEvent({
+          messageId: id(90),
+          sequence: 1,
+          expectedReceiptProfile,
+          payload: JSON.stringify({
+            protocol_version: "1.0",
+            type: "job.cancelled",
+            message_id: id(90),
+            sequence: 1,
+            correlation_id: id(91),
+            sent_at: "2026-09-01T00:00:00Z",
+            expires_at: "2026-09-01T00:01:00Z",
+            payload: {
+              job_id: id(1),
+              attempt: 1,
+              reason: "Cancelled by owner",
+            },
+          }),
+        }),
+      ).toThrow();
+      expect(snapshot(raw)).toEqual(before);
+    },
+  );
   it("atomically prepares, returns exact duplicates, and reopens immutable identity", () => {
     const { store, raw, path } = setup();
     receipt(store);

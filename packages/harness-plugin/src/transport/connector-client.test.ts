@@ -205,6 +205,335 @@ const makeStore = (): { store: SqlitePluginStore; directory: string } => {
   };
 };
 
+it.each([
+  "getter",
+  "secrets",
+  "root",
+  "clock",
+  "store",
+  "session",
+  "empty-store",
+  "empty-session",
+  "iterator",
+  "element",
+  "sparse",
+  "custom",
+  "prototype",
+])(
+  "I2 rejects invalid %s setup safely before allocation or store effects",
+  (fault) => {
+    const { store, directory } = makeStore();
+    const raw = new Database(join(directory, "state.sqlite"));
+    const snapshot = () =>
+      ["metadata", "job_mappings", "inbound_messages", "outbound_events"].map(
+        (table) => raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+      );
+    const before = snapshot();
+    let allocations = 0;
+    let callbacks = 0;
+    let operations = 0;
+    const maxInbound = store.maxInboundSequence.bind(store);
+    store.maxInboundSequence = () => {
+      operations++;
+      return maxInbound();
+    };
+    const options: ConnectorClientOptions = {
+      connectorId: CONNECTOR_ID,
+      controlPlaneUrl: "wss://localhost",
+      store,
+      bootstrapCredentialProvider: async () => "fixture",
+      sessionTokenClient: {
+        exchange: async () => ({
+          token: "fixture",
+          expiresAt: isoAfter(60000),
+        }),
+      },
+      now: () => {
+        allocations++;
+        return new Date();
+      },
+      randomUUID: () => {
+        allocations++;
+        return randomUUID();
+      },
+      webSocketFactory: () => {
+        allocations++;
+        throw new Error("socket reached");
+      },
+      redaction: { repositoryRoot: directory, homeDirectory: tmpdir() },
+    };
+    if (fault === "getter")
+      Object.defineProperty(options, "redaction", {
+        get() {
+          throw new Error("private diagnostic");
+        },
+      });
+    if (fault === "secrets")
+      Object.assign(options.redaction ?? {}, { secrets: [null] });
+    if (fault === "root")
+      Object.assign(options.redaction ?? {}, { repositoryRoot: null });
+    if (fault === "clock") Object.assign(options, { now: "invalid" });
+    if (fault === "store") Object.assign(options, { store: "invalid" });
+    if (fault === "session")
+      Object.assign(options, { sessionTokenClient: "invalid" });
+    if (fault === "empty-store") Object.assign(options, { store: {} });
+    if (fault === "empty-session")
+      Object.assign(options, { sessionTokenClient: {} });
+    const secrets = ["synthetic-sentinel-unique"];
+    if (fault === "iterator")
+      Object.defineProperty(secrets, Symbol.iterator, {
+        value: function* () {
+          callbacks++;
+          yield* [];
+        },
+      });
+    if (fault === "element")
+      Object.defineProperty(secrets, "0", {
+        enumerable: true,
+        get() {
+          callbacks++;
+          return "synthetic-sentinel-unique";
+        },
+      });
+    if (fault === "sparse") delete secrets[0];
+    if (fault === "custom") Object.assign(secrets, { extra: true });
+    if (fault === "prototype") Object.setPrototypeOf(secrets, null);
+    if (
+      ["iterator", "element", "sparse", "custom", "prototype"].includes(fault)
+    )
+      Object.assign(options.redaction ?? {}, { secrets });
+    try {
+      expect
+        .soft(() => createConnectorClient(options))
+        .toThrow("CONNECTOR_OPTIONS_INVALID");
+      expect.soft(callbacks).toBe(0);
+      expect.soft(operations).toBe(0);
+      expect(allocations).toBe(0);
+      expect(snapshot()).toEqual(before);
+    } finally {
+      raw.close();
+      store.close();
+    }
+  },
+);
+
+const baseMethodNames = [
+  "recordInbound",
+  "maxInboundSequence",
+  "inboundMessage",
+  "inboundMessageBySequence",
+  "replaceInbound",
+  "pendingInboundMessages",
+  "markInboundDelivered",
+  "markInboundExpired",
+  "mapJob",
+  "findJob",
+  "listNonterminalJobs",
+  "maxOutboundSequence",
+  "enqueueEvent",
+  "activeHello",
+  "outboundEvent",
+  "renewDelivery",
+  "provenClientSequence",
+  "acknowledgeThrough",
+  "pendingEvents",
+  "acknowledgeEvent",
+  "close",
+] as const;
+function setupPortCapture() {
+  const { store, directory } = makeStore();
+  const close = store.close.bind(store);
+  const raw = new Database(join(directory, "state.sqlite"));
+  const counts = { allocation: 0, operation: 0, getter: 0 };
+  const original = store.maxInboundSequence.bind(store);
+  store.maxInboundSequence = () => {
+    counts.operation++;
+    return original();
+  };
+  const options: ConnectorClientOptions = {
+    connectorId: CONNECTOR_ID,
+    controlPlaneUrl: "wss://localhost",
+    store,
+    bootstrapCredentialProvider: async () => {
+      counts.operation++;
+      return "fixture";
+    },
+    sessionTokenClient: {
+      exchange: async () => {
+        counts.operation++;
+        return { token: "fixture", expiresAt: isoAfter(60000) };
+      },
+    },
+    now: () => {
+      counts.allocation++;
+      return new Date();
+    },
+    randomUUID: () => {
+      counts.allocation++;
+      return randomUUID();
+    },
+    webSocketFactory: () => {
+      counts.allocation++;
+      throw new Error("unexpected socket");
+    },
+    redaction: { repositoryRoot: directory, homeDirectory: tmpdir() },
+  };
+  const snapshot = () =>
+    ["metadata", "job_mappings", "inbound_messages", "outbound_events"].map(
+      (table) => raw.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+    );
+  return {
+    store,
+    options,
+    counts,
+    snapshot,
+    close: () => {
+      raw.close();
+      close();
+    },
+  };
+}
+it.each(
+  [...baseMethodNames, "exchange"].flatMap((method) =>
+    ["missing", "nonfunction", "throwing"].map((shape) => ({ method, shape })),
+  ),
+)(
+  "fix2 I2 validates $method $shape before port operations",
+  ({ method, shape }) => {
+    const f = setupPortCapture();
+    const service =
+      method === "exchange" ? f.options.sessionTokenClient : f.store;
+    Object.defineProperty(
+      service,
+      method,
+      shape === "throwing"
+        ? {
+            get() {
+              f.counts.getter++;
+              throw new Error("private structural diagnostic");
+            },
+          }
+        : { value: shape === "missing" ? undefined : 1 },
+    );
+    const before = f.snapshot();
+    try {
+      expect(() => createConnectorClient(f.options)).toThrow(
+        "CONNECTOR_OPTIONS_INVALID",
+      );
+      expect(f.counts).toEqual({
+        allocation: 0,
+        operation: 0,
+        getter: shape === "throwing" ? 1 : 0,
+      });
+      expect(f.snapshot()).toEqual(before);
+    } finally {
+      f.close();
+    }
+  },
+);
+it.each(["secrets", "capabilities"] as const)(
+  "fix2 I2 applies strict list structure to %s",
+  (field) => {
+    const f = setupPortCapture();
+    try {
+      for (const kind of [
+        "iterator",
+        "accessor",
+        "sparse",
+        "extra",
+        "nonenumerable",
+        "prototype",
+        "too-long",
+      ]) {
+        const list = ["synthetic-sentinel-unique"];
+        if (kind === "iterator")
+          Object.defineProperty(list, Symbol.iterator, {
+            value: function* () {
+              f.counts.getter++;
+              yield* [];
+            },
+          });
+        if (kind === "accessor")
+          Object.defineProperty(list, "0", {
+            get() {
+              f.counts.getter++;
+              return "synthetic-sentinel-unique";
+            },
+          });
+        if (kind === "sparse") delete list[0];
+        if (kind === "extra") Object.assign(list, { extra: 1 });
+        if (kind === "nonenumerable")
+          Object.defineProperty(list, "0", { enumerable: false });
+        if (kind === "prototype") Object.setPrototypeOf(list, null);
+        if (kind === "too-long") list.length = 65;
+        Object.assign(
+          field === "secrets" ? (f.options.redaction ?? {}) : f.options,
+          { [field]: list },
+        );
+        const before = f.snapshot();
+        expect(() => createConnectorClient(f.options), kind).toThrow(
+          "CONNECTOR_OPTIONS_INVALID",
+        );
+        expect(f.counts).toEqual({ allocation: 0, operation: 0, getter: 0 });
+        expect(f.snapshot()).toEqual(before);
+      }
+    } finally {
+      f.close();
+    }
+  },
+);
+it.each([false, true])(
+  "fix2 I2 preserves valid plain/frozen lists (frozen=%s) and legacy ports",
+  (frozen) => {
+    const f = setupPortCapture();
+    try {
+      for (const list of [[], ["synthetic-sentinel-unique"]]) {
+        const value = frozen ? Object.freeze(list) : list;
+        Object.assign(f.options.redaction ?? {}, { secrets: value });
+        Object.assign(f.options, { capabilities: value });
+        for (const method of [
+          "coordinationReceipt",
+          "coordinationRequest",
+          "commitTerminal",
+          "reconcileTerminal",
+          "readTerminal",
+        ])
+          Object.defineProperty(f.store, method, {
+            configurable: true,
+            value: undefined,
+          });
+        const before = f.snapshot();
+        expect(() => createConnectorClient(f.options)).not.toThrow();
+        expect(Object.isFrozen(f.store)).toBe(false);
+        expect(Object.isFrozen(f.options.sessionTokenClient)).toBe(false);
+        expect(f.snapshot()).toEqual(before);
+        expect(() =>
+          createConnectorClient({
+            ...f.options,
+            requireJobCoordination: true,
+            requireOwnedTerminal: true,
+            store: f.store,
+          }),
+        ).toThrow("CONNECTOR_TERMINAL_UNAVAILABLE");
+      }
+    } finally {
+      f.close();
+    }
+  },
+);
+it("fix2 I2 preserves a real closed-store operational error", () => {
+  const f = setupPortCapture();
+  const before = f.snapshot();
+  f.store.close();
+  try {
+    expect(() => createConnectorClient(f.options)).toThrow("STORE_CLOSED");
+    expect(f.counts).toEqual({ allocation: 0, operation: 1, getter: 0 });
+    expect(f.snapshot()).toEqual(before);
+  } finally {
+    f.close();
+  }
+});
+
 const makeTokenClient = (
   fixture: Fixture,
   request?: SessionTokenHttpRequest,
@@ -398,6 +727,99 @@ describe("negotiated transport epochs", () => {
       database.close();
     }
   };
+  it("rejects recursive publication from UUID allocation before a second durable row", async () => {
+    let reenter: (() => void) | undefined;
+    const r = await rig({
+      randomUUID: () => {
+        const action = reenter;
+        reenter = undefined;
+        action?.();
+        return randomUUID();
+      },
+    });
+    const before = r.store.maxOutboundSequence();
+    let nested: Promise<unknown> | undefined;
+    reenter = () => {
+      nested = r.client
+        .publish("job.event", jobEventPayload(), randomUUID())
+        .catch((error) => error);
+    };
+    await r.client.publish("job.event", jobEventPayload(), randomUUID());
+    expect(await nested).toMatchObject({
+      message: "CONNECTOR_ALLOCATION_REENTRANT",
+    });
+    expect(r.store.maxOutboundSequence()).toBe(before + 1);
+  });
+  it.each(["sync", "ack", "heartbeat", "hello"])(
+    "shares the allocation fence with %s",
+    async (kind) => {
+      let reenter: (() => void) | undefined;
+      const r = await rig({
+        randomUUID: () => {
+          const action = reenter;
+          reenter = undefined;
+          action?.();
+          return randomUUID();
+        },
+      });
+      let nested: Promise<unknown> | undefined;
+      const arm = () => {
+        reenter = () => {
+          nested = r.client
+            .publish("job.event", jobEventPayload(), randomUUID())
+            .catch((error) => error);
+        };
+      };
+      if (kind === "hello") {
+        const last = required(
+          r.store.outboundEvent(r.store.maxOutboundSequence()),
+        );
+        const message = JSON.parse(last.payload);
+        r.fixture.send(
+          required([...r.fixture.sockets][0]),
+          envelope(
+            "ack",
+            r.fixture.nextServerSequence++,
+            { sequence: last.sequence },
+            message.correlation_id,
+          ),
+        );
+        await waitFor(() => r.store.provenClientSequence() === last.sequence);
+        arm();
+        r.fixture.closeSockets();
+      } else {
+        arm();
+        if (kind === "sync")
+          r.client.publishSync(
+            { job_id: JOB_ID, attempt: 1, nonce: randomUUID() },
+            randomUUID(),
+            () => undefined,
+          );
+        if (kind === "ack")
+          r.fixture.send(
+            required([...r.fixture.sockets][0]),
+            envelope("job.offer", r.fixture.nextServerSequence++, {
+              job_id: JOB_ID,
+              attempt: 1,
+              repository_id: "repo-one",
+              lease_id: randomUUID(),
+              request: "fixture",
+            }),
+          );
+      }
+      await waitFor(
+        () => nested !== undefined,
+        kind === "heartbeat" ? 12000 : 2000,
+      );
+      expect(await nested).toMatchObject({
+        message: "CONNECTOR_ALLOCATION_REENTRANT",
+      });
+      expect(
+        r.store.pendingEvents(0).map((event) => JSON.parse(event.payload).type),
+      ).not.toContain("job.event");
+    },
+    15000,
+  );
   const syncRequest = (r: Awaited<ReturnType<typeof rig>>) => {
     r.client.publishSync(
       { job_id: JOB_ID, attempt: 1, nonce: randomUUID() },

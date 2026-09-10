@@ -8,10 +8,27 @@ import {
   SequenceCursor,
 } from "@qhb/protocol";
 import WebSocket, { type ClientOptions } from "ws";
+import {
+  type RedactionOptions,
+  redactEvent,
+} from "../redaction/redact-event.js";
+import {
+  captureTerminalBinding,
+  type TerminalAuthority,
+} from "../runtime/terminal-authority.js";
+import {
+  captureTerminalValue,
+  type LocalTerminalBinding,
+  type ReconciliationBinding,
+  type TerminalCommitResult,
+  type TerminalReconcileResult,
+  terminalCorrelation,
+} from "../store/owned-terminal.js";
 import type {
   CoordinatingPluginStore,
   PluginStore,
   StoredInboundMessage,
+  TerminalPluginStore,
 } from "../store/plugin-store.js";
 import {
   type StoredOutboundEvent,
@@ -62,6 +79,18 @@ export interface CoordinatingConnectorClient extends ConnectorClient {
   onState(handler: StateHandler): () => void;
 }
 
+export interface TerminalConnectorClient extends CoordinatingConnectorClient {
+  commitTerminal(
+    binding: LocalTerminalBinding,
+    authority: TerminalAuthority,
+    nativeProjection?: unknown,
+  ): TerminalCommitResult;
+  reconcileTerminal(
+    binding: ReconciliationBinding,
+    authority: TerminalAuthority,
+  ): TerminalReconcileResult;
+}
+
 type SocketEpoch = {
   socket: WebSocket;
   epoch: ConnectorEpoch;
@@ -93,6 +122,8 @@ export type ConnectorClientOptions = Readonly<
     random?: () => number;
     webSocketFactory?: SocketFactory;
     reconnectDelay?: (attempt: number) => number;
+    requireOwnedTerminal?: boolean;
+    redaction?: RedactionOptions;
   } & (
     | { requireJobCoordination: true; store: CoordinatingPluginStore }
     | { requireJobCoordination?: false; store: PluginStore }
@@ -109,6 +140,139 @@ const RECEIPT_TIMEOUT_MS = 30_000;
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 const SOCKET_CLOSE_TIMEOUT_MS = 1_000;
 const ABORTED = Symbol("CONNECTOR_ABORTED");
+
+function captureOptions(input: ConnectorClientOptions): ConnectorClientOptions {
+  try {
+    const captured = {
+      connectorId: input.connectorId,
+      controlPlaneUrl: input.controlPlaneUrl,
+      sessionTokenClient: input.sessionTokenClient,
+      bootstrapCredentialProvider: input.bootstrapCredentialProvider,
+      connectorVersion: input.connectorVersion,
+      capabilities: input.capabilities,
+      now: input.now,
+      randomUUID: input.randomUUID,
+      random: input.random,
+      webSocketFactory: input.webSocketFactory,
+      reconnectDelay: input.reconnectDelay,
+      requireOwnedTerminal: input.requireOwnedTerminal,
+      requireJobCoordination: input.requireJobCoordination,
+      store: input.store,
+      redaction: input.redaction,
+    };
+    if (
+      typeof captured.connectorId !== "string" ||
+      typeof captured.controlPlaneUrl !== "string" ||
+      !captured.store ||
+      typeof captured.store !== "object" ||
+      Array.isArray(captured.store) ||
+      !captured.sessionTokenClient ||
+      typeof captured.sessionTokenClient !== "object" ||
+      Array.isArray(captured.sessionTokenClient) ||
+      typeof captured.bootstrapCredentialProvider !== "function" ||
+      (captured.connectorVersion !== undefined &&
+        typeof captured.connectorVersion !== "string") ||
+      [captured.requireOwnedTerminal, captured.requireJobCoordination].some(
+        (value) => value !== undefined && typeof value !== "boolean",
+      ) ||
+      [
+        captured.now,
+        captured.randomUUID,
+        captured.random,
+        captured.webSocketFactory,
+        captured.reconnectDelay,
+      ].some((value) => value !== undefined && typeof value !== "function")
+    )
+      throw new Error();
+    // Inspect required base ports only. Keep service identity and leave actual
+    // method execution (and its operational errors) outside this capture catch.
+    const methods = [
+      "recordInbound",
+      "maxInboundSequence",
+      "inboundMessage",
+      "inboundMessageBySequence",
+      "replaceInbound",
+      "pendingInboundMessages",
+      "markInboundDelivered",
+      "markInboundExpired",
+      "mapJob",
+      "findJob",
+      "listNonterminalJobs",
+      "maxOutboundSequence",
+      "enqueueEvent",
+      "activeHello",
+      "outboundEvent",
+      "renewDelivery",
+      "provenClientSequence",
+      "acknowledgeThrough",
+      "pendingEvents",
+      "acknowledgeEvent",
+      "close",
+    ] as const satisfies readonly (keyof PluginStore)[];
+    for (const method of methods)
+      if (typeof captured.store[method] !== "function") throw new Error();
+    if (typeof captured.sessionTokenClient.exchange !== "function")
+      throw new Error();
+    const list = (value: readonly string[], max: number) => {
+      if (
+        !Array.isArray(value) ||
+        Object.getPrototypeOf(value) !== Array.prototype ||
+        Object.getOwnPropertySymbols(value).length
+      )
+        throw new Error();
+      const length = Object.getOwnPropertyDescriptor(value, "length")?.value;
+      if (
+        !Number.isSafeInteger(length) ||
+        length < 0 ||
+        length > max ||
+        Object.getOwnPropertyNames(value).length !== length + 1
+      )
+        throw new Error();
+      const copy: string[] = [];
+      for (let index = 0; index < length; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(
+          value,
+          String(index),
+        );
+        if (
+          !descriptor ||
+          !("value" in descriptor) ||
+          !descriptor.enumerable ||
+          typeof descriptor.value !== "string" ||
+          !descriptor.value.length ||
+          Buffer.byteLength(descriptor.value, "utf8") > 4096
+        )
+          throw new Error();
+        copy.push(descriptor.value);
+      }
+      return Object.freeze(copy);
+    };
+    if (captured.capabilities !== undefined)
+      captured.capabilities = list(captured.capabilities, 64);
+    const redaction = captured.redaction;
+    if (redaction !== undefined) {
+      const repositoryRoot = redaction.repositoryRoot;
+      const homeDirectory = redaction.homeDirectory;
+      const secrets = redaction.secrets;
+      if (
+        typeof repositoryRoot !== "string" ||
+        !repositoryRoot.startsWith("/") ||
+        typeof homeDirectory !== "string" ||
+        !homeDirectory.startsWith("/") ||
+        /\p{Cc}/u.test(repositoryRoot + homeDirectory)
+      )
+        throw new Error();
+      captured.redaction = Object.freeze({
+        repositoryRoot,
+        homeDirectory,
+        ...(secrets === undefined ? {} : { secrets: list(secrets, 64) }),
+      });
+    }
+    return Object.freeze(captured) as ConnectorClientOptions;
+  } catch {
+    throw new Error("CONNECTOR_OPTIONS_INVALID");
+  }
+}
 
 const assertWssUrl = (value: string): void => {
   let url: URL;
@@ -196,7 +360,7 @@ type PendingMessage = Readonly<{
   message: ConnectorClientMessage;
 }>;
 
-export class DurableConnectorClient implements CoordinatingConnectorClient {
+export class DurableConnectorClient implements TerminalConnectorClient {
   readonly #options: ConnectorClientOptions;
   readonly #now: () => Date;
   readonly #randomUUID: () => string;
@@ -213,6 +377,7 @@ export class DurableConnectorClient implements CoordinatingConnectorClient {
   #receiptTimer: ReturnType<typeof setInterval> | undefined;
   #fatalError: Error | undefined;
   #clientSequence = 0;
+  #allocating = false;
   #serverCursor: SequenceCursor;
   #socket: WebSocket | undefined;
   #startPromise: Promise<void> | undefined;
@@ -229,8 +394,10 @@ export class DurableConnectorClient implements CoordinatingConnectorClient {
   #nextSession: { token: string; expiresAt: string } | undefined;
 
   constructor(options: ConnectorClientOptions) {
+    options = captureOptions(options);
     assertWssUrl(options.controlPlaneUrl);
     this.#options = options;
+    if (options.requireOwnedTerminal) this.#terminalStore();
     this.#now = options.now ?? (() => new Date());
     this.#randomUUID = options.randomUUID ?? nodeRandomUUID;
     this.#random = options.random ?? Math.random;
@@ -272,17 +439,199 @@ export class DurableConnectorClient implements CoordinatingConnectorClient {
     ) {
       throw new Error("CONNECTOR_PUBLISH_TYPE_NOT_DURABLE");
     }
-    const messageId = this.#randomUUID();
-    const now = this.#now();
-    this.#persistMessage((sequence) =>
-      messageEnvelope(type, sequence, payload, correlationId, now, messageId),
-    );
-    this.#scheduleSendPump();
+    this.#allocate(() => {
+      // Capture and validate once before injected clock/UUID code can change input.
+      // The store repeats the negative ownership check inside its insert transaction.
+      if (type === "job.event" || type === "job.cancelled") {
+        let message: ConnectorClientMessage;
+        try {
+          payload = captureTerminalValue(payload);
+          message = messageEnvelope(
+            type,
+            1,
+            payload,
+            correlationId,
+            new Date("2026-09-01T00:00:00Z"),
+            "00000000-0000-4000-8000-000000000001",
+          );
+        } catch {
+          if (this.#clientSequence >= Number.MAX_SAFE_INTEGER)
+            throw new Error("CONNECTOR_SEQUENCE_EXHAUSTED");
+          throw new Error("CONNECTOR_EVENT_REJECTED");
+        }
+        const store = this.#options.store as Partial<TerminalPluginStore>;
+        store.assertGenericPublication?.(message, payload);
+      }
+      this.#persistAllocatedMessage((sequence) => {
+        const message = messageEnvelope(
+          type,
+          sequence,
+          payload,
+          correlationId,
+          this.#now(),
+          this.#randomUUID(),
+        );
+        // Preserve raw exact-name evidence through the actual insertion check.
+        // Wire parsing may still normalize unowned legacy events for delivery.
+        if (message.type === "job.event")
+          return {
+            ...message,
+            payload: {
+              ...message.payload,
+              event_type: (payload as { event_type: string }).event_type,
+            },
+          };
+        return message;
+      });
+      this.#scheduleSendPump();
+    });
   }
 
   onCommand(handler: (command: ServerEnvelope) => Promise<void>): () => void {
     this.#handlers.add(handler);
     return () => this.#handlers.delete(handler);
+  }
+
+  #terminalStore(): TerminalPluginStore {
+    const store = this.#options.store as Partial<TerminalPluginStore>;
+    if (
+      !this.#options.requireOwnedTerminal ||
+      this.#options.requireJobCoordination !== true ||
+      !isCoordinatingStore(this.#options.store) ||
+      typeof store.commitTerminal !== "function" ||
+      typeof store.reconcileTerminal !== "function" ||
+      typeof store.readTerminal !== "function" ||
+      typeof store.ownedIntent !== "function"
+    )
+      throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+    return store as TerminalPluginStore;
+  }
+
+  commitTerminal(
+    input: LocalTerminalBinding,
+    authority: TerminalAuthority,
+    nativeProjection?: unknown,
+  ): TerminalCommitResult {
+    return this.#allocate(() => {
+      const store = this.#terminalStore();
+      if (!this.currentEpoch())
+        throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+      const binding = captureTerminalBinding(input) as LocalTerminalBinding;
+      const { operation, owner } = binding;
+      let payload: unknown;
+      let type: "job.event" | "job.cancelled";
+      if (operation.kind === "native") {
+        if (!this.#options.redaction)
+          throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+        type = "job.event";
+        payload = {
+          job_id: owner.jobId,
+          attempt: owner.attempt,
+          event_type: `job.${operation.outcome}`,
+          source: "harness",
+          payload: redactEvent(nativeProjection, this.#options.redaction),
+        };
+      } else {
+        if (nativeProjection !== undefined)
+          throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+        if (operation.kind === "cancel") {
+          type = "job.cancelled";
+          payload = {
+            job_id: owner.jobId,
+            attempt: owner.attempt,
+            reason: "Cancelled by owner",
+          };
+        } else if (operation.kind === "unavailable") {
+          type = "job.event";
+          payload = {
+            job_id: owner.jobId,
+            attempt: owner.attempt,
+            event_type: "job.failed",
+            source: "harness",
+            payload: { stage: "failed", summary: operation.reason },
+          };
+        } else throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+      }
+      const proposal = {
+        binding,
+        type,
+        payload,
+        correlationId: terminalCorrelation(binding),
+      };
+      let candidate: StoredOutboundEvent | undefined;
+      let committed = false;
+      try {
+        const result = store.commitTerminal(proposal, authority, () => {
+          const sequence = this.#clientSequence + 1;
+          if (!Number.isSafeInteger(sequence))
+            throw new Error("CONNECTOR_SEQUENCE_EXHAUSTED");
+          const message = messageEnvelope(
+            type,
+            sequence,
+            payload,
+            proposal.correlationId,
+            this.#now(),
+            this.#randomUUID(),
+          );
+          candidate = {
+            messageId: message.message_id,
+            sequence,
+            payload: JSON.stringify(message),
+            expectedReceiptProfile: JOB_COORDINATION,
+            attempts: 0,
+            acknowledgedAt: null,
+          };
+          return candidate;
+        });
+        if (result.kind !== "committed") return result;
+        committed = true;
+        if (
+          !candidate ||
+          result.winner.outbound.messageId !== candidate.messageId ||
+          result.winner.outbound.sequence !== candidate.sequence
+        )
+          throw new Error();
+        this.#outboundBySequence.set(candidate.sequence, candidate);
+        this.#clientSequence = candidate.sequence;
+        this.#scheduleSendPump();
+        return result;
+      } catch (error) {
+        if (committed) {
+          this.#fatal("CONNECTOR_TERMINAL_COMMIT_UNCERTAIN");
+          throw this.#fatalError;
+        }
+        if (error instanceof StoreSequenceError) {
+          this.#fatal("CONNECTOR_SEQUENCE_CONFLICT");
+          throw this.#fatalError;
+        }
+        // A store wrapper may throw after its actual commit. Durable evidence
+        // distinguishes that uncertainty from a rolled-back write.
+        if (candidate) {
+          try {
+            if (
+              store.outboundEvent(candidate.sequence)?.messageId ===
+              candidate.messageId
+            )
+              this.#fatal("CONNECTOR_TERMINAL_COMMIT_UNCERTAIN");
+          } catch {
+            this.#fatal("CONNECTOR_TERMINAL_COMMIT_UNCERTAIN");
+          }
+        }
+        if (this.#fatalError) throw this.#fatalError;
+        throw error;
+      }
+    });
+  }
+
+  reconcileTerminal(
+    binding: ReconciliationBinding,
+    authority: TerminalAuthority,
+  ): TerminalReconcileResult {
+    return this.#allocate(() => {
+      if (!this.currentEpoch())
+        throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+      return this.#terminalStore().reconcileTerminal(binding, authority);
+    });
   }
 
   currentEpoch(): ConnectorEpoch | undefined {
@@ -1077,6 +1426,22 @@ export class DurableConnectorClient implements CoordinatingConnectorClient {
   }
 
   #persistMessage(
+    build: (sequence: number) => ConnectorClientMessage,
+  ): PendingMessage {
+    return this.#allocate(() => this.#persistAllocatedMessage(build));
+  }
+
+  #allocate<T>(operation: () => T): T {
+    if (this.#allocating) throw new Error("CONNECTOR_ALLOCATION_REENTRANT");
+    this.#allocating = true;
+    try {
+      return operation();
+    } finally {
+      this.#allocating = false;
+    }
+  }
+
+  #persistAllocatedMessage(
     build: (sequence: number) => ConnectorClientMessage,
   ): PendingMessage {
     if (this.#stopping) throw new Error("CONNECTOR_STOPPED");

@@ -47,7 +47,7 @@ const evidence = z
   })
   .strict();
 
-export const OwnedIntentSchema = z
+const intentFields = z
   .object({
     schemaVersion: z.literal(1),
     owner: OwnedIntentOwnerSchema,
@@ -69,48 +69,72 @@ export const OwnedIntentSchema = z
     startedEvidence: evidence.nullable(),
     unavailable: unavailable.nullable(),
   })
-  .strict()
-  .superRefine((value, context) => {
-    const valid =
-      value.phase === "prepared"
-        ? value.mode === null && value.startedEvidence === null
-        : value.mode !== null &&
-          (value.phase === "started"
-            ? value.startedEvidence !== null &&
-              value.startedEvidence.sessionId === value.owner.sessionId &&
-              value.startedEvidence.messageId === value.initialMessageId &&
-              value.startedEvidence.requestDigest === value.requestDigest
-            : value.startedEvidence === null);
-    if (!valid)
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "Invalid phase relationships",
-      });
-    // Reuse the protocol's full envelope calendar/expiry validation without
-    // retaining a request body in the journal.
-    if (
-      !ConnectorServerMessageSchema.safeParse({
-        protocol_version: "1.0",
-        type: "job.offer",
-        message_id: value.offer.messageId,
-        sequence: value.offer.sequence,
-        correlation_id: value.offer.correlationId,
-        sent_at: value.offer.sentAt,
-        expires_at: value.offer.expiresAt,
-        payload: {
-          job_id: value.owner.jobId,
-          attempt: value.owner.attempt,
-          repository_id: value.owner.repositoryId,
-          lease_id: value.leaseId,
-          request: "identity validation",
+  .strict();
+const validateIntent = (
+  value: z.infer<typeof intentFields>,
+  context: z.RefinementCtx,
+): void => {
+  const valid =
+    value.phase === "prepared"
+      ? value.mode === null && value.startedEvidence === null
+      : value.mode !== null &&
+        (value.phase === "started"
+          ? value.startedEvidence !== null &&
+            value.startedEvidence.sessionId === value.owner.sessionId &&
+            value.startedEvidence.messageId === value.initialMessageId &&
+            value.startedEvidence.requestDigest === value.requestDigest
+          : value.startedEvidence === null);
+  if (!valid)
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Invalid phase relationships",
+    });
+  // Reuse the protocol's full envelope calendar/expiry validation without
+  // retaining a request body in the journal.
+  if (
+    !ConnectorServerMessageSchema.safeParse({
+      protocol_version: "1.0",
+      type: "job.offer",
+      message_id: value.offer.messageId,
+      sequence: value.offer.sequence,
+      correlation_id: value.offer.correlationId,
+      sent_at: value.offer.sentAt,
+      expires_at: value.offer.expiresAt,
+      payload: {
+        job_id: value.owner.jobId,
+        attempt: value.owner.attempt,
+        repository_id: value.owner.repositoryId,
+        lease_id: value.leaseId,
+        request: "identity validation",
+      },
+    }).success
+  )
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Invalid offer identity",
+    });
+};
+export const NonterminalOwnedIntentSchema =
+  intentFields.superRefine(validateIntent);
+export const OwnedIntentSchema = z.union([
+  NonterminalOwnedIntentSchema,
+  intentFields
+    .extend({ phase: z.literal("terminal") })
+    .superRefine((value, context) => {
+      validateIntent(
+        {
+          ...value,
+          phase:
+            value.startedEvidence !== null
+              ? "started"
+              : value.mode === null
+                ? "prepared"
+                : "creating",
         },
-      }).success
-    )
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "Invalid offer identity",
-      });
-  });
+        context,
+      );
+    }),
+]);
 
 type DeepReadonly<T> = {
   readonly [K in keyof T]: T[K] extends object ? DeepReadonly<T[K]> : T[K];

@@ -20,14 +20,17 @@ import type {
 import type { JobCancelMessage } from "./cancel-handler.js";
 import {
   admitCoordinationTiming,
+  admitReconciliationTiming,
   type CoordinationClockSample,
   type CoordinationTiming,
   cancellationCoordinationDeadline,
   isCoordinationTimingCurrent,
+  isReconciliationTimingCurrent,
 } from "./coordination-deadlines.js";
 import type { JobStateClient } from "./job-state-client.js";
 
-const operationSchema = z.discriminatedUnion("kind", [
+export const TerminalOperationSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("reconcile") }).strict(),
   z
     .object({
       kind: z.literal("native"),
@@ -51,7 +54,9 @@ const operationSchema = z.discriminatedUnion("kind", [
     })
     .strict(),
 ]);
-export type TerminalOperation = Readonly<z.infer<typeof operationSchema>>;
+export type TerminalOperation = Readonly<
+  z.infer<typeof TerminalOperationSchema>
+>;
 export type TerminalAuthorityBinding = {
   owner: OwnedIntentOwner;
   expectedVersion: number;
@@ -94,37 +99,41 @@ function fields(
       captured[name] = (value as Record<string, unknown>)[name];
   return captured;
 }
-function captureBinding(
+export function captureTerminalBinding(
   input: TerminalAuthorityBinding,
 ): Readonly<TerminalAuthorityBinding> {
-  const owner = input.owner;
-  const version = input.expectedVersion;
-  const operation = input.operation;
-  return Object.freeze({
-    owner: Object.freeze(
-      OwnedIntentOwnerSchema.parse(
-        fields(owner, [
-          "jobId",
-          "attempt",
-          "repositoryId",
-          "sessionId",
-          "ownerGeneration",
-        ]),
+  try {
+    const owner = input.owner;
+    const version = input.expectedVersion;
+    const operation = input.operation;
+    return Object.freeze({
+      owner: Object.freeze(
+        OwnedIntentOwnerSchema.parse(
+          fields(owner, [
+            "jobId",
+            "attempt",
+            "repositoryId",
+            "sessionId",
+            "ownerGeneration",
+          ]),
+        ),
       ),
-    ),
-    expectedVersion: OwnedVersionSchema.parse(version),
-    operation: Object.freeze(
-      operationSchema.parse(
-        fields(operation, [
-          "kind",
-          "outcome",
-          "eventSequence",
-          "cancelRevision",
-          "reason",
-        ]),
+      expectedVersion: OwnedVersionSchema.parse(version),
+      operation: Object.freeze(
+        TerminalOperationSchema.parse(
+          fields(operation, [
+            "kind",
+            "outcome",
+            "eventSequence",
+            "cancelRevision",
+            "reason",
+          ]),
+        ),
       ),
-    ),
-  });
+    });
+  } catch {
+    throw invalid();
+  }
 }
 function captureCommand(value: unknown): JobCancelMessage {
   const command = fields(value, [
@@ -204,10 +213,12 @@ function checkCurrent(value: Capability, snapshot: boolean): void {
   const now = sampleClock(value.lifetime.clock);
   if (
     now.monotonicTimeMs < value.lastMonotonic ||
-    !isCoordinationTimingCurrent(value.timing, now, {
-      snapshot,
-      lease: false,
-    }) ||
+    !(value.snapshot.binding.operation.kind === "reconcile"
+      ? isReconciliationTimingCurrent(value.timing, now)
+      : isCoordinationTimingCurrent(value.timing, now, {
+          snapshot,
+          lease: false,
+        })) ||
     (value.commandDeadline !== undefined &&
       now.monotonicTimeMs >= value.commandDeadline)
   )
@@ -226,7 +237,7 @@ function check(
   if (!value) throw invalid();
   try {
     if (value.revoked) throw revoked();
-    if (ownedJson(captureBinding(binding)) !== value.bindingKey)
+    if (ownedJson(captureTerminalBinding(binding)) !== value.bindingKey)
       throw invalid();
     if (!begin && !value.admitted) throw revoked();
     checkCurrent(value, !value.admitted);
@@ -260,6 +271,8 @@ export function assertTerminalAuthority(
 }
 
 function eligible(record: OwnedIntent, operation: TerminalOperation): boolean {
+  if (operation.kind === "reconcile") return record.mode !== null;
+  if (record.phase === "terminal") return false;
   if (operation.kind === "cancel") return true;
   if (operation.kind === "unavailable")
     return record.unavailable === operation.reason;
@@ -281,6 +294,11 @@ function stateEligible(
     (record.mode !== null && record.mode !== state.mode)
   )
     return false;
+  if (operation.kind === "reconcile")
+    return (
+      record.mode !== null &&
+      ["succeeded", "failed", "cancelled", "expired"].includes(state.status)
+    );
   if (operation.kind === "cancel")
     return (
       state.status === "cancelling" &&
@@ -371,7 +389,7 @@ export class TerminalAuthorityIssuer {
     let signal: AbortSignal | undefined;
     const removals: (() => void)[] = [];
     try {
-      const binding = captureBinding(input);
+      const binding = captureTerminalBinding(input);
       signal = input.signal;
       const commandInput = input.command;
       if (!(signal instanceof AbortSignal)) throw invalid();
@@ -436,11 +454,11 @@ export class TerminalAuthorityIssuer {
         !stateEligible(state, before, binding.operation, command)
       )
         throw unavailable();
-      const timing = admitCoordinationTiming(
-        state,
-        exchange.sent,
-        exchange.received,
-      );
+      const timing = (
+        binding.operation.kind === "reconcile"
+          ? admitReconciliationTiming
+          : admitCoordinationTiming
+      )(state, exchange.sent, exchange.received);
       if (!timing) throw unavailable();
       const commandDeadline =
         command === undefined

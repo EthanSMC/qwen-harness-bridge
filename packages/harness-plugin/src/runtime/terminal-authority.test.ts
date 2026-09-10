@@ -6,8 +6,16 @@ import { join } from "node:path";
 import type { JobStatePayload, JobSyncPayload } from "@qhb/protocol";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { redactEvent } from "../redaction/redact-event.js";
 import type { OwnedIntent } from "../store/owned-intent.js";
-import { SqlitePluginStore } from "../store/plugin-store.js";
+import {
+  parseTerminalRecord,
+  terminalCorrelation,
+} from "../store/owned-terminal.js";
+import {
+  SqlitePluginStore,
+  StoreSequenceError,
+} from "../store/plugin-store.js";
 import type {
   ConnectorEpoch,
   CoordinatingConnectorClient,
@@ -20,6 +28,7 @@ import { JobStateClient } from "./job-state-client.js";
 import {
   assertTerminalAuthority,
   beginTerminalAuthority,
+  captureTerminalBinding,
   type TerminalAuthorityBinding,
   TerminalAuthorityError,
   TerminalAuthorityIssuer,
@@ -298,7 +307,856 @@ function revoked(effect: () => unknown) {
   }
 }
 
+function cancellationProposal(f: ReturnType<typeof fixture>) {
+  const binding = {
+    ...f.binding(),
+    operation: { kind: "cancel" as const, cancelRevision: 4 },
+  };
+  const proposal = {
+    binding,
+    type: "job.cancelled" as const,
+    correlationId: terminalCorrelation(binding),
+    payload: {
+      job_id: binding.owner.jobId,
+      attempt: binding.owner.attempt,
+      reason: "Cancelled by owner",
+    },
+  };
+  const factory = () => {
+    const messageId = randomUUID();
+    return {
+      messageId,
+      sequence: 1,
+      expectedReceiptProfile: "job-coordination-v1" as const,
+      payload: JSON.stringify({
+        protocol_version: "1.0",
+        type: proposal.type,
+        message_id: messageId,
+        sequence: 1,
+        correlation_id: proposal.correlationId,
+        sent_at: stamp(100),
+        expires_at: stamp(60100),
+        payload: proposal.payload,
+      }),
+    };
+  };
+  return { binding, proposal, factory };
+}
+
 describe("live terminal authority", () => {
+  it.each([
+    "missing-outbox",
+    "missing-profile",
+    "wrong-profile",
+    "sent-at",
+    "correlation",
+    "payload",
+    "status",
+    "outcome",
+    "type",
+  ])(
+    "I4 local committed history fails closed after %s corruption",
+    async (fault) => {
+      const f = fixture();
+      const cancel = cancellationProposal(f);
+      const binding = {
+        ...f.binding(),
+        operation: {
+          kind: "native" as const,
+          outcome: "succeeded" as const,
+          eventSequence: 1,
+        },
+      };
+      const token = await f.ready(binding);
+      const proposal = {
+        binding,
+        type: "job.event" as const,
+        correlationId: terminalCorrelation(binding),
+        payload: {
+          job_id: binding.owner.jobId,
+          attempt: 1,
+          event_type: "job.succeeded",
+          source: "harness",
+          payload: { summary: "Done" },
+        },
+      };
+      const result = f.store.commitTerminal(proposal, token, () => {
+        const event = cancel.factory();
+        return {
+          ...event,
+          payload: JSON.stringify({
+            ...JSON.parse(event.payload),
+            type: proposal.type,
+            correlation_id: proposal.correlationId,
+            payload: proposal.payload,
+          }),
+        };
+      });
+      if (result.kind !== "committed") throw new Error();
+      const winner = result.winner;
+      if (fault === "missing-outbox") f.raw.exec("DELETE FROM outbound_events");
+      else if (fault === "missing-profile")
+        f.raw.exec(
+          "DELETE FROM metadata WHERE key LIKE 'outbound-receipt-profile:%'",
+        );
+      else if (fault === "wrong-profile")
+        f.raw.exec(
+          "UPDATE metadata SET value = 'wrong' WHERE key LIKE 'outbound-receipt-profile:%'",
+        );
+      else {
+        const row = f.raw
+          .prepare("SELECT payload_json FROM outbound_events")
+          .get() as { payload_json: string };
+        const message = JSON.parse(row.payload_json);
+        if (fault === "sent-at") message.sent_at = stamp(101);
+        else if (fault === "correlation") message.correlation_id = randomUUID();
+        else if (fault === "payload")
+          message.payload.payload.summary = "Changed";
+        else {
+          message.payload.payload[fault] = "failed";
+          const corrupt = { ...winner, payload: message.payload };
+          expect(() => parseTerminalRecord(JSON.stringify(corrupt))).toThrow(
+            "OWNED_INTENT_CORRUPT",
+          );
+          f.raw
+            .prepare("UPDATE metadata SET value = ? WHERE key = ?")
+            .run(
+              JSON.stringify(corrupt),
+              `owned-terminal-v1:${binding.owner.jobId}:1`,
+            );
+        }
+        f.raw
+          .prepare("UPDATE outbound_events SET payload_json = ?")
+          .run(JSON.stringify(message));
+      }
+      const before = f.rows();
+      expect(() => f.store.readTerminal(binding.owner)).toThrow(
+        "OWNED_INTENT_CORRUPT",
+      );
+      expect(() => f.store.ownedIntent(binding.owner.jobId, 1)).toThrow(
+        "OWNED_INTENT_CORRUPT",
+      );
+      let allocations = 0;
+      expect(() =>
+        f.store.commitTerminal(proposal, token, () => {
+          allocations++;
+          return cancel.factory();
+        }),
+      ).toThrow();
+      expect(allocations).toBe(0);
+      expect(f.rows()).toEqual(before);
+    },
+  );
+  it("I3 accepts actual structured redactor output and I4 rejects same-event changed summary", async () => {
+    const f = fixture();
+    const binding = {
+      ...f.binding(),
+      operation: {
+        kind: "native" as const,
+        outcome: "succeeded" as const,
+        eventSequence: 1,
+      },
+    };
+    const token = await f.ready(binding);
+    const payload = redactEvent(
+      {
+        summary: "Done",
+        stage: "complete",
+        changed_files: ["package.json"],
+        tests: { passed: 2, failed: 0, total: 2 },
+        artifacts: [
+          {
+            name: "Report",
+            media_type: "text/plain",
+            url: "https://example.com/report",
+          },
+        ],
+      },
+      { repositoryRoot: process.cwd(), homeDirectory: tmpdir() },
+    );
+    const proposal = {
+      binding,
+      type: "job.event" as const,
+      correlationId: terminalCorrelation(binding),
+      payload: {
+        job_id: binding.owner.jobId,
+        attempt: 1,
+        event_type: "job.succeeded",
+        source: "harness",
+        payload,
+      },
+    };
+    const result = f.store.commitTerminal(proposal, token, () => {
+      const event = cancellationProposal(f).factory();
+      return {
+        ...event,
+        payload: JSON.stringify({
+          ...JSON.parse(event.payload),
+          type: proposal.type,
+          correlation_id: proposal.correlationId,
+          payload: proposal.payload,
+        }),
+      };
+    });
+    if (result.kind !== "committed") throw new Error();
+    expect(parseTerminalRecord(JSON.stringify(result.winner))).toEqual(
+      result.winner,
+    );
+    const before = f.rows();
+    let allocations = 0;
+    expect(() =>
+      f.store.commitTerminal(
+        {
+          ...proposal,
+          payload: {
+            ...proposal.payload,
+            payload: { ...payload, summary: "Changed" },
+          },
+        },
+        token,
+        () => {
+          allocations++;
+          return cancellationProposal(f).factory();
+        },
+      ),
+    ).toThrow("OWNED_INTENT_CONFLICT");
+    expect(allocations).toBe(0);
+    expect(f.rows()).toEqual(before);
+    expect(f.store.readTerminal(binding.owner)).toEqual(result.winner);
+  });
+  it.each([
+    { summary: "Done", status: "failed" },
+    { summary: "Done", outcome: "failed" },
+    { summary: "Done", type: "failed" },
+    {},
+    { summary: "" },
+    { summary: "x".repeat(501) },
+    { summary: "Done", tests: { passed: 1, failed: 1, total: 1 } },
+    {
+      summary: "Done",
+      artifacts: [
+        {
+          name: "Report",
+          media_type: "text/plain",
+          url: "https://example.com/?secret=x",
+        },
+      ],
+    },
+  ])(
+    "I3 rejects malformed native projection %j before factory",
+    async (payload) => {
+      const f = fixture();
+      const binding = {
+        ...f.binding(),
+        operation: {
+          kind: "native" as const,
+          outcome: "succeeded" as const,
+          eventSequence: 1,
+        },
+      };
+      const token = await f.ready(binding);
+      const before = f.rows();
+      let allocations = 0;
+      expect
+        .soft(() =>
+          f.store.commitTerminal(
+            {
+              binding,
+              type: "job.event",
+              correlationId: terminalCorrelation(binding),
+              payload: {
+                job_id: binding.owner.jobId,
+                attempt: 1,
+                event_type: "job.succeeded",
+                source: "harness",
+                payload,
+              },
+            },
+            token,
+            () => {
+              allocations++;
+              throw new Error("factory reached");
+            },
+          ),
+        )
+        .toThrow("OWNED_INTENT_INVALID");
+      expect(allocations).toBe(0);
+      expect(f.rows()).toEqual(before);
+    },
+  );
+  it("keeps the shared binding capture error fixed for invalid private input", () => {
+    const f = fixture();
+    expect(() =>
+      captureTerminalBinding({
+        ...f.binding(),
+        operation: { kind: "unavailable", reason: "private input" } as never,
+      }),
+    ).toThrow("TERMINAL_AUTHORITY_INVALID");
+  });
+  it("prevents a terminal factory from mutating unrelated legacy mappings", async () => {
+    const f = fixture();
+    const { binding, proposal, factory } = cancellationProposal(f);
+    const token = await f.ready(
+      binding,
+      { status: "cancelling", cancel_revision: 4 },
+      f.command(),
+    );
+    expect(
+      f.store.commitTerminal(proposal, token, () => {
+        expect(() =>
+          f.store.mapJob({
+            jobId: randomUUID(),
+            attempt: 1,
+            sessionId: randomUUID(),
+            status: "running",
+          }),
+        ).toThrow("OWNED_INTENT_UNAVAILABLE");
+        return factory();
+      }).kind,
+    ).toBe("committed");
+    expect(f.raw.prepare("SELECT * FROM job_mappings").all()).toHaveLength(1);
+  });
+  it("rolls back when the original lifetime ends at the precommit fence", async () => {
+    const f = fixture();
+    const { binding, proposal, factory } = cancellationProposal(f);
+    const token = await f.ready(
+      binding,
+      { status: "cancelling", cancel_revision: 4 },
+      f.command(),
+    );
+    let checks = 0;
+    f.clock(() => {
+      if (++checks === 3) f.lifetime.abort();
+      return { wallTimeMs: origin + 100, monotonicTimeMs: 10100 };
+    });
+    const before = f.rows();
+    expect(() => f.store.commitTerminal(proposal, token, factory)).toThrow();
+    expect(checks).toBe(3);
+    expect(f.rows()).toEqual(before);
+  });
+  it("rejects asynchronous envelope construction with no partial writes", async () => {
+    const f = fixture();
+    const { binding, proposal, factory } = cancellationProposal(f);
+    const token = await f.ready(
+      binding,
+      { status: "cancelling", cancel_revision: 4 },
+      f.command(),
+    );
+    const before = f.rows();
+    expect(() =>
+      f.store.commitTerminal(proposal, token, (() =>
+        Promise.resolve(factory())) as never),
+    ).toThrow("OWNED_INTENT_INVALID");
+    expect(f.rows()).toEqual(before);
+  });
+  it.each(["payload_json", "attempts", "acknowledged_at"])(
+    "rejects BLOB %s in retained local outbound evidence",
+    async (field) => {
+      const f = fixture();
+      const { binding, proposal, factory } = cancellationProposal(f);
+      const token = await f.ready(
+        binding,
+        { status: "cancelling", cancel_revision: 4 },
+        f.command(),
+      );
+      f.store.commitTerminal(proposal, token, factory);
+      const row = f.raw
+        .prepare(`SELECT ${field} AS value FROM outbound_events`)
+        .get() as { value: unknown };
+      f.raw
+        .prepare(`UPDATE outbound_events SET ${field} = ?`)
+        .run(Buffer.from(String(row.value ?? stamp(100))));
+      const before = f.rows();
+      expect(() => f.store.readTerminal(binding.owner)).toThrow(
+        "OWNED_INTENT_CORRUPT",
+      );
+      expect(f.rows()).toEqual(before);
+    },
+  );
+  it.each(["native", "cancel"] as const)(
+    "arbitrates %s first, rejects contradictory native content, and retains the local winner during remote reconciliation",
+    async (first) => {
+      const f = fixture();
+      const cancel = cancellationProposal(f);
+      const nativeBinding = {
+        ...cancel.binding,
+        operation: {
+          kind: "native" as const,
+          outcome: "succeeded" as const,
+          eventSequence: 1,
+        },
+      };
+      const changedBinding = {
+        ...nativeBinding,
+        operation: { ...nativeBinding.operation, outcome: "failed" as const },
+      };
+      const cancelToken = await f.ready(
+        cancel.binding,
+        { status: "cancelling", cancel_revision: 4 },
+        f.command(),
+      );
+      const nativeToken = await f.ready(nativeBinding);
+      const changedToken = await f.ready(changedBinding);
+      const nativeProposal = {
+        binding: nativeBinding,
+        type: "job.event" as const,
+        correlationId: terminalCorrelation(nativeBinding),
+        payload: {
+          job_id: f.record.owner.jobId,
+          attempt: 1,
+          event_type: "job.succeeded",
+          source: "harness",
+          payload: { summary: "Done" },
+        },
+      };
+      const nativeFactory = () => {
+        const event = cancel.factory();
+        return {
+          ...event,
+          payload: JSON.stringify({
+            ...JSON.parse(event.payload),
+            type: nativeProposal.type,
+            correlation_id: nativeProposal.correlationId,
+            payload: nativeProposal.payload,
+          }),
+        };
+      };
+      const winner =
+        first === "native"
+          ? f.store.commitTerminal(nativeProposal, nativeToken, nativeFactory)
+          : f.store.commitTerminal(
+              cancel.proposal,
+              cancelToken,
+              cancel.factory,
+            );
+      expect(winner.kind).toBe("committed");
+      const before = f.rows();
+      const forbidden = () => {
+        throw new Error("existing winner allocated");
+      };
+      expect(
+        first === "native"
+          ? f.store.commitTerminal(cancel.proposal, cancelToken, forbidden)
+          : f.store.commitTerminal(nativeProposal, nativeToken, forbidden),
+      ).toMatchObject({ kind: "existing", relation: "competing" });
+      if (first === "native")
+        expect(() =>
+          f.store.commitTerminal(
+            {
+              ...nativeProposal,
+              binding: changedBinding,
+              payload: { ...nativeProposal.payload, event_type: "job.failed" },
+            },
+            changedToken,
+            forbidden,
+          ),
+        ).toThrow("OWNED_INTENT_CONFLICT");
+      expect(f.rows()).toEqual(before);
+      const current = f.store.ownedIntent(f.record.owner.jobId, 1);
+      if (!current) throw new Error();
+      const remoteBinding = {
+        owner: current.owner,
+        expectedVersion: current.version,
+        operation: { kind: "reconcile" as const },
+      };
+      const remote = await f.ready(remoteBinding, {
+        status: "expired",
+        expires_at: stamp(-1000),
+      });
+      expect(f.store.reconcileTerminal(remoteBinding, remote)).toMatchObject({
+        kind: "existing",
+        record: {
+          kind: "local",
+          status: first === "native" ? "succeeded" : "cancelled",
+        },
+        observedRemote: { status: "expired" },
+      });
+      expect(f.rows()).toEqual(before);
+    },
+  );
+  it("commits the fixed latched unavailable reason from a prepared predecessor", async () => {
+    const f = fixture("prepared");
+    const current = f.store.advanceOwnedIntent(
+      f.record.owner,
+      f.record.version,
+      { unavailable: "HARNESS_SESSION_LOST" },
+    );
+    const binding = {
+      owner: current.owner,
+      expectedVersion: current.version,
+      operation: {
+        kind: "unavailable" as const,
+        reason: "HARNESS_SESSION_LOST" as const,
+      },
+    };
+    const token = await f.ready(binding);
+    const proposal = {
+      binding,
+      correlationId: terminalCorrelation(binding),
+      type: "job.event" as const,
+      payload: {
+        job_id: current.owner.jobId,
+        attempt: 1,
+        event_type: "job.failed",
+        source: "harness",
+        payload: { stage: "failed", summary: "HARNESS_SESSION_LOST" },
+      },
+    };
+    const factory = () => {
+      const messageId = randomUUID();
+      return {
+        messageId,
+        sequence: 1,
+        expectedReceiptProfile: "job-coordination-v1" as const,
+        payload: JSON.stringify({
+          protocol_version: "1.0",
+          type: proposal.type,
+          message_id: messageId,
+          sequence: 1,
+          correlation_id: proposal.correlationId,
+          sent_at: stamp(100),
+          expires_at: stamp(60100),
+          payload: proposal.payload,
+        }),
+      };
+    };
+    expect(f.store.commitTerminal(proposal, token, factory)).toMatchObject({
+      kind: "committed",
+      winner: {
+        status: "failed",
+        predecessor: { phase: "prepared", unavailable: "HARNESS_SESSION_LOST" },
+      },
+    });
+    expect(() =>
+      f.store.advanceOwnedIntent(current.owner, current.version + 1, {
+        unavailable: "HARNESS_SESSION_LOST",
+      }),
+    ).toThrow();
+  });
+  it("rejects store recursion while capturing a proposal before entering SQLite", async () => {
+    const f = fixture();
+    const { binding, proposal, factory } = cancellationProposal(f);
+    const token = await f.ready(
+      binding,
+      { status: "cancelling", cancel_revision: 4 },
+      f.command(),
+    );
+    let reads = 0;
+    const input = {
+      ...proposal,
+      get correlationId() {
+        reads++;
+        expect(() => f.store.commitTerminal(proposal, token, factory)).toThrow(
+          "OWNED_INTENT_UNAVAILABLE",
+        );
+        return proposal.correlationId;
+      },
+    };
+    expect(f.store.commitTerminal(input, token, factory).kind).toBe(
+      "committed",
+    );
+    expect(reads).toBe(1);
+  });
+  it("rejects predecessor mutation during envelope construction instead of overwriting a changed CAS", async () => {
+    const f = fixture();
+    const { binding, proposal, factory } = cancellationProposal(f);
+    const token = await f.ready(
+      binding,
+      { status: "cancelling", cancel_revision: 4 },
+      f.command(),
+    );
+    const db = (f.store as unknown as { database: Database.Database }).database;
+    const before = f.rows();
+    expect(() =>
+      f.store.commitTerminal(proposal, token, () => {
+        db.prepare(
+          "UPDATE metadata SET value = json_set(value, '$.version', 99) WHERE key LIKE 'owned-intent-v1:%'",
+        ).run();
+        return factory();
+      }),
+    ).toThrow();
+    expect(f.rows()).toEqual(before);
+  });
+  it.each(["intent", "mapping", "marker", "outbox", "profile"])(
+    "rolls back the complete joined snapshot after reached %s write",
+    async (point) => {
+      const f = fixture();
+      const { binding, proposal, factory } = cancellationProposal(f);
+      const token = await f.ready(
+        binding,
+        { status: "cancelling", cancel_revision: 4 },
+        f.command(),
+      );
+      const db = (f.store as unknown as { database: Database.Database })
+        .database;
+      let reached = 0;
+      db.function("terminal_failure", () => {
+        reached++;
+        return 1;
+      });
+      const target =
+        point === "intent"
+          ? ["UPDATE", "metadata", "NEW.key LIKE 'owned-intent-v1:%'"]
+          : point === "mapping"
+            ? ["UPDATE", "job_mappings", "1"]
+            : point === "outbox"
+              ? [
+                  "INSERT",
+                  "outbound_events",
+                  "json_extract(NEW.payload_json, '$.type') = 'job.cancelled'",
+                ]
+              : [
+                  "INSERT",
+                  "metadata",
+                  `NEW.key LIKE '${point === "marker" ? "owned-terminal-v1:" : "outbound-receipt-profile:"}%'`,
+                ];
+      db.exec(
+        `CREATE TRIGGER terminal_failure AFTER ${target[0]} ON ${target[1]} WHEN ${target[2]} BEGIN SELECT terminal_failure(); SELECT RAISE(ABORT, 'private failure'); END`,
+      );
+      const before = f.rows();
+      expect(() => f.store.commitTerminal(proposal, token, factory)).toThrow(
+        "OWNED_INTENT_UNAVAILABLE",
+      );
+      expect(reached).toBe(1);
+      expect(f.rows()).toEqual(before);
+    },
+  );
+  it("rejects nested terminal entry before authority or envelope callbacks", async () => {
+    const f = fixture();
+    const { binding, proposal, factory } = cancellationProposal(f);
+    const token = await f.ready(
+      binding,
+      { status: "cancelling", cancel_revision: 4 },
+      f.command(),
+    );
+    const db = (f.store as unknown as { database: Database.Database }).database;
+    let callbacks = 0;
+    f.clock(() => {
+      callbacks++;
+      return { wallTimeMs: origin + 100, monotonicTimeMs: 10100 };
+    });
+    const before = f.rows();
+    db.transaction(() =>
+      expect(() => f.store.commitTerminal(proposal, token, factory)).toThrow(
+        "OWNED_INTENT_UNAVAILABLE",
+      ),
+    )();
+    expect(callbacks).toBe(0);
+    expect(f.rows()).toEqual(before);
+  });
+  it.each(["intent", "mapping", "marker", "outbox", "profile"])(
+    "fails closed on reached zero-row %s CAS",
+    async (point) => {
+      const f = fixture();
+      const { binding, proposal, factory } = cancellationProposal(f);
+      const token = await f.ready(
+        binding,
+        { status: "cancelling", cancel_revision: 4 },
+        f.command(),
+      );
+      const db = (f.store as unknown as { database: Database.Database })
+        .database;
+      let reached = 0;
+      db.function("terminal_ignore", () => {
+        reached++;
+        return 1;
+      });
+      const update = point === "intent" || point === "mapping";
+      const table =
+        point === "mapping"
+          ? "job_mappings"
+          : point === "outbox"
+            ? "outbound_events"
+            : "metadata";
+      const condition =
+        point === "marker"
+          ? "NEW.key LIKE 'owned-terminal-v1:%'"
+          : point === "profile"
+            ? "NEW.key LIKE 'outbound-receipt-profile:%'"
+            : "1";
+      db.exec(
+        `CREATE TRIGGER terminal_ignore BEFORE ${update ? "UPDATE" : "INSERT"} ON ${table} WHEN ${condition} BEGIN SELECT terminal_ignore(); SELECT RAISE(IGNORE); END`,
+      );
+      const before = f.rows();
+      expect(() => f.store.commitTerminal(proposal, token, factory)).toThrow(
+        "OWNED_INTENT_UNAVAILABLE",
+      );
+      expect(reached).toBe(1);
+      expect(f.rows()).toEqual(before);
+    },
+  );
+  it.each(["succeeded", "failed", "cancelled", "expired"] as const)(
+    "closes remote %s without outbound identity or rows",
+    async (status) => {
+      const f = fixture();
+      const binding = {
+        ...f.binding(),
+        operation: { kind: "reconcile" as const },
+      };
+      const token = await f.ready(binding, {
+        status,
+        expires_at: stamp(-1000),
+      });
+      expect(f.store.reconcileTerminal(binding, token)).toMatchObject({
+        kind: "reconciled",
+        record: { kind: "remote", status },
+      });
+      expect(f.store.maxOutboundSequence()).toBe(0);
+      expect(f.raw.prepare("SELECT * FROM outbound_events").all()).toEqual([]);
+      const record = f.store.readTerminal(binding.owner);
+      expect(record).not.toHaveProperty("outbound");
+      expect(record).not.toHaveProperty("correlationId");
+      expect(f.store.listNonterminalJobs()).toEqual([]);
+      const current = f.store.ownedIntent(binding.owner.jobId, 1);
+      if (!current) throw new Error();
+      const freshBinding = { ...binding, expectedVersion: current.version };
+      const fresh = await f.ready(freshBinding, {
+        status,
+        expires_at: stamp(-1000),
+      });
+      const before = f.rows();
+      expect(f.store.reconcileTerminal(freshBinding, fresh)).toMatchObject({
+        kind: "existing",
+        record,
+      });
+      expect(f.rows()).toEqual(before);
+      await failure(
+        f.ready({ ...f.binding(), expectedVersion: current.version }),
+      );
+    },
+  );
+  it("preserves sequence conflict classification across the outer terminal transaction", async () => {
+    const f = fixture();
+    const binding = f.binding({ kind: "cancel", cancelRevision: 4 });
+    const token = await f.ready(
+      binding,
+      { status: "cancelling", cancel_revision: 4 },
+      f.command(),
+    );
+    const correlationId = terminalCorrelation(binding as never);
+    const payload = {
+      job_id: f.record.owner.jobId,
+      attempt: 1,
+      reason: "Cancelled by owner",
+    };
+    const event = {
+      messageId: randomUUID(),
+      sequence: 1,
+      expectedReceiptProfile: "job-coordination-v1" as const,
+      payload: JSON.stringify({
+        protocol_version: "1.0",
+        type: "job.cancelled",
+        message_id: randomUUID(),
+        sequence: 1,
+        correlation_id: correlationId,
+        sent_at: stamp(100),
+        expires_at: stamp(60100),
+        payload,
+      }),
+    };
+    const body = JSON.parse(event.payload);
+    body.message_id = event.messageId;
+    event.payload = JSON.stringify(body);
+    f.store.enqueueEvent({
+      messageId: randomUUID(),
+      sequence: 1,
+      payload: "{}",
+    });
+    const before = f.rows();
+    expect(() =>
+      f.store.commitTerminal(
+        {
+          binding: binding as never,
+          type: "job.cancelled",
+          payload,
+          correlationId,
+        },
+        token,
+        () => event,
+      ),
+    ).toThrow(StoreSequenceError);
+    expect(f.rows()).toEqual(before);
+  });
+  it("atomically joins a local cancellation and arbitrates exact retries without allocation", async () => {
+    const f = fixture();
+    const binding = f.binding({ kind: "cancel", cancelRevision: 4 });
+    const token = await f.ready(
+      binding,
+      { status: "cancelling", cancel_revision: 4 },
+      f.command(),
+    );
+    const proposal = {
+      binding: binding as never,
+      correlationId: terminalCorrelation(binding as never),
+      type: "job.cancelled" as const,
+      payload: {
+        job_id: f.record.owner.jobId,
+        attempt: 1,
+        reason: "Cancelled by owner",
+      },
+    };
+    let allocations = 0;
+    const factory = () => {
+      allocations++;
+      return {
+        messageId: randomUUID(),
+        sequence: 1,
+        expectedReceiptProfile: "job-coordination-v1" as const,
+        payload: "",
+      };
+    };
+    const commit = f.store.commitTerminal;
+    const result = commit.call(f.store, proposal, token, () => {
+      const event = factory();
+      return {
+        ...event,
+        payload: JSON.stringify({
+          protocol_version: "1.0",
+          message_id: event.messageId,
+          sequence: event.sequence,
+          correlation_id: proposal.correlationId,
+          type: proposal.type,
+          payload: proposal.payload,
+          sent_at: stamp(100),
+          expires_at: stamp(60100),
+        }),
+      };
+    });
+    expect(result).toMatchObject({
+      kind: "committed",
+      winner: { status: "cancelled" },
+    });
+    expect(f.store.ownedIntent(f.record.owner.jobId, 1)).toMatchObject({
+      phase: "terminal",
+      version: 4,
+    });
+    expect(f.store.findJob(f.record.owner.jobId)?.status).toBe("cancelled");
+    const before = f.rows();
+    expect(commit.call(f.store, proposal, token, factory)).toMatchObject({
+      kind: "existing",
+      relation: "same",
+    });
+    expect(allocations).toBe(1);
+    expect(f.rows()).toEqual(before);
+  });
+  it.each(["succeeded", "failed", "cancelled", "expired"] as const)(
+    "reconciles fresh remote %s after job expiry, but never beyond snapshot",
+    async (status) => {
+      const f = fixture();
+      const binding = f.binding({ kind: "reconcile" } as TerminalOperation);
+      const token = await f.ready(binding, {
+        status,
+        expires_at: stamp(-1000),
+      });
+      expect(beginTerminalAuthority(token, binding).state.status).toBe(status);
+      f.time(10999);
+      expect(assertTerminalAuthority(token, binding).state.status).toBe(status);
+      f.time(11000);
+      revoked(() => beginTerminalAuthority(token, binding));
+      f.time(10100);
+      revoked(() => assertTerminalAuthority(token, binding));
+    },
+  );
   it.each(["normal", "read_only"] as const)(
     "admits %s native completion with expired different dispatch lease and no writes",
     async (mode) => {

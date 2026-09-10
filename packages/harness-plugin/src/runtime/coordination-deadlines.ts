@@ -165,6 +165,24 @@ export function admitCoordinationTiming(
   sentInput: CoordinationClockSample,
   receivedInput: CoordinationClockSample,
 ): CoordinationTiming | undefined {
+  return admitTiming(state, sentInput, receivedInput, "effect");
+}
+
+/** Snapshot-only admission for remote closure; never local effect permission. */
+export function admitReconciliationTiming(
+  state: JobStatePayload,
+  sentInput: CoordinationClockSample,
+  receivedInput: CoordinationClockSample,
+): CoordinationTiming | undefined {
+  return admitTiming(state, sentInput, receivedInput, "reconcile");
+}
+
+function admitTiming(
+  state: JobStatePayload,
+  sentInput: CoordinationClockSample,
+  receivedInput: CoordinationClockSample,
+  purpose: "effect" | "reconcile",
+): CoordinationTiming | undefined {
   const sent = captureClock(sentInput);
   const received = captureClock(receivedInput);
   const parsed = JobStatePayloadSchema.safeParse(state);
@@ -201,7 +219,8 @@ export function admitCoordinationTiming(
     m1 + deadline - observed - elapsed - 1000n * scale;
   const snapshotEndpoint = endpoint(snapshot);
   const jobEndpoint = endpoint(job);
-  if (snapshotEndpoint <= m1 || jobEndpoint <= m1) return undefined;
+  if (snapshotEndpoint <= m1 || (purpose === "effect" && jobEndpoint <= m1))
+    return undefined;
   const snapshotDeadlineMonotonicMs = floorDeadline(snapshotEndpoint, scale);
   const jobDeadlineMonotonicMs = floorDeadline(jobEndpoint, scale);
   const leaseDeadlineMonotonicMs =
@@ -213,7 +232,7 @@ export function admitCoordinationTiming(
     jobDeadlineMonotonicMs === undefined ||
     leaseDeadlineMonotonicMs === undefined ||
     snapshotDeadlineMonotonicMs <= received.monotonicTimeMs ||
-    jobDeadlineMonotonicMs <= received.monotonicTimeMs
+    (purpose === "effect" && jobDeadlineMonotonicMs <= received.monotonicTimeMs)
   )
     return undefined;
   return Object.freeze({
@@ -286,5 +305,19 @@ export function isCoordinationTimingCurrent(
     (!requirements.lease ||
       (timing.leaseDeadlineMonotonicMs !== null &&
         now.monotonicTimeMs < timing.leaseDeadlineMonotonicMs))
+  );
+}
+
+/** Remote closure stays snapshot-current on every check, including retries. */
+export function isReconciliationTimingCurrent(
+  timing: CoordinationTiming,
+  nowInput: CoordinationClockSample,
+): boolean {
+  const now = captureClock(nowInput);
+  return (
+    finite(now) &&
+    now.monotonicTimeMs >= timing.received.monotonicTimeMs &&
+    stableOffset(timing.sent, now, timing[exact].scale) &&
+    now.monotonicTimeMs < timing.snapshotDeadlineMonotonicMs
   );
 }

@@ -328,6 +328,8 @@ Store nullable `jobs.cancel_revision` atomically only when the server enters can
 
 [ADR 0006](../../adr/0006-local-attempt-journal.md) refines the local pre-factory intent and initial-input journal: immutable offer/session/message identity, exact CAS phases, monotonic unavailable state, no legacy backfill, and persistence before any native effect. A journal record is not execution authority or proof of a native flush. Atomic terminal integration and real session recovery remain mandatory before activation.
 
+[ADR 0007](../../adr/0007-owned-terminal-outbox.md) defines the shared owned terminal/outbox transaction, immutable winner and predecessor linkage, stable minimized projection identity, postcommit transport adoption, and distinct remote-terminal closure without fabricated outbound evidence. All native result and cancellation producers must use that boundary; its implementation and real recovery evidence remain activation gates.
+
 ## 10. Job and approval model
 
 ### 10.1 Public job states

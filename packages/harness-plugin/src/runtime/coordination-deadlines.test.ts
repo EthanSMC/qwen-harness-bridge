@@ -2,6 +2,7 @@ import type { JobStatePayload } from "@qhb/protocol";
 import { describe, expect, it } from "vitest";
 import {
   admitCoordinationTiming,
+  admitReconciliationTiming,
   approvalCoordinationDeadlines,
   cancellationCoordinationDeadline,
   coordinationWaiterRemainingMs,
@@ -32,6 +33,20 @@ const received = { wallTimeMs: 100, monotonicTimeMs: 10100 };
 const initial = { snapshot: true, lease: true };
 const started = { snapshot: true, lease: false };
 const ongoing = { snapshot: false, lease: false };
+
+describe("remote terminal reconciliation timing", () => {
+  it.each(["succeeded", "failed", "cancelled", "expired"] as const)(
+    "admits fresh %s observation with expired job and preserves original endpoints",
+    (status) => {
+      const observed = { ...state, status, expires_at: "1969-12-31T23:59:59Z" };
+      expect(admitCoordinationTiming(observed, sent, received)).toBeUndefined();
+      const timing = admitReconciliationTiming(observed, sent, received);
+      expect(timing).toBeDefined();
+      expect(timing?.snapshotDeadlineMonotonicMs).toBe(11000);
+      expect(timing?.jobDeadlineMonotonicMs).toBe(8000);
+    },
+  );
+});
 
 describe("original cancellation command deadlines", () => {
   // m0=10000, observed=0: endpoint = 9000 + command milliseconds.
