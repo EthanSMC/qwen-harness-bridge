@@ -144,6 +144,7 @@ export function apply(ctx: Context, config?: unknown): void {
       );
     },
     flush: (session) => ctx.sessions.flush(session),
+    onAttemptEnded: (agent) => actions.withdraw(agent),
     setupFactory: (sessionId, context) => {
       const adapter = createTrustedExecutionAdapter({
         repositoryId: context.repositoryId,

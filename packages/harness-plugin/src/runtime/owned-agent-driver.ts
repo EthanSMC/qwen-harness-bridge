@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type {
+  Agent,
   AgentHandle,
   AgentOptions,
   AgentSetup,
@@ -82,6 +83,8 @@ export type OwnedAgentDriverOptions = Readonly<{
       repositoryPath: string;
     }>,
   ) => AgentSetup;
+  /** Terminal/cancel/teardown hook: revoke the per-Agent trusted projection. */
+  onAttemptEnded?: (agent: Agent) => void;
   now?: () => number;
   randomUUID?: () => string;
   signal?: AbortSignal;
@@ -300,6 +303,7 @@ export class OwnedAgentDriver implements OwnedJobStarter {
     for (const attempt of live) {
       attempt.operationLifetime.abort();
       attempt.normalWork.abort();
+      this.#endAttempt(attempt);
     }
     await Promise.allSettled(live.map((attempt) => attempt.handle.dispose()));
     await Promise.allSettled(live.map((attempt) => attempt.terminalWork));
@@ -456,6 +460,14 @@ export class OwnedAgentDriver implements OwnedJobStarter {
       wallTimeMs: now.wallTimeMs,
       monotonicTimeMs: now.monotonicTimeMs,
     });
+  }
+
+  #endAttempt(attempt: LiveAttempt): void {
+    try {
+      this.#options.onAttemptEnded?.(attempt.handle.agent);
+    } catch {
+      // Revocation is contained; it cannot fail teardown.
+    }
   }
 
   async #disposeHandle(handle: AgentHandle): Promise<void> {

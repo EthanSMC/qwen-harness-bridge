@@ -55,6 +55,7 @@ const build = (
   options: {
     flushResult?: boolean;
     stateOverrides?: Record<string, unknown>;
+    onAttemptEnded?: (agent: { id: unknown }) => void;
     setupFactory?: (
       sessionId: string,
       context: {
@@ -165,6 +166,11 @@ const build = (
     },
     publishClaim,
     flush,
+    ...(options.onAttemptEnded === undefined
+      ? {}
+      : {
+          onAttemptEnded: options.onAttemptEnded as unknown as OwnedAgentDriverOptions["onAttemptEnded"],
+        }),
     ...(options.setupFactory === undefined
       ? {}
       : {
@@ -225,6 +231,20 @@ describe("OwnedAgentDriver.start", () => {
       repositoryPath: "/repo/example",
     });
     expect(harness.create.mock.calls[0][0].setup).toBe(setupMarker);
+  });
+
+  it("revokes the per-Agent projection when the driver disposes", async () => {
+    const offer = offerOf();
+    const ended: unknown[] = [];
+    const harness = build(offer, {
+      onAttemptEnded: (agent) => ended.push(agent),
+    });
+    await harness.driver.start(offer);
+    await harness.driver.dispose();
+    expect(ended).toHaveLength(1);
+    expect(String((ended[0] as { id: unknown }).id)).toBe(
+      harness.store.findJob(offer.payload.job_id)?.sessionId,
+    );
   });
 
   it("never creates a second Agent for a duplicate offer", async () => {
