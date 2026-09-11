@@ -55,6 +55,7 @@ const build = (
   options: {
     flushResult?: boolean;
     stateOverrides?: Record<string, unknown>;
+    setupFactory?: (sessionId: string) => unknown;
   } = {},
 ): Harness => {
   const root = mkdtempSync(join(tmpdir(), "qhb-driver-"));
@@ -66,7 +67,10 @@ const build = (
   let captured: unknown;
   const followup = vi.fn();
   const create = vi.fn(
-    async (input: { sessionId: unknown }): Promise<AgentHandle> => {
+    async (input: {
+      sessionId: unknown;
+      setup?: unknown;
+    }): Promise<AgentHandle> => {
       const session = {
         ownEvents: () =>
           captured === undefined
@@ -153,6 +157,13 @@ const build = (
     },
     publishClaim,
     flush,
+    ...(options.setupFactory === undefined
+      ? {}
+      : {
+          setupFactory: options.setupFactory as unknown as (
+            sessionId: string,
+          ) => never,
+        }),
   });
   return {
     driver,
@@ -187,6 +198,20 @@ describe("OwnedAgentDriver.start", () => {
     );
     expect(harness.followup).toHaveBeenCalledTimes(1);
     expect(harness.flush).toHaveBeenCalledTimes(1);
+  });
+
+  it("derives a per-Agent policy setup from the preallocated session id", async () => {
+    const offer = offerOf();
+    const setupMarker = { kind: "policy-setup" };
+    const setupFactory = vi.fn(() => setupMarker);
+    const harness = build(offer, { setupFactory });
+    await harness.driver.start(offer);
+    const intent = harness.store.ownedIntent(
+      offer.payload.job_id,
+      offer.payload.attempt,
+    );
+    expect(setupFactory).toHaveBeenCalledWith(intent?.owner.sessionId);
+    expect(harness.create.mock.calls[0][0].setup).toBe(setupMarker);
   });
 
   it("never creates a second Agent for a duplicate offer", async () => {
