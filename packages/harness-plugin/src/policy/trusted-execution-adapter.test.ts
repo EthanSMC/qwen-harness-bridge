@@ -1,8 +1,25 @@
-import { describe, expect, it } from "vitest";
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { classifyAction } from "./action-classifier.js";
 import {
   createTrustedExecutionAdapter,
   DECLARED_TOOL_ROLES,
 } from "./trusted-execution-adapter.js";
+
+const fixtureRoots: string[] = [];
+afterEach(() => {
+  vi.unstubAllEnvs();
+  for (const root of fixtureRoots.splice(0))
+    rmSync(root, { recursive: true, force: true });
+});
 
 const adapter = () =>
   createTrustedExecutionAdapter({
@@ -92,3 +109,70 @@ describe("trusted execution adapter", () => {
     expect(adapter()({ name, arguments: args })).toBeUndefined();
   });
 });
+// The policy engine resolves trusted executables through the platform PATH and
+// X_OK semantics; the fixture runs on the Linux required-CI runner.
+describe.skipIf(process.platform === "win32")(
+  "declared tool classification",
+  () => {
+    const fixture = () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "qhb-adapter-")));
+      fixtureRoots.push(root);
+      const repository = join(root, "repository");
+      const bin = join(root, "bin");
+      mkdirSync(repository);
+      mkdirSync(join(repository, "src"));
+      mkdirSync(bin);
+      const trustedExecutables: Record<string, string> = {};
+      for (const name of ["git", "npm", "pnpm"]) {
+        const file = join(bin, name);
+        writeFileSync(file, "fixture\n", { mode: 0o755 });
+        trustedExecutables[name] = realpathSync(file);
+      }
+      vi.stubEnv("PATH", bin);
+      const options = {
+        repositories: [{ id: "example", canonicalPath: repository }],
+        trustedExecutables,
+        protectedPaths: { example: ["private-data"] },
+      };
+      const adapter = createTrustedExecutionAdapter({
+        repositoryId: "example",
+        repositoryRoot: repository,
+      });
+      return (name: string, args: unknown) => {
+        const resolved = adapter({ name, arguments: args });
+        if (resolved === undefined) return undefined;
+        return classifyAction(resolved.action, options, {
+          provenance: resolved.provenance,
+        });
+      };
+    };
+
+    it.each([
+      ["read", { path: "src/a.ts" }],
+      ["write", { path: "src/a.ts" }],
+      ["edit", { path: "src/a.ts", old_string: "a", new_string: "b" }],
+      ["grep", { pattern: "x", path: "src" }],
+      ["glob", { pattern: "*.ts" }],
+      ["bash", { command: "git status --short" }],
+    ])("classifies %s inside the repository as automatic", (name, args) => {
+      expect(fixture()(name, args)?.classification).toBe("automatic");
+    });
+
+    it.each([
+      ["bash", { command: "npm install left-pad" }],
+      ["bash", { command: "git push origin main" }],
+    ])("requires approval for %s", (name, args) => {
+      expect(fixture()(name, args)?.classification).toBe("approval_required");
+    });
+
+    it("denies an undeclared tool without fabricating a classification", () => {
+      expect(fixture()("subagent", { task: "x" })).toBeUndefined();
+    });
+
+    it("denies a path traversal outside the repository", () => {
+      expect(fixture()("read", { path: "../outside.ts" })?.classification).toBe(
+        "denied",
+      );
+    });
+  },
+);
