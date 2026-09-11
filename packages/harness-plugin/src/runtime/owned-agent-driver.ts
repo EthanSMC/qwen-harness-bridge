@@ -233,7 +233,9 @@ export class OwnedAgentDriver implements OwnedJobStarter {
         );
         if (result.kind === "remote")
           throw new Error("CONNECTOR_TERMINAL_RECONCILIATION_REQUIRED");
-        return result.kind === "committed" || result.relation === "same";
+        const won = result.kind === "committed" || result.relation === "same";
+        if (won) this.#endAttempt(live);
+        return won;
       },
     };
   }
@@ -294,7 +296,9 @@ export class OwnedAgentDriver implements OwnedJobStarter {
         () => undefined,
       ),
     );
-    return work;
+    const result = await work;
+    this.#endAttempt(live);
+    return result;
   }
 
   async dispose(): Promise<void> {
