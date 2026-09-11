@@ -249,10 +249,18 @@ it("drives one owned execution across a restart", async () => {
   }
 
   // Restart on the same durable store: the owned intent refuses a second attempt.
+  const sequenceBefore = store.maxOutboundSequence();
   const second = makePlane();
   await second.driver.start(offer);
   expect(creates).toBe(1);
   expect(store.findJob(jobId)?.status).toBe("cancelled");
+  // Ordered replay: the restart allocates nothing new and the single cancellation
+  // remains the only terminal outbound frame.
+  expect(store.maxOutboundSequence()).toBe(sequenceBefore);
+  const frameTypes = store
+    .pendingEvents(0)
+    .map((event) => JSON.parse(event.payload).type as string);
+  expect(frameTypes.filter((type) => type === "job.cancelled")).toHaveLength(1);
   await second.driver.dispose();
   second.states.dispose();
 
