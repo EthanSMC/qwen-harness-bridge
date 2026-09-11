@@ -143,7 +143,7 @@ function fixture(
 }
 describe("official approval service answerer integration", () => {
   it("refreshes live state before the broker reserves", async () => {
-    const refresh = vi.fn(async () => {});
+    const refresh = vi.fn(async (_action: AnswererAction) => {});
     const f = fixture({ refresh });
     try {
       const pending = f.request();
