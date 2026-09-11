@@ -72,10 +72,13 @@ const build = () => {
   return {
     registry,
     epoch,
-    deliver: (message: unknown, delivery: StateDelivery = {
-      epoch,
-      recovered: false,
-    }) =>
+    deliver: (
+      message: unknown,
+      delivery: StateDelivery = {
+        epoch,
+        recovered: false,
+      },
+    ) =>
       handler?.(
         message as Extract<ConnectorServerMessage, { type: "job.state" }>,
         delivery,
@@ -135,5 +138,25 @@ describe("LiveStateRegistry", () => {
     harness.deliver(stateEnvelope(jobId));
     harness.registry.dispose();
     expect(harness.registry.revisionFor(jobId, 1, at(0))).toBeUndefined();
+  });
+
+  it("captures a directly observed exchange without delivery order", () => {
+    const harness = build();
+    const jobId = randomUUID();
+    const envelope = stateEnvelope(jobId);
+    if (envelope.type !== "job.state") throw new Error("unexpected");
+    expect(
+      harness.registry.capture({
+        payload: envelope.payload,
+        received: { wallTimeMs: WALL, monotonicTimeMs: MONO },
+      }),
+    ).toBe(true);
+    expect(harness.registry.revisionFor(jobId, 1, at(0))).toBe(7);
+    expect(
+      harness.registry.capture({
+        payload: envelope.payload,
+        received: { wallTimeMs: WALL + 5_000, monotonicTimeMs: MONO + 5_000 },
+      }),
+    ).toBe(false);
   });
 });

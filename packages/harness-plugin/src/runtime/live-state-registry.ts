@@ -1,6 +1,7 @@
 import {
   ConnectorServerMessageSchema,
   type JobStatePayload,
+  JobStatePayloadSchema,
 } from "@qhb/protocol";
 import type { CoordinatingConnectorClient } from "../transport/connector-client.js";
 import type { CoordinationClockSample } from "./coordination-deadlines.js";
@@ -87,6 +88,28 @@ export class LiveStateRegistry {
     return entry.payload.job_revision;
   }
 
+  /** Cache a directly observed live exchange. `JobStateClient.observe` resolves
+   * before every `onState` listener has necessarily run, so a refresh must write
+   * the exact validated payload it received instead of racing delivery order. */
+  capture(
+    input: Readonly<{
+      payload: JobStatePayload;
+      received: CoordinationClockSample;
+    }>,
+  ): boolean {
+    if (this.#terminated) return false;
+    try {
+      const payload = JobStatePayloadSchema.parse(input.payload);
+      if (!finite(input.received)) return false;
+      return this.#cache(payload, {
+        wallTimeMs: input.received.wallTimeMs,
+        monotonicTimeMs: input.received.monotonicTimeMs,
+      });
+    } catch {
+      return false;
+    }
+  }
+
   clear(jobId: string, attempt: number): void {
     this.#entries.delete(keyOf(jobId, attempt));
   }
@@ -117,26 +140,32 @@ export class LiveStateRegistry {
       const parsed = ConnectorServerMessageSchema.safeParse(message);
       if (!parsed.success || parsed.data.type !== "job.state") return;
       const payload = parsed.data.payload;
-      const observedMs = Date.parse(payload.observed_at);
-      const validUntilMs = Date.parse(payload.state_valid_until);
-      if (!Number.isFinite(observedMs) || !Number.isFinite(validUntilMs))
-        return;
-      const validity = validUntilMs - observedMs;
-      if (validity <= 0) return;
       const received = this.#sample();
       if (received === undefined) return;
-      if (Math.abs(received.wallTimeMs - observedMs) > 1000) return;
-      const snapshotDeadlineMonotonicMs =
-        received.monotonicTimeMs + validity - 1000;
-      if (snapshotDeadlineMonotonicMs <= received.monotonicTimeMs) return;
-      this.#entries.set(keyOf(payload.job_id, payload.current_attempt), {
-        payload: Object.freeze({ ...payload }),
-        received: Object.freeze({ ...received }),
-        snapshotDeadlineMonotonicMs,
-      });
+      this.#cache(payload, received);
     } catch {
       // A malformed delivery never disturbs the transport receive pump.
     }
+  }
+
+  #cache(payload: JobStatePayload, received: CoordinationClockSample): boolean {
+    const observedMs = Date.parse(payload.observed_at);
+    const validUntilMs = Date.parse(payload.state_valid_until);
+    if (!Number.isFinite(observedMs) || !Number.isFinite(validUntilMs))
+      return false;
+    const validity = validUntilMs - observedMs;
+    if (validity <= 0) return false;
+    if (!finite(received)) return false;
+    if (Math.abs(received.wallTimeMs - observedMs) > 1000) return false;
+    const snapshotDeadlineMonotonicMs =
+      received.monotonicTimeMs + validity - 1000;
+    if (snapshotDeadlineMonotonicMs <= received.monotonicTimeMs) return false;
+    this.#entries.set(keyOf(payload.job_id, payload.current_attempt), {
+      payload: Object.freeze({ ...payload }),
+      received: Object.freeze({ ...received }),
+      snapshotDeadlineMonotonicMs,
+    });
+    return true;
   }
 
   #sample(): CoordinationClockSample | undefined {
