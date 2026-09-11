@@ -29,6 +29,7 @@ export default defineWorkspace([
         "tests/contract/runtime-build.test.ts",
         "tests/contract/shutdown.test.ts",
         "tests/contract/connector-version-negotiation.test.ts",
+        "tests/contract/harness-plugin-shape.test.ts",
       ],
     },
   },

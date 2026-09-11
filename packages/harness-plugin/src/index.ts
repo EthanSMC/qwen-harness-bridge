@@ -1,3 +1,13 @@
+// Cordis plugin identity. The `apply(ctx)` composition is added once the
+// integration seams recorded on Issue #13 are confirmed.
+export const name = "qwen-harness-bridge";
+export const inject = [
+  "agents",
+  "sessions",
+  "sessionPersistence",
+  "approval",
+] as const;
+
 export * from "./config.js";
 export {
   AgentAdapter,
