@@ -13,6 +13,7 @@ import { TrustedActionRegistry } from "./runtime/action-registry.js";
 import { ApprovalReservationProvider } from "./runtime/approval-reservation.js";
 import { CancelHandler } from "./runtime/cancel-handler.js";
 import { JobCommandCoordinator } from "./runtime/job-command-coordinator.js";
+import type { HarnessContext } from "./harness/types.js";
 import { JobStateClient } from "./runtime/job-state-client.js";
 import { LiveStateRegistry } from "./runtime/live-state-registry.js";
 import { OwnedAgentDriver } from "./runtime/owned-agent-driver.js";
@@ -144,6 +145,15 @@ export function apply(ctx: Context, config?: unknown): void {
       );
     },
     flush: (session) => ctx.sessions.flush(session),
+    onSessionEvent: (handler) => {
+      const context = ctx as unknown as HarnessContext;
+      const unregister = context.on("session/event", (session, event) => {
+        handler(String(session.id), event);
+      });
+      return () => {
+        unregister();
+      };
+    },
     onAttemptEnded: (agent) => actions.withdraw(agent),
     setupFactory: (sessionId, context) => {
       const adapter = createTrustedExecutionAdapter({

@@ -6,7 +6,11 @@ import type {
   AgentSetup,
 } from "@deepseek-ai/dsh-agent";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
-import { type Session, SessionId } from "@deepseek-ai/dsh-session";
+import {
+  type Session,
+  type SessionEvent,
+  SessionId,
+} from "@deepseek-ai/dsh-session";
 import type { HarnessAgentRegistry } from "../harness/types.js";
 import type { OwnedIntent } from "../store/owned-intent.js";
 import type {
@@ -33,6 +37,7 @@ import type {
   RepositoryAliasResolver,
 } from "./job-command-coordinator.js";
 import type { JobStateClient } from "./job-state-client.js";
+import { sessionTerminalOutcome } from "./session-terminal.js";
 import {
   beginTerminalAuthority,
   type TerminalAuthority,
@@ -83,6 +88,11 @@ export type OwnedAgentDriverOptions = Readonly<{
       repositoryPath: string;
     }>,
   ) => AgentSetup;
+  /** Owned session-event source. Terminal events are routed through the same
+   * commitNativeOutcome sink; unrelated sessions are ignored. */
+  onSessionEvent?: (
+    handler: (sessionId: string, event: SessionEvent) => void,
+  ) => () => void;
   /** Terminal/cancel/teardown hook: revoke the per-Agent trusted projection. */
   onAttemptEnded?: (agent: Agent) => void;
   now?: () => number;
@@ -140,10 +150,19 @@ export class OwnedAgentDriver implements OwnedJobStarter {
   readonly #options: OwnedAgentDriverOptions;
   readonly #starting = new Map<string, Promise<void>>();
   readonly #live = new Map<string, LiveAttempt>();
+  readonly #liveBySession = new Map<string, LiveAttempt>();
+  #unsubscribe: (() => void) | undefined;
   #disposed = false;
 
   constructor(options: OwnedAgentDriverOptions) {
     this.#options = options;
+    try {
+      this.#unsubscribe = options.onSessionEvent?.((sessionId, event) =>
+        this.#handleSessionEvent(sessionId, event),
+      );
+    } catch {
+      this.#unsubscribe = undefined;
+    }
   }
 
   async start(offer: JobOfferMessage): Promise<void> {
@@ -303,6 +322,13 @@ export class OwnedAgentDriver implements OwnedJobStarter {
 
   async dispose(): Promise<void> {
     this.#disposed = true;
+    const unsubscribe = this.#unsubscribe;
+    this.#unsubscribe = undefined;
+    try {
+      unsubscribe?.();
+    } catch {
+      // Termination stays latched.
+    }
     const live = [...this.#live.values()];
     for (const attempt of live) {
       attempt.operationLifetime.abort();
@@ -312,6 +338,7 @@ export class OwnedAgentDriver implements OwnedJobStarter {
     await Promise.allSettled(live.map((attempt) => attempt.handle.dispose()));
     await Promise.allSettled(live.map((attempt) => attempt.terminalWork));
     this.#live.clear();
+    this.#liveBySession.clear();
   }
 
   async #start(
@@ -393,13 +420,15 @@ export class OwnedAgentDriver implements OwnedJobStarter {
             },
           },
         );
-        this.#live.set(key, {
+        const record: LiveAttempt = {
           intent: started,
           handle,
           operationLifetime: new AbortController(),
           normalWork: new AbortController(),
           terminalWork: Promise.resolve(),
-        });
+        };
+        this.#live.set(key, record);
+        this.#liveBySession.set(started.owner.sessionId, record);
       } catch (error) {
         await this.#disposeHandle(handle);
         throw error;
@@ -464,6 +493,20 @@ export class OwnedAgentDriver implements OwnedJobStarter {
       wallTimeMs: now.wallTimeMs,
       monotonicTimeMs: now.monotonicTimeMs,
     });
+  }
+
+  #handleSessionEvent(sessionId: string, event: SessionEvent): void {
+    const attempt = this.#liveBySession.get(sessionId);
+    if (attempt === undefined || this.#disposed) return;
+    const terminal = sessionTerminalOutcome(attempt.intent.owner.jobId, event);
+    if (terminal === undefined) return;
+    void this.commitNativeOutcome({
+      jobId: attempt.intent.owner.jobId,
+      attempt: attempt.intent.owner.attempt,
+      outcome: terminal.outcome,
+      eventSequence: terminal.eventSequence,
+      projection: terminal.projection,
+    }).catch(() => undefined);
   }
 
   #endAttempt(attempt: LiveAttempt): void {
