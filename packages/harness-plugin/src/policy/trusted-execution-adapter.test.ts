@@ -108,7 +108,7 @@ describe("trusted execution adapter", () => {
     expect(
       a({ name: "grep", arguments: { pattern: "x", path: "src" } })?.action,
     ).toMatchObject({
-      toolName: "search",
+      toolName: "read",
       touchedPaths: ["src"],
       fileChange: "none",
     });

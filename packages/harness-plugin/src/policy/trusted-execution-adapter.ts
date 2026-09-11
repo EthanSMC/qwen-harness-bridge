@@ -153,7 +153,7 @@ export function createTrustedExecutionAdapter(
                   "bounded",
                   true,
                 )
-              : fileAction(execution, options, "search", "none", false);
+              : fileAction(execution, options, "read", "none", false);
       if (action === undefined) return undefined;
       return { action: Object.freeze(action), provenance: "local_tool" };
     } catch {
