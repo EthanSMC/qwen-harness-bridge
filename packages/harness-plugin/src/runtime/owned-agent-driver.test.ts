@@ -55,7 +55,15 @@ const build = (
   options: {
     flushResult?: boolean;
     stateOverrides?: Record<string, unknown>;
-    setupFactory?: (sessionId: string) => unknown;
+    setupFactory?: (
+      sessionId: string,
+      context: {
+        jobId: string;
+        attempt: number;
+        repositoryId: string;
+        repositoryPath: string;
+      },
+    ) => unknown;
   } = {},
 ): Harness => {
   const root = mkdtempSync(join(tmpdir(), "qhb-driver-"));
@@ -210,7 +218,12 @@ describe("OwnedAgentDriver.start", () => {
       offer.payload.job_id,
       offer.payload.attempt,
     );
-    expect(setupFactory).toHaveBeenCalledWith(intent?.owner.sessionId);
+    expect(setupFactory).toHaveBeenCalledWith(intent?.owner.sessionId, {
+      jobId: offer.payload.job_id,
+      attempt: offer.payload.attempt,
+      repositoryId: offer.payload.repository_id,
+      repositoryPath: "/repo/example",
+    });
     expect(harness.create.mock.calls[0][0].setup).toBe(setupMarker);
   });
 

@@ -71,8 +71,17 @@ export type OwnedAgentDriverOptions = Readonly<{
   agentOptions?: AgentOptions;
   setup?: AgentSetup;
   /** Per-Agent composition (for example the policy guard) derived from the
-   * preallocated SessionId. Takes precedence over a static `setup`. */
-  setupFactory?: (sessionId: string) => AgentSetup;
+   * preallocated SessionId and the owned attempt identity. Takes precedence
+   * over a static `setup`. */
+  setupFactory?: (
+    sessionId: string,
+    context: Readonly<{
+      jobId: string;
+      attempt: number;
+      repositoryId: string;
+      repositoryPath: string;
+    }>,
+  ) => AgentSetup;
   now?: () => number;
   randomUUID?: () => string;
   signal?: AbortSignal;
@@ -337,7 +346,12 @@ export class OwnedAgentDriver implements OwnedJobStarter {
         agentOptions: this.#options.agentOptions,
         setup:
           this.#options.setupFactory !== undefined
-            ? this.#options.setupFactory(intent.owner.sessionId)
+            ? this.#options.setupFactory(intent.owner.sessionId, {
+                jobId: intent.owner.jobId,
+                attempt: intent.owner.attempt,
+                repositoryId: intent.owner.repositoryId,
+                repositoryPath,
+              })
             : this.#options.setup,
       });
       try {
