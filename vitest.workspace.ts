@@ -16,6 +16,7 @@ export default defineWorkspace([
         "tests/integration/cancellation-flow.test.ts",
         "tests/integration/result-flow.test.ts",
         "tests/integration/readiness.test.ts",
+        "tests/integration/harness-connector-e2e.test.ts",
       ],
     },
   },
