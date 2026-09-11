@@ -57,6 +57,7 @@ type Harness = {
 const build = (
   offer: JobOfferMessage,
   options: {
+    store?: SqlitePluginStore;
     flushResult?: boolean;
     stateOverrides?: Record<string, unknown>;
     onAttemptEnded?: (agent: { id: unknown }) => void;
@@ -71,11 +72,20 @@ const build = (
     ) => unknown;
   } = {},
 ): Harness => {
-  const root = mkdtempSync(join(tmpdir(), "qhb-driver-"));
-  roots.push(root);
-  const store = new SqlitePluginStore(join(root, "store.sqlite"));
-  stores.push(store);
-  store.recordInbound(offer.message_id, offer.sequence, JSON.stringify(offer));
+  const store =
+    options.store ??
+    (() => {
+      const root = mkdtempSync(join(tmpdir(), "qhb-driver-"));
+      roots.push(root);
+      const created = new SqlitePluginStore(join(root, "store.sqlite"));
+      stores.push(created);
+      created.recordInbound(
+        offer.message_id,
+        offer.sequence,
+        JSON.stringify(offer),
+      );
+      return created;
+    })();
   const epoch = { signal: new AbortController().signal };
   let captured: unknown;
   const followup = vi.fn();
@@ -278,6 +288,16 @@ describe("OwnedAgentDriver.start", () => {
     ).not.toThrow();
     await harness.driver.dispose();
     expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not start a second attempt after a restart on the same store", async () => {
+    const offer = offerOf();
+    const first = build(offer);
+    await first.driver.start(offer);
+    expect(first.create).toHaveBeenCalledTimes(1);
+    const restarted = build(offer, { store: first.store });
+    await restarted.driver.start(offer);
+    expect(restarted.create).not.toHaveBeenCalled();
   });
 
   it("never creates a second Agent for a duplicate offer", async () => {
