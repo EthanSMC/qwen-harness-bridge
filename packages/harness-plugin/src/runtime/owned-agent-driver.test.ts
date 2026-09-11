@@ -48,7 +48,9 @@ type Harness = {
   flush: ReturnType<typeof vi.fn>;
   followup: ReturnType<typeof vi.fn>;
   stateOverrides: Record<string, unknown>;
-  sessionHandler: () => ((sessionId: string, event: unknown) => void) | undefined;
+  sessionHandler: () =>
+    | ((sessionId: string, event: unknown) => void)
+    | undefined;
   unsubscribe: ReturnType<typeof vi.fn>;
 };
 
@@ -110,9 +112,7 @@ const build = (
     },
   );
   const publishClaim = vi.fn(async () => {});
-  let sessionHandler:
-    | ((sessionId: string, event: unknown) => void)
-    | undefined;
+  let sessionHandler: ((sessionId: string, event: unknown) => void) | undefined;
   const unsubscribe = vi.fn();
   const flush = vi.fn(async () => options.flushResult ?? true);
   const stateOverrides = options.stateOverrides ?? {};
@@ -172,10 +172,18 @@ const build = (
     },
     publishClaim,
     flush,
+    onSessionEvent: (handler) => {
+      sessionHandler = handler as unknown as (
+        sessionId: string,
+        event: unknown,
+      ) => void;
+      return unsubscribe;
+    },
     ...(options.onAttemptEnded === undefined
       ? {}
       : {
-          onAttemptEnded: options.onAttemptEnded as unknown as OwnedAgentDriverOptions["onAttemptEnded"],
+          onAttemptEnded:
+            options.onAttemptEnded as unknown as OwnedAgentDriverOptions["onAttemptEnded"],
         }),
     ...(options.setupFactory === undefined
       ? {}
