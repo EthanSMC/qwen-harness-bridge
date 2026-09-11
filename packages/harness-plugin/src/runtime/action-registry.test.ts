@@ -4,11 +4,11 @@ import { TrustedActionRegistry } from "./action-registry.js";
 
 const agentOf = (id: string) => ({ id }) as unknown as Agent;
 
-const action = (callId: string) => ({
+const action = (_callId: string) => ({
   jobId: "11111111-1111-4111-8111-111111111111",
   attempt: 1,
   toolName: "shell",
-  fingerprint: "sha256:" + "a".repeat(64),
+  fingerprint: `sha256:${"a".repeat(64)}`,
   classification: "approval_required" as const,
   actionSummary: "Run tests",
   impactSummary: "Executes a repository command",

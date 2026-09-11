@@ -63,6 +63,11 @@ const stateOf = (
 
 const timingFor = (state: JobStatePayload) =>
   admitCoordinationTiming(state, clock(0), clock(10));
+const timingForSure = (state: JobStatePayload) => {
+  const timing = timingFor(state);
+  if (timing === undefined) throw new Error("timing unavailable");
+  return timing;
+};
 
 const prepared = (offer: JobOfferMessage): OwnedIntent =>
   initialOwnedIntent({
@@ -80,12 +85,13 @@ describe("admitInitialStart", () => {
     const state = stateOf(jobId, 1, leaseId);
     const timing = timingFor(state);
     expect(timing).toBeDefined();
+    if (timing === undefined) throw new Error("timing unavailable");
     const admitted = admitInitialStart({
       state,
       offer,
       intent: prepared(offer),
       repositoryId: "example",
-      timing: timing!,
+      timing,
       now: clock(20),
     });
     expect(admitted).toEqual({ mode: "normal" });
@@ -102,7 +108,7 @@ describe("admitInitialStart", () => {
         offer,
         intent: prepared(offer),
         repositoryId: "example",
-        timing: timingFor(state)!,
+        timing: timingForSure(state),
         now: clock(20),
       }),
     ).toEqual({ mode: "read_only" });
@@ -159,7 +165,7 @@ describe("admitInitialStart", () => {
         offer,
         intent,
         repositoryId: "example",
-        timing: timingFor(state)!,
+        timing: timingForSure(state),
         now: clock(20),
       }),
     ).toBeUndefined();
@@ -176,7 +182,7 @@ describe("admitInitialStart", () => {
         offer,
         intent: prepared(offer),
         repositoryId: "example",
-        timing: timingFor(state)!,
+        timing: timingForSure(state),
         now: clock(5_000),
       }),
     ).toBeUndefined();

@@ -5,6 +5,7 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import { RemoteApprovalBroker } from "./approvals/approval-broker.js";
 import { registerAnswerer } from "./approvals/register-answerer.js";
 import { parsePluginConfig } from "./config.js";
+import type { HarnessContext } from "./harness/types.js";
 import { MacOSKeychainCredentialReader } from "./keychain.js";
 import { classifyAction } from "./policy/action-classifier.js";
 import { createPolicyAgentSetup } from "./policy/register-guard.js";
@@ -13,7 +14,6 @@ import { TrustedActionRegistry } from "./runtime/action-registry.js";
 import { ApprovalReservationProvider } from "./runtime/approval-reservation.js";
 import { CancelHandler } from "./runtime/cancel-handler.js";
 import { JobCommandCoordinator } from "./runtime/job-command-coordinator.js";
-import type { HarnessContext } from "./harness/types.js";
 import { JobStateClient } from "./runtime/job-state-client.js";
 import { LiveStateRegistry } from "./runtime/live-state-registry.js";
 import { OwnedAgentDriver } from "./runtime/owned-agent-driver.js";
@@ -105,12 +105,6 @@ export function apply(ctx: Context, config?: unknown): void {
   const states = new JobStateClient({ connector });
   const liveStates = new LiveStateRegistry({ connector });
   const actions = new TrustedActionRegistry();
-  const policyOptions = {
-    repositories: parsed.repositories.map((candidate) => ({
-      id: candidate.id,
-      canonicalPath: candidate.canonicalPath,
-    })),
-  };
   const authority = new TerminalAuthorityIssuer({ connector, states, store });
   const reservation = new ApprovalReservationProvider({
     registry: liveStates,
