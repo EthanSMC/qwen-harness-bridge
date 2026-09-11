@@ -108,7 +108,7 @@ describe("trusted execution adapter", () => {
     expect(
       a({ name: "grep", arguments: { pattern: "x", path: "src" } })?.action,
     ).toMatchObject({
-      toolName: "read",
+      toolName: "search",
       touchedPaths: ["src"],
       fileChange: "none",
     });
@@ -140,6 +140,7 @@ describe.skipIf(process.platform === "win32")(
       const bin = join(root, "bin");
       mkdirSync(repository);
       mkdirSync(join(repository, "src"));
+      writeFileSync(join(repository, "src", "a.ts"), "export const a = 1;\n");
       mkdirSync(bin);
       const trustedExecutables: Record<string, string> = {};
       for (const name of ["pnpm", "git", "npm", "vercel", "vitest", "tsc"]) {
@@ -170,8 +171,7 @@ describe.skipIf(process.platform === "win32")(
       ["read", { path: "src/a.ts" }],
       ["write", { path: "src/a.ts" }],
       ["edit", { path: "src/a.ts", old_string: "a", new_string: "b" }],
-      ["grep", { pattern: "x", path: "src" }],
-      ["glob", { pattern: "*.ts" }],
+      ["grep", { pattern: "x", path: "src/a.ts" }],
       ["bash", { command: "pnpm test" }],
       ["bash", { command: "pnpm build" }],
     ])("classifies %s as automatic", (name, args) => {
@@ -183,6 +183,13 @@ describe.skipIf(process.platform === "win32")(
       ["bash", { command: "git push origin main" }],
     ])("requires approval for %s", (name, args) => {
       expect(fixture()(name, args)?.classification).toBe("approval_required");
+    });
+
+    it.each([
+      ["grep", { pattern: "x", path: "src" }],
+      ["glob", { pattern: "*.ts" }],
+    ])("denies an unproven search scope for %s", (name, args) => {
+      expect(fixture()(name, args)?.classification).toBe("denied");
     });
 
     it("fails closed for undeclared tools", () => {
