@@ -48,6 +48,8 @@ type Harness = {
   flush: ReturnType<typeof vi.fn>;
   followup: ReturnType<typeof vi.fn>;
   stateOverrides: Record<string, unknown>;
+  sessionHandler: () => ((sessionId: string, event: unknown) => void) | undefined;
+  unsubscribe: ReturnType<typeof vi.fn>;
 };
 
 const build = (
@@ -108,6 +110,10 @@ const build = (
     },
   );
   const publishClaim = vi.fn(async () => {});
+  let sessionHandler:
+    | ((sessionId: string, event: unknown) => void)
+    | undefined;
+  const unsubscribe = vi.fn();
   const flush = vi.fn(async () => options.flushResult ?? true);
   const stateOverrides = options.stateOverrides ?? {};
   const observe = vi.fn(async () => {
@@ -187,6 +193,8 @@ const build = (
     flush,
     followup,
     stateOverrides,
+    sessionHandler: () => sessionHandler,
+    unsubscribe,
   };
 };
 
@@ -245,6 +253,23 @@ describe("OwnedAgentDriver.start", () => {
     expect(String((ended[0] as { id: unknown }).id)).toBe(
       harness.store.findJob(offer.payload.job_id)?.sessionId,
     );
+  });
+
+  it("subscribes to owned session events and releases them on dispose", async () => {
+    const offer = offerOf();
+    const harness = build(offer);
+    await harness.driver.start(offer);
+    const handler = harness.sessionHandler();
+    expect(typeof handler).toBe("function");
+    expect(() =>
+      handler?.("unrelated-session", {
+        type: "step/start",
+        seq: 1,
+        data: undefined,
+      }),
+    ).not.toThrow();
+    await harness.driver.dispose();
+    expect(harness.unsubscribe).toHaveBeenCalledTimes(1);
   });
 
   it("never creates a second Agent for a duplicate offer", async () => {
