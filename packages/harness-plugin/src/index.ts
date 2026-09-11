@@ -1,12 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import type { Context } from "@deepseek-ai/cordis";
+import { Context } from "@deepseek-ai/cordis";
 import { RemoteApprovalBroker } from "./approvals/approval-broker.js";
+import { registerAnswerer } from "./approvals/register-answerer.js";
 import { parsePluginConfig } from "./config.js";
 import { MacOSKeychainCredentialReader } from "./keychain.js";
+import { TrustedActionRegistry } from "./runtime/action-registry.js";
+import { ApprovalReservationProvider } from "./runtime/approval-reservation.js";
 import { CancelHandler } from "./runtime/cancel-handler.js";
 import { JobCommandCoordinator } from "./runtime/job-command-coordinator.js";
 import { JobStateClient } from "./runtime/job-state-client.js";
+import { LiveStateRegistry } from "./runtime/live-state-registry.js";
 import { OwnedAgentDriver } from "./runtime/owned-agent-driver.js";
 import { createPluginComposition } from "./runtime/plugin-composition.js";
 import { TerminalAuthorityIssuer } from "./runtime/terminal-authority.js";
@@ -93,7 +97,17 @@ export function apply(ctx: Context, config?: unknown): void {
       credentials.read(parsed.keychainService, parsed.keychainAccount),
   });
   const states = new JobStateClient({ connector });
+  const liveStates = new LiveStateRegistry({ connector });
+  const actions = new TrustedActionRegistry();
   const authority = new TerminalAuthorityIssuer({ connector, states, store });
+  const reservation = new ApprovalReservationProvider({
+    registry: liveStates,
+    states,
+    epoch: () => connector.currentEpoch(),
+    approvalTimeoutSeconds: (repositoryId) =>
+      parsed.repositories.find((candidate) => candidate.id === repositoryId)
+        ?.approvalTimeoutSeconds,
+  });
   const repositories = {
     resolve: (id: string): string | undefined =>
       parsed.repositories.find((candidate) => candidate.id === id)
@@ -121,7 +135,15 @@ export function apply(ctx: Context, config?: unknown): void {
     flush: (session) => ctx.sessions.flush(session),
   });
   const approvals = new RemoteApprovalBroker({
-    reserve: () => undefined,
+    reserve: (input) => {
+      const intent = store.ownedIntent(input.jobId, input.attempt);
+      if (intent === undefined) return undefined;
+      return reservation.reserve({
+        jobId: input.jobId,
+        repositoryId: intent.owner.repositoryId,
+        attempt: input.attempt,
+      });
+    },
     publish: (type, payload, correlationId) =>
       connector.publish(type, payload, correlationId),
   });
@@ -140,6 +162,22 @@ export function apply(ctx: Context, config?: unknown): void {
     approvals,
     repositories,
   });
+  if (Context.is(ctx)) {
+    registerAnswerer(ctx, {
+      broker: approvals,
+      findOwner: (agentId) => actions.findOwner(agentId),
+      resolveAction: (agent, callId) => actions.resolveAction(agent, callId),
+      refresh: async (action) => {
+        const intent = store.ownedIntent(action.jobId, action.attempt);
+        if (intent === undefined) throw new Error("APPROVAL_OWNER_UNAVAILABLE");
+        await reservation.refresh({
+          jobId: action.jobId,
+          repositoryId: intent.owner.repositoryId,
+          attempt: action.attempt,
+        });
+      },
+    });
+  }
   const composition = createPluginComposition({
     coordinator,
     connector,
