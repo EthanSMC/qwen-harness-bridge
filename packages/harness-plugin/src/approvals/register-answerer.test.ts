@@ -11,7 +11,9 @@ import {
 } from "./approval-broker.js";
 import { type AnswererAction, registerAnswerer } from "./register-answerer.js";
 
-function fixture() {
+function fixture(
+  overrides: { refresh?: (action: AnswererAction) => Promise<void> } = {},
+) {
   const root = new Context();
   const approval = new ApprovalService(root, { policy: "ask" });
   // Official Context, scope and audited ApprovalService; session is an in-memory
@@ -72,6 +74,7 @@ function fixture() {
   });
   const unregister = registerAnswerer(root, {
     broker,
+    ...(overrides.refresh === undefined ? {} : { refresh: overrides.refresh }),
     findOwner: (id) => {
       if (++lookups.owner === 2) finalLookup("owner");
       return id === "owned" ? agent : undefined;
@@ -139,6 +142,34 @@ function fixture() {
   };
 }
 describe("official approval service answerer integration", () => {
+  it("refreshes live state before the broker reserves", async () => {
+    const refresh = vi.fn(async () => {});
+    const f = fixture({ refresh });
+    try {
+      const pending = f.request();
+      await f.ready;
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(refresh.mock.calls[0][0].classification).toBe("approval_required");
+      expect(f.decide()).toBe("accepted");
+      await expect(pending).resolves.toBe("allowed-once");
+    } finally {
+      f.dispose();
+    }
+  });
+
+  it("denies when the reservation refresh fails", async () => {
+    const f = fixture({
+      refresh: async () => {
+        throw new Error("stale snapshot");
+      },
+    });
+    try {
+      await expect(f.request()).resolves.toBe("unavailable");
+    } finally {
+      f.dispose();
+    }
+  });
+
   describe.each(["owner", "action"] as const)("final %s lookup", (boundary) => {
     it.each([
       ["registration disposal", "unavailable"],
