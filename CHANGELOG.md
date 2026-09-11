@@ -14,6 +14,18 @@ All notable changes use synchronized Semantic Versioning and are recorded here. 
 - Five detailed test-driven implementation plans and master roadmap.
 - Public-repository governance, issue templates, planning validation, and GitHub synchronization tooling.
 
+## 0.2.0 — pending publication
+
+This entry describes the prepared M1 connector-installation scope; it does not assert that a release tag, GitHub Release, or package publication exists. Package versions, the tag, and the GitHub Release remain release-process actions.
+
+### Added
+
+- Deterministic packaged Harness Connector artifact built by `pnpm --filter @qhb/harness-plugin pack`, containing compiled code with self-contained source maps, the SQLite schema, the license when present, and a credential-free sample Cordis wiring.
+- Packaged smoke test (`pnpm --filter @qhb/harness-plugin pack:test`) that extracts the artifact into a temporary Harness extension root, imports the plugin entry, asserts the Cordis plugin identity, and fails packaging when a credential value or credential-looking assignment would be included.
+- Credential-free `cordis.example.yml` sample wiring that references Keychain service/account names and one canonical repository root, with no token and no user-specific absolute repository path.
+- macOS install, credential-rotation, and plugin-rollback runbooks under `docs/runbooks/`.
+- `docs/product/v0.2.0-acceptance.md` acceptance record for M1 Spec items 2, 3, 5, 6, 7, and 10, including its unverified manual macOS steps.
+
 ## 0.1.0 — pending publication
 
 This entry describes the qualified M0 scope; it does not assert that a release tag, GitHub Release, or package publication exists.
