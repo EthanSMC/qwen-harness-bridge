@@ -16,7 +16,10 @@ import { LOCALHOST_TLS } from "../../../../tests/integration/support/tls.js";
 import { SqlitePluginStore } from "../store/plugin-store.js";
 import { DurableConnectorClient } from "../transport/connector-client.js";
 import { CancelHandler } from "./cancel-handler.js";
-import type { JobOfferMessage } from "./job-command-coordinator.js";
+import {
+  JobCommandCoordinator,
+  type JobOfferMessage,
+} from "./job-command-coordinator.js";
 import { JobStateClient } from "./job-state-client.js";
 import { OwnedAgentDriver } from "./owned-agent-driver.js";
 import { TerminalAuthorityIssuer } from "./terminal-authority.js";
@@ -42,6 +45,13 @@ it("driver routes a confirmed cancellation through the owned sink", async () => 
   });
 });
 
+it("routes a cancellation through the command coordinator", async () => {
+  await withDriver({}, async ({ coordinator, store, jobId, command }) => {
+    await coordinator.handle(command);
+    expect(store.findJob(jobId)?.status).toBe("cancelled");
+  });
+});
+
 it.skipIf(!POSIX_REDACTION_SUPPORTED)(
   "driver routes a native result through the owned sink",
   async () => {
@@ -64,6 +74,7 @@ it.skipIf(!POSIX_REDACTION_SUPPORTED)(
 );
 
 type Context = {
+  coordinator: JobCommandCoordinator;
   driver: OwnedAgentDriver;
   store: SqlitePluginStore;
   jobId: string;
@@ -239,6 +250,23 @@ async function withDriver(
     },
     flush: async () => true,
   });
+  const cancellation = new CancelHandler({
+    resolveOwner: (value) => driver.cancellationOwner(value),
+    beforeCancel: (owner) => driver.beginCancellation(owner),
+  });
+  const coordinator = new JobCommandCoordinator({
+    starter: driver,
+    cancel: {
+      handle: async (value) => {
+        await driver.admitCancellation(value);
+        return cancellation.handle(value);
+      },
+    },
+    approvals: { acceptDecision: () => "ignored" },
+    repositories: {
+      resolve: (id) => (id === "example" ? directory : undefined),
+    },
+  });
   const command = ConnectorServerMessageSchema.parse({
     protocol_version: "1.0",
     type: "job.cancel",
@@ -271,7 +299,7 @@ async function withDriver(
       socket.send(JSON.stringify({ ...offer, sequence: ++sequence }));
     await driver.start(await delivered);
     cancelling = true;
-    await run({ driver, store, jobId, command });
+    await run({ coordinator, driver, store, jobId, command });
   } finally {
     await driver.dispose();
     authority.dispose();
