@@ -13,6 +13,8 @@
   },
   "scripts": {
     "build": "pnpm --filter @qhb/protocol build && rm -rf dist && tsc -p tsconfig.build.json && cp src/store/schema.sql dist/store/schema.sql",
+    "pack": "node scripts/package.mjs",
+    "pack:test": "vitest run src/packaging-smoke.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
