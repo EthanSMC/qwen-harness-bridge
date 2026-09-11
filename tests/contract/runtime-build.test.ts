@@ -1300,6 +1300,7 @@ describe("release runtime build contract", () => {
         "packages/protocol/dist/index.d.ts",
         "apps/control-plane/dist/db/migrations/meta/_journal.json",
         "apps/control-plane/dist/db/migrations/0002_result_acknowledgement.sql",
+        "apps/control-plane/dist/db/migrations/0003_cancel_revision.sql",
       ];
       for (const path of assets) {
         expect(existsSync(built(path)), path).toBe(true);
@@ -1340,8 +1341,8 @@ describe("release runtime build contract", () => {
         readBuilt("apps/control-plane/dist/db/migrations/meta/_journal.json"),
       ) as { entries?: Array<{ tag?: string; when?: number }> };
       expect(journal.entries?.at(-1)).toMatchObject({
-        tag: "0002_result_acknowledgement",
-        when: 1788244364352,
+        tag: "0003_cancel_revision",
+        when: 1788609600000,
       });
       expect(
         createHash("sha256")
@@ -1353,6 +1354,17 @@ describe("release runtime build contract", () => {
           .digest("hex"),
       ).toBe(
         "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
+      );
+      expect(
+        createHash("sha256")
+          .update(
+            readBuilt(
+              "apps/control-plane/dist/db/migrations/0003_cancel_revision.sql",
+            ),
+          )
+          .digest("hex"),
+      ).toBe(
+        "79ec6ea05778bda661733c32ca7557e0ec000d4a0567cbf2e9617ac6910a8e79",
       );
 
       const protocol = JSON.parse(
@@ -2203,11 +2215,11 @@ printf 'prerequisites-ready\\n'
     expect(evidence).toMatch(/recovery[^\n]*\$recovery_readiness_status/i);
     expect(evidence).toMatch(/__drizzle_migrations/);
     for (const [name, value] of [
-      ["migration_tag", "0002_result_acknowledgement"],
-      ["migration_when", "1788244364352"],
+      ["migration_tag", "0003_cancel_revision"],
+      ["migration_when", "1788609600000"],
       [
         "migration_sha256",
-        "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
+        "79ec6ea05778bda661733c32ca7557e0ec000d4a0567cbf2e9617ac6910a8e79",
       ],
     ]) {
       expect(evidence).toMatch(
@@ -2220,7 +2232,7 @@ printf 'prerequisites-ready\\n'
     expect(evidence).toMatch(
       /migration_tag=\$\(docker compose[\s\S]*_journal\.json/,
     );
-    expect(evidence).not.toMatch(/migration_tag=0002_result_acknowledgement/);
+    expect(evidence).not.toMatch(/migration_tag=0003_cancel_revision/);
     expect(evidence).toMatch(
       /image_digest\s*=\s*["']?\$\(docker\s+image\s+inspect[\s\S]*--format\s+["']?\{\{\.Id\}\}/i,
     );

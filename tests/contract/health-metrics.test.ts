@@ -287,6 +287,8 @@ const MESSAGE_TYPES = [
   "connector.hello",
   "connector.heartbeat",
   "job.claim",
+  "job.sync",
+  "job.state",
   "job.event",
   "approval.requested",
   "job.cancelled",
@@ -319,6 +321,7 @@ const ERROR_CODES = [
   "CLIENT_REPLAY_MISMATCH",
   "CLAIM_REJECTED",
   "EVENT_REJECTED",
+  "JOB_AUTHORITY_UNAVAILABLE",
   "MESSAGE_EXPIRED",
   "INVALID_MESSAGE",
   "HELLO_REQUIRED",
@@ -335,6 +338,33 @@ const METRIC_TYPES = {
 } as const;
 
 describe("bounded Prometheus metrics", () => {
+  it("counts only fixed coordination message and error labels", async () => {
+    const registry = (await loadRegistry())({
+      async readSnapshot() {
+        return {
+          connectorOnline: false,
+          queueAgeSeconds: 0,
+          jobsByStatus: ALL_JOB_COUNTS,
+        };
+      },
+    });
+    registry.recordConnectorMessage("job.sync");
+    registry.recordConnectorMessage("job.sync");
+    registry.recordConnectorMessage("job.state");
+    registry.recordError("JOB_AUTHORITY_UNAVAILABLE");
+    const body = await registry.render();
+    expect(sampleLines(body, "qhb_connector_messages_total")).toHaveLength(14);
+    expect(sampleLines(body, "qhb_errors_total")).toHaveLength(25);
+    expect(body).toContain(
+      'qhb_connector_messages_total{message_type="job.sync"} 2',
+    );
+    expect(body).toContain(
+      'qhb_connector_messages_total{message_type="job.state"} 1',
+    );
+    expect(body).toContain(
+      'qhb_errors_total{error_code="JOB_AUTHORITY_UNAVAILABLE"} 1',
+    );
+  });
   it("exports correct stable gauges, bounded families, and histogram samples", async () => {
     const createMetricsRegistry = await loadRegistry();
     const terminalSummaryFixture =

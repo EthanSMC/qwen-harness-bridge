@@ -129,9 +129,9 @@ const createFakeReadinessTransaction = (
       identities.push(backendPid);
       return (
         options.migration ?? {
-          tag: "0002_result_acknowledgement",
-          createdAt: 1788244364352,
-          hash: "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
+          tag: "0003_cancel_revision",
+          createdAt: 1788609600000,
+          hash: "79ec6ea05778bda661733c32ca7557e0ec000d4a0567cbf2e9617ac6910a8e79",
         }
       );
     },
@@ -276,8 +276,8 @@ describe("readiness transaction orchestrator contract", () => {
     const fake = createFakeReadinessTransaction({
       migration: {
         tag: "0001_initial",
-        createdAt: 1788244364352,
-        hash: "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
+        createdAt: 1788609600000,
+        hash: "79ec6ea05778bda661733c32ca7557e0ec000d4a0567cbf2e9617ac6910a8e79",
       },
     });
 
@@ -295,7 +295,7 @@ describe("readiness transaction orchestrator contract", () => {
   });
 
   it.each([
-    ["createdAt", { createdAt: 1788244364351 }],
+    ["createdAt", { createdAt: 1788609599999 }],
     ["hash", { hash: "0" }],
   ] as const)(
     "rejects a wrong migration %s before the temporary write/read",
@@ -303,9 +303,9 @@ describe("readiness transaction orchestrator contract", () => {
       const health = await loadHealthModule();
       const fake = createFakeReadinessTransaction({
         migration: {
-          tag: "0002_result_acknowledgement",
-          createdAt: 1788244364352,
-          hash: "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
+          tag: "0003_cancel_revision",
+          createdAt: 1788609600000,
+          hash: "79ec6ea05778bda661733c32ca7557e0ec000d4a0567cbf2e9617ac6910a8e79",
           ...mismatch,
         },
       });
@@ -570,9 +570,9 @@ describe("PostgreSQL readiness probe", () => {
   it("checks the exact migration and rolls back its temporary write/read probe", async () => {
     const health = await loadHealthModule();
     expect(health.EXPECTED_MIGRATION).toEqual({
-      tag: "0002_result_acknowledgement",
-      createdAt: 1788244364352,
-      hash: "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89",
+      tag: "0003_cancel_revision",
+      createdAt: 1788609600000,
+      hash: "79ec6ea05778bda661733c32ca7557e0ec000d4a0567cbf2e9617ac6910a8e79",
     });
     const before = await applicationRowCount();
     const probe = health.createPostgresReadinessProbe(database.client, {

@@ -28,6 +28,10 @@ export type AnswererOptions = Readonly<{
   broker: ApprovalBroker;
   findOwner(agentId: string): Agent | undefined;
   resolveAction(agent: Agent, callId: string): AnswererAction | undefined;
+  /** Refresh the exact owner's live state before the broker reserves a
+   * revision. Failure denies the request; it never falls back to a stale
+   * snapshot. */
+  refresh?(action: AnswererAction): Promise<void>;
 }>;
 
 export function registerAnswerer(
@@ -60,6 +64,19 @@ export function registerAnswerer(
           action.signal.aborted
         )
           return "unavailable";
+        if (options.refresh !== undefined) {
+          try {
+            await options.refresh(action);
+          } catch {
+            return "unavailable";
+          }
+          if (
+            action.signal.aborted ||
+            lifetime.signal.aborted ||
+            req.signal?.aborted === true
+          )
+            return "unavailable";
+        }
         const signal = AbortSignal.any([
           lifetime.signal,
           action.signal,

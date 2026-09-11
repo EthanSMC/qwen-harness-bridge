@@ -4,7 +4,13 @@ import type {
   ConnectorServerMessage,
   JobStatus,
 } from "@qhb/protocol";
-import { ConnectorServerMessageSchema, rfc3339InstantKey } from "@qhb/protocol";
+import {
+  ConnectorServerMessageSchema,
+  JOB_COORDINATION_CAPABILITY,
+  JobClaimPayloadSchema,
+  JobStatePayloadSchema,
+  rfc3339InstantKey,
+} from "@qhb/protocol";
 import { and, asc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import type { Database } from "../db/client.js";
 import {
@@ -16,7 +22,11 @@ import {
   repositoryPolicies,
 } from "../db/schema.js";
 import type { RequestDecryptor } from "../domain/job-coordinator.js";
-import { assertTransition, TERMINAL_JOB_STATES } from "../domain/job-state.js";
+import {
+  assertTransition,
+  canTransition,
+  TERMINAL_JOB_STATES,
+} from "../domain/job-state.js";
 import { sanitizePublicText } from "../domain/presenters.js";
 import type {
   ConnectorCredentialRecord,
@@ -57,9 +67,13 @@ type StoredResponseMetadata = Readonly<{
 
 const STORED_RESPONSE_KEY = "__qhb_original_response";
 const RECEIPT_PROFILE_KEY = "__qhb_receipt_profile";
+const COORDINATION_PROFILE_KEY = "__qhb_coordination_profile";
 const RECEIPT_ACK_KEY = "__qhb_receipt_ack";
 const DURABLE_RECEIPTS = "durable-receipts-v1";
 const BUSINESS_EXPIRED_MESSAGE = "The business deadline has expired.";
+const AUTHORITY_CHANGED_MESSAGE = "The job authority has changed.";
+const BUSINESS_LIMIT_MESSAGE = "The job business limit has been reached.";
+const AUTHORITY_UNAVAILABLE_MESSAGE = "The job authority is unavailable.";
 const CLAIM_REJECTED_MESSAGE =
   "The offered job was cancelled before it was claimed.";
 const APPROVAL_SUMMARY_MAX_LENGTH = 800;
@@ -93,6 +107,7 @@ export type ConnectorStoreErrorCode =
   | "CLIENT_REPLAY_MISMATCH"
   | "CLAIM_REJECTED"
   | "EVENT_REJECTED"
+  | "JOB_AUTHORITY_UNAVAILABLE"
   | "MESSAGE_EXPIRED"
   | "INTERNAL";
 
@@ -113,6 +128,38 @@ class BusinessDeadlineExpired extends ConnectorStoreError {
     super(code, BUSINESS_EXPIRED_MESSAGE);
   }
 }
+
+// Only the explicit checks below construct this savepoint disposition.
+class BusinessConflict extends ConnectorStoreError {
+  constructor(
+    code: "CLAIM_REJECTED" | "EVENT_REJECTED" | "JOB_AUTHORITY_UNAVAILABLE",
+    message = AUTHORITY_CHANGED_MESSAGE,
+  ) {
+    super(code, message);
+  }
+}
+
+const rejectConflict = (
+  coordination: boolean,
+  code: "CLAIM_REJECTED" | "EVENT_REJECTED",
+): never => {
+  if (coordination) throw new BusinessConflict(code);
+  throw new ConnectorStoreError(code);
+};
+
+const checkedJobIncrement = (
+  value: number,
+  coordination: boolean,
+  code: "CLAIM_REJECTED" | "EVENT_REJECTED",
+): number => {
+  if (!Number.isInteger(value) || value < 0 || value > 2147483647)
+    throw new ConnectorStoreError("INTERNAL", "Invalid job business value");
+  if (value === 2147483647) {
+    if (coordination) throw new BusinessConflict(code, BUSINESS_LIMIT_MESSAGE);
+    throw new ConnectorStoreError(code, BUSINESS_LIMIT_MESSAGE);
+  }
+  return value + 1;
+};
 
 const asRecord = (value: unknown): Record<string, unknown> | null =>
   value !== null && typeof value === "object" && !Array.isArray(value)
@@ -296,6 +343,7 @@ const isExactDuplicate = (
             ([key]) =>
               key !== STORED_RESPONSE_KEY &&
               key !== RECEIPT_PROFILE_KEY &&
+              key !== COORDINATION_PROFILE_KEY &&
               key !== RECEIPT_ACK_KEY &&
               (!durable || key !== "expires_at_instant"),
           ),
@@ -323,12 +371,27 @@ const findOriginalResponse = async (
     asRecord(clientMessage.payload)?.[RECEIPT_PROFILE_KEY] === DURABLE_RECEIPTS;
   if (message.type === "ack" && !durable) return null;
   const storedPayload = asRecord(clientMessage.payload);
+  const coordination =
+    durable &&
+    storedPayload?.[COORDINATION_PROFILE_KEY] === JOB_COORDINATION_CAPABILITY;
+  if (
+    (storedPayload?.[COORDINATION_PROFILE_KEY] !== undefined &&
+      !coordination) ||
+    (message.type === "job.sync" && !coordination)
+  ) {
+    throw new ConnectorStoreError(
+      "INTERNAL",
+      "Original coordination profile is invalid",
+    );
+  }
   const storedResponse: StoredResponseMetadata | null =
     storedPayload === null
       ? null
       : (asRecord(storedPayload[responseKey]) as StoredResponseMetadata | null);
   if (
     storedResponse === null ||
+    (coordination &&
+      storedResponse.correlation_id !== message.correlation_id) ||
     typeof storedResponse.type !== "string" ||
     typeof storedResponse.sequence !== "number" ||
     !Number.isSafeInteger(storedResponse.sequence) ||
@@ -403,6 +466,27 @@ const findOriginalResponse = async (
       ) {
         return null;
       }
+    } else if (
+      message.type === "job.sync" &&
+      responseKey === STORED_RESPONSE_KEY
+    ) {
+      if (
+        coordination &&
+        response.type === "protocol.error" &&
+        response.payload.code === "JOB_AUTHORITY_UNAVAILABLE" &&
+        response.payload.message === AUTHORITY_UNAVAILABLE_MESSAGE
+      ) {
+        // Only this original sync disposition may describe historical absence.
+      } else if (
+        !coordination ||
+        response.type !== "job.state" ||
+        response.payload.job_id !== message.payload.job_id ||
+        response.payload.requested_attempt !== message.payload.attempt ||
+        response.payload.request_message_id !== message.message_id ||
+        response.payload.request_sequence !== message.sequence ||
+        response.payload.nonce !== message.payload.nonce
+      )
+        return null;
     } else if (response.type === "ack") {
       if (response.payload.sequence !== message.sequence) return null;
     } else if (
@@ -417,6 +501,10 @@ const findOriginalResponse = async (
       response.payload.code ===
         (message.type === "job.claim" ? "CLAIM_REJECTED" : "EVENT_REJECTED") &&
       (response.payload.message === BUSINESS_EXPIRED_MESSAGE ||
+        (coordination &&
+          [AUTHORITY_CHANGED_MESSAGE, BUSINESS_LIMIT_MESSAGE].includes(
+            response.payload.message,
+          )) ||
         (message.type === "job.claim" &&
           response.payload.message === CLAIM_REJECTED_MESSAGE))
     ) {
@@ -439,6 +527,14 @@ const findOriginalResponse = async (
   const storedCorrelationId = Object.hasOwn(storedResponse, "correlation_id")
     ? storedResponse.correlation_id
     : row.correlationId;
+  if (
+    coordination &&
+    row.type === "protocol.error" &&
+    row.payload.code === "MESSAGE_EXPIRED" &&
+    canonicalJson(row.payload) !== canonicalJson(expiredTombstonePayload())
+  ) {
+    throw new ConnectorStoreError("INTERNAL", "Original response is invalid");
+  }
   if (
     storedCorrelationId !== row.correlationId ||
     (row.type !== storedResponse.type &&
@@ -757,6 +853,56 @@ const hasExpiredOriginalOffer = async (
   );
 };
 
+const hasOriginalOffer = async (
+  database: QueryDatabase,
+  identity: ConnectorIdentity,
+  message: Extract<ConnectorClientMessage, { type: "job.sync" | "job.claim" }>,
+): Promise<boolean> => {
+  const rows = await database
+    .select({ payload: jobEvents.payload, repositoryId: jobs.repositoryId })
+    .from(jobEvents)
+    .innerJoin(jobs, eq(jobs.id, jobEvents.jobId))
+    .where(
+      and(
+        eq(jobEvents.jobId, message.payload.job_id),
+        eq(jobs.ownerId, identity.ownerId),
+        eq(jobEvents.source, "control-plane"),
+        inArray(jobEvents.eventType, ["job.dispatched", "job.redispatched"]),
+        sql`${jobEvents.payload}->>'connector_id' = ${identity.connectorId}`,
+        sql`${jobEvents.payload}->>'attempt' = ${String(message.payload.attempt)}`,
+        message.type === "job.claim"
+          ? sql`${jobEvents.payload}->>'lease_id' = ${message.payload.lease_id}`
+          : undefined,
+      ),
+    )
+    .limit(2);
+  if (rows.length !== 1) return false;
+  const row = rows[0];
+  if (!row) return false;
+  const proof = row.payload;
+  if (
+    proof.owner_id !== identity.ownerId ||
+    proof.connector_id !== identity.connectorId ||
+    proof.repository_id !== row.repositoryId ||
+    proof.attempt !== message.payload.attempt ||
+    typeof proof.lease_expires_at !== "string"
+  )
+    return false;
+  if (
+    !JobClaimPayloadSchema.safeParse({
+      job_id: message.payload.job_id,
+      attempt: proof.attempt,
+      lease_id: proof.lease_id,
+    }).success
+  )
+    return false;
+  const deadline = Date.parse(proof.lease_expires_at);
+  return (
+    Number.isFinite(deadline) &&
+    new Date(deadline).toISOString() === proof.lease_expires_at
+  );
+};
+
 const readDatabaseTime = async (database: QueryDatabase): Promise<Date> => {
   const rows = await database.execute(
     sql`select clock_timestamp() as "currentTime"`,
@@ -873,7 +1019,10 @@ const nextJobEventSequence = async (
   if (!Number.isSafeInteger(current) || current < 0) {
     throw new ConnectorStoreError("INTERNAL", "Invalid job event sequence");
   }
-  return current + 1;
+  const next = current + 1;
+  if (!Number.isSafeInteger(next))
+    throw new ConnectorStoreError("INTERNAL", "Job event sequence exhausted");
+  return next;
 };
 
 const appendJobEvent = async (
@@ -919,15 +1068,20 @@ const ingestApprovalRequested = async (
   message: Extract<ConnectorClientMessage, { type: "approval.requested" }>,
   job: JobRow | undefined,
   now: Date,
+  coordination = false,
 ): Promise<void> => {
+  if (job === undefined) throw new ConnectorStoreError("EVENT_REJECTED");
   if (
-    job === undefined ||
     !["running", "waiting_approval"].includes(job.status) ||
-    job.attempt !== message.payload.attempt ||
-    message.payload.job_revision !== job.revision + 1
+    job.attempt !== message.payload.attempt
   ) {
-    throw new ConnectorStoreError("EVENT_REJECTED");
+    rejectConflict(coordination, "EVENT_REJECTED");
   }
+  if (
+    message.payload.job_revision !==
+    checkedJobIncrement(job.revision, coordination, "EVENT_REJECTED")
+  )
+    rejectConflict(coordination, "EVENT_REJECTED");
 
   if (
     job.expiresAt.getTime() <= now.getTime() ||
@@ -1019,9 +1173,11 @@ const ingestJobCancelled = async (
   message: Extract<ConnectorClientMessage, { type: "job.cancelled" }>,
   job: JobRow | undefined,
   now: Date,
+  coordination = false,
 ): Promise<void> => {
-  if (job === undefined || job.attempt !== message.payload.attempt) {
-    throw new ConnectorStoreError("EVENT_REJECTED");
+  if (job === undefined) throw new ConnectorStoreError("EVENT_REJECTED");
+  if (job.attempt !== message.payload.attempt) {
+    rejectConflict(coordination, "EVENT_REJECTED");
   }
 
   const reason = sanitizeConnectorText(message.payload.reason, 400);
@@ -1030,6 +1186,7 @@ const ingestJobCancelled = async (
     if (job.expiresAt.getTime() <= now.getTime()) {
       throw new BusinessDeadlineExpired("EVENT_REJECTED");
     }
+    checkedJobIncrement(job.revision, coordination, "EVENT_REJECTED");
     const updatedRows = await database
       .update(jobs)
       .set({
@@ -1059,7 +1216,7 @@ const ingestJobCancelled = async (
       throw new ConnectorStoreError("EVENT_REJECTED");
     }
   } else if (!TERMINAL_JOB_STATES.has(job.status)) {
-    throw new ConnectorStoreError("EVENT_REJECTED");
+    rejectConflict(coordination, "EVENT_REJECTED");
   }
 
   await appendJobEvent(database, job.id, {
@@ -1121,13 +1278,15 @@ const claimOfferedJob = async (
   job: JobRow | undefined,
   now: Date,
   durable = false,
+  coordination = false,
 ): Promise<"claimed" | "cancelled"> => {
   if (
     job !== undefined &&
     job.status === "cancelled" &&
     job.expiresAt.getTime() > now.getTime() &&
     job.leaseId === message.payload.lease_id &&
-    message.payload.attempt === job.attempt + 1
+    message.payload.attempt ===
+      (job.attempt === 2147483647 ? 2147483648 : job.attempt + 1)
   ) {
     await withdrawCancelledOffer(
       database,
@@ -1143,8 +1302,17 @@ const claimOfferedJob = async (
     job.status !== "dispatched" ||
     job.leaseId !== message.payload.lease_id ||
     job.leaseExpiresAt === null ||
-    message.payload.attempt !== job.attempt + 1
+    // A pre-guard legacy offer can contain this value. Compare it without
+    // incrementing an exhausted job, and keep guessed attempts unauthorized.
+    message.payload.attempt !==
+      (job.attempt === 2147483647 ? 2147483648 : job.attempt + 1)
   ) {
+    if (
+      coordination &&
+      job !== undefined &&
+      (await hasOriginalOffer(database, identity, message))
+    )
+      throw new BusinessConflict("CLAIM_REJECTED");
     throw new ConnectorStoreError("CLAIM_REJECTED");
   }
   if (
@@ -1153,6 +1321,12 @@ const claimOfferedJob = async (
   ) {
     throw new BusinessDeadlineExpired("CLAIM_REJECTED");
   }
+  const provenLimit =
+    coordination && (job.revision === 2147483647 || job.attempt === 2147483647)
+      ? await hasOriginalOffer(database, identity, message)
+      : false;
+  checkedJobIncrement(job.attempt, provenLimit, "CLAIM_REJECTED");
+  checkedJobIncrement(job.revision, provenLimit, "CLAIM_REJECTED");
   const updated = await database
     .update(jobs)
     .set({
@@ -1243,9 +1417,11 @@ const ingestJobEvent = async (
   message: Extract<ConnectorClientMessage, { type: "job.event" }>,
   job: JobRow | undefined,
   now: Date,
+  coordination = false,
 ): Promise<void> => {
-  if (job === undefined || job.attempt !== message.payload.attempt) {
-    throw new ConnectorStoreError("EVENT_REJECTED");
+  if (job === undefined) throw new ConnectorStoreError("EVENT_REJECTED");
+  if (job.attempt !== message.payload.attempt) {
+    rejectConflict(coordination, "EVENT_REJECTED");
   }
   const sanitizedPayload = sanitizeConnectorEventPayload(
     message.payload.payload,
@@ -1263,7 +1439,7 @@ const ingestJobEvent = async (
   const terminal =
     terminalStatusForEvent(sanitizedEventType, sanitizedPayload) !== null;
   if (TERMINAL_JOB_STATES.has(job.status)) {
-    if (!terminal) throw new ConnectorStoreError("EVENT_REJECTED");
+    if (!terminal) rejectConflict(coordination, "EVENT_REJECTED");
     await appendJobEvent(database, job.id, {
       type: sanitizedEventType,
       payload: sanitizedPayload,
@@ -1275,19 +1451,18 @@ const ingestJobEvent = async (
     return;
   }
   if (!CLAIMED_JOB_STATES.has(job.status)) {
-    throw new ConnectorStoreError("EVENT_REJECTED");
+    rejectConflict(coordination, "EVENT_REJECTED");
   }
   if (job.expiresAt.getTime() <= now.getTime()) {
     throw new BusinessDeadlineExpired("EVENT_REJECTED");
   }
   if (nextStatus !== job.status) {
-    try {
-      assertTransition(job.status, nextStatus);
-    } catch {
-      throw new ConnectorStoreError("EVENT_REJECTED");
-    }
+    if (!canTransition(job.status, nextStatus))
+      rejectConflict(coordination, "EVENT_REJECTED");
+    assertTransition(job.status, nextStatus);
   }
   const stage = sanitizedPayload.stage;
+  checkedJobIncrement(job.revision, coordination, "EVENT_REJECTED");
   const currentStage =
     typeof stage === "string" && stage.length <= 128
       ? stage
@@ -1374,6 +1549,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
     return this.#db.transaction(async (tx) => {
       const lockedJob =
         message.type === "job.claim" ||
+        message.type === "job.sync" ||
         message.type === "job.event" ||
         message.type === "approval.requested" ||
         message.type === "job.cancelled"
@@ -1385,6 +1561,13 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         message.type === "connector.hello"
           ? message.payload.capabilities?.includes(DURABLE_RECEIPTS) === true
           : connector.capabilities.includes(DURABLE_RECEIPTS);
+      const coordination =
+        durable &&
+        (message.type === "connector.hello"
+          ? message.payload.capabilities?.includes(
+              JOB_COORDINATION_CAPABILITY,
+            ) === true
+          : connector.capabilities.includes(JOB_COORDINATION_CAPABILITY));
       const existingRows = await tx
         .select()
         .from(connectorMessages)
@@ -1418,6 +1601,18 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
           message,
           existing,
         );
+        if (
+          (message.type === "job.sync" ||
+            (asRecord(existing.payload)?.[COORDINATION_PROFILE_KEY] ===
+              JOB_COORDINATION_CAPABILITY &&
+              originalResponse?.type === "protocol.error")) &&
+          asRecord(existing.payload)?.[RECEIPT_ACK_KEY] === undefined
+        ) {
+          throw new ConnectorStoreError(
+            "INTERNAL",
+            "Original receipt ACK is missing",
+          );
+        }
         const responseNeedsRefresh =
           originalResponse !== null &&
           (originalResponse.row.expiresAt.getTime() <= currentTime.getTime() ||
@@ -1493,6 +1688,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
       }
 
       const expectedSequence = connector.lastClientSequence + 1;
+      assertSafeSequence(expectedSequence);
       if (message.sequence !== expectedSequence) {
         throw new ConnectorStoreError(
           message.sequence > expectedSequence
@@ -1529,6 +1725,9 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         }
       }
 
+      if (message.type === "job.sync" && !coordination) {
+        throw new ConnectorStoreError("AUTHORIZATION_FAILED");
+      }
       await tx.insert(connectorMessages).values({
         connectorId: connector.id,
         direction: "client",
@@ -1538,16 +1737,26 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         payload: {
           ...storedClientPayload(message),
           ...(durable ? { [RECEIPT_PROFILE_KEY]: DURABLE_RECEIPTS } : {}),
+          ...(coordination
+            ? { [COORDINATION_PROFILE_KEY]: JOB_COORDINATION_CAPABILITY }
+            : {}),
         },
         correlationId: message.correlation_id,
         expiresAt: new Date(message.expires_at),
       });
 
       let claimResult: "claimed" | "cancelled" | undefined;
-      let rejection: BusinessDeadlineExpired | undefined;
+      let rejection: BusinessDeadlineExpired | BusinessConflict | undefined;
       let historicalClaimExpired = false;
       const applyBusiness = async (businessTx: Transaction): Promise<void> => {
-        if (message.type === "job.claim") {
+        if (message.type === "job.sync" && lockedJob === undefined) {
+          if (!(await hasOriginalOffer(businessTx, identity, message)))
+            throw new ConnectorStoreError("AUTHORIZATION_FAILED");
+          throw new BusinessConflict(
+            "JOB_AUTHORITY_UNAVAILABLE",
+            AUTHORITY_UNAVAILABLE_MESSAGE,
+          );
+        } else if (message.type === "job.claim") {
           if (durable && lockedJob?.leaseId !== message.payload.lease_id) {
             historicalClaimExpired = await hasExpiredOriginalOffer(
               businessTx,
@@ -1565,18 +1774,32 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
             lockedJob,
             currentTime,
             durable,
+            coordination,
           );
         } else if (message.type === "job.event") {
-          await ingestJobEvent(businessTx, message, lockedJob, currentTime);
+          await ingestJobEvent(
+            businessTx,
+            message,
+            lockedJob,
+            currentTime,
+            coordination,
+          );
         } else if (message.type === "approval.requested") {
           await ingestApprovalRequested(
             businessTx,
             message,
             lockedJob,
             currentTime,
+            coordination,
           );
         } else if (message.type === "job.cancelled") {
-          await ingestJobCancelled(businessTx, message, lockedJob, currentTime);
+          await ingestJobCancelled(
+            businessTx,
+            message,
+            lockedJob,
+            currentTime,
+            coordination,
+          );
         } else if (message.type === "ack") {
           await businessTx
             .update(connectorMessages)
@@ -1594,12 +1817,16 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         try {
           await tx.transaction(applyBusiness);
         } catch (error) {
-          if (
-            !(error instanceof BusinessDeadlineExpired) ||
-            (lockedJob === undefined && !historicalClaimExpired)
-          )
-            throw error;
-          rejection = error;
+          if (coordination && error instanceof BusinessConflict) {
+            rejection = error;
+          } else {
+            if (
+              !(error instanceof BusinessDeadlineExpired) ||
+              (lockedJob === undefined && !historicalClaimExpired)
+            )
+              throw error;
+            rejection = error;
+          }
         }
       } else {
         await applyBusiness(tx);
@@ -1607,17 +1834,24 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
 
       const capabilities =
         message.type === "connector.hello"
-          ? (message.payload.capabilities?.map((capability: string) =>
-              sanitizeConnectorText(capability, 64),
-            ) ??
-            connector.capabilities.filter(
-              (capability) => capability !== DURABLE_RECEIPTS,
-            ))
+          ? (
+              message.payload.capabilities?.map((capability: string) =>
+                sanitizeConnectorText(capability, 64),
+              ) ??
+              connector.capabilities.filter(
+                (capability) =>
+                  capability !== DURABLE_RECEIPTS &&
+                  capability !== JOB_COORDINATION_CAPABILITY,
+              )
+            ).filter(
+              (capability: string) =>
+                capability !== JOB_COORDINATION_CAPABILITY || coordination,
+            )
           : connector.capabilities;
       const isHeartbeat =
         message.type === "connector.hello" ||
         message.type === "connector.heartbeat";
-      await tx
+      const consumed = await tx
         .update(connectors)
         .set({
           lastClientSequence: message.sequence,
@@ -1632,7 +1866,10 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
             eq(connectors.id, connector.id),
             eq(connectors.lastClientSequence, connector.lastClientSequence),
           ),
-        );
+        )
+        .returning({ sequence: connectors.lastClientSequence });
+      if (consumed.length !== 1 || consumed[0]?.sequence !== message.sequence)
+        throw new ConnectorStoreError("INTERNAL", "Client sequence conflict");
       connector.lastClientSequence = message.sequence;
       if (isHeartbeat) {
         connector.lastHeartbeatAt = currentTime;
@@ -1682,7 +1919,14 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
             connector_id: connector.id,
             server_sequence: connector.lastServerSequence + 1,
             replay_from: message.payload.last_server_sequence + 1,
-            ...(durable ? { capabilities: [DURABLE_RECEIPTS] } : {}),
+            ...(durable
+              ? {
+                  capabilities: [
+                    DURABLE_RECEIPTS,
+                    ...(coordination ? [JOB_COORDINATION_CAPABILITY] : []),
+                  ],
+                }
+              : {}),
           },
           new Date(currentTime.getTime() + 60_000),
           message.correlation_id,
@@ -1695,6 +1939,55 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         };
       }
 
+      if (message.type === "job.sync" && rejection === undefined) {
+        if (lockedJob === undefined)
+          throw new ConnectorStoreError("AUTHORIZATION_FAILED");
+        const observed = await readDatabaseTime(tx);
+        const state = await enqueueServerMessage(
+          tx,
+          connector,
+          "job.state",
+          JobStatePayloadSchema.parse({
+            job_id: lockedJob.id,
+            repository_id: lockedJob.repositoryId,
+            mode: lockedJob.mode,
+            requested_attempt: message.payload.attempt,
+            current_attempt: lockedJob.attempt,
+            status: lockedJob.status,
+            job_revision: lockedJob.revision,
+            cancel_revision: lockedJob.cancelRevision,
+            lease_id: lockedJob.leaseId,
+            lease_expires_at: lockedJob.leaseExpiresAt?.toISOString() ?? null,
+            expires_at: lockedJob.expiresAt.toISOString(),
+            observed_at: observed.toISOString(),
+            state_valid_until: new Date(
+              observed.getTime() + 2000,
+            ).toISOString(),
+            request_message_id: message.message_id,
+            request_sequence: message.sequence,
+            nonce: message.payload.nonce,
+          }),
+          undefined,
+          message.correlation_id,
+        );
+        await rememberOriginalResponse(tx, connector.id, message, state);
+        const ack = await enqueueServerMessage(
+          tx,
+          connector,
+          "ack",
+          { sequence: message.sequence },
+          undefined,
+          message.correlation_id,
+        );
+        await rememberOriginalResponse(
+          tx,
+          connector.id,
+          message,
+          ack,
+          RECEIPT_ACK_KEY,
+        );
+        return { duplicate: false, replay: [state], response: ack };
+      }
       const response =
         message.type === "ack" && !durable
           ? null
@@ -1708,7 +2001,7 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
                   message:
                     rejection === undefined
                       ? CLAIM_REJECTED_MESSAGE
-                      : BUSINESS_EXPIRED_MESSAGE,
+                      : rejection.message,
                 },
                 new Date(currentTime.getTime() + 60_000),
                 message.correlation_id,
@@ -1842,13 +2135,14 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
         throw new ConnectorStoreError("INTERNAL", "Offer lease is invalid");
       }
       const leaseId = crypto.randomUUID();
+      checkedJobIncrement(job.revision, false, "CLAIM_REJECTED");
+      const attempt = checkedJobIncrement(job.attempt, false, "CLAIM_REJECTED");
       const leaseExpiresAt = new Date(
         Math.min(
           currentTime.getTime() + OFFER_LEASE_MS,
           job.expiresAt.getTime(),
         ),
       );
-      const attempt = job.attempt + 1;
       const updated = await tx
         .update(jobs)
         .set({
@@ -1875,7 +2169,14 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
           ),
         )
         .returning({ id: jobs.id });
-      if (updated.length !== 1) return null;
+      if (updated.length !== 1) {
+        if (
+          updated.length === 0 &&
+          job.expiresAt.getTime() <= (await readDatabaseTime(tx)).getTime()
+        )
+          return null;
+        throw new ConnectorStoreError("INTERNAL", "Dispatch write conflict");
+      }
       await appendJobEvent(tx, job.id, {
         type: redispatch ? "job.redispatched" : "job.dispatched",
         payload: {

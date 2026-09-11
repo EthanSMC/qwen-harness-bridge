@@ -65,6 +65,172 @@ afterEach(() => {
 });
 
 describe("Harness plugin configuration", () => {
+  it.each(["object", "JSON"])(
+    "retains a normalized model route from %s input",
+    (kind) => {
+      const raw = makeConfig(makeFixture(), {
+        harnessModel: {
+          provider: " Provider/示例:One ",
+          model: " Model/版本:V1 🚀 ",
+        },
+      });
+      const config = parsePluginConfig(kind === "JSON" ? raw : JSON.parse(raw));
+      expect(config.harnessModel).toEqual({
+        provider: "Provider/示例:One",
+        model: "Model/版本:V1 🚀",
+      });
+    },
+  );
+
+  it("preserves the exact legacy shape when the route is absent", () => {
+    const fixture = makeFixture();
+    const input = JSON.parse(
+      makeConfig(fixture, {
+        databasePath: join(realpathSync(fixture.directory), "state.sqlite"),
+      }),
+    );
+    const config = parsePluginConfig(input);
+    expect(config).toEqual(input);
+    expect(Object.hasOwn(config, "harnessModel")).toBe(false);
+  });
+
+  it.each(["provider", "model"] as const)(
+    "bounds %s by trimmed UTF-16 length",
+    (field) => {
+      const input = JSON.parse(makeConfig(makeFixture()));
+      const value = "🚀".repeat(128);
+      input.harnessModel = {
+        provider: "Provider",
+        model: "Model",
+        [field]: ` ${value} `,
+      };
+      expect(parsePluginConfig(input).harnessModel?.[field]).toBe(value);
+      input.harnessModel[field] = `${value}x`;
+      expect(() => parsePluginConfig(input)).toThrowError(
+        new ConfigValidationError("INVALID_PLUGIN_CONFIG"),
+      );
+    },
+  );
+
+  it.each([
+    undefined,
+    null,
+    [],
+    1,
+    "route",
+    {},
+    { provider: "Provider" },
+    { model: "Model" },
+    ...["provider", "model"].flatMap((field) =>
+      [undefined, null, [], 1, {}, "", "   "].map((value) => ({
+        provider: "Provider",
+        model: "Model",
+        [field]: value,
+      })),
+    ),
+    ...[
+      "apiKey",
+      "token",
+      "credentialId",
+      "baseUrl",
+      "reasoningEffort",
+      "extra",
+    ].map((field) => ({
+      provider: "Provider",
+      model: "Model",
+      [field]: "private-value",
+    })),
+  ])(
+    "rejects malformed or extended model route %# with a fixed error",
+    (route) => {
+      const input = JSON.parse(makeConfig(makeFixture()));
+      input.harnessModel = route;
+      expect(() => parsePluginConfig(input)).toThrowError(
+        new ConfigValidationError("INVALID_PLUGIN_CONFIG"),
+      );
+    },
+  );
+
+  it.each(["provider", "model"] as const)(
+    "rejects every embedded control or line separator in %s",
+    (field) => {
+      const input = JSON.parse(makeConfig(makeFixture()));
+      const codes = [
+        ...Array.from({ length: 32 }, (_, i) => i),
+        ...Array.from({ length: 33 }, (_, i) => 127 + i),
+        0x2028,
+        0x2029,
+      ];
+      for (const code of codes) {
+        input.harnessModel = {
+          provider: "Provider",
+          model: "Model",
+          [field]: `before${String.fromCharCode(code)}after`,
+        };
+        expect(() => parsePluginConfig(input)).toThrowError(
+          new ConfigValidationError("INVALID_PLUGIN_CONFIG"),
+        );
+      }
+    },
+  );
+
+  it("captures nested route getters once and retains only the captured values", () => {
+    const input = JSON.parse(makeConfig(makeFixture()));
+    let providerReads = 0;
+    let modelReads = 0;
+    input.harnessModel = {
+      get provider() {
+        return ++providerReads === 1 ? " Provider " : "changed";
+      },
+      get model() {
+        return ++modelReads === 1 ? " Model " : "changed";
+      },
+    };
+    expect(parsePluginConfig(input).harnessModel).toEqual({
+      provider: "Provider",
+      model: "Model",
+    });
+    expect([providerReads, modelReads]).toEqual([1, 1]);
+  });
+
+  it.each(["harnessModel", "provider", "model", "connectorId"])(
+    "sanitizes a thrown %s getter",
+    (field) => {
+      const input = JSON.parse(makeConfig(makeFixture()));
+      input.harnessModel = { provider: "Provider", model: "Model" };
+      Object.defineProperty(
+        field === "provider" || field === "model" ? input.harnessModel : input,
+        field,
+        {
+          enumerable: true,
+          get() {
+            throw new Error("private getter diagnostic");
+          },
+        },
+      );
+      expect(() => parsePluginConfig(input)).toThrowError(
+        new ConfigValidationError("INVALID_PLUGIN_CONFIG"),
+      );
+    },
+  );
+
+  it("detaches and deeply freezes the result without freezing caller objects", () => {
+    const input = JSON.parse(makeConfig(makeFixture()));
+    input.harnessModel = { provider: "Provider", model: "Model" };
+    const config = parsePluginConfig(input);
+    expect(config.harnessModel).not.toBe(input.harnessModel);
+    expect(Object.isFrozen(config)).toBe(true);
+    expect(Object.isFrozen(config.harnessModel)).toBe(true);
+    expect(Object.isFrozen(input)).toBe(false);
+    expect(Object.isFrozen(input.harnessModel)).toBe(false);
+    input.harnessModel.provider = "changed";
+    input.harnessModel.model = "changed";
+    expect(config.harnessModel).toEqual({
+      provider: "Provider",
+      model: "Model",
+    });
+  });
+
   it("rejects insecure ws control-plane URLs", () => {
     const fixture = makeFixture();
 

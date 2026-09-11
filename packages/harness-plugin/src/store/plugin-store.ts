@@ -1,5 +1,55 @@
 import { readFileSync } from "node:fs";
+import {
+  type ConnectorClientMessage,
+  ConnectorClientMessageSchema,
+  ConnectorServerMessageSchema,
+} from "@qhb/protocol";
 import Database from "better-sqlite3";
+import { z } from "zod";
+import {
+  assertTerminalAuthority,
+  beginTerminalAuthority,
+  captureTerminalBinding,
+  type TerminalAuthority,
+  type TerminalAuthorityBinding,
+} from "../runtime/terminal-authority.js";
+import {
+  activeOwnedKey,
+  captureOwned,
+  freezeOwned,
+  generationOwnedKey,
+  initialOwnedIntent,
+  OwnedAttemptSchema,
+  type OwnedIntent,
+  OwnedIntentError,
+  type OwnedIntentOwner,
+  OwnedIntentOwnerSchema,
+  OwnedIntentSchema,
+  type OwnedIntentTransition,
+  OwnedTransitionSchema,
+  OwnedVersionSchema,
+  ownedJson,
+  ownedKey,
+  type PrepareOwnedIntentInput,
+  PrepareOwnedIntentSchema,
+  parseOwnedRecord,
+} from "./owned-intent.js";
+import {
+  captureTerminalProposal,
+  forbiddenOwnedGeneric,
+  freezeTerminal,
+  parseTerminalRecord,
+  type ReconciliationBinding,
+  type TerminalCommitResult,
+  type TerminalProposal,
+  type TerminalReconcileResult,
+  type TerminalRecord,
+  terminalKey,
+  validateTerminalProposal,
+} from "./owned-terminal.js";
+
+export type { OwnedIntent, OwnedIntentOwner } from "./owned-intent.js";
+export { OwnedIntentError } from "./owned-intent.js";
 
 const SCHEMA_SQL = readFileSync(
   new URL("./schema.sql", import.meta.url),
@@ -15,12 +65,14 @@ export type LocalJobMapping = Readonly<{
 }>;
 
 export type OutboundEventInput = Readonly<{
+  expectedReceiptProfile?: "job-coordination-v1";
   messageId: string;
   sequence: number;
   payload: string;
 }>;
 
 export type StoredOutboundEvent = Readonly<{
+  expectedReceiptProfile?: "job-coordination-v1";
   messageId: string;
   sequence: number;
   payload: string;
@@ -36,6 +88,7 @@ export type StoredInboundMessage = Readonly<{
 }>;
 
 export type InboundReplacement = Readonly<{
+  coordinationRequestSequence?: number;
   previousMessageId: string;
   previousBody: string;
   messageId: string;
@@ -48,6 +101,7 @@ export interface PluginStore {
     messageId: string,
     sequence: number,
     body: string,
+    evidence?: Readonly<{ coordinationRequestSequence: number }>,
   ): "new" | "duplicate";
   maxInboundSequence(): number;
   inboundMessage(messageId: string): StoredInboundMessage | undefined;
@@ -74,6 +128,63 @@ export interface PluginStore {
   pendingEvents(afterSequence: number): StoredOutboundEvent[];
   acknowledgeEvent(messageId: string): void;
   close(): void;
+}
+
+const CoordinationReceiptSchema = z
+  .object({
+    expectedReceiptProfile: z.literal("job-coordination-v1"),
+    requestSequence: z.number().int().positive().safe(),
+    requestMessageId: z.string(),
+    requestCorrelationId: z.string(),
+    requestType: z.enum([
+      "job.sync",
+      "job.claim",
+      "job.event",
+      "approval.requested",
+      "job.cancelled",
+    ]),
+    responseSequence: z.number().int().positive().safe(),
+    responseCorrelationId: z.string(),
+    responseType: z.enum(["job.state", "protocol.error"]),
+    responsePayloadJson: z.string(),
+  })
+  .strict();
+
+export type StoredCoordinationReceipt = Readonly<
+  z.infer<typeof CoordinationReceiptSchema>
+>;
+
+export interface CoordinatingPluginStore extends PluginStore {
+  coordinationReceipt(sequence: number): StoredCoordinationReceipt | undefined;
+  coordinationRequest(correlationId: string): StoredOutboundEvent | undefined;
+}
+
+export interface OwnedIntentPluginStore extends CoordinatingPluginStore {
+  prepareOwnedIntent(input: PrepareOwnedIntentInput): OwnedIntent;
+  ownedIntent(jobId: string, attempt: number): OwnedIntent | undefined;
+  listOwnedIntents(): readonly OwnedIntent[];
+  advanceOwnedIntent(
+    owner: OwnedIntentOwner,
+    expectedVersion: number,
+    transition: OwnedIntentTransition,
+  ): OwnedIntent;
+}
+
+export interface TerminalPluginStore extends OwnedIntentPluginStore {
+  assertGenericPublication(
+    message: ConnectorClientMessage,
+    originalPayload: unknown,
+  ): void;
+  readTerminal(owner: OwnedIntentOwner): TerminalRecord | undefined;
+  commitTerminal(
+    proposal: TerminalProposal,
+    authority: TerminalAuthority,
+    factory: () => OutboundEventInput,
+  ): TerminalCommitResult;
+  reconcileTerminal(
+    binding: ReconciliationBinding,
+    authority: TerminalAuthority,
+  ): TerminalReconcileResult;
 }
 
 export class StoreSequenceError extends Error {
@@ -106,6 +217,51 @@ class StoreError extends Error {
 
 const now = (): string => new Date().toISOString();
 const INBOUND_DELIVERED_METADATA_PREFIX = "inbound-delivered:";
+const OUTBOUND_PROFILE_PREFIX = "outbound-receipt-profile:";
+const COORDINATION_PROFILE = "job-coordination-v1";
+const INBOUND_RECEIPT_PREFIX = "inbound-coordination-receipt:";
+
+// Strict state and error payloads contain only scalar fields.
+const canonicalPayload = (payload: object): string =>
+  JSON.stringify(
+    Object.fromEntries(
+      Object.entries(payload).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+    ),
+  );
+
+const parseResponse = (messageId: string, sequence: number, body: string) => {
+  const decoded = JSON.parse(body);
+  const parsed = ConnectorServerMessageSchema.parse(decoded);
+  // Coordination evidence must not acquire exact fixed-error semantics through
+  // the shared legacy schema's trimming. Compare decoded scalars, not JSON bytes.
+  if (
+    parsed.type === "protocol.error" &&
+    (decoded.payload.code !== parsed.payload.code ||
+      decoded.payload.message !== parsed.payload.message)
+  )
+    throw new Error();
+  if (parsed.message_id !== messageId || parsed.sequence !== sequence)
+    throw new Error();
+  return parsed;
+};
+
+const isExpiryPlaceholder = (
+  response: ReturnType<typeof parseResponse>,
+): boolean =>
+  response.type === "protocol.error" &&
+  response.payload.code === "MESSAGE_EXPIRED" &&
+  response.payload.message === "A Connector message expired before delivery.";
+
+const parseRequest = (event: OutboundEventInput) => {
+  const parsed = ConnectorClientMessageSchema.parse(JSON.parse(event.payload));
+  if (
+    parsed.message_id !== event.messageId ||
+    parsed.sequence !== event.sequence
+  ) {
+    throw new StoreError("STORE_COORDINATION_INVALID");
+  }
+  return parsed;
+};
 
 const assertNonEmpty = (value: string, code: string): void => {
   if (typeof value !== "string" || value.length === 0) {
@@ -184,7 +340,8 @@ const schemaMatches = (database: Database.Database): boolean =>
   JSON.stringify(schemaObjects(database)) ===
   JSON.stringify(EXPECTED_SCHEMA_OBJECTS);
 
-export class SqlitePluginStore implements PluginStore {
+export class SqlitePluginStore implements TerminalPluginStore {
+  #terminalBusy = false;
   #database: Database.Database | null = null;
   #closed = false;
 
@@ -228,17 +385,674 @@ export class SqlitePluginStore implements PluginStore {
     }
   }
 
+  // All journal reads and writes observe one database snapshot, and return only
+  // after an outermost commit. No callback is exposed to consumers.
+  private ownedTransaction<T>(operation: () => T): T {
+    try {
+      this.assertOpen();
+      if (this.database.inTransaction)
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      return this.database.transaction(operation).immediate();
+    } catch (error) {
+      if (
+        error instanceof OwnedIntentError ||
+        error instanceof StoreSequenceError
+      )
+        throw error;
+      throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+    }
+  }
+
+  private readOwnedIntents(): OwnedIntent[] {
+    // TEXT affinity still permits BLOBs. Check storage classes before any
+    // namespace predicate can hide a malformed key or coerce a value.
+    if (
+      this.database
+        .prepare(
+          "SELECT 1 FROM metadata WHERE typeof(key) <> 'text' OR typeof(value) <> 'text' LIMIT 1",
+        )
+        .get() !== undefined
+    )
+      throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+    const rows = this.database
+      .prepare(
+        "SELECT key, value FROM metadata WHERE key GLOB 'owned-intent-*' OR key GLOB 'owned-active-*' OR key GLOB 'owned-generation-*' OR key GLOB 'owned-terminal-*' ORDER BY key",
+      )
+      .all() as { key: string; value: string }[];
+    if (
+      !z
+        .array(z.object({ key: z.string(), value: z.string() }).strict())
+        .safeParse(rows).success
+    )
+      throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+    const metadata = new Map(rows.map((row) => [row.key, row.value]));
+    const records: OwnedIntent[] = [];
+    const consumed = new Set<string>();
+    const mappings = this.database
+      .prepare("SELECT job_id, attempt, session_id, status FROM job_mappings")
+      .all() as JobRow[];
+    if (
+      !z
+        .array(
+          z
+            .object({
+              job_id: z.string().min(1),
+              attempt: z.number().int().positive().safe(),
+              session_id: z.string().min(1),
+              status: z.string().min(1),
+            })
+            .strict(),
+        )
+        .safeParse(mappings).success
+    )
+      throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+    for (const row of rows) {
+      if (!row.key.startsWith("owned-intent-v1:")) continue;
+      const value = parseOwnedRecord(OwnedIntentSchema, row.value);
+      const owner = value.owner;
+      if (row.key !== ownedKey(owner))
+        throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+      for (const index of [activeOwnedKey(owner), generationOwnedKey(owner)]) {
+        const body = metadata.get(index);
+        if (
+          body === undefined ||
+          consumed.has(index) ||
+          ownedJson(parseOwnedRecord(OwnedIntentOwnerSchema, body)) !==
+            ownedJson(owner)
+        )
+          throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+        consumed.add(index);
+      }
+      const matching = mappings.filter(
+        (mapping) =>
+          mapping.job_id.toLowerCase() === owner.jobId ||
+          mapping.session_id.toLowerCase() === owner.sessionId,
+      );
+      const mapping = matching[0];
+      const markerText = metadata.get(terminalKey(owner));
+      let terminal: TerminalRecord | undefined;
+      if (value.phase === "terminal") {
+        if (markerText === undefined)
+          throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+        terminal = parseTerminalRecord(markerText);
+        if (
+          ownedJson(value) !==
+          ownedJson({
+            ...terminal.predecessor,
+            phase: "terminal",
+            version: terminal.committedVersion,
+          })
+        )
+          throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+        if (terminal.kind === "local") {
+          if (
+            this.database
+              .prepare(
+                "SELECT 1 FROM outbound_events WHERE sequence = ? AND (typeof(message_id) <> 'text' OR typeof(sequence) <> 'integer' OR typeof(payload_json) <> 'text' OR typeof(attempts) <> 'integer' OR typeof(acknowledged_at) NOT IN ('text', 'null') OR typeof(created_at) <> 'text')",
+              )
+              .get(terminal.outbound.sequence)
+          )
+            throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+          const profile = this.database
+            .prepare("SELECT value FROM metadata WHERE key = ?")
+            .get(`${OUTBOUND_PROFILE_PREFIX}${terminal.outbound.sequence}`) as
+            | { value: unknown }
+            | undefined;
+          if (profile?.value !== COORDINATION_PROFILE)
+            throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+          const event = this.outboundEvent(terminal.outbound.sequence);
+          if (
+            !event ||
+            event.expectedReceiptProfile !== COORDINATION_PROFILE ||
+            event.messageId !== terminal.outbound.messageId
+          )
+            throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+          const message = ConnectorClientMessageSchema.parse(
+            JSON.parse(event.payload),
+          );
+          if (
+            message.sent_at !== terminal.outbound.sentAt ||
+            message.type !== terminal.type ||
+            message.correlation_id !== terminal.correlationId ||
+            ownedJson(message.payload) !== ownedJson(terminal.payload)
+          )
+            throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+        }
+        consumed.add(terminalKey(owner));
+      } else if (markerText !== undefined)
+        throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+      if (
+        matching.length !== 1 ||
+        mapping === undefined ||
+        mapping.job_id !== owner.jobId ||
+        mapping.attempt !== owner.attempt ||
+        mapping.session_id !== owner.sessionId ||
+        mapping.status !== (terminal?.status ?? value.phase)
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+      consumed.add(row.key);
+      records.push(freezeOwned(value));
+    }
+    if (
+      consumed.size !== rows.length ||
+      mappings.some(
+        (mapping) =>
+          ["prepared", "creating", "submitting", "started"].includes(
+            mapping.status,
+          ) &&
+          !records.some(
+            (record) =>
+              record.owner.jobId === mapping.job_id &&
+              record.owner.attempt === mapping.attempt,
+          ),
+      )
+    )
+      throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+    return records.sort((a, b) =>
+      a.owner.jobId < b.owner.jobId
+        ? -1
+        : a.owner.jobId > b.owner.jobId
+          ? 1
+          : a.owner.attempt - b.owner.attempt,
+    );
+  }
+
+  prepareOwnedIntent(input: PrepareOwnedIntentInput): OwnedIntent {
+    this.assertNotTerminalMutation();
+    const captured = captureOwned(PrepareOwnedIntentSchema, input);
+    // The refinement above rejects other envelope types before any SQL work.
+    if (captured.offer.type !== "job.offer")
+      throw new OwnedIntentError("OWNED_INTENT_INVALID");
+    captureOwned(OwnedAttemptSchema, captured.offer.payload.attempt);
+    const candidate = initialOwnedIntent({
+      ...captured,
+      offer: captured.offer,
+    });
+    return this.ownedTransaction(() => {
+      const records = this.readOwnedIntents();
+      const existing = records.find(
+        (record) => ownedKey(record.owner) === ownedKey(candidate.owner),
+      );
+      if (existing !== undefined) {
+        const original = {
+          ...existing,
+          phase: "prepared",
+          version: 0,
+          mode: null,
+          startedEvidence: null,
+          unavailable: null,
+        };
+        if (ownedJson(original) !== ownedJson(candidate))
+          throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+        return existing;
+      }
+      const inbound = this.database
+        .prepare(
+          "SELECT body FROM inbound_messages WHERE message_id = ? AND sequence = ?",
+        )
+        .get(captured.offer.message_id, captured.offer.sequence) as
+        | { body: string }
+        | undefined;
+      if (inbound === undefined)
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      let stored: ReturnType<typeof ConnectorServerMessageSchema.parse>;
+      try {
+        stored = ConnectorServerMessageSchema.parse(JSON.parse(inbound.body));
+      } catch {
+        throw new OwnedIntentError("OWNED_INTENT_CORRUPT");
+      }
+      if (
+        stored.type !== "job.offer" ||
+        ownedJson(stored) !== ownedJson(captured.offer)
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      const value = initialOwnedIntent({ ...captured, offer: stored });
+      const owner = value.owner;
+      if (
+        records.some(
+          (record) =>
+            record.owner.jobId === owner.jobId ||
+            record.owner.ownerGeneration === owner.ownerGeneration,
+        ) ||
+        this.database
+          .prepare(
+            "SELECT 1 FROM job_mappings WHERE lower(job_id) = ? OR lower(session_id) = ?",
+          )
+          .get(owner.jobId, owner.sessionId) !== undefined
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      const serialized = ownedJson(value);
+      if (Buffer.byteLength(serialized, "utf8") > 16384)
+        throw new OwnedIntentError("OWNED_INTENT_INVALID");
+      const mapping = this.database
+        .prepare(
+          "INSERT INTO job_mappings (job_id, attempt, session_id, status, updated_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .run(owner.jobId, owner.attempt, owner.sessionId, value.phase, now());
+      if (mapping.changes !== 1)
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      const insert = this.database.prepare(
+        "INSERT INTO metadata (key, value) VALUES (?, ?)",
+      );
+      for (const [key, body] of [
+        [ownedKey(owner), serialized],
+        [activeOwnedKey(owner), ownedJson(owner)],
+        [generationOwnedKey(owner), ownedJson(owner)],
+      ] as const) {
+        if (insert.run(key, body).changes !== 1)
+          throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      }
+      return freezeOwned(value);
+    });
+  }
+
+  ownedIntent(jobId: string, attempt: number): OwnedIntent | undefined {
+    const captured = captureOwned(
+      z
+        .object({
+          jobId: OwnedIntentOwnerSchema.shape.jobId,
+          attempt: OwnedAttemptSchema,
+        })
+        .strict(),
+      { jobId, attempt },
+    );
+    return this.ownedTransaction(() =>
+      this.readOwnedIntents().find(
+        (record) =>
+          record.owner.jobId === captured.jobId &&
+          record.owner.attempt === captured.attempt,
+      ),
+    );
+  }
+
+  listOwnedIntents(): readonly OwnedIntent[] {
+    return this.ownedTransaction(() => Object.freeze(this.readOwnedIntents()));
+  }
+
+  advanceOwnedIntent(
+    owner: OwnedIntentOwner,
+    expectedVersion: number,
+    transition: OwnedIntentTransition,
+  ): OwnedIntent {
+    this.assertNotTerminalMutation();
+    const capturedOwner = captureOwned(OwnedIntentOwnerSchema, owner);
+    const version = captureOwned(OwnedVersionSchema, expectedVersion);
+    const next = captureOwned(OwnedTransitionSchema, transition);
+    return this.ownedTransaction(() => {
+      const current = this.readOwnedIntents().find(
+        (record) => ownedKey(record.owner) === ownedKey(capturedOwner),
+      );
+      if (
+        current === undefined ||
+        current.phase === "terminal" ||
+        ownedJson(current.owner) !== ownedJson(capturedOwner) ||
+        current.version !== version
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      let updated: OwnedIntent;
+      if ("unavailable" in next) {
+        if (current.unavailable !== null) {
+          if (current.unavailable === next.unavailable) return current;
+          throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+        }
+        updated = { ...current, unavailable: next.unavailable };
+      } else {
+        if (current.unavailable !== null)
+          throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+        if (next.phase === "creating" && current.phase === "prepared")
+          updated = { ...current, phase: next.phase, mode: next.mode };
+        else if (next.phase === "submitting" && current.phase === "creating")
+          updated = { ...current, phase: next.phase };
+        else if (
+          next.phase === "started" &&
+          current.phase === "submitting" &&
+          next.evidence.sessionId === current.owner.sessionId &&
+          next.evidence.messageId === current.initialMessageId &&
+          next.evidence.requestDigest === current.requestDigest
+        ) {
+          // Identity validation only: the native adapter must independently
+          // verify own-session history and complete the actual persistence flush.
+          updated = {
+            ...current,
+            phase: next.phase,
+            startedEvidence: next.evidence,
+          };
+        } else throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      }
+      if (version === Number.MAX_SAFE_INTEGER)
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      updated = { ...updated, version: version + 1 };
+      const serialized = ownedJson(updated);
+      if (Buffer.byteLength(serialized, "utf8") > 16384)
+        throw new OwnedIntentError("OWNED_INTENT_INVALID");
+      const row = this.database
+        .prepare("SELECT value FROM metadata WHERE key = ?")
+        .get(ownedKey(capturedOwner)) as { value: string };
+      const changed = this.database
+        .prepare("UPDATE metadata SET value = ? WHERE key = ? AND value = ?")
+        .run(serialized, ownedKey(capturedOwner), row.value);
+      if (changed.changes !== 1)
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      const mapped = this.database
+        .prepare(
+          "UPDATE job_mappings SET status = ?, updated_at = ? WHERE job_id = ? AND attempt = ? AND session_id = ? AND status = ?",
+        )
+        .run(
+          updated.phase,
+          now(),
+          capturedOwner.jobId,
+          capturedOwner.attempt,
+          capturedOwner.sessionId,
+          current.phase,
+        );
+      if (mapped.changes !== 1)
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      return freezeOwned(updated);
+    });
+  }
+
+  readTerminal(owner: OwnedIntentOwner): TerminalRecord | undefined {
+    const captured = captureOwned(OwnedIntentOwnerSchema, owner);
+    return this.ownedTransaction(() => {
+      const current = this.readOwnedIntents().find(
+        (value) => ownedKey(value.owner) === ownedKey(captured),
+      );
+      if (!current || ownedJson(current.owner) !== ownedJson(captured))
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      return this.terminalMarker(current);
+    });
+  }
+
+  private terminalMarker(current: OwnedIntent): TerminalRecord | undefined {
+    if (current.phase !== "terminal") return undefined;
+    const row = this.database
+      .prepare("SELECT value FROM metadata WHERE key = ?")
+      .get(terminalKey(current.owner)) as { value: string };
+    return parseTerminalRecord(row.value);
+  }
+
+  private terminalEntry(): void {
+    this.assertOpen();
+    if (this.database.inTransaction || this.#terminalBusy)
+      throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+  }
+
+  private terminalOperation<T>(operation: () => T): T {
+    this.terminalEntry();
+    this.#terminalBusy = true;
+    try {
+      return operation();
+    } finally {
+      this.#terminalBusy = false;
+    }
+  }
+
+  private terminalOwner(binding: TerminalAuthorityBinding): OwnedIntent {
+    const current = this.readOwnedIntents().find(
+      (value) => ownedKey(value.owner) === ownedKey(binding.owner),
+    );
+    if (!current || ownedJson(current.owner) !== ownedJson(binding.owner))
+      throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+    return current;
+  }
+
+  private writeTerminal(current: OwnedIntent, record: TerminalRecord): void {
+    const serialized = ownedJson(record);
+    parseTerminalRecord(serialized);
+    const successor = ownedJson({
+      ...current,
+      phase: "terminal",
+      version: record.committedVersion,
+    });
+    if (Buffer.byteLength(successor, "utf8") > 16384)
+      throw new OwnedIntentError("OWNED_INTENT_INVALID");
+    const old = this.database
+      .prepare("SELECT value FROM metadata WHERE key = ?")
+      .get(ownedKey(current.owner)) as { value: string };
+    if (
+      !old ||
+      ownedJson(parseOwnedRecord(OwnedIntentSchema, old.value)) !==
+        ownedJson(current)
+    )
+      throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+    const updates = this.database
+      .prepare("UPDATE metadata SET value = ? WHERE key = ? AND value = ?")
+      .run(successor, ownedKey(current.owner), old.value);
+    if (updates.changes !== 1)
+      throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+    const mapped = this.database
+      .prepare(
+        "UPDATE job_mappings SET status = ?, updated_at = ? WHERE job_id = ? AND attempt = ? AND session_id = ? AND status = ?",
+      )
+      .run(
+        record.status,
+        now(),
+        current.owner.jobId,
+        current.owner.attempt,
+        current.owner.sessionId,
+        current.phase,
+      );
+    if (mapped.changes !== 1)
+      throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+    if (
+      this.database
+        .prepare("INSERT INTO metadata(key, value) VALUES (?, ?)")
+        .run(terminalKey(current.owner), serialized).changes !== 1
+    )
+      throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+  }
+
+  commitTerminal(
+    input: TerminalProposal,
+    authority: TerminalAuthority,
+    factory: () => OutboundEventInput,
+  ): TerminalCommitResult {
+    return this.terminalOperation(() =>
+      this.commitCapturedTerminal(input, authority, factory),
+    );
+  }
+
+  private commitCapturedTerminal(
+    input: TerminalProposal,
+    authority: TerminalAuthority,
+    factory: () => OutboundEventInput,
+  ): TerminalCommitResult {
+    const proposal = captureTerminalProposal(input);
+    const { binding } = proposal;
+    const checked = beginTerminalAuthority(authority, binding);
+    return this.ownedTransaction(() => {
+      assertTerminalAuthority(authority, binding);
+      const current = this.terminalOwner(binding);
+      const existing = this.terminalMarker(current);
+      const predecessor = existing?.predecessor ?? current;
+      if (predecessor.version !== binding.expectedVersion)
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      const operation = binding.operation;
+      if (
+        (operation.kind === "native" &&
+          (predecessor.phase !== "started" ||
+            predecessor.unavailable !== null ||
+            !predecessor.startedEvidence ||
+            operation.eventSequence <
+              predecessor.startedEvidence.eventSequence)) ||
+        (operation.kind === "unavailable" &&
+          predecessor.unavailable !== operation.reason) ||
+        checked.state.current_attempt !== predecessor.owner.attempt ||
+        (predecessor.mode !== null && predecessor.mode !== checked.state.mode)
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      if (existing) {
+        assertTerminalAuthority(authority, binding);
+        if (existing.kind === "remote")
+          return { kind: "remote", record: existing };
+        const same = existing.correlationId === proposal.correlationId;
+        if (
+          same &&
+          (ownedJson(existing.operation) !== ownedJson(operation) ||
+            existing.type !== proposal.type ||
+            ownedJson(existing.payload) !== ownedJson(proposal.payload))
+        )
+          throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+        return {
+          kind: "existing",
+          relation: same ? "same" : "competing",
+          winner: existing,
+        };
+      }
+      if (
+        current.version >= Number.MAX_SAFE_INTEGER ||
+        current.phase === "terminal"
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      const candidate = factory();
+      if (!candidate || typeof candidate !== "object" || "then" in candidate)
+        throw new OwnedIntentError("OWNED_INTENT_INVALID");
+      const event = {
+        messageId: candidate.messageId,
+        sequence: candidate.sequence,
+        payload: candidate.payload,
+        expectedReceiptProfile: candidate.expectedReceiptProfile,
+      };
+      const message = parseRequest(event);
+      if (
+        event.expectedReceiptProfile !== COORDINATION_PROFILE ||
+        message.type !== proposal.type ||
+        message.correlation_id !== proposal.correlationId ||
+        ownedJson(message.payload) !== ownedJson(proposal.payload)
+      )
+        throw new OwnedIntentError("OWNED_INTENT_INVALID");
+      if (event.sequence <= this.maxOutboundSequence())
+        throw new StoreSequenceError();
+      const record = parseTerminalRecord(
+        ownedJson({
+          schemaVersion: 1,
+          kind: "local",
+          predecessor: current,
+          committedVersion: current.version + 1,
+          operation,
+          correlationId: proposal.correlationId,
+          type: proposal.type,
+          payload: proposal.payload,
+          status: validateTerminalProposal(proposal),
+          outbound: {
+            messageId: event.messageId,
+            sequence: event.sequence,
+            sentAt: message.sent_at,
+          },
+        }),
+      );
+      if (record.kind !== "local")
+        throw new OwnedIntentError("OWNED_INTENT_INVALID");
+      this.writeTerminal(current, record);
+      if (
+        this.database
+          .prepare(
+            "INSERT INTO outbound_events(message_id, sequence, payload_json, attempts, acknowledged_at, created_at) VALUES (?, ?, ?, 0, NULL, ?)",
+          )
+          .run(event.messageId, event.sequence, event.payload, now())
+          .changes !== 1
+      )
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      if (
+        this.database
+          .prepare("INSERT INTO metadata(key, value) VALUES (?, ?)")
+          .run(
+            `${OUTBOUND_PROFILE_PREFIX}${event.sequence}`,
+            COORDINATION_PROFILE,
+          ).changes !== 1
+      )
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      this.readOwnedIntents();
+      assertTerminalAuthority(authority, binding);
+      return { kind: "committed", winner: record };
+    });
+  }
+
+  reconcileTerminal(
+    input: ReconciliationBinding,
+    authority: TerminalAuthority,
+  ): TerminalReconcileResult {
+    return this.terminalOperation(() =>
+      this.reconcileCapturedTerminal(input, authority),
+    );
+  }
+
+  private reconcileCapturedTerminal(
+    input: ReconciliationBinding,
+    authority: TerminalAuthority,
+  ): TerminalReconcileResult {
+    const binding = captureTerminalBinding(input);
+    if (binding.operation.kind !== "reconcile")
+      throw new OwnedIntentError("OWNED_INTENT_INVALID");
+    const { state } = beginTerminalAuthority(authority, binding);
+    return this.ownedTransaction(() => {
+      assertTerminalAuthority(authority, binding);
+      const current = this.terminalOwner(binding);
+      if (
+        current.version !== binding.expectedVersion ||
+        current.mode === null ||
+        current.mode !== state.mode ||
+        state.current_attempt !== current.owner.attempt ||
+        !["succeeded", "failed", "cancelled", "expired"].includes(state.status)
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+      const existing = this.terminalMarker(current);
+      if (existing) {
+        if (existing.kind === "remote" && existing.status !== state.status)
+          throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+        assertTerminalAuthority(authority, binding);
+        return freezeTerminal({
+          kind: "existing",
+          record: existing,
+          observedRemote: state,
+        });
+      }
+      const record = parseTerminalRecord(
+        ownedJson({
+          schemaVersion: 1,
+          kind: "remote",
+          predecessor: current,
+          committedVersion: current.version + 1,
+          status: state.status,
+          state,
+        }),
+      );
+      if (record.kind !== "remote")
+        throw new OwnedIntentError("OWNED_INTENT_INVALID");
+      this.writeTerminal(current, record);
+      this.readOwnedIntents();
+      assertTerminalAuthority(authority, binding);
+      return { kind: "reconciled", record };
+    });
+  }
+
   recordInbound(
     messageId: string,
     sequence: number,
     body: string,
+    evidence?: Readonly<{ coordinationRequestSequence: number }>,
   ): "new" | "duplicate" {
+    this.assertNotTerminalMutation();
     this.assertOpen();
     assertNonEmpty(messageId, "STORE_MESSAGE_ID_REQUIRED");
     assertPositiveInteger(sequence, "STORE_SEQUENCE_INVALID");
     assertNonEmpty(body, "STORE_MESSAGE_BODY_REQUIRED");
 
     const write = this.database.transaction((): "new" | "duplicate" => {
+      if (evidence !== undefined) {
+        z.object({
+          coordinationRequestSequence: z.number().int().positive().safe(),
+        })
+          .strict()
+          .parse(evidence);
+      }
+      const receipt = this.prepareCoordinationReceipt(
+        messageId,
+        sequence,
+        body,
+        evidence?.coordinationRequestSequence,
+        false,
+      );
       const byMessage = this.database
         .prepare(
           `SELECT message_id, sequence, body
@@ -267,6 +1081,7 @@ export class SqlitePluginStore implements PluginStore {
            VALUES (?, ?, ?, ?)`,
         )
         .run(messageId, sequence, body, now());
+      this.insertCoordinationReceipt(receipt);
       return "new";
     });
 
@@ -319,6 +1134,7 @@ export class SqlitePluginStore implements PluginStore {
   }
 
   replaceInbound(replacement: InboundReplacement): void {
+    this.assertNotTerminalMutation();
     this.assertOpen();
     assertNonEmpty(replacement.previousMessageId, "STORE_MESSAGE_ID_REQUIRED");
     assertNonEmpty(replacement.previousBody, "STORE_MESSAGE_BODY_REQUIRED");
@@ -343,6 +1159,20 @@ export class SqlitePluginStore implements PluginStore {
       ) {
         throw new StoreInboundConflictError();
       }
+      const receipt = this.prepareCoordinationReceipt(
+        replacement.messageId,
+        replacement.sequence,
+        replacement.body,
+        replacement.coordinationRequestSequence,
+        true,
+      );
+      // Completion belongs to the proven state sequence, not its renewable
+      // outer identity. Read it before mutation and transfer it atomically.
+      const original =
+        receipt ?? this.coordinationReceipt(replacement.sequence);
+      const preserveCompletion =
+        original?.responseType === "job.state" &&
+        this.inboundMessage(current.message_id)?.delivered === true;
       const updated = this.database
         .prepare(
           `UPDATE inbound_messages
@@ -364,6 +1194,15 @@ export class SqlitePluginStore implements PluginStore {
           `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.previousMessageId}`,
           `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.messageId}`,
         );
+      this.insertCoordinationReceipt(receipt);
+      if (preserveCompletion) {
+        this.database
+          .prepare("INSERT INTO metadata (key, value) VALUES (?, ?)")
+          .run(
+            `${INBOUND_DELIVERED_METADATA_PREFIX}${replacement.messageId}`,
+            String(replacement.sequence),
+          );
+      }
     });
     try {
       write.immediate();
@@ -371,6 +1210,148 @@ export class SqlitePluginStore implements PluginStore {
       if (error instanceof StoreInboundConflictError) throw error;
       throw new StoreError("STORE_INBOUND_WRITE_FAILED");
     }
+  }
+
+  private createCoordinationReceipt(
+    requestSequence: number,
+    response: ReturnType<typeof parseResponse>,
+  ): StoredCoordinationReceipt {
+    assertPositiveInteger(requestSequence, "STORE_COORDINATION_INVALID");
+    const stored = this.outboundEvent(requestSequence);
+    if (stored?.expectedReceiptProfile !== COORDINATION_PROFILE)
+      throw new Error();
+    const request = parseRequest(stored);
+    if (request.correlation_id !== response.correlation_id) throw new Error();
+    if (response.type === "job.state") {
+      if (
+        request.type !== "job.sync" ||
+        response.payload.job_id !== request.payload.job_id ||
+        response.payload.requested_attempt !== request.payload.attempt ||
+        response.payload.request_message_id !== request.message_id ||
+        response.payload.request_sequence !== request.sequence ||
+        response.payload.nonce !== request.payload.nonce
+      )
+        throw new Error();
+    } else if (response.type === "protocol.error") {
+      const { code, message } = response.payload;
+      const conflict =
+        message === "The job authority has changed." ||
+        message === "The job business limit has been reached.";
+      const valid =
+        request.type === "job.sync"
+          ? code === "JOB_AUTHORITY_UNAVAILABLE" &&
+            message === "The job authority is unavailable."
+          : request.type === "job.claim"
+            ? code === "CLAIM_REJECTED" && conflict
+            : ["job.event", "approval.requested", "job.cancelled"].includes(
+                request.type,
+              ) &&
+              code === "EVENT_REJECTED" &&
+              conflict;
+      if (!valid) throw new Error();
+    } else throw new Error();
+    return CoordinationReceiptSchema.parse({
+      expectedReceiptProfile: COORDINATION_PROFILE,
+      requestSequence: request.sequence,
+      requestMessageId: request.message_id,
+      requestCorrelationId: request.correlation_id,
+      requestType: request.type,
+      responseSequence: response.sequence,
+      responseCorrelationId: response.correlation_id,
+      responseType: response.type,
+      responsePayloadJson: canonicalPayload(response.payload),
+    });
+  }
+
+  coordinationReceipt(sequence: number): StoredCoordinationReceipt | undefined {
+    this.assertOpen();
+    assertPositiveInteger(sequence, "STORE_SEQUENCE_INVALID");
+    try {
+      const metadata = this.database
+        .prepare("SELECT value FROM metadata WHERE key = ?")
+        .get(`${INBOUND_RECEIPT_PREFIX}${sequence}`) as
+        | { value: string }
+        | undefined;
+      if (metadata === undefined) return undefined;
+      const receipt = CoordinationReceiptSchema.parse(
+        JSON.parse(metadata.value),
+      );
+      const inbound = this.inboundMessageBySequence(sequence);
+      if (inbound === undefined || receipt.responseSequence !== sequence)
+        throw new Error();
+      const current = parseResponse(inbound.messageId, sequence, inbound.body);
+      // Revalidate the retained original even when the current row is a tombstone.
+      const original = ConnectorServerMessageSchema.parse({
+        ...current,
+        type: receipt.responseType,
+        payload: JSON.parse(receipt.responsePayloadJson),
+      });
+      const validated = this.createCoordinationReceipt(
+        receipt.requestSequence,
+        original,
+      );
+      if (JSON.stringify(validated) !== JSON.stringify(receipt))
+        throw new Error();
+      if (
+        !isExpiryPlaceholder(current) &&
+        (current.type !== receipt.responseType ||
+          canonicalPayload(current.payload) !== receipt.responsePayloadJson)
+      )
+        throw new Error();
+      return Object.freeze(receipt);
+    } catch {
+      throw new StoreError("STORE_COORDINATION_INVALID");
+    }
+  }
+
+  private prepareCoordinationReceipt(
+    messageId: string,
+    sequence: number,
+    body: string,
+    requestSequence: number | undefined,
+    replacing: boolean,
+  ): StoredCoordinationReceipt | undefined {
+    const original = this.coordinationReceipt(sequence);
+    if (original === undefined && requestSequence === undefined)
+      return undefined;
+    const response = parseResponse(messageId, sequence, body);
+    if (requestSequence === undefined) {
+      if (
+        !isExpiryPlaceholder(response) ||
+        response.correlation_id !== original?.responseCorrelationId
+      )
+        throw new Error();
+      return undefined;
+    }
+    const candidate = this.createCoordinationReceipt(requestSequence, response);
+    if (original !== undefined) {
+      if (JSON.stringify(candidate) !== JSON.stringify(original))
+        throw new Error();
+      return undefined;
+    }
+    const current = this.inboundMessageBySequence(sequence);
+    if (current !== undefined) {
+      const previous = parseResponse(current.messageId, sequence, current.body);
+      if (
+        !replacing ||
+        !isExpiryPlaceholder(previous) ||
+        previous.correlation_id !== response.correlation_id
+      )
+        throw new Error();
+    }
+    return candidate;
+  }
+
+  private insertCoordinationReceipt(
+    receipt: StoredCoordinationReceipt | undefined,
+  ): void {
+    if (receipt === undefined) return;
+    this.database
+      .prepare("INSERT INTO metadata (key, value) VALUES (?, ?)")
+      .run(
+        `${INBOUND_RECEIPT_PREFIX}${receipt.responseSequence}`,
+        JSON.stringify(receipt),
+      );
   }
 
   pendingInboundMessages(): StoredInboundMessage[] {
@@ -396,6 +1377,7 @@ export class SqlitePluginStore implements PluginStore {
   }
 
   markInboundDelivered(messageId: string): void {
+    this.assertNotTerminalMutation();
     this.assertOpen();
     assertNonEmpty(messageId, "STORE_MESSAGE_ID_REQUIRED");
     const write = this.database.transaction(() => {
@@ -422,31 +1404,60 @@ export class SqlitePluginStore implements PluginStore {
     sessionId: string;
     status: string;
   }): void {
+    this.assertNotTerminalMutation();
     this.assertOpen();
-    assertNonEmpty(input.jobId, "STORE_JOB_ID_REQUIRED");
-    assertPositiveInteger(input.attempt, "STORE_ATTEMPT_INVALID");
-    assertNonEmpty(input.sessionId, "STORE_SESSION_ID_REQUIRED");
-    assertNonEmpty(input.status, "STORE_STATUS_REQUIRED");
+    let captured: LocalJobMapping;
+    try {
+      captured = {
+        jobId: input.jobId,
+        attempt: input.attempt,
+        sessionId: input.sessionId,
+        status: input.status,
+      };
+    } catch {
+      throw new StoreError("STORE_MAPPING_INPUT_INVALID");
+    }
+    assertNonEmpty(captured.jobId, "STORE_JOB_ID_REQUIRED");
+    assertPositiveInteger(captured.attempt, "STORE_ATTEMPT_INVALID");
+    assertNonEmpty(captured.sessionId, "STORE_SESSION_ID_REQUIRED");
+    assertNonEmpty(captured.status, "STORE_STATUS_REQUIRED");
 
     const write = this.database.transaction(() => {
+      // Legacy mappings cannot mutate or replace journal ownership. Validate
+      // every journal fact first so corrupt indexes cannot bypass this guard.
+      let owned: OwnedIntent[];
+      try {
+        owned = this.readOwnedIntents();
+      } catch (error) {
+        if (error instanceof OwnedIntentError) throw error;
+        throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
+      }
+      if (
+        owned.some(
+          (record) =>
+            record.owner.jobId === captured.jobId.toLowerCase() ||
+            record.owner.sessionId === captured.sessionId.toLowerCase(),
+        )
+      )
+        throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
       const byJob = this.database
         .prepare(
           `SELECT job_id, attempt, session_id, status
            FROM job_mappings WHERE job_id = ? AND attempt = ?`,
         )
-        .get(input.jobId, input.attempt) as JobRow | undefined;
+        .get(captured.jobId, captured.attempt) as JobRow | undefined;
       const bySession = this.database
         .prepare(
           `SELECT job_id, attempt, session_id, status
            FROM job_mappings WHERE session_id = ?`,
         )
-        .get(input.sessionId) as JobRow | undefined;
+        .get(captured.sessionId) as JobRow | undefined;
 
       if (
-        (byJob !== undefined && byJob.session_id !== input.sessionId) ||
+        (byJob !== undefined && byJob.session_id !== captured.sessionId) ||
         (bySession !== undefined &&
-          (bySession.job_id !== input.jobId ||
-            bySession.attempt !== input.attempt))
+          (bySession.job_id !== captured.jobId ||
+            bySession.attempt !== captured.attempt))
       ) {
         throw new StoreError("STORE_MAPPING_CONFLICT");
       }
@@ -457,7 +1468,7 @@ export class SqlitePluginStore implements PluginStore {
             `UPDATE job_mappings SET status = ?, updated_at = ?
              WHERE job_id = ? AND attempt = ?`,
           )
-          .run(input.status, now(), input.jobId, input.attempt);
+          .run(captured.status, now(), captured.jobId, captured.attempt);
         return;
       }
 
@@ -467,7 +1478,13 @@ export class SqlitePluginStore implements PluginStore {
             (job_id, attempt, session_id, status, updated_at)
            VALUES (?, ?, ?, ?, ?)`,
         )
-        .run(input.jobId, input.attempt, input.sessionId, input.status, now());
+        .run(
+          captured.jobId,
+          captured.attempt,
+          captured.sessionId,
+          captured.status,
+          now(),
+        );
     });
     write();
   }
@@ -523,8 +1540,32 @@ export class SqlitePluginStore implements PluginStore {
     return sequence;
   }
 
-  enqueueEvent(event: OutboundEventInput, pinHello = false): void {
+  assertGenericPublication(
+    message: ConnectorClientMessage,
+    originalPayload: unknown,
+  ): void {
     this.assertOpen();
+    if (
+      forbiddenOwnedGeneric(message, originalPayload) &&
+      (message.type === "job.event" || message.type === "job.cancelled") &&
+      this.readOwnedIntents().some(
+        (record) =>
+          record.owner.jobId === message.payload.job_id &&
+          record.owner.attempt === message.payload.attempt,
+      )
+    )
+      throw new OwnedIntentError("OWNED_INTENT_CONFLICT");
+  }
+
+  enqueueEvent(event: OutboundEventInput, pinHello = false): void {
+    this.assertNotTerminalMutation();
+    this.assertOpen();
+    event = {
+      messageId: event.messageId,
+      sequence: event.sequence,
+      payload: event.payload,
+      expectedReceiptProfile: event.expectedReceiptProfile,
+    };
     assertNonEmpty(event.messageId, "STORE_MESSAGE_ID_REQUIRED");
     assertPositiveInteger(event.sequence, "STORE_SEQUENCE_INVALID");
     if (typeof event.payload !== "string") {
@@ -535,7 +1576,20 @@ export class SqlitePluginStore implements PluginStore {
     } catch {
       throw new StoreError("STORE_PAYLOAD_INVALID");
     }
+    if (event.expectedReceiptProfile !== undefined) {
+      try {
+        if (event.expectedReceiptProfile !== COORDINATION_PROFILE)
+          throw new Error();
+        parseRequest(event);
+      } catch {
+        throw new StoreError("STORE_COORDINATION_INVALID");
+      }
+    }
     const write = this.database.transaction(() => {
+      const original = JSON.parse(event.payload);
+      const parsed = ConnectorClientMessageSchema.safeParse(original);
+      if (parsed.success)
+        this.assertGenericPublication(parsed.data, original.payload);
       const byMessage = this.database
         .prepare(
           `SELECT message_id, sequence, payload_json, attempts, acknowledged_at
@@ -545,7 +1599,9 @@ export class SqlitePluginStore implements PluginStore {
       if (byMessage !== undefined) {
         if (
           byMessage.sequence === event.sequence &&
-          byMessage.payload_json === event.payload
+          byMessage.payload_json === event.payload &&
+          this.storedEvent(byMessage).expectedReceiptProfile ===
+            event.expectedReceiptProfile
         ) {
           return;
         }
@@ -581,8 +1637,22 @@ export class SqlitePluginStore implements PluginStore {
           )
           .run(String(event.sequence));
       }
+      if (event.expectedReceiptProfile !== undefined) {
+        this.database
+          .prepare("INSERT INTO metadata (key, value) VALUES (?, ?)")
+          .run(
+            `${OUTBOUND_PROFILE_PREFIX}${event.sequence}`,
+            event.expectedReceiptProfile,
+          );
+      }
     });
-    write();
+    try {
+      write();
+    } catch (error) {
+      if (error instanceof StoreError || error instanceof StoreSequenceError)
+        throw error;
+      throw new StoreError("STORE_OUTBOUND_WRITE_FAILED");
+    }
   }
 
   outboundEvent(sequence: number): StoredOutboundEvent | undefined {
@@ -592,15 +1662,55 @@ export class SqlitePluginStore implements PluginStore {
         "SELECT message_id, sequence, payload_json, attempts, acknowledged_at FROM outbound_events WHERE sequence = ?",
       )
       .get(sequence) as EventRow | undefined;
-    return row === undefined
-      ? undefined
-      : {
-          messageId: row.message_id,
-          sequence: row.sequence,
-          payload: row.payload_json,
-          attempts: row.attempts,
-          acknowledgedAt: row.acknowledged_at,
-        };
+    return row === undefined ? undefined : this.storedEvent(row);
+  }
+
+  private storedEvent(row: EventRow): StoredOutboundEvent {
+    const metadata = this.database
+      .prepare("SELECT value FROM metadata WHERE key = ?")
+      .get(`${OUTBOUND_PROFILE_PREFIX}${row.sequence}`) as
+      | { value: string }
+      | undefined;
+    const stored: StoredOutboundEvent = {
+      messageId: row.message_id,
+      sequence: row.sequence,
+      payload: row.payload_json,
+      attempts: row.attempts,
+      acknowledgedAt: row.acknowledged_at,
+      ...(metadata === undefined
+        ? {}
+        : { expectedReceiptProfile: COORDINATION_PROFILE }),
+    };
+    if (metadata !== undefined) {
+      try {
+        if (metadata.value !== COORDINATION_PROFILE) throw new Error();
+        parseRequest(stored);
+      } catch {
+        throw new StoreError("STORE_COORDINATION_INVALID");
+      }
+    }
+    return stored;
+  }
+
+  coordinationRequest(correlationId: string): StoredOutboundEvent | undefined {
+    this.assertOpen();
+    assertNonEmpty(correlationId, "STORE_COORDINATION_INVALID");
+    try {
+      const rows = this.database
+        .prepare(
+          `SELECT message_id, sequence, payload_json, attempts, acknowledged_at
+         FROM outbound_events WHERE json_extract(payload_json, '$.correlation_id') = ? LIMIT 2`,
+        )
+        .all(correlationId) as EventRow[];
+      if (rows.length > 1) throw new Error();
+      const row = rows[0];
+      if (row === undefined) return undefined;
+      const stored = this.storedEvent(row);
+      parseRequest(stored);
+      return stored.expectedReceiptProfile === undefined ? undefined : stored;
+    } catch {
+      throw new StoreError("STORE_COORDINATION_INVALID");
+    }
   }
 
   activeHello(): StoredOutboundEvent | undefined {
@@ -631,6 +1741,7 @@ export class SqlitePluginStore implements PluginStore {
   }
 
   acknowledgeThrough(sequence: number, correlationId: string): void {
+    this.assertNotTerminalMutation();
     this.database.transaction(() => {
       const stored = this.outboundEvent(sequence);
       if (stored === undefined) throw new StoreError("STORE_RECEIPT_INVALID");
@@ -655,6 +1766,7 @@ export class SqlitePluginStore implements PluginStore {
   }
 
   renewDelivery(sequence: number, expiresAt: string): StoredOutboundEvent {
+    this.assertNotTerminalMutation();
     return this.database.transaction(() => {
       const stored = this.outboundEvent(sequence);
       if (stored === undefined) throw new StoreError("STORE_DELIVERY_MISSING");
@@ -665,6 +1777,13 @@ export class SqlitePluginStore implements PluginStore {
       )
         throw new StoreError("STORE_DELIVERY_INVALID");
       const payload = JSON.stringify({ ...message, expires_at: expiresAt });
+      if (stored.expectedReceiptProfile !== undefined) {
+        try {
+          parseRequest({ ...stored, payload });
+        } catch {
+          throw new StoreError("STORE_DELIVERY_INVALID");
+        }
+      }
       this.database
         .prepare(
           "UPDATE outbound_events SET payload_json = ? WHERE sequence = ?",
@@ -675,6 +1794,7 @@ export class SqlitePluginStore implements PluginStore {
   }
 
   markInboundExpired(messageId: string): void {
+    this.assertNotTerminalMutation();
     this.database.transaction(() => {
       this.database
         .prepare(
@@ -686,6 +1806,7 @@ export class SqlitePluginStore implements PluginStore {
   }
 
   pendingEvents(afterSequence: number): StoredOutboundEvent[] {
+    this.assertNotTerminalMutation();
     this.assertOpen();
     assertNonNegativeInteger(afterSequence, "STORE_SEQUENCE_INVALID");
 
@@ -706,18 +1827,15 @@ export class SqlitePluginStore implements PluginStore {
       );
       for (const row of rows) update.run(row.message_id);
 
-      return rows.map((row) => ({
-        messageId: row.message_id,
-        sequence: row.sequence,
-        payload: row.payload_json,
-        attempts: row.attempts + 1,
-        acknowledgedAt: row.acknowledged_at,
-      }));
+      return rows.map((row) =>
+        this.storedEvent({ ...row, attempts: row.attempts + 1 }),
+      );
     });
     return read();
   }
 
   acknowledgeEvent(messageId: string): void {
+    this.assertNotTerminalMutation();
     this.assertOpen();
     assertNonEmpty(messageId, "STORE_MESSAGE_ID_REQUIRED");
     this.database
@@ -729,6 +1847,7 @@ export class SqlitePluginStore implements PluginStore {
   }
 
   close(): void {
+    this.assertNotTerminalMutation();
     if (this.#closed) return;
     this.#closed = true;
     this.#database?.close();
@@ -737,6 +1856,11 @@ export class SqlitePluginStore implements PluginStore {
 
   private assertOpen(): void {
     if (this.#closed) throw new StoreError("STORE_CLOSED");
+  }
+
+  private assertNotTerminalMutation(): void {
+    if (this.#terminalBusy)
+      throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
   }
 
   private get database(): Database.Database {

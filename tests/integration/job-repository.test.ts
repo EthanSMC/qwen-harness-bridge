@@ -1,7 +1,10 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { ConnectorClientMessageSchema } from "@qhb/protocol";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql as drizzleSql } from "../../apps/control-plane/node_modules/drizzle-orm";
+import { migrate } from "../../apps/control-plane/node_modules/drizzle-orm/postgres-js/migrator";
+import { PostgresConnectorStore } from "../../apps/control-plane/src/connector/outbox.js";
 import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js";
 import {
   Aes256GcmEncryptor,
@@ -319,6 +322,170 @@ afterAll(async () => {
 });
 
 describe("JobRepository schema", () => {
+  it("upgrades legacy cancellation rows without inferring provenance and retains old-column reads", async () => {
+    const migrationsFolder = fileURLToPath(
+      new URL("../../apps/control-plane/src/db/migrations", import.meta.url),
+    );
+    const folder = await mkdtemp(join(tmpdir(), "qhb-cancel-migrations-"));
+    const legacy = createTestDatabase({ migrationsFolder: folder });
+    try {
+      await mkdir(join(folder, "meta"));
+      const journal = JSON.parse(
+        await readFile(join(migrationsFolder, "meta/_journal.json"), "utf8"),
+      );
+      journal.entries = journal.entries.slice(0, 2);
+      for (const entry of journal.entries)
+        await copyFile(
+          join(migrationsFolder, `${entry.tag}.sql`),
+          join(folder, `${entry.tag}.sql`),
+        );
+      await writeFile(
+        join(folder, "meta/_journal.json"),
+        JSON.stringify(journal),
+      );
+      await legacy.start();
+      const input = createInput();
+      await seedJobDependencies(legacy, input);
+      const connectorId = crypto.randomUUID();
+      await seedConnector(legacy, connectorId, input.ownerId);
+      const queuedId = crypto.randomUUID();
+      const cancellingId = crypto.randomUUID();
+      for (const [id, shortId, status] of [
+        [queuedId, "OLD0001", "queued"],
+        [cancellingId, "OLD0002", "cancelling"],
+      ]) {
+        await legacy.query(
+          "INSERT INTO jobs (id, short_id, owner_id, repository_id, connector_id, request_digest, status, revision, attempt) VALUES ($1,$2,$3,$4,$5,$6,$7,3,1)",
+          [
+            id,
+            shortId,
+            input.ownerId,
+            input.repositoryId,
+            connectorId,
+            SHA256_A,
+            status,
+          ],
+        );
+      }
+      await legacy.query(
+        "INSERT INTO job_events (job_id, sequence, event_type, source, payload) VALUES ($1,1,'job.cancelling','control-plane',$2)",
+        [cancellingId, JSON.stringify({ revision: 3 })],
+      );
+      await legacy.query(
+        "INSERT INTO connector_messages (connector_id, direction, sequence, type, payload, expires_at) VALUES ($1,'server',1,'job.cancel',$2,now()+interval '1 hour')",
+        [
+          connectorId,
+          JSON.stringify({
+            job_id: cancellingId,
+            attempt: 1,
+            job_revision: 3,
+            reason: "user requested",
+            nonce: crypto.randomUUID(),
+          }),
+        ],
+      );
+      await legacy.query(
+        "UPDATE connectors SET last_server_sequence = 1 WHERE id = $1",
+        [connectorId],
+      );
+      const oldRows = await legacy.query("SELECT * FROM jobs ORDER BY id");
+      expect(
+        (
+          await legacy.query(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'jobs' AND column_name = 'cancel_revision'",
+          )
+        ).rows,
+      ).toEqual([]);
+      await migrate(legacy.client, { migrationsFolder });
+      expect(
+        (
+          await legacy.query(
+            "SELECT column_name, is_nullable, data_type FROM information_schema.columns WHERE table_name = 'jobs' AND column_name = 'cancel_revision'",
+          )
+        ).rows,
+      ).toEqual([
+        {
+          column_name: "cancel_revision",
+          is_nullable: "YES",
+          data_type: "integer",
+        },
+      ]);
+      expect(
+        (await legacy.query("SELECT * FROM jobs ORDER BY id")).rows,
+      ).toEqual(oldRows.rows.map((row) => ({ ...row, cancel_revision: null })));
+      expect(
+        (
+          await legacy.query(
+            "SELECT conname FROM pg_constraint WHERE conrelid = 'jobs'::regclass AND conname = 'jobs_cancel_revision_check'",
+          )
+        ).rows,
+      ).toEqual([{ conname: "jobs_cancel_revision_check" }]);
+      await new JobRepository(legacy.client).cancelAtomically({
+        ownerId: input.ownerId,
+        jobId: cancellingId,
+        expectedRevision: 2,
+      });
+      expect(
+        (await legacy.query("SELECT * FROM jobs ORDER BY id")).rows,
+      ).toEqual(oldRows.rows.map((row) => ({ ...row, cancel_revision: null })));
+      expect(
+        (
+          await legacy.query(
+            "SELECT last_server_sequence FROM connectors WHERE id = $1",
+            [connectorId],
+          )
+        ).rows,
+      ).toEqual([{ last_server_sequence: "1" }]);
+      expect(
+        (await legacy.query("SELECT id FROM connector_messages")).rows,
+      ).toHaveLength(1);
+      expect(
+        (await legacy.query("SELECT id FROM job_events")).rows,
+      ).toHaveLength(1);
+      for (const value of [0, 3, null])
+        await legacy.query(
+          "UPDATE jobs SET cancel_revision = $1 WHERE id = $2",
+          [value, queuedId],
+        );
+      for (const value of [-1, 4])
+        await expect(
+          legacy.query("UPDATE jobs SET cancel_revision = $1 WHERE id = $2", [
+            value,
+            queuedId,
+          ]),
+        ).rejects.toMatchObject({
+          code: "23514",
+          constraint_name: "jobs_cancel_revision_check",
+        });
+      await legacy.query(
+        "UPDATE jobs SET revision = 2147483647, cancel_revision = 2147483647 WHERE id = $1",
+        [queuedId],
+      );
+      await migrate(legacy.client, { migrationsFolder });
+      expect(
+        (
+          await legacy.query(
+            "SELECT id, status, revision FROM jobs WHERE id = $1",
+            [queuedId],
+          )
+        ).rows,
+      ).toEqual([{ id: queuedId, status: "queued", revision: 2147483647 }]);
+      expect(
+        (
+          await legacy.query("SELECT cancel_revision FROM jobs WHERE id = $1", [
+            queuedId,
+          ])
+        ).rows,
+      ).toEqual([{ cancel_revision: 2147483647 }]);
+    } finally {
+      try {
+        await legacy.stop();
+      } finally {
+        await rm(folder, { recursive: true, force: true });
+      }
+    }
+  });
+
   it("creates every required table and preserves encrypted-request boundaries", async () => {
     const tableRows = await db.query<{ table_name: string }>(
       `
@@ -1318,6 +1485,13 @@ describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
       [job.jobId],
     );
     expect(messages.rows).toEqual([]);
+    expect(
+      (
+        await db.query("SELECT cancel_revision FROM jobs WHERE id = $1", [
+          job.jobId,
+        ])
+      ).rows,
+    ).toEqual([{ cancel_revision: null }]);
   });
 
   it("moves running work to cancelling and allocates one locked server sequence", async () => {
@@ -1376,6 +1550,116 @@ describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
       [connectorId],
     );
     expect(Number(connector.rows[0]?.last_server_sequence)).toBe(1);
+    const provenance = () =>
+      db.query("SELECT revision, cancel_revision FROM jobs WHERE id = $1", [
+        job.jobId,
+      ]);
+    expect((await provenance()).rows).toEqual([
+      { revision: 3, cancel_revision: 3 },
+    ]);
+    const sentAt = new Date();
+    const progress = ConnectorClientMessageSchema.parse({
+      protocol_version: "1.0",
+      message_id: crypto.randomUUID(),
+      sequence: 1,
+      sent_at: sentAt.toISOString(),
+      expires_at: new Date(sentAt.getTime() + 60_000).toISOString(),
+      correlation_id: crypto.randomUUID(),
+      type: "job.event",
+      payload: {
+        job_id: job.jobId,
+        attempt: 2,
+        event_type: "job.progress",
+        source: "connector",
+        payload: { stage: "draining", summary: "Finishing pending work" },
+      },
+    });
+    await expect(
+      new PostgresConnectorStore(db.client).acceptClientMessage(
+        { ownerId, connectorId, protocolVersion: "1.0" },
+        progress,
+      ),
+    ).resolves.toMatchObject({
+      duplicate: false,
+      response: { type: "ack", sequence: 2, payload: { sequence: 1 } },
+    });
+    expect(
+      (
+        await db.query(
+          "SELECT status, current_stage, revision, cancel_revision FROM jobs WHERE id = $1",
+          [job.jobId],
+        )
+      ).rows,
+    ).toEqual([
+      {
+        status: "cancelling",
+        current_stage: "draining",
+        revision: 4,
+        cancel_revision: 3,
+      },
+    ]);
+    expect(
+      (
+        await db.query(
+          "SELECT event_type, source, payload, message_id, correlation_id FROM job_events WHERE job_id = $1 AND message_id = $2",
+          [job.jobId, progress.message_id],
+        )
+      ).rows,
+    ).toEqual([
+      {
+        event_type: "job.progress",
+        source: "connector",
+        payload: { stage: "draining", summary: "Finishing pending work" },
+        message_id: progress.message_id,
+        correlation_id: progress.correlation_id,
+      },
+    ]);
+    expect((await provenance()).rows).toEqual([
+      { revision: 4, cancel_revision: 3 },
+    ]);
+    await repository.cancelAtomically({
+      ownerId,
+      jobId: job.jobId,
+      expectedRevision: 2,
+    });
+    await repository.transitionAndAppend(
+      job.jobId,
+      4,
+      "cancelled",
+      event("job.cancelled"),
+    );
+    await repository.cancelAtomically({
+      ownerId,
+      jobId: job.jobId,
+      expectedRevision: 2,
+    });
+    expect((await provenance()).rows).toEqual([
+      { revision: 5, cancel_revision: 3 },
+    ]);
+    expect(
+      (
+        await db.query(
+          "SELECT id FROM connector_messages WHERE connector_id = $1 AND direction = 'server' AND type = 'job.cancel'",
+          [connectorId],
+        )
+      ).rows,
+    ).toHaveLength(1);
+    expect(
+      (
+        await db.query(
+          "SELECT last_server_sequence, last_client_sequence FROM connectors WHERE id = $1",
+          [connectorId],
+        )
+      ).rows,
+    ).toEqual([{ last_server_sequence: "2", last_client_sequence: "1" }]);
+    expect(
+      (
+        await db.query(
+          "SELECT id FROM job_events WHERE job_id = $1 AND event_type = 'job.cancelling'",
+          [job.jobId],
+        )
+      ).rows,
+    ).toHaveLength(1);
   });
 
   it("rejects a stale active cancellation and owner mismatch without writes", async () => {
@@ -1404,6 +1688,124 @@ describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
       status: "queued",
       revision: 0,
     });
+  });
+
+  it.each(["queued", "dispatched", "running", "waiting_approval"])(
+    "rejects cancellation overflow atomically for %s",
+    async (status) => {
+      const repository = new JobRepository(db.client);
+      const job = await createJob(repository);
+      const connectorId = crypto.randomUUID();
+      await seedConnector(db, connectorId, job.ownerId);
+      await db.query(
+        "UPDATE jobs SET status = $1, revision = 2147483647, connector_id = $2 WHERE id = $3",
+        [status, connectorId, job.jobId],
+      );
+      const snapshot = async () => ({
+        jobs: (await db.query("SELECT * FROM jobs WHERE id = $1", [job.jobId]))
+          .rows,
+        events: (
+          await db.query(
+            "SELECT * FROM job_events WHERE job_id = $1 ORDER BY sequence",
+            [job.jobId],
+          )
+        ).rows,
+        messages: (
+          await db.query(
+            "SELECT * FROM connector_messages WHERE connector_id = $1 ORDER BY sequence",
+            [connectorId],
+          )
+        ).rows,
+        connector: (
+          await db.query("SELECT * FROM connectors WHERE id = $1", [
+            connectorId,
+          ])
+        ).rows,
+      });
+      const before = await snapshot();
+      for (const [ownerId, expectedRevision, code] of [
+        [job.ownerId, 2147483646, "REVISION_CONFLICT"],
+        [crypto.randomUUID(), 2147483647, "NOT_FOUND"],
+        [job.ownerId, 2147483647, "REVISION_CONFLICT"],
+      ] as const) {
+        await expectCode(
+          repository.cancelAtomically({
+            ownerId,
+            jobId: job.jobId,
+            expectedRevision,
+          }),
+          code,
+        );
+        expect(await snapshot()).toEqual(before);
+      }
+    },
+  );
+
+  it.each(["cancelling", "cancelled", "succeeded", "failed", "expired"])(
+    "keeps %s cancellation retries unchanged at the integer limit",
+    async (status) => {
+      const repository = new JobRepository(db.client);
+      const job = await createJob(repository);
+      await db.query(
+        "UPDATE jobs SET status = $1, revision = 2147483647 WHERE id = $2",
+        [status, job.jobId],
+      );
+      const before = await db.query("SELECT * FROM jobs WHERE id = $1", [
+        job.jobId,
+      ]);
+      const events = await db.query(
+        "SELECT * FROM job_events WHERE job_id = $1 ORDER BY sequence",
+        [job.jobId],
+      );
+      await expect(
+        repository.cancelAtomically({
+          ownerId: job.ownerId,
+          jobId: job.jobId,
+          expectedRevision: 0,
+        }),
+      ).resolves.toMatchObject({ status, revision: 2147483647 });
+      expect(
+        await db.query("SELECT * FROM jobs WHERE id = $1", [job.jobId]),
+      ).toEqual(before);
+      expect(
+        await db.query(
+          "SELECT * FROM job_events WHERE job_id = $1 ORDER BY sequence",
+          [job.jobId],
+        ),
+      ).toEqual(events);
+    },
+  );
+
+  it("leaves dispatched immediate cancellation provenance null", async () => {
+    const repository = new JobRepository(db.client);
+    const job = await createJob(repository);
+    await repository.transitionAndAppend(
+      job.jobId,
+      0,
+      "dispatched",
+      event("job.dispatched"),
+    );
+    await repository.cancelAtomically({
+      ownerId: job.ownerId,
+      jobId: job.jobId,
+      expectedRevision: 1,
+    });
+    expect(
+      (
+        await db.query(
+          "SELECT status, revision, cancel_revision FROM jobs WHERE id = $1",
+          [job.jobId],
+        )
+      ).rows,
+    ).toEqual([{ status: "cancelled", revision: 2, cancel_revision: null }]);
+    expect(
+      (
+        await db.query(
+          "SELECT id FROM connector_messages WHERE payload->>'job_id' = $1",
+          [job.jobId],
+        )
+      ).rows,
+    ).toEqual([]);
   });
 
   it("commits the first owner-scoped approval decision and its outbox command together", async () => {
@@ -1981,3 +2383,15 @@ describe("JobRepository Task 4 owner-scoped reads and atomic commands", () => {
     }
   });
 });
+
+import {
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";

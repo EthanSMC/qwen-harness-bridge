@@ -95,6 +95,8 @@ const run = async (binary: string, args: string[]): Promise<void> => {
 };
 
 class TemporaryPostgresDatabase implements TestDatabase {
+  constructor(private readonly migrationPath = migrationsFolder) {}
+
   #database: TestDatabaseClient | undefined;
   #sql: Sql<Record<string, unknown>> | undefined;
   #cluster: IsolatedCluster | undefined;
@@ -132,7 +134,7 @@ class TemporaryPostgresDatabase implements TestDatabase {
 
       await this.sql`SELECT 1`;
       this.#database = drizzle(this.sql, { schema });
-      await migrate(this.#database, { migrationsFolder });
+      await migrate(this.#database, { migrationsFolder: this.migrationPath });
       this.#started = true;
     } catch (error) {
       await this.stop();
@@ -255,5 +257,6 @@ class TemporaryPostgresDatabase implements TestDatabase {
   }
 }
 
-export const createTestDatabase = (): TestDatabase =>
-  new TemporaryPostgresDatabase();
+export const createTestDatabase = (
+  options: { migrationsFolder?: string } = {},
+): TestDatabase => new TemporaryPostgresDatabase(options.migrationsFolder);

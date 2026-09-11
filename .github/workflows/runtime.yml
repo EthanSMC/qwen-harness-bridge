@@ -428,9 +428,9 @@ jobs:
           ' | tr -d '\r\n')
           migration_when=$(docker compose --env-file "$RUNTIME_ENV_FILE" exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc 'SELECT created_at FROM drizzle.__drizzle_migrations ORDER BY created_at DESC LIMIT 1' | tr -d '\r')
           migration_sha256=$(docker compose --env-file "$RUNTIME_ENV_FILE" exec -T postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc 'SELECT hash FROM drizzle.__drizzle_migrations ORDER BY created_at DESC LIMIT 1' | tr -d '\r')
-          test "$migration_tag" = "0002_result_acknowledgement"
-          test "$migration_when" = "1788244364352"
-          test "$migration_sha256" = "2e4a1f323453e6f4a7ec7319250f474ce7552c536ed3a55af4b5fe52c5a9cb89"
+          test "$migration_tag" = "0003_cancel_revision"
+          test "$migration_when" = "1788609600000"
+          test "$migration_sha256" = "79ec6ea05778bda661733c32ca7557e0ec000d4a0567cbf2e9617ac6910a8e79"
           image_digest="$(docker image inspect --format '{{.Id}}' "$RUNTIME_IMAGE_REF")"
           if ! printf '%s\n' "$image_digest" | grep -E '^sha256:[0-9a-f]{64}$'; then exit 1; fi
           # config-digest-parser

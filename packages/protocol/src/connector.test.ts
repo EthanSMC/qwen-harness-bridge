@@ -36,6 +36,76 @@ const commonEnvelope = {
 };
 const validActionFingerprint = `sha256:${"a".repeat(64)}`;
 
+describe("root changed-file projection", () => {
+  it("rejects hidden root lists and non-data array structures without invoking getters", () => {
+    const schema = JobEventPayloadSchema.shape.payload;
+    expect(
+      schema.safeParse(
+        Object.defineProperty({}, "changed_files", { value: [] }),
+      ).success,
+    ).toBe(false);
+    let reads = 0;
+    const files = Object.defineProperty([], "0", {
+      get() {
+        reads++;
+        return "a.ts";
+      },
+      enumerable: true,
+    });
+    expect(schema.safeParse({ changed_files: files }).success).toBe(false);
+    expect(reads).toBe(0);
+    expect(
+      schema.safeParse({
+        changed_files: Object.assign(["a.ts"], { [Symbol("synthetic")]: true }),
+      }).success,
+    ).toBe(false);
+    expect(
+      schema.safeParse({ changed_files: Object.setPrototypeOf(["a.ts"], {}) })
+        .success,
+    ).toBe(false);
+  });
+  const parse = (payload: unknown) =>
+    JobEventPayloadSchema.safeParse({
+      job_id: ids.job,
+      attempt: 1,
+      event_type: "job.succeeded",
+      source: "connector",
+      payload,
+    }).success;
+  it("accepts exactly fifty root file names", () => {
+    expect(
+      parse({
+        summary: "Done",
+        changed_files: Array.from({ length: 50 }, (_, i) => `src/file-${i}.ts`),
+      }),
+    ).toBe(true);
+  });
+  it("rejects malformed root lists even below the generic cap", () => {
+    for (const changed_files of [
+      "file.ts",
+      [1],
+      [undefined],
+      Array(1),
+      Array(51).fill("a.ts"),
+    ]) {
+      expect(parse({ changed_files })).toBe(false);
+    }
+  });
+  it("retains nested, generic, string and total byte bounds", () => {
+    expect(parse({ nested: { changed_files: Array(33).fill("a.ts") } })).toBe(
+      false,
+    );
+    expect(parse({ items: Array(33).fill("a.ts") })).toBe(false);
+    expect(parse({ changed_files: ["a".repeat(501)] })).toBe(false);
+    expect(parse({ changed_files: Array(50).fill("a".repeat(400)) })).toBe(
+      false,
+    );
+    expect(parse({ changed_files: ["Bearer syntheticcredential"] })).toBe(
+      false,
+    );
+  });
+});
+
 describe("connector envelope", () => {
   it("canonicalizes equivalent RFC3339 instants without losing sub-millisecond precision", () => {
     expect(rfc3339InstantKey("2026-09-01T00:00:00.123400Z")).toBe(

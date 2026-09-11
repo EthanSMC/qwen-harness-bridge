@@ -4,12 +4,31 @@ import {
   ConnectorClientMessageSchema,
   type ConnectorServerMessage,
   ConnectorServerMessageSchema,
+  type JobSyncPayload,
   SequenceCursor,
 } from "@qhb/protocol";
 import WebSocket, { type ClientOptions } from "ws";
+import {
+  type RedactionOptions,
+  redactEvent,
+} from "../redaction/redact-event.js";
+import {
+  captureTerminalBinding,
+  type TerminalAuthority,
+} from "../runtime/terminal-authority.js";
+import {
+  captureTerminalValue,
+  type LocalTerminalBinding,
+  type ReconciliationBinding,
+  type TerminalCommitResult,
+  type TerminalReconcileResult,
+  terminalCorrelation,
+} from "../store/owned-terminal.js";
 import type {
+  CoordinatingPluginStore,
   PluginStore,
   StoredInboundMessage,
+  TerminalPluginStore,
 } from "../store/plugin-store.js";
 import {
   type StoredOutboundEvent,
@@ -31,32 +50,229 @@ export interface ConnectorClient {
   onCommand(handler: (command: ServerEnvelope) => Promise<void>): () => void;
 }
 
+export type ConnectorEpoch = Readonly<{ signal: AbortSignal }>;
+export type PublishedSync = Readonly<{
+  messageId: string;
+  sequence: number;
+  correlationId: string;
+  jobId: string;
+  attempt: number;
+  nonce: string;
+  epoch: ConnectorEpoch;
+}>;
+type StateDelivery = Readonly<{
+  epoch: ConnectorEpoch | null;
+  recovered: boolean;
+}>;
+type StateHandler = (
+  message: Extract<ServerEnvelope, { type: "job.state" }>,
+  delivery: StateDelivery,
+) => undefined;
+export interface CoordinatingConnectorClient extends ConnectorClient {
+  currentEpoch(): ConnectorEpoch | undefined;
+  onEpoch(handler: (epoch: ConnectorEpoch) => undefined): () => void;
+  publishSync(
+    payload: JobSyncPayload,
+    correlationId: string,
+    onPersisted: (request: PublishedSync) => undefined,
+  ): void;
+  onState(handler: StateHandler): () => void;
+}
+
+export interface TerminalConnectorClient extends CoordinatingConnectorClient {
+  commitTerminal(
+    binding: LocalTerminalBinding,
+    authority: TerminalAuthority,
+    nativeProjection?: unknown,
+  ): TerminalCommitResult;
+  reconcileTerminal(
+    binding: ReconciliationBinding,
+    authority: TerminalAuthority,
+  ): TerminalReconcileResult;
+}
+
+type SocketEpoch = {
+  socket: WebSocket;
+  epoch: ConnectorEpoch;
+  controller: AbortController;
+  eligible: boolean;
+  requested: boolean;
+};
+
+const isCoordinatingStore = (
+  store: PluginStore,
+): store is CoordinatingPluginStore =>
+  "coordinationReceipt" in store &&
+  typeof store.coordinationReceipt === "function" &&
+  "coordinationRequest" in store &&
+  typeof store.coordinationRequest === "function";
+
 type SocketFactory = (url: string, options: ClientOptions) => WebSocket;
 
-export type ConnectorClientOptions = Readonly<{
-  connectorId: string;
-  controlPlaneUrl: `wss://${string}`;
-  store: PluginStore;
-  sessionTokenClient: SessionTokenClient;
-  bootstrapCredentialProvider: (signal?: AbortSignal) => Promise<string>;
-  connectorVersion?: string;
-  capabilities?: readonly string[];
-  now?: () => Date;
-  randomUUID?: () => string;
-  random?: () => number;
-  webSocketFactory?: SocketFactory;
-  reconnectDelay?: (attempt: number) => number;
-}>;
+export type ConnectorClientOptions = Readonly<
+  {
+    connectorId: string;
+    controlPlaneUrl: `wss://${string}`;
+    sessionTokenClient: SessionTokenClient;
+    bootstrapCredentialProvider: (signal?: AbortSignal) => Promise<string>;
+    connectorVersion?: string;
+    capabilities?: readonly string[];
+    now?: () => Date;
+    randomUUID?: () => string;
+    random?: () => number;
+    webSocketFactory?: SocketFactory;
+    reconnectDelay?: (attempt: number) => number;
+    requireOwnedTerminal?: boolean;
+    redaction?: RedactionOptions;
+  } & (
+    | { requireJobCoordination: true; store: CoordinatingPluginStore }
+    | { requireJobCoordination?: false; store: PluginStore }
+  )
+>;
 
 const HEARTBEAT_INTERVAL_MS = 10_000;
 const MESSAGE_TTL_MS = 60_000;
 const DURABLE_RECEIPTS = "durable-receipts-v1";
+const JOB_COORDINATION = "job-coordination-v1";
 const MAX_UNCONFIRMED_FRAMES = 32;
 const MAX_UNCONFIRMED_BYTES = 128 * 1024;
 const RECEIPT_TIMEOUT_MS = 30_000;
 const TOKEN_REFRESH_SKEW_MS = 60_000;
 const SOCKET_CLOSE_TIMEOUT_MS = 1_000;
 const ABORTED = Symbol("CONNECTOR_ABORTED");
+
+function captureOptions(input: ConnectorClientOptions): ConnectorClientOptions {
+  try {
+    const captured = {
+      connectorId: input.connectorId,
+      controlPlaneUrl: input.controlPlaneUrl,
+      sessionTokenClient: input.sessionTokenClient,
+      bootstrapCredentialProvider: input.bootstrapCredentialProvider,
+      connectorVersion: input.connectorVersion,
+      capabilities: input.capabilities,
+      now: input.now,
+      randomUUID: input.randomUUID,
+      random: input.random,
+      webSocketFactory: input.webSocketFactory,
+      reconnectDelay: input.reconnectDelay,
+      requireOwnedTerminal: input.requireOwnedTerminal,
+      requireJobCoordination: input.requireJobCoordination,
+      store: input.store,
+      redaction: input.redaction,
+    };
+    if (
+      typeof captured.connectorId !== "string" ||
+      typeof captured.controlPlaneUrl !== "string" ||
+      !captured.store ||
+      typeof captured.store !== "object" ||
+      Array.isArray(captured.store) ||
+      !captured.sessionTokenClient ||
+      typeof captured.sessionTokenClient !== "object" ||
+      Array.isArray(captured.sessionTokenClient) ||
+      typeof captured.bootstrapCredentialProvider !== "function" ||
+      (captured.connectorVersion !== undefined &&
+        typeof captured.connectorVersion !== "string") ||
+      [captured.requireOwnedTerminal, captured.requireJobCoordination].some(
+        (value) => value !== undefined && typeof value !== "boolean",
+      ) ||
+      [
+        captured.now,
+        captured.randomUUID,
+        captured.random,
+        captured.webSocketFactory,
+        captured.reconnectDelay,
+      ].some((value) => value !== undefined && typeof value !== "function")
+    )
+      throw new Error();
+    // Inspect required base ports only. Keep service identity and leave actual
+    // method execution (and its operational errors) outside this capture catch.
+    const methods = [
+      "recordInbound",
+      "maxInboundSequence",
+      "inboundMessage",
+      "inboundMessageBySequence",
+      "replaceInbound",
+      "pendingInboundMessages",
+      "markInboundDelivered",
+      "markInboundExpired",
+      "mapJob",
+      "findJob",
+      "listNonterminalJobs",
+      "maxOutboundSequence",
+      "enqueueEvent",
+      "activeHello",
+      "outboundEvent",
+      "renewDelivery",
+      "provenClientSequence",
+      "acknowledgeThrough",
+      "pendingEvents",
+      "acknowledgeEvent",
+      "close",
+    ] as const satisfies readonly (keyof PluginStore)[];
+    for (const method of methods)
+      if (typeof captured.store[method] !== "function") throw new Error();
+    if (typeof captured.sessionTokenClient.exchange !== "function")
+      throw new Error();
+    const list = (value: readonly string[], max: number) => {
+      if (
+        !Array.isArray(value) ||
+        Object.getPrototypeOf(value) !== Array.prototype ||
+        Object.getOwnPropertySymbols(value).length
+      )
+        throw new Error();
+      const length = Object.getOwnPropertyDescriptor(value, "length")?.value;
+      if (
+        !Number.isSafeInteger(length) ||
+        length < 0 ||
+        length > max ||
+        Object.getOwnPropertyNames(value).length !== length + 1
+      )
+        throw new Error();
+      const copy: string[] = [];
+      for (let index = 0; index < length; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(
+          value,
+          String(index),
+        );
+        if (
+          !descriptor ||
+          !("value" in descriptor) ||
+          !descriptor.enumerable ||
+          typeof descriptor.value !== "string" ||
+          !descriptor.value.length ||
+          Buffer.byteLength(descriptor.value, "utf8") > 4096
+        )
+          throw new Error();
+        copy.push(descriptor.value);
+      }
+      return Object.freeze(copy);
+    };
+    if (captured.capabilities !== undefined)
+      captured.capabilities = list(captured.capabilities, 64);
+    const redaction = captured.redaction;
+    if (redaction !== undefined) {
+      const repositoryRoot = redaction.repositoryRoot;
+      const homeDirectory = redaction.homeDirectory;
+      const secrets = redaction.secrets;
+      if (
+        typeof repositoryRoot !== "string" ||
+        !repositoryRoot.startsWith("/") ||
+        typeof homeDirectory !== "string" ||
+        !homeDirectory.startsWith("/") ||
+        /\p{Cc}/u.test(repositoryRoot + homeDirectory)
+      )
+        throw new Error();
+      captured.redaction = Object.freeze({
+        repositoryRoot,
+        homeDirectory,
+        ...(secrets === undefined ? {} : { secrets: list(secrets, 64) }),
+      });
+    }
+    return Object.freeze(captured) as ConnectorClientOptions;
+  } catch {
+    throw new Error("CONNECTOR_OPTIONS_INVALID");
+  }
+}
 
 const assertWssUrl = (value: string): void => {
   let url: URL;
@@ -144,13 +360,16 @@ type PendingMessage = Readonly<{
   message: ConnectorClientMessage;
 }>;
 
-export class DurableConnectorClient implements ConnectorClient {
+export class DurableConnectorClient implements TerminalConnectorClient {
   readonly #options: ConnectorClientOptions;
   readonly #now: () => Date;
   readonly #randomUUID: () => string;
   readonly #random: () => number;
   readonly #socketFactory: SocketFactory;
   readonly #handlers = new Set<(command: ServerEnvelope) => Promise<void>>();
+  readonly #epochHandlers = new Set<(epoch: ConnectorEpoch) => undefined>();
+  readonly #stateHandlers = new Set<StateHandler>();
+  readonly #epochs = new WeakMap<WebSocket, SocketEpoch>();
   readonly #outboundBySequence = new Map<number, StoredOutboundEvent>();
   readonly #sentOnConnection = new Set<number>();
   readonly #unconfirmed = new Map<number, number>();
@@ -158,6 +377,7 @@ export class DurableConnectorClient implements ConnectorClient {
   #receiptTimer: ReturnType<typeof setInterval> | undefined;
   #fatalError: Error | undefined;
   #clientSequence = 0;
+  #allocating = false;
   #serverCursor: SequenceCursor;
   #socket: WebSocket | undefined;
   #startPromise: Promise<void> | undefined;
@@ -174,8 +394,10 @@ export class DurableConnectorClient implements ConnectorClient {
   #nextSession: { token: string; expiresAt: string } | undefined;
 
   constructor(options: ConnectorClientOptions) {
+    options = captureOptions(options);
     assertWssUrl(options.controlPlaneUrl);
     this.#options = options;
+    if (options.requireOwnedTerminal) this.#terminalStore();
     this.#now = options.now ?? (() => new Date());
     this.#randomUUID = options.randomUUID ?? nodeRandomUUID;
     this.#random = options.random ?? Math.random;
@@ -208,6 +430,8 @@ export class DurableConnectorClient implements ConnectorClient {
   ): Promise<void> {
     if (!this.#started) throw new Error("CONNECTOR_NOT_STARTED");
     if (this.#stopping) throw new Error("CONNECTOR_STOPPED");
+    if (type === "job.sync")
+      throw new Error("CONNECTOR_SYNC_REQUIRES_TRACKED_ALLOCATION");
     if (
       type === "connector.hello" ||
       type === "connector.heartbeat" ||
@@ -215,17 +439,322 @@ export class DurableConnectorClient implements ConnectorClient {
     ) {
       throw new Error("CONNECTOR_PUBLISH_TYPE_NOT_DURABLE");
     }
-    const messageId = this.#randomUUID();
-    const now = this.#now();
-    this.#persistMessage((sequence) =>
-      messageEnvelope(type, sequence, payload, correlationId, now, messageId),
-    );
-    this.#scheduleSendPump();
+    this.#allocate(() => {
+      // Capture and validate once before injected clock/UUID code can change input.
+      // The store repeats the negative ownership check inside its insert transaction.
+      if (type === "job.event" || type === "job.cancelled") {
+        let message: ConnectorClientMessage;
+        try {
+          payload = captureTerminalValue(payload);
+          message = messageEnvelope(
+            type,
+            1,
+            payload,
+            correlationId,
+            new Date("2026-09-01T00:00:00Z"),
+            "00000000-0000-4000-8000-000000000001",
+          );
+        } catch {
+          if (this.#clientSequence >= Number.MAX_SAFE_INTEGER)
+            throw new Error("CONNECTOR_SEQUENCE_EXHAUSTED");
+          throw new Error("CONNECTOR_EVENT_REJECTED");
+        }
+        const store = this.#options.store as Partial<TerminalPluginStore>;
+        store.assertGenericPublication?.(message, payload);
+      }
+      this.#persistAllocatedMessage((sequence) => {
+        const message = messageEnvelope(
+          type,
+          sequence,
+          payload,
+          correlationId,
+          this.#now(),
+          this.#randomUUID(),
+        );
+        // Preserve raw exact-name evidence through the actual insertion check.
+        // Wire parsing may still normalize unowned legacy events for delivery.
+        if (message.type === "job.event")
+          return {
+            ...message,
+            payload: {
+              ...message.payload,
+              event_type: (payload as { event_type: string }).event_type,
+            },
+          };
+        return message;
+      });
+      this.#scheduleSendPump();
+    });
   }
 
   onCommand(handler: (command: ServerEnvelope) => Promise<void>): () => void {
     this.#handlers.add(handler);
     return () => this.#handlers.delete(handler);
+  }
+
+  #terminalStore(): TerminalPluginStore {
+    const store = this.#options.store as Partial<TerminalPluginStore>;
+    if (
+      !this.#options.requireOwnedTerminal ||
+      this.#options.requireJobCoordination !== true ||
+      !isCoordinatingStore(this.#options.store) ||
+      typeof store.commitTerminal !== "function" ||
+      typeof store.reconcileTerminal !== "function" ||
+      typeof store.readTerminal !== "function" ||
+      typeof store.ownedIntent !== "function"
+    )
+      throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+    return store as TerminalPluginStore;
+  }
+
+  commitTerminal(
+    input: LocalTerminalBinding,
+    authority: TerminalAuthority,
+    nativeProjection?: unknown,
+  ): TerminalCommitResult {
+    return this.#allocate(() => {
+      const store = this.#terminalStore();
+      if (!this.currentEpoch())
+        throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+      const binding = captureTerminalBinding(input) as LocalTerminalBinding;
+      const { operation, owner } = binding;
+      let payload: unknown;
+      let type: "job.event" | "job.cancelled";
+      if (operation.kind === "native") {
+        if (!this.#options.redaction)
+          throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+        type = "job.event";
+        payload = {
+          job_id: owner.jobId,
+          attempt: owner.attempt,
+          event_type: `job.${operation.outcome}`,
+          source: "harness",
+          payload: redactEvent(nativeProjection, this.#options.redaction),
+        };
+      } else {
+        if (nativeProjection !== undefined)
+          throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+        if (operation.kind === "cancel") {
+          type = "job.cancelled";
+          payload = {
+            job_id: owner.jobId,
+            attempt: owner.attempt,
+            reason: "Cancelled by owner",
+          };
+        } else if (operation.kind === "unavailable") {
+          type = "job.event";
+          payload = {
+            job_id: owner.jobId,
+            attempt: owner.attempt,
+            event_type: "job.failed",
+            source: "harness",
+            payload: { stage: "failed", summary: operation.reason },
+          };
+        } else throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+      }
+      const proposal = {
+        binding,
+        type,
+        payload,
+        correlationId: terminalCorrelation(binding),
+      };
+      let candidate: StoredOutboundEvent | undefined;
+      let committed = false;
+      try {
+        const result = store.commitTerminal(proposal, authority, () => {
+          const sequence = this.#clientSequence + 1;
+          if (!Number.isSafeInteger(sequence))
+            throw new Error("CONNECTOR_SEQUENCE_EXHAUSTED");
+          const message = messageEnvelope(
+            type,
+            sequence,
+            payload,
+            proposal.correlationId,
+            this.#now(),
+            this.#randomUUID(),
+          );
+          candidate = {
+            messageId: message.message_id,
+            sequence,
+            payload: JSON.stringify(message),
+            expectedReceiptProfile: JOB_COORDINATION,
+            attempts: 0,
+            acknowledgedAt: null,
+          };
+          return candidate;
+        });
+        if (result.kind !== "committed") return result;
+        committed = true;
+        if (
+          !candidate ||
+          result.winner.outbound.messageId !== candidate.messageId ||
+          result.winner.outbound.sequence !== candidate.sequence
+        )
+          throw new Error();
+        this.#outboundBySequence.set(candidate.sequence, candidate);
+        this.#clientSequence = candidate.sequence;
+        this.#scheduleSendPump();
+        return result;
+      } catch (error) {
+        if (committed) {
+          this.#fatal("CONNECTOR_TERMINAL_COMMIT_UNCERTAIN");
+          throw this.#fatalError;
+        }
+        if (error instanceof StoreSequenceError) {
+          this.#fatal("CONNECTOR_SEQUENCE_CONFLICT");
+          throw this.#fatalError;
+        }
+        // A store wrapper may throw after its actual commit. Durable evidence
+        // distinguishes that uncertainty from a rolled-back write.
+        if (candidate) {
+          try {
+            if (
+              store.outboundEvent(candidate.sequence)?.messageId ===
+              candidate.messageId
+            )
+              this.#fatal("CONNECTOR_TERMINAL_COMMIT_UNCERTAIN");
+          } catch {
+            this.#fatal("CONNECTOR_TERMINAL_COMMIT_UNCERTAIN");
+          }
+        }
+        if (this.#fatalError) throw this.#fatalError;
+        throw error;
+      }
+    });
+  }
+
+  reconcileTerminal(
+    binding: ReconciliationBinding,
+    authority: TerminalAuthority,
+  ): TerminalReconcileResult {
+    return this.#allocate(() => {
+      if (!this.currentEpoch())
+        throw new Error("CONNECTOR_TERMINAL_UNAVAILABLE");
+      return this.#terminalStore().reconcileTerminal(binding, authority);
+    });
+  }
+
+  currentEpoch(): ConnectorEpoch | undefined {
+    const context =
+      this.#socket === undefined ? undefined : this.#epochs.get(this.#socket);
+    return context?.eligible && this.#active(context)
+      ? context.epoch
+      : undefined;
+  }
+
+  onEpoch(handler: (epoch: ConnectorEpoch) => undefined): () => void {
+    this.#epochHandlers.add(handler);
+    const epoch = this.currentEpoch();
+    if (epoch !== undefined) this.#invokeCoordination(() => handler(epoch));
+    return () => {
+      this.#epochHandlers.delete(handler);
+    };
+  }
+
+  onState(handler: StateHandler): () => void {
+    this.#stateHandlers.add(handler);
+    return () => {
+      this.#stateHandlers.delete(handler);
+    };
+  }
+
+  publishSync(
+    payload: JobSyncPayload,
+    correlationId: string,
+    onPersisted: (request: PublishedSync) => undefined,
+  ): void {
+    const epoch = this.currentEpoch();
+    if (epoch === undefined)
+      throw new Error("CONNECTOR_COORDINATION_UNAVAILABLE");
+    const pending = this.#persistMessage((sequence) =>
+      messageEnvelope(
+        "job.sync",
+        sequence,
+        payload,
+        correlationId,
+        this.#now(),
+        this.#randomUUID(),
+      ),
+    );
+    const message = pending.message;
+    if (message.type !== "job.sync")
+      throw new Error("CONNECTOR_STORED_OUTBOUND_INVALID");
+    const request = Object.freeze({
+      messageId: message.message_id,
+      sequence: message.sequence,
+      correlationId: message.correlation_id,
+      jobId: message.payload.job_id,
+      attempt: message.payload.attempt,
+      nonce: message.payload.nonce,
+      epoch,
+    });
+    // No pump scheduling or yield may precede this registration: SQLite has
+    // committed the exact request and original receipt profile at this point.
+    this.#invokeCoordination(() => onPersisted(request));
+    this.#scheduleSendPump();
+  }
+
+  #invokeCoordination(callback: () => unknown): void {
+    try {
+      const result = callback();
+      if (result !== undefined) {
+        // Contain rejected async callbacks without awaiting user work.
+        void Promise.resolve(result).catch(() => undefined);
+        throw new Error();
+      }
+    } catch {
+      this.#fatal("CONNECTOR_COORDINATION_CALLBACK_FAILED");
+      throw this.#fatalError;
+    }
+  }
+
+  #fatal(code: string): void {
+    this.#fatalError ??= new Error(code);
+    this.#stopping = true;
+    this.#closeSocket();
+    this.#clearTimers();
+  }
+
+  #active(context: SocketEpoch): boolean {
+    return (
+      !this.#stopping &&
+      this.#socket === context.socket &&
+      context.socket.readyState === WebSocket.OPEN &&
+      !context.epoch.signal.aborted
+    );
+  }
+
+  #canComplete(context: SocketEpoch): boolean {
+    return !this.#stopping && (!context.requested || this.#active(context));
+  }
+
+  #rejectIncoming(
+    context: SocketEpoch,
+    code = "CONNECTOR_STORED_INBOUND_INVALID",
+  ): void {
+    if (context.requested && this.#socket === context.socket) this.#fatal(code);
+    this.#closeSocket(context.socket);
+  }
+
+  #outboundFailure(socket: WebSocket): void {
+    if (this.#socket === socket && this.#epochs.get(socket)?.requested)
+      this.#fatal("STORE_OUTBOUND_WRITE_FAILED");
+    this.#closeSocket(socket);
+  }
+
+  #requestsCoordination(): boolean {
+    const hello = this.#helloMessage?.message;
+    return (
+      hello?.type === "connector.hello" &&
+      hello.payload.capabilities?.includes(JOB_COORDINATION) === true
+    );
+  }
+
+  #coordinationStore(): CoordinatingPluginStore {
+    const store = this.#options.store;
+    if (!isCoordinatingStore(store))
+      throw new Error("CONNECTOR_COORDINATION_STORE_REQUIRED");
+    return store;
   }
 
   async #run(signal: AbortSignal): Promise<void> {
@@ -295,6 +824,16 @@ export class DurableConnectorClient implements ConnectorClient {
     const socket = this.#socketFactory(this.#options.controlPlaneUrl, {
       headers: { authorization: `Bearer ${session.token}` },
     });
+    this.#closeSocket();
+    const controller = new AbortController();
+    const context: SocketEpoch = {
+      socket,
+      controller,
+      epoch: Object.freeze({ signal: controller.signal }),
+      eligible: false,
+      requested: this.#requestsCoordination(),
+    };
+    this.#epochs.set(socket, context);
     this.#socket = socket;
     this.#sentOnConnection.clear();
     this.#unconfirmed.clear();
@@ -315,15 +854,17 @@ export class DurableConnectorClient implements ConnectorClient {
       };
       socket.once("open", () => {
         void this.#afterOpen(socket, signal).catch((error: unknown) => {
-          this.#closeSocket(socket);
+          this.#outboundFailure(socket);
           finish(asError(error, "CONNECTOR_SOCKET_OPEN_FAILED"));
         });
       });
       socket.on("message", (data) => {
         const serialized = typeof data === "string" ? data : data.toString();
         this.#receivePump = this.#receivePump
-          .then(() => this.#handleIncoming(socket, serialized, signal))
+          .then(() => this.#handleIncoming(context, serialized, signal))
           .catch(() => {
+            if (context.requested && this.#socket === socket)
+              this.#fatal("CONNECTOR_STORED_INBOUND_INVALID");
             this.#closeSocket(socket);
           });
       });
@@ -332,7 +873,8 @@ export class DurableConnectorClient implements ConnectorClient {
         finish(asError(error, "CONNECTOR_SOCKET_ERROR"));
       });
       socket.once("close", () => {
-        this.#resolveWelcome?.();
+        context.controller.abort();
+        if (this.#socket === socket) this.#resolveWelcome?.();
         finish();
       });
     });
@@ -345,6 +887,7 @@ export class DurableConnectorClient implements ConnectorClient {
       if (this.#welcomeReceived) return true;
       throw error;
     } finally {
+      context.controller.abort();
       if (this.#socket === socket) this.#socket = undefined;
       this.#welcomeWaiter = undefined;
       this.#resolveWelcome = undefined;
@@ -388,13 +931,21 @@ export class DurableConnectorClient implements ConnectorClient {
       const message = this.#helloMessage.message;
       if (
         message.type !== "connector.hello" ||
-        !message.payload.capabilities?.includes(DURABLE_RECEIPTS)
+        !message.payload.capabilities?.includes(DURABLE_RECEIPTS) ||
+        (this.#options.requireJobCoordination &&
+          !message.payload.capabilities?.includes(JOB_COORDINATION))
       )
         throw new Error("CONNECTOR_INCOMPATIBLE_STATE");
+      if (this.#requestsCoordination()) this.#coordinationStore();
       if (this.#options.store.provenClientSequence() !== this.#clientSequence)
         return;
     }
     const lastClientSequence = this.#clientSequence;
+    if (
+      this.#options.requireJobCoordination ||
+      this.#options.capabilities?.includes(JOB_COORDINATION)
+    )
+      this.#coordinationStore();
     this.#helloMessage = this.#persistMessage((sequence) =>
       buildConnectorHello({
         connectorId: this.#options.connectorId,
@@ -411,6 +962,7 @@ export class DurableConnectorClient implements ConnectorClient {
           ...new Set([
             ...(this.#options.capabilities ?? ["harness", "replay"]),
             DURABLE_RECEIPTS,
+            ...(this.#options.requireJobCoordination ? [JOB_COORDINATION] : []),
           ]),
         ],
       }),
@@ -418,11 +970,12 @@ export class DurableConnectorClient implements ConnectorClient {
   }
 
   async #handleIncoming(
-    socket: WebSocket,
+    context: SocketEpoch,
     serialized: string,
     signal: AbortSignal,
   ): Promise<void> {
-    if (this.#socket !== socket || this.#stopping) return;
+    const { socket } = context;
+    if (!this.#active(context)) return;
     let message: ConnectorServerMessage;
     try {
       message = ConnectorServerMessageSchema.parse(JSON.parse(serialized));
@@ -430,26 +983,37 @@ export class DurableConnectorClient implements ConnectorClient {
         throw new Error("CONNECTOR_MESSAGE_EXPIRED");
       }
     } catch {
-      this.#closeSocket(socket);
+      this.#rejectIncoming(context);
       return;
     }
     if (message.type === "connector.welcome" && !this.#validWelcome(message)) {
-      if (!message.payload.capabilities?.includes(DURABLE_RECEIPTS))
+      if (
+        !message.payload.capabilities?.includes(DURABLE_RECEIPTS) ||
+        (this.#options.requireJobCoordination &&
+          !message.payload.capabilities?.includes(JOB_COORDINATION))
+      )
         this.#fatalError = new Error("CONNECTOR_INCOMPATIBLE_PEER");
-      this.#closeSocket(socket);
+      this.#rejectIncoming(
+        context,
+        this.#fatalError?.message ?? "CONNECTOR_STORED_INBOUND_INVALID",
+      );
       return;
     }
     if (message.type === "ack" && !this.#validReceipt(message)) {
-      this.#closeSocket(socket);
+      this.#rejectIncoming(context);
       return;
     }
+
+    const evidence = this.#coordinationEvidence(message);
+    if (isCoordinatingStore(this.#options.store))
+      this.#options.store.coordinationReceipt(message.sequence);
 
     const existing = this.#options.store.inboundMessage(message.message_id);
     if (
       existing !== undefined &&
       (existing.sequence !== message.sequence || existing.body !== serialized)
     ) {
-      this.#closeSocket(socket);
+      this.#rejectIncoming(context);
       return;
     }
     const existingAtSequence =
@@ -469,14 +1033,15 @@ export class DurableConnectorClient implements ConnectorClient {
           messageId: message.message_id,
           sequence: message.sequence,
           body: serialized,
+          ...evidence,
         });
         replacement = true;
       } catch {
-        this.#closeSocket(socket);
+        this.#rejectIncoming(context, "STORE_INBOUND_WRITE_FAILED");
         return;
       }
     } else if (existing === undefined && existingAtSequence !== undefined) {
-      this.#closeSocket(socket);
+      this.#rejectIncoming(context);
       return;
     }
     if (
@@ -484,7 +1049,7 @@ export class DurableConnectorClient implements ConnectorClient {
       !replacement &&
       message.sequence !== this.#serverCursor.lastSequence + 1
     ) {
-      this.#closeSocket(socket);
+      this.#rejectIncoming(context);
       return;
     }
     if (
@@ -493,7 +1058,7 @@ export class DurableConnectorClient implements ConnectorClient {
       existing === undefined &&
       !replacement
     ) {
-      this.#closeSocket(socket);
+      this.#rejectIncoming(context);
       return;
     }
     if (existing === undefined && !replacement) {
@@ -502,34 +1067,63 @@ export class DurableConnectorClient implements ConnectorClient {
           message.message_id,
           message.sequence,
           serialized,
+          evidence,
         );
         this.#serverCursor.accept(message.sequence);
       } catch {
-        this.#closeSocket(socket);
+        this.#rejectIncoming(context, "STORE_INBOUND_WRITE_FAILED");
         return;
       }
     }
 
-    if (this.#stopping) return;
+    if (existing !== undefined && evidence !== undefined) {
+      this.#options.store.recordInbound(
+        message.message_id,
+        message.sequence,
+        serialized,
+        evidence,
+      );
+    }
+
+    if (!this.#active(context)) return;
     if (message.type === "connector.welcome") {
       this.#welcomeReceived = true;
       const hello = this.#helloMessage?.message;
       if (hello === undefined) throw new Error("CONNECTOR_HELLO_MISSING");
       this.#acknowledgeOutbound(hello.sequence, hello.correlation_id);
+      const alreadyEligible = context.eligible;
+      context.eligible =
+        context.requested &&
+        message.payload.capabilities?.includes(JOB_COORDINATION) === true &&
+        message.payload.capabilities.includes(DURABLE_RECEIPTS) &&
+        isCoordinatingStore(this.#options.store);
+      if (context.eligible && !alreadyEligible) {
+        for (const handler of [...this.#epochHandlers]) {
+          if (!this.#active(context)) return;
+          this.#invokeCoordination(() => handler(context.epoch));
+        }
+      }
+      if (!this.#active(context)) return;
       this.#startHeartbeat(socket, signal);
       // The hello remains pinned separately after its receipt retires the row
       // from the pending queue. Reconnect retains its immutable identity.
-      await this.#recoverPendingInbound(socket);
-      if (this.#stopping) return;
+      await this.#recoverPendingInbound(context);
+      if (!this.#active(context)) return;
       if (existing?.delivered === true) {
-        await this.#completeInbound(message, true);
+        await this.#completeInbound(message, true, context, false);
       }
-      if (this.#stopping) return;
+      if (!this.#active(context)) return;
       this.#resolveWelcome?.();
       return;
     }
     if (!this.#welcomeReceived) return;
-    await this.#completeInbound(message, existing?.delivered ?? false);
+    await this.#completeInbound(
+      message,
+      this.#options.store.inboundMessage(message.message_id)?.delivered ??
+        false,
+      context,
+      false,
+    );
   }
 
   #validReplacement(
@@ -572,6 +1166,14 @@ export class DurableConnectorClient implements ConnectorClient {
       previous.type === "protocol.error" &&
       previous.payload.code === "MESSAGE_EXPIRED" &&
       replacement.type === "protocol.error" &&
+      ((replacement.payload.code === "CLAIM_REJECTED" &&
+        [
+          "The business deadline has expired.",
+          "The offered job was cancelled before it was claimed.",
+        ].includes(replacement.payload.message)) ||
+        (replacement.payload.code === "EVENT_REJECTED" &&
+          replacement.payload.message ===
+            "The business deadline has expired.")) &&
       this.#pendingMessages().some(
         ({ message }) =>
           message.correlation_id === replacement.correlation_id &&
@@ -588,6 +1190,10 @@ export class DurableConnectorClient implements ConnectorClient {
               replacement.payload.message ===
                 "The business deadline has expired.")),
       );
+    const restoresCoordination =
+      previous.type === "protocol.error" &&
+      previous.payload.code === "MESSAGE_EXPIRED" &&
+      this.#coordinationEvidence(replacement) !== undefined;
     return (
       (previousExpired &&
         ((sameSemanticEnvelope && !isCommand(replacement)) ||
@@ -595,8 +1201,35 @@ export class DurableConnectorClient implements ConnectorClient {
       isInactiveOfferTombstone ||
       restoresWelcome ||
       restoresAck ||
+      restoresCoordination ||
       restoresRejection
     );
+  }
+
+  #coordinationEvidence(
+    message: ConnectorServerMessage,
+  ): Readonly<{ coordinationRequestSequence: number }> | undefined {
+    if (message.type === "job.state") {
+      const store = this.#coordinationStore();
+      const request = store.outboundEvent(message.payload.request_sequence);
+      if (request?.expectedReceiptProfile !== JOB_COORDINATION)
+        throw new Error("CONNECTOR_STORED_INBOUND_INVALID");
+      return { coordinationRequestSequence: request.sequence };
+    }
+    if (
+      message.type === "protocol.error" &&
+      (message.payload.code === "JOB_AUTHORITY_UNAVAILABLE" ||
+        message.payload.message === "The job authority has changed." ||
+        message.payload.message === "The job business limit has been reached.")
+    ) {
+      const request = this.#coordinationStore().coordinationRequest(
+        message.correlation_id,
+      );
+      if (request === undefined)
+        throw new Error("CONNECTOR_STORED_INBOUND_INVALID");
+      return { coordinationRequestSequence: request.sequence };
+    }
+    return undefined;
   }
 
   #validWelcome(
@@ -606,6 +1239,8 @@ export class DurableConnectorClient implements ConnectorClient {
     return (
       hello?.type === "connector.hello" &&
       message.payload.capabilities?.includes(DURABLE_RECEIPTS) === true &&
+      (!this.#options.requireJobCoordination ||
+        message.payload.capabilities?.includes(JOB_COORDINATION) === true) &&
       message.correlation_id === hello.correlation_id &&
       message.payload.connector_id === this.#options.connectorId &&
       message.payload.server_sequence === message.sequence &&
@@ -613,25 +1248,27 @@ export class DurableConnectorClient implements ConnectorClient {
     );
   }
 
-  async #recoverPendingInbound(socket: WebSocket): Promise<void> {
+  async #recoverPendingInbound(context: SocketEpoch): Promise<void> {
     if (this.#stopping) return;
     for (const stored of this.#options.store.pendingInboundMessages()) {
-      if (
-        this.#stopping ||
-        this.#socket !== socket ||
-        socket.readyState !== WebSocket.OPEN
-      ) {
+      if (!this.#active(context)) {
         return;
       }
       const message = this.#parseStoredInbound(stored);
       if (message === undefined) {
         throw new Error("CONNECTOR_STORED_INBOUND_INVALID");
       }
+      const evidence = this.#coordinationEvidence(message);
+      const receipt = isCoordinatingStore(this.#options.store)
+        ? this.#options.store.coordinationReceipt(message.sequence)
+        : undefined;
+      if (evidence !== undefined && receipt === undefined)
+        throw new Error("CONNECTOR_STORED_INBOUND_INVALID");
       if (Date.parse(message.expires_at) <= this.#now().getTime()) {
         this.#options.store.markInboundExpired(message.message_id);
         continue;
       }
-      await this.#completeInbound(message, false);
+      await this.#completeInbound(message, false, context, true);
     }
   }
 
@@ -657,9 +1294,27 @@ export class DurableConnectorClient implements ConnectorClient {
   async #completeInbound(
     message: ConnectorServerMessage,
     delivered: boolean,
+    context: SocketEpoch,
+    recovered: boolean,
   ): Promise<void> {
-    if (this.#stopping) return;
+    if (!this.#canComplete(context)) return;
     if (!delivered) {
+      if (message.type === "job.state") {
+        if (!context.eligible) return;
+        const receipt = this.#coordinationStore().coordinationReceipt(
+          message.sequence,
+        );
+        if (receipt?.responseType !== "job.state")
+          throw new Error("CONNECTOR_STORED_INBOUND_INVALID");
+        const delivery = Object.freeze({
+          epoch: recovered ? null : context.epoch,
+          recovered,
+        });
+        for (const handler of [...this.#stateHandlers]) {
+          if (!this.#active(context)) return;
+          this.#invokeCoordination(() => handler(message, delivery));
+        }
+      }
       if (message.type === "ack") {
         this.#acknowledgeOutbound(
           message.payload.sequence,
@@ -673,7 +1328,7 @@ export class DurableConnectorClient implements ConnectorClient {
           return;
         }
         for (const handler of [...this.#handlers]) {
-          if (this.#stopping) return;
+          if (!this.#canComplete(context)) return;
           if (Date.parse(message.expires_at) <= this.#now().getTime()) {
             this.#options.store.markInboundExpired(message.message_id);
             this.#enqueueAck(message.sequence);
@@ -683,11 +1338,11 @@ export class DurableConnectorClient implements ConnectorClient {
           // start() does not await uncooperative application handlers on abort.
           // A late completion retains the unfinished receipt for recovery and
           // must never invoke another handler or touch a possibly closed store.
-          if (this.#stopping) return;
+          if (!this.#canComplete(context)) return;
         }
       }
     }
-    if (this.#stopping) return;
+    if (!this.#canComplete(context)) return;
     if (message.type !== "ack") this.#enqueueAck(message.sequence);
     if (this.#stopping) return;
     if (!delivered) {
@@ -773,6 +1428,22 @@ export class DurableConnectorClient implements ConnectorClient {
   #persistMessage(
     build: (sequence: number) => ConnectorClientMessage,
   ): PendingMessage {
+    return this.#allocate(() => this.#persistAllocatedMessage(build));
+  }
+
+  #allocate<T>(operation: () => T): T {
+    if (this.#allocating) throw new Error("CONNECTOR_ALLOCATION_REENTRANT");
+    this.#allocating = true;
+    try {
+      return operation();
+    } finally {
+      this.#allocating = false;
+    }
+  }
+
+  #persistAllocatedMessage(
+    build: (sequence: number) => ConnectorClientMessage,
+  ): PendingMessage {
     if (this.#stopping) throw new Error("CONNECTOR_STOPPED");
     const sequence = this.#clientSequence + 1;
     if (!Number.isSafeInteger(sequence)) {
@@ -780,6 +1451,17 @@ export class DurableConnectorClient implements ConnectorClient {
     }
     const message = build(sequence);
     const serialized = JSON.stringify(message);
+    const profile =
+      this.#requestsCoordination() &&
+      [
+        "job.sync",
+        "job.claim",
+        "job.event",
+        "approval.requested",
+        "job.cancelled",
+      ].includes(message.type)
+        ? ({ expectedReceiptProfile: JOB_COORDINATION } as const)
+        : {};
     if (this.#stopping) throw new Error("CONNECTOR_STOPPED");
     try {
       this.#options.store.enqueueEvent(
@@ -787,6 +1469,7 @@ export class DurableConnectorClient implements ConnectorClient {
           messageId: message.message_id,
           sequence,
           payload: serialized,
+          ...profile,
         },
         message.type === "connector.hello",
       );
@@ -794,7 +1477,13 @@ export class DurableConnectorClient implements ConnectorClient {
       if (error instanceof StoreSequenceError) {
         // One client process exclusively owns a Connector store. A conflict
         // means an unsupported concurrent writer violated that invariant.
+        if (this.#requestsCoordination())
+          this.#fatal("CONNECTOR_SEQUENCE_CONFLICT");
         throw new Error("CONNECTOR_SEQUENCE_CONFLICT");
+      }
+      if (this.#requestsCoordination()) {
+        this.#fatal("STORE_OUTBOUND_WRITE_FAILED");
+        throw this.#fatalError;
       }
       throw error;
     }
@@ -805,6 +1494,7 @@ export class DurableConnectorClient implements ConnectorClient {
       payload: serialized,
       attempts: 0,
       acknowledgedAt: null,
+      ...profile,
     };
     this.#outboundBySequence.set(sequence, stored);
     return { stored, message };
@@ -911,7 +1601,7 @@ export class DurableConnectorClient implements ConnectorClient {
     if (this.#stopping) return;
     const socket = this.#socket;
     if (socket === undefined || !this.#welcomeReceived) return;
-    void this.#sendPending(socket).catch(() => this.#closeSocket(socket));
+    void this.#sendPending(socket).catch(() => this.#outboundFailure(socket));
   }
 
   #startHeartbeat(socket: WebSocket, signal: AbortSignal): void {
@@ -925,7 +1615,11 @@ export class DurableConnectorClient implements ConnectorClient {
       ) {
         return;
       }
-      this.#enqueueHeartbeat();
+      try {
+        this.#enqueueHeartbeat();
+      } catch {
+        this.#outboundFailure(socket);
+      }
     }, HEARTBEAT_INTERVAL_MS);
   }
 
@@ -970,7 +1664,7 @@ export class DurableConnectorClient implements ConnectorClient {
         (socket.readyState === WebSocket.OPEN ||
           socket.readyState === WebSocket.CONNECTING)
       )
-        socket.close();
+        this.#closeSocket(socket);
     } catch {
       if (!signal.aborted && !this.#stopping) {
         this.#refreshTimer = setTimeout(
@@ -1044,6 +1738,7 @@ export class DurableConnectorClient implements ConnectorClient {
   #closeSocket(expected?: WebSocket): void {
     const socket = expected ?? this.#socket;
     if (socket === undefined) return;
+    this.#epochs.get(socket)?.controller.abort();
     try {
       if (
         socket.readyState === WebSocket.OPEN ||

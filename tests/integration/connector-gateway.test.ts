@@ -21,6 +21,7 @@ import { JobRepository } from "../../apps/control-plane/src/db/job-repository.js
 import { Aes256GcmEncryptor } from "../../apps/control-plane/src/domain/job-coordinator.js";
 import { createApp } from "../../apps/control-plane/src/http/app.js";
 import WebSocket from "../../packages/harness-plugin/node_modules/ws/index.js";
+import { JobStateClient } from "../../packages/harness-plugin/src/runtime/job-state-client.js";
 import { SqlitePluginStore } from "../../packages/harness-plugin/src/store/plugin-store.js";
 import {
   buildConnectorHello,
@@ -474,7 +475,7 @@ const harnessClient = (
   app: Awaited<ReturnType<typeof startApp>>,
   credentials: ConnectorCredentials,
   store: SqlitePluginStore,
-  options: Partial<ConnectorClientOptions> = {},
+  options: Partial<Omit<ConnectorClientOptions, "store">> = {},
 ) => {
   const address = app.server.address() as AddressInfo;
   return createConnectorClient({
@@ -567,6 +568,770 @@ afterAll(async () => {
 });
 
 describe("Connector gateway authentication and handshake", () => {
+  it("does not turn a retained welcome echo into working sync after server rollback", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const local = new SqlitePluginStore(
+      join(mkdtempSync(join(tmpdir(), "qhb-rollback-")), "state.sqlite"),
+    );
+    const repositoryId = `rollback-${crypto.randomUUID()}`;
+    await db.query(
+      "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, enabled) VALUES ($1, $2, 'Rollback fixture', '/redacted', false)",
+      [repositoryId, OWNER_ID],
+    );
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      repositoryId,
+      clientRequestId: crypto.randomUUID(),
+      requestCiphertext: "fixture",
+      requestDigest: "fixture",
+    });
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1 WHERE id = $2",
+      [credentials.connector_id, job.jobId],
+    );
+    const original = PostgresConnectorStore.prototype.acceptClientMessage;
+    // Model an old executable returning retained welcome evidence while its
+    // actual current admission supports only durable receipts.
+    const hook = vi
+      .spyOn(PostgresConnectorStore.prototype, "acceptClientMessage")
+      .mockImplementation(async function (identity, message, now) {
+        const result = await original.call(this, identity, message, now);
+        if (
+          identity.connectorId === credentials.connector_id &&
+          message.type === "connector.hello"
+        ) {
+          await db.query(
+            "UPDATE connectors SET capabilities = '[\"durable-receipts-v1\"]'::jsonb WHERE id = $1",
+            [credentials.connector_id],
+          );
+        }
+        return result;
+      });
+    const controller = new AbortController();
+    const client = harnessClient(app, credentials, local, {
+      requireJobCoordination: true,
+    });
+    let calls = 0;
+    client.onState(() => {
+      calls++;
+    });
+    const running = client.start(controller.signal);
+    try {
+      await vi.waitFor(() => expect(client.currentEpoch()).toBeDefined());
+      const epoch = client.currentEpoch();
+      let sequence = 0;
+      client.publishSync(
+        { job_id: job.jobId, attempt: 1, nonce: crypto.randomUUID() },
+        crypto.randomUUID(),
+        (request) => {
+          sequence = request.sequence;
+        },
+      );
+      await vi.waitFor(() => expect(epoch?.signal.aborted).toBe(true));
+      expect(calls).toBe(0);
+      expect(local.outboundEvent(sequence)?.acknowledgedAt).toBeNull();
+      expect(client.currentEpoch()).toBeUndefined();
+      expect(
+        (
+          await db.query(
+            "SELECT id FROM connector_messages WHERE connector_id = $1 AND type = 'job.state'",
+            [credentials.connector_id],
+          )
+        ).rows,
+      ).toEqual([]);
+    } finally {
+      controller.abort();
+      await running;
+      hook.mockRestore();
+      local.close();
+      await app.close();
+      await db.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    }
+  });
+
+  it("bounds live state exchanges before real SQLite allocation over TLS", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const store = new SqlitePluginStore(
+      join(mkdtempSync(join(tmpdir(), "qhb-state-capacity-")), "state.sqlite"),
+    );
+    const controller = new AbortController();
+    const connector = harnessClient(app, credentials, store, {
+      requireJobCoordination: true,
+      webSocketFactory: (url, options) => {
+        const socket = new WebSocket(url, {
+          ...options,
+          ca: LOCALHOST_TLS.cert,
+        });
+        const send = socket.send.bind(socket);
+        socket.send = ((
+          data: Parameters<typeof socket.send>[0],
+          ...args: unknown[]
+        ) => {
+          if (JSON.parse(String(data)).type === "job.sync") return;
+          return Reflect.apply(send, socket, [data, ...args]);
+        }) as typeof socket.send;
+        return socket;
+      },
+    });
+    const states = new JobStateClient({ connector });
+    const running = connector.start(controller.signal);
+    try {
+      await vi.waitFor(() => expect(connector.currentEpoch()).toBeDefined());
+      const firstJob = crypto.randomUUID();
+      const inputs = Array.from({ length: 32 }, (_, index) => ({
+        jobId: index === 0 ? firstJob : crypto.randomUUID(),
+        repositoryId: "example",
+        attempt: 1,
+      }));
+      const before = store.maxOutboundSequence();
+      const pending = inputs.map((input) =>
+        states.observe(input).catch((error: unknown) => error),
+      );
+      const persisted = Array.from({ length: 32 }, (_, index) =>
+        store.outboundEvent(before + index + 1),
+      );
+      expect(
+        persisted.every(
+          (row) => row?.expectedReceiptProfile === "job-coordination-v1",
+        ),
+      ).toBe(true);
+      expect(
+        persisted.map((row) => JSON.parse(row?.payload ?? "null").type),
+      ).toEqual(Array(32).fill("job.sync"));
+      const sameJob = expect(
+        states.observe({
+          ...inputs[0],
+          jobId: firstJob.toUpperCase(),
+          attempt: 2,
+        }),
+      ).rejects.toMatchObject({ code: "JOB_STATE_CAPACITY" });
+      const overflow = expect(
+        states.observe({ ...inputs[0], jobId: crypto.randomUUID() }),
+      ).rejects.toMatchObject({ code: "JOB_STATE_CAPACITY" });
+      expect(store.maxOutboundSequence()).toBe(before + 32);
+      expect(
+        Array.from({ length: 32 }, (_, index) =>
+          store.outboundEvent(before + index + 1),
+        ),
+      ).toEqual(persisted);
+      await sameJob;
+      await overflow;
+      states.dispose();
+      expect(await Promise.all(pending)).toEqual(
+        Array.from({ length: 32 }, () =>
+          expect.objectContaining({ code: "JOB_STATE_DISPOSED" }),
+        ),
+      );
+      expect(store.maxOutboundSequence()).toBe(before + 32);
+    } finally {
+      states.dispose();
+      controller.abort();
+      await running;
+      store.close();
+      await app.close();
+    }
+  });
+
+  it("returns fresh and terminal mismatch observations over PostgreSQL TLS without business writes", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const store = new SqlitePluginStore(
+      join(mkdtempSync(join(tmpdir(), "qhb-state-facts-")), "state.sqlite"),
+    );
+    const repositoryId = `state-${crypto.randomUUID()}`;
+    await db.query(
+      "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, enabled) VALUES ($1, $2, 'State fixture', '/redacted', false)",
+      [repositoryId, OWNER_ID],
+    );
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      repositoryId,
+      clientRequestId: crypto.randomUUID(),
+      requestCiphertext: "fixture",
+      requestDigest: "fixture",
+    });
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1, revision = 7, mode = 'read_only' WHERE id = $2",
+      [credentials.connector_id, job.jobId],
+    );
+    const controller = new AbortController();
+    const connector = harnessClient(app, credentials, store, {
+      requireJobCoordination: true,
+    });
+    const states = new JobStateClient({ connector });
+    const running = connector.start(controller.signal);
+    try {
+      await vi.waitFor(() => expect(connector.currentEpoch()).toBeDefined());
+      const input = { jobId: job.jobId, repositoryId, attempt: 1 };
+      const fresh = await states.observe(input);
+      expect(fresh.state.payload).toMatchObject({
+        mode: "read_only",
+        status: "running",
+        current_attempt: 1,
+        job_revision: 7,
+      });
+      expect(fresh.epoch).toBe(connector.currentEpoch());
+      expect(
+        store.outboundEvent(fresh.request.sequence)?.expectedReceiptProfile,
+      ).toBe("job-coordination-v1");
+      await db.query(
+        "UPDATE jobs SET status = 'succeeded', attempt = 2, revision = 8, expires_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+        [job.jobId],
+      );
+      const terminal = await states.observe(input);
+      expect(terminal.state.payload).toMatchObject({
+        status: "succeeded",
+        requested_attempt: 1,
+        current_attempt: 2,
+        job_revision: 8,
+      });
+      expect(terminal.request.nonce).not.toBe(fresh.request.nonce);
+      const rows = Array.from(
+        { length: store.maxOutboundSequence() },
+        (_, index) => store.outboundEvent(index + 1),
+      ).filter((row) => row !== undefined);
+      expect(
+        rows
+          .map((row) => JSON.parse(row.payload).type)
+          .filter(
+            (type) =>
+              ![
+                "connector.hello",
+                "ack",
+                "connector.heartbeat",
+                "job.sync",
+              ].includes(type),
+          ),
+      ).toEqual([]);
+      expect(
+        (
+          await db.query(
+            "SELECT status, attempt, revision FROM jobs WHERE id = $1",
+            [job.jobId],
+          )
+        ).rows,
+      ).toEqual([{ status: "succeeded", attempt: 2, revision: 8 }]);
+    } finally {
+      states.dispose();
+      controller.abort();
+      await running;
+      store.close();
+      await app.close();
+      await db.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    }
+  });
+
+  it("withdraws a live exchange after outbound commit and ignores its replay on SQLite restart", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const path = join(
+      mkdtempSync(join(tmpdir(), "qhb-state-restart-")),
+      "state.sqlite",
+    );
+    let store = new SqlitePluginStore(path);
+    const repositoryId = `state-${crypto.randomUUID()}`;
+    await db.query(
+      "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, enabled) VALUES ($1, $2, 'State fixture', '/redacted', false)",
+      [repositoryId, OWNER_ID],
+    );
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      repositoryId,
+      clientRequestId: crypto.randomUUID(),
+      requestCiphertext: "fixture",
+      requestDigest: "fixture",
+    });
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1, revision = 7 WHERE id = $2",
+      [credentials.connector_id, job.jobId],
+    );
+    const controller = new AbortController();
+    const connector = harnessClient(app, credentials, store, {
+      requireJobCoordination: true,
+    });
+    const states = new JobStateClient({ connector });
+    const running = connector.start(controller.signal);
+    let resumedStates: JobStateClient | undefined;
+    let resumedRun: Promise<void> | undefined;
+    const resumedController = new AbortController();
+    const enqueue = store.enqueueEvent.bind(store);
+    const hook = vi
+      .spyOn(store, "enqueueEvent")
+      .mockImplementation((event, pin) => {
+        enqueue(event, pin);
+        if (JSON.parse(event.payload).type === "job.sync") controller.abort();
+      });
+    try {
+      await vi.waitFor(() => expect(connector.currentEpoch()).toBeDefined());
+      const input = { jobId: job.jobId, repositoryId, attempt: 1 };
+      const oldEpoch = connector.currentEpoch();
+      await expect(states.observe(input)).rejects.toMatchObject({
+        code: "JOB_STATE_UNAVAILABLE",
+      });
+      await running;
+      hook.mockRestore();
+      const old = store.outboundEvent(store.maxOutboundSequence());
+      expect(old?.acknowledgedAt).toBeNull();
+      const oldMessage = ConnectorClientMessageSchema.parse(
+        JSON.parse(old?.payload ?? "null"),
+      );
+      expect(oldMessage.type).toBe("job.sync");
+      expect(oldEpoch?.signal.aborted).toBe(true);
+      states.dispose();
+      store.close();
+      store = new SqlitePluginStore(path);
+      const resumed = harnessClient(app, credentials, store, {
+        requireJobCoordination: true,
+      });
+      resumedStates = new JobStateClient({ connector: resumed });
+      const deliveries: string[] = [];
+      resumed.onState((message) => {
+        deliveries.push(message.payload.request_message_id);
+      });
+      resumedRun = resumed.start(resumedController.signal);
+      await vi.waitFor(() => expect(resumed.currentEpoch()).toBeDefined());
+      const fresh = await resumedStates.observe(input);
+      expect(fresh.request.messageId).not.toBe(oldMessage.message_id);
+      expect(fresh.request.correlationId).not.toBe(oldMessage.correlation_id);
+      expect(fresh.epoch).not.toBe(oldEpoch);
+      expect(deliveries).toContain(oldMessage.message_id);
+      expect(fresh.state.payload.request_message_id).toBe(
+        fresh.request.messageId,
+      );
+      expect(store.outboundEvent(oldMessage.sequence)?.messageId).toBe(
+        oldMessage.message_id,
+      );
+    } finally {
+      hook.mockRestore();
+      states.dispose();
+      controller.abort();
+      await running;
+      resumedStates?.dispose();
+      resumedController.abort();
+      await resumedRun;
+      store.close();
+      await app.close();
+      await db.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    }
+  });
+
+  it.each(["before receipt", "after receipt"] as const)(
+    "recovers negotiated sync lost %s over PostgreSQL TLS and reopened SQLite without fresh permission",
+    async (loss) => {
+      const credentials = await seedConnector(db);
+      const app = await startApp(5_000);
+      const directory = mkdtempSync(
+        join(tmpdir(), "qhb-coordination-restart-"),
+      );
+      const path = join(directory, "state.sqlite");
+      let store = new SqlitePluginStore(path);
+      const repositoryId = `sync-${crypto.randomUUID()}`;
+      await db.query(
+        "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, enabled) VALUES ($1, $2, 'Coordination fixture', '/redacted', false)",
+        [repositoryId, OWNER_ID],
+      );
+      const job = await new JobRepository(db.client).createIdempotent({
+        ownerId: OWNER_ID,
+        repositoryId,
+        clientRequestId: crypto.randomUUID(),
+        requestCiphertext: "fixture",
+        requestDigest: "fixture",
+      });
+      await db.query(
+        "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1, revision = 7, mode = 'read_only' WHERE id = $2",
+        [credentials.connector_id, job.jobId],
+      );
+      const controller = new AbortController();
+      let originalState:
+        | Extract<
+            ReturnType<typeof ConnectorServerMessageSchema.parse>,
+            { type: "job.state" }
+          >
+        | undefined;
+      let request:
+        | import("../../packages/harness-plugin/src/transport/connector-client.js").PublishedSync
+        | undefined;
+      let registered = false;
+      let callbacks = 0;
+      const receivedTypes: string[] = [];
+      const first = harnessClient(app, credentials, store, {
+        requireJobCoordination: true,
+        webSocketFactory: (url, options) => {
+          const socket = new WebSocket(url, {
+            ...options,
+            ca: LOCALHOST_TLS.cert,
+          });
+          const emit = socket.emit.bind(socket);
+          socket.emit = ((event: string | symbol, ...args: unknown[]) => {
+            if (event === "message") {
+              const message = ConnectorServerMessageSchema.parse(
+                JSON.parse(String(args[0])),
+              );
+              receivedTypes.push(
+                message.type === "protocol.error"
+                  ? message.payload.code
+                  : message.type,
+              );
+              if (message.type === "job.state") {
+                expect(registered).toBe(true);
+                originalState = message;
+                if (loss === "before receipt") {
+                  controller.abort();
+                  return true;
+                }
+              }
+            }
+            return emit(event, ...args);
+          }) as typeof socket.emit;
+          return socket;
+        },
+      });
+      first.onState(() => {
+        callbacks++;
+      });
+      const record = store.recordInbound.bind(store);
+      const hook = vi
+        .spyOn(store, "recordInbound")
+        .mockImplementation((...args) => {
+          const result = record(...args);
+          if (loss === "after receipt" && args[0] === originalState?.message_id)
+            controller.abort();
+          return result;
+        });
+      const running = first.start(controller.signal);
+      let resumedController: AbortController | undefined;
+      let resumedRun: Promise<void> | undefined;
+      try {
+        await vi.waitFor(() => expect(first.currentEpoch()).toBeDefined());
+        first.publishSync(
+          { job_id: job.jobId, attempt: 1, nonce: crypto.randomUUID() },
+          crypto.randomUUID(),
+          (persisted) => {
+            request = persisted;
+            expect(
+              store.outboundEvent(persisted.sequence)?.expectedReceiptProfile,
+            ).toBe("job-coordination-v1");
+            registered = true;
+          },
+        );
+        await vi.waitFor(() =>
+          expect(receivedTypes.join(",")).toContain("job.state"),
+        );
+        await running;
+        hook.mockRestore();
+        if (request === undefined || originalState === undefined)
+          throw new Error("fixture response missing");
+        expect(request.epoch.signal.aborted).toBe(true);
+        expect(callbacks).toBe(0);
+        expect(
+          store.outboundEvent(request.sequence)?.acknowledgedAt,
+        ).toBeNull();
+        expect(originalState.payload).toMatchObject({
+          mode: "read_only",
+          job_revision: 7,
+        });
+        // Change authoritative state after consumption. Replaying the request
+        // must restore the first observation, including its original validity.
+        await db.query(
+          "UPDATE jobs SET revision = 8, mode = 'normal' WHERE id = $1",
+          [job.jobId],
+        );
+        if (loss === "before receipt") {
+          await db.query(
+            "UPDATE connector_messages SET expires_at = clock_timestamp() - interval '1 second' WHERE connector_id = $1 AND direction = 'server' AND sequence >= $2",
+            [credentials.connector_id, originalState.sequence],
+          );
+        }
+        store.close();
+        store = new SqlitePluginStore(path);
+        const deliveries: Array<{ epoch: unknown; recovered: boolean }> = [];
+        const wire: string[] = [];
+        resumedController = new AbortController();
+        const resumed = harnessClient(app, credentials, store, {
+          requireJobCoordination: true,
+          webSocketFactory: (url, options) => {
+            const socket = new WebSocket(url, {
+              ...options,
+              ca: LOCALHOST_TLS.cert,
+            });
+            socket.on("message", (data) => {
+              const message = ConnectorServerMessageSchema.parse(
+                JSON.parse(String(data)),
+              );
+              if (message.sequence === originalState?.sequence)
+                wire.push(message.type);
+            });
+            return socket;
+          },
+        });
+        resumed.onState((message, delivery) => {
+          if (!delivery.recovered)
+            expect(
+              store.outboundEvent(message.payload.request_sequence)
+                ?.acknowledgedAt,
+            ).toBeNull();
+          deliveries.push(delivery);
+        });
+        resumedRun = resumed.start(resumedController.signal);
+        await vi.waitFor(
+          () =>
+            expect(
+              store.outboundEvent(request?.sequence ?? 0)?.acknowledgedAt,
+            ).not.toBeNull(),
+          { timeout: 5_000 },
+        );
+        expect(
+          store.coordinationReceipt(originalState.sequence)
+            ?.responsePayloadJson,
+        ).toBe(
+          JSON.stringify(
+            Object.fromEntries(
+              Object.entries(originalState.payload).sort(([a], [b]) =>
+                a.localeCompare(b),
+              ),
+            ),
+          ),
+        );
+        if (loss === "after receipt")
+          expect(deliveries).toEqual([{ epoch: null, recovered: true }]);
+        else {
+          expect(wire).toContain("protocol.error");
+          expect(wire).toContain("job.state");
+          expect(deliveries).toEqual([]);
+        }
+        const freshEpoch = resumed.currentEpoch();
+        expect(freshEpoch).toBeDefined();
+        expect(freshEpoch).not.toBe(request.epoch);
+        const prior = deliveries.length;
+        let freshMessage: typeof originalState;
+        resumed.onState((message) => {
+          freshMessage = message;
+        });
+        resumed.publishSync(
+          { job_id: job.jobId, attempt: 1, nonce: crypto.randomUUID() },
+          crypto.randomUUID(),
+          (fresh) => {
+            expect(fresh.messageId).not.toBe(request?.messageId);
+            expect(fresh.epoch).toBe(freshEpoch);
+          },
+        );
+        await vi.waitFor(() => expect(deliveries).toHaveLength(prior + 1));
+        expect(deliveries.at(-1)).toEqual({
+          epoch: freshEpoch,
+          recovered: false,
+        });
+        expect(freshMessage?.payload).toMatchObject({
+          mode: "normal",
+          job_revision: 8,
+        });
+      } finally {
+        controller.abort();
+        await running;
+        hook.mockRestore();
+        resumedController?.abort();
+        await resumedRun;
+        store.close();
+        await app.close();
+        await db.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+      }
+    },
+    15_000,
+  );
+
+  it("orders negotiated stale-business then immutable state and ordinary ACK over actual TLS and reconnect", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp(5_000);
+    const repositoryId = `coordination-${crypto.randomUUID()}`;
+    await db.query(
+      "INSERT INTO repository_policies (id, owner_id, display_name, canonical_path, allowed_action_classes) VALUES ($1, $2, 'Coordination', '/private/redacted', '[]')",
+      [repositoryId, OWNER_ID],
+    );
+    const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(67));
+    const job = await new JobRepository(db.client).createIdempotent({
+      ownerId: OWNER_ID,
+      repositoryId,
+      clientRequestId: crypto.randomUUID(),
+      requestCiphertext: cipher.encrypt("Coordination fixture"),
+      requestDigest: "fixture",
+    });
+    await db.query(
+      "UPDATE jobs SET connector_id = $1, status = 'running', attempt = 1, revision = 7, mode = 'read_only' WHERE id = $2",
+      [credentials.connector_id, job.jobId],
+    );
+    const sockets: WebSocket[] = [];
+    const openPeer = async () => {
+      const session = await FakeConnector.exchangeSession(app, credentials);
+      const address = app.server.address() as AddressInfo;
+      const socket = new WebSocket(
+        `wss://127.0.0.1:${address.port}/connector/v1`,
+        {
+          headers: { authorization: `Bearer ${session.token}` },
+          ca: LOCALHOST_TLS.cert,
+        },
+      );
+      sockets.push(socket);
+      const received: ReturnType<typeof ConnectorServerMessageSchema.parse>[] =
+        [];
+      socket.on("message", (data) =>
+        received.push(
+          ConnectorServerMessageSchema.parse(JSON.parse(String(data))),
+        ),
+      );
+      await new Promise<void>((resolve, reject) => {
+        socket.once("open", resolve);
+        socket.once("error", reject);
+      });
+      return {
+        socket,
+        received,
+        async count(n: number) {
+          await vi.waitFor(
+            () => expect(received.length).toBeGreaterThanOrEqual(n),
+            { timeout: 2000, interval: 10 },
+          );
+        },
+      };
+    };
+    try {
+      const peer = await openPeer();
+      const hello = buildConnectorHello({
+        connectorId: credentials.connector_id,
+        sequence: 1,
+        lastServerSequence: 0,
+        correlationId: crypto.randomUUID(),
+        now: new Date(),
+        capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+      });
+      peer.socket.send(JSON.stringify(hello));
+      await peer.count(1);
+      expect(peer.received[0]).toMatchObject({
+        type: "connector.welcome",
+        payload: {
+          capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+        },
+      });
+      const stale = ConnectorClientMessageSchema.parse({
+        ...hello,
+        message_id: crypto.randomUUID(),
+        correlation_id: crypto.randomUUID(),
+        sequence: 2,
+        type: "approval.requested",
+        payload: {
+          job_id: job.jobId,
+          attempt: 1,
+          job_revision: 1,
+          approval_id: crypto.randomUUID(),
+          action_summary: "Run checks",
+          impact_summary: "Checks only",
+          risk_class: "low",
+          action_fingerprint: `sha256:${"a".repeat(64)}`,
+          expires_at: new Date(Date.now() + 30_000).toISOString(),
+        },
+      });
+      peer.socket.send(JSON.stringify(stale));
+      await peer.count(3);
+      expect(peer.received[1]).toMatchObject({
+        type: "protocol.error",
+        payload: {
+          code: "EVENT_REJECTED",
+          message: "The job authority has changed.",
+        },
+      });
+      expect(peer.received[2]).toMatchObject({
+        type: "ack",
+        payload: { sequence: 2 },
+      });
+      const sync = ConnectorClientMessageSchema.parse({
+        ...hello,
+        message_id: crypto.randomUUID(),
+        correlation_id: crypto.randomUUID(),
+        sequence: 3,
+        type: "job.sync",
+        payload: { job_id: job.jobId, attempt: 1, nonce: crypto.randomUUID() },
+      });
+      peer.socket.send(JSON.stringify(sync));
+      await peer.count(5);
+      expect(peer.received.map((message) => message.sequence)).toEqual([
+        1, 2, 3, 4, 5,
+      ]);
+      expect(peer.received[3]).toMatchObject({
+        type: "job.state",
+        payload: {
+          mode: "read_only",
+          job_revision: 7,
+          request_message_id: sync.message_id,
+        },
+      });
+      expect(peer.received[4]).toMatchObject({
+        type: "ack",
+        payload: { sequence: 3 },
+      });
+      peer.socket.terminate();
+      await db.query(
+        "UPDATE jobs SET revision = 8, mode = 'normal', connector_id = NULL WHERE id = $1",
+        [job.jobId],
+      );
+      const reconnect = await openPeer();
+      reconnect.socket.send(
+        JSON.stringify(
+          buildConnectorHello({
+            connectorId: credentials.connector_id,
+            sequence: 4,
+            lastClientSequence: 3,
+            lastServerSequence: 5,
+            correlationId: crypto.randomUUID(),
+            now: new Date(),
+            capabilities: ["durable-receipts-v1"],
+          }),
+        ),
+      );
+      await reconnect.count(1);
+      expect(reconnect.received[0]).toMatchObject({
+        sequence: 6,
+        type: "connector.welcome",
+        payload: { capabilities: ["durable-receipts-v1"] },
+      });
+      reconnect.socket.send(JSON.stringify(sync));
+      await reconnect.count(3);
+      expect(reconnect.received.slice(1)).toEqual(peer.received.slice(3));
+    } finally {
+      for (const socket of sockets) socket.terminate();
+      await app.close();
+      await db.query("DELETE FROM jobs WHERE id = $1", [job.jobId]);
+    }
+  });
+
+  it("refuses legacy sync over actual TLS without an ordinary receipt or sequence consumption", async () => {
+    const credentials = await seedConnector(db);
+    const app = await startApp();
+    const peer = await FakeConnector.connect(app, credentials);
+    try {
+      await peer.send("job.sync", {
+        job_id: crypto.randomUUID(),
+        attempt: 1,
+        nonce: crypto.randomUUID(),
+      });
+      expect(await peer.next("protocol.error")).toMatchObject({
+        payload: { code: "AUTHORIZATION_FAILED" },
+      });
+      expect(
+        peer.wireReceived.some(
+          (message) => message.type === "job.state" || message.type === "ack",
+        ),
+      ).toBe(false);
+      const cursor = await db.query(
+        "SELECT last_client_sequence FROM connectors WHERE id = $1",
+        [credentials.connector_id],
+      );
+      expect(Number(cursor.rows[0]?.last_client_sequence)).toBe(1);
+    } finally {
+      await peer.disconnectWithoutAck();
+      await app.close();
+    }
+  });
+
   it("receipts unseen original claims after normal gateway redispatch to the same or another connector", async () => {
     const cipher = new Aes256GcmEncryptor(new Uint8Array(32).fill(67));
     const app = await startApp(5_000, cipher);

@@ -16,6 +16,7 @@ export default defineWorkspace([
         "tests/integration/cancellation-flow.test.ts",
         "tests/integration/result-flow.test.ts",
         "tests/integration/readiness.test.ts",
+        "tests/integration/harness-connector-e2e.test.ts",
       ],
     },
   },
@@ -29,13 +30,17 @@ export default defineWorkspace([
         "tests/contract/runtime-build.test.ts",
         "tests/contract/shutdown.test.ts",
         "tests/contract/connector-version-negotiation.test.ts",
+        "tests/contract/harness-plugin-shape.test.ts",
       ],
     },
   },
   {
     test: {
       name: "security",
-      include: ["tests/security/local-policy.test.ts"],
+      include: [
+        "tests/security/local-policy.test.ts",
+        "tests/security/connector-redaction.test.ts",
+      ],
     },
   },
 ]);

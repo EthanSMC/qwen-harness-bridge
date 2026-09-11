@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { RepositoryIdSchema } from "./job.js";
+import { JobStatusSchema, RepositoryIdSchema } from "./job.js";
 
 const UuidSchema = z
   .string()
@@ -206,6 +206,78 @@ const VersionSchema = boundedUtf8Text(32);
 const EventTypeSchema = boundedUtf8Text(64);
 const SourceSchema = boundedUtf8Text(32);
 const ReasonSchema = boundedUtf8Text(400);
+export const JOB_COORDINATION_CAPABILITY = "job-coordination-v1";
+
+const CoordinationAttemptSchema = PositiveIntegerSchema.max(2147483647);
+const CoordinationRevisionSchema = NonNegativeIntegerSchema.max(2147483647);
+
+export const JobSyncPayloadSchema = z
+  .object({
+    job_id: UuidSchema,
+    attempt: CoordinationAttemptSchema,
+    nonce: UuidSchema,
+  })
+  .strict();
+
+export const JobStatePayloadSchema = z
+  .object({
+    job_id: UuidSchema,
+    repository_id: RepositoryIdSchema,
+    mode: z.enum(["normal", "read_only"]),
+    requested_attempt: CoordinationAttemptSchema,
+    current_attempt: CoordinationRevisionSchema,
+    status: JobStatusSchema,
+    job_revision: CoordinationRevisionSchema,
+    cancel_revision: CoordinationRevisionSchema.nullable(),
+    lease_id: UuidSchema.nullable(),
+    lease_expires_at: Rfc3339TimestampSchema.nullable(),
+    expires_at: Rfc3339TimestampSchema,
+    observed_at: Rfc3339TimestampSchema,
+    state_valid_until: Rfc3339TimestampSchema,
+    request_message_id: UuidSchema,
+    request_sequence: PositiveIntegerSchema,
+    nonce: UuidSchema,
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (
+      value.cancel_revision !== null &&
+      value.cancel_revision > value.job_revision
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["cancel_revision"],
+        message: "cancel_revision must not exceed job_revision",
+      });
+    }
+    if ((value.lease_id === null) !== (value.lease_expires_at === null)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["lease_expires_at"],
+        message: "lease_id and lease_expires_at must be null together",
+      });
+    }
+    const observed = parseRfc3339Instant(value.observed_at);
+    const validUntil = parseRfc3339Instant(value.state_valid_until);
+    if (
+      observed !== null &&
+      validUntil !== null &&
+      (validUntil.wholeSeconds - observed.wholeSeconds !== 2 ||
+        validUntil.fraction.replace(/0+$/, "") !==
+          observed.fraction.replace(/0+$/, ""))
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["state_valid_until"],
+        message:
+          "state_valid_until must be exactly two seconds after observed_at",
+      });
+    }
+  });
+
+export type JobSyncPayload = z.infer<typeof JobSyncPayloadSchema>;
+export type JobStatePayload = z.infer<typeof JobStatePayloadSchema>;
+
 const ActionFingerprintSchema = z
   .string()
   .regex(/^sha256:[0-9a-f]{64}$/, "Invalid SHA-256 action fingerprint");
@@ -275,6 +347,21 @@ const SafeEventPayloadSchema = z
     }
 
     const activeObjects = new Set<object>();
+    const changedFilesDescriptor = Object.getOwnPropertyDescriptor(
+      payload,
+      "changed_files",
+    );
+    if (
+      changedFilesDescriptor &&
+      (!changedFilesDescriptor.enumerable ||
+        !("value" in changedFilesDescriptor))
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["changed_files"],
+        message: "Root changed_files must be an enumerable data property",
+      });
+    }
     let estimatedBytes = 0;
     let payloadTooLarge = false;
 
@@ -323,6 +410,12 @@ const SafeEventPayloadSchema = z
         ) {
           addIssue(path, "Event payload contains a restricted field");
         }
+      }
+
+      const rootChangedFiles = path.length === 1 && path[0] === "changed_files";
+      if (rootChangedFiles && !Array.isArray(value)) {
+        addIssue(path, "Root changed_files must be a string array");
+        return;
       }
 
       if (typeof value === "string") {
@@ -378,10 +471,19 @@ const SafeEventPayloadSchema = z
 
       if (Array.isArray(value)) {
         addStructuralBytes(1);
-        if (value.length > MAX_EVENT_PAYLOAD_ITEMS) {
+        if (
+          rootChangedFiles &&
+          (Object.getPrototypeOf(value) !== Array.prototype ||
+            Object.getOwnPropertySymbols(value).length > 0 ||
+            Object.getOwnPropertyNames(value).length !== value.length + 1)
+        ) {
+          addIssue(path, "Root changed_files must be a plain dense array");
+        }
+        const itemLimit = rootChangedFiles ? 50 : MAX_EVENT_PAYLOAD_ITEMS;
+        if (value.length > itemLimit) {
           addIssue(path, "Event payload array is too large");
         }
-        const itemCount = Math.min(value.length, MAX_EVENT_PAYLOAD_ITEMS);
+        const itemCount = Math.min(value.length, itemLimit);
         for (let index = 0; index < itemCount; index += 1) {
           if (index > 0) {
             addStructuralBytes(1);
@@ -393,6 +495,15 @@ const SafeEventPayloadSchema = z
           if (descriptor === undefined || !("value" in descriptor)) {
             addIssue([...path, index], "Event payload arrays must be dense");
             continue;
+          }
+          if (
+            rootChangedFiles &&
+            (!descriptor.enumerable || typeof descriptor.value !== "string")
+          ) {
+            addIssue(
+              [...path, index],
+              "Root changed_files entries must be strings",
+            );
           }
           visit(descriptor.value, [...path, index], depth + 1);
         }
@@ -622,6 +733,8 @@ const ConnectorHeartbeatMessageSchema = envelope(
   ConnectorHeartbeatPayloadSchema,
 );
 const JobClaimMessageSchema = envelope("job.claim", JobClaimPayloadSchema);
+const JobSyncMessageSchema = envelope("job.sync", JobSyncPayloadSchema);
+const JobStateMessageSchema = envelope("job.state", JobStatePayloadSchema);
 const JobEventMessageSchema = envelope("job.event", JobEventPayloadSchema);
 const ApprovalRequestedMessageSchema = envelope(
   "approval.requested",
@@ -655,6 +768,7 @@ export const ConnectorClientMessageSchema = enforceEnvelopeConstraints(
     ConnectorHelloMessageSchema,
     ConnectorHeartbeatMessageSchema,
     JobClaimMessageSchema,
+    JobSyncMessageSchema,
     JobEventMessageSchema,
     ApprovalRequestedMessageSchema,
     JobCancelledMessageSchema,
@@ -665,6 +779,7 @@ export const ConnectorClientMessageSchema = enforceEnvelopeConstraints(
 export const ConnectorServerMessageSchema = enforceEnvelopeConstraints(
   z.discriminatedUnion("type", [
     ConnectorWelcomeMessageSchema,
+    JobStateMessageSchema,
     JobOfferMessageSchema,
     JobCancelMessageSchema,
     ApprovalDecisionMessageSchema,
@@ -678,10 +793,12 @@ export const EnvelopeSchema = enforceEnvelopeConstraints(
     ConnectorHelloMessageSchema,
     ConnectorHeartbeatMessageSchema,
     JobClaimMessageSchema,
+    JobSyncMessageSchema,
     JobEventMessageSchema,
     ApprovalRequestedMessageSchema,
     JobCancelledMessageSchema,
     ConnectorWelcomeMessageSchema,
+    JobStateMessageSchema,
     JobOfferMessageSchema,
     JobCancelMessageSchema,
     ApprovalDecisionMessageSchema,
