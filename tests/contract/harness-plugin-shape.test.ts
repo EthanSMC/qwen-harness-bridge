@@ -8,6 +8,7 @@ import {
   apply,
   inject,
   name,
+  sessionEndpoint,
 } from "../../packages/harness-plugin/src/index.js";
 
 // The transport requires a canonical POSIX repository root for outbound
@@ -28,6 +29,55 @@ describe("harness plugin shape", () => {
       "tools",
     ]);
   });
+
+  it("derives the HTTPS session endpoint from the WebSocket address", () => {
+    expect(sessionEndpoint("wss://example.test/connector/v1")).toBe(
+      "https://example.test/connector/v1",
+    );
+    expect(sessionEndpoint("wss://example.test:8443/connector/v1")).toBe(
+      "https://example.test:8443/connector/v1",
+    );
+  });
+
+  it.skipIf(!POSIX_REDACTION_SUPPORTED)(
+    "fails closed when more than one repository root is configured",
+    () => {
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "qhb-shape-multi-")),
+      );
+      const first = join(root, "first");
+      const second = join(root, "second");
+      mkdirSync(first);
+      mkdirSync(second);
+      try {
+        expect(() =>
+          apply({} as unknown as Context, {
+            connectorId: randomUUID(),
+            controlPlaneUrl: "wss://127.0.0.1:1/connector/v1",
+            keychainService: "qhb-shape",
+            keychainAccount: "qhb-shape-account",
+            databasePath: join(root, "store.sqlite"),
+            repositories: [
+              {
+                id: "first",
+                displayName: "First",
+                canonicalPath: first,
+                approvalTimeoutSeconds: 120,
+              },
+              {
+                id: "second",
+                displayName: "Second",
+                canonicalPath: second,
+                approvalTimeoutSeconds: 120,
+              },
+            ],
+          }),
+        ).toThrow("MULTI_REPOSITORY_UNSUPPORTED");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("fails closed before any effect on invalid configuration", () => {
     const ctx = {} as unknown as Context;

@@ -5,10 +5,10 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import { RemoteApprovalBroker } from "./approvals/approval-broker.js";
 import { registerAnswerer } from "./approvals/register-answerer.js";
 import { parsePluginConfig } from "./config.js";
+import { MacOSKeychainCredentialReader } from "./keychain.js";
 import { classifyAction } from "./policy/action-classifier.js";
 import { createPolicyAgentSetup } from "./policy/register-guard.js";
 import { createTrustedExecutionAdapter } from "./policy/trusted-execution-adapter.js";
-import { MacOSKeychainCredentialReader } from "./keychain.js";
 import { TrustedActionRegistry } from "./runtime/action-registry.js";
 import { ApprovalReservationProvider } from "./runtime/approval-reservation.js";
 import { CancelHandler } from "./runtime/cancel-handler.js";
@@ -61,7 +61,7 @@ export * from "./store/plugin-store.js";
 /** Derive the HTTPS bootstrap-token endpoint from the configured WebSocket
  * address. The Control Plane serves the exchange at `/connector/v1/session`
  * and `HttpsSessionTokenClient` appends the trailing `/session`. */
-function sessionEndpoint(controlPlaneUrl: `wss://${string}`): string {
+export function sessionEndpoint(controlPlaneUrl: `wss://${string}`): string {
   const url = new URL(controlPlaneUrl);
   url.protocol = "https:";
   url.search = "";
