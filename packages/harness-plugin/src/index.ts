@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { Context } from "@deepseek-ai/cordis";
+import type { Agent } from "@deepseek-ai/dsh-agent";
 import { RemoteApprovalBroker } from "./approvals/approval-broker.js";
 import { registerAnswerer } from "./approvals/register-answerer.js";
 import { parsePluginConfig } from "./config.js";
+import { classifyAction } from "./policy/action-classifier.js";
+import { createPolicyAgentSetup } from "./policy/register-guard.js";
+import { createTrustedExecutionAdapter } from "./policy/trusted-execution-adapter.js";
 import { MacOSKeychainCredentialReader } from "./keychain.js";
 import { TrustedActionRegistry } from "./runtime/action-registry.js";
 import { ApprovalReservationProvider } from "./runtime/approval-reservation.js";
@@ -25,6 +29,7 @@ export const inject = [
   "sessions",
   "sessionPersistence",
   "approval",
+  "tools",
 ] as const;
 
 export * from "./config.js";
@@ -99,6 +104,12 @@ export function apply(ctx: Context, config?: unknown): void {
   const states = new JobStateClient({ connector });
   const liveStates = new LiveStateRegistry({ connector });
   const actions = new TrustedActionRegistry();
+  const policyOptions = {
+    repositories: parsed.repositories.map((candidate) => ({
+      id: candidate.id,
+      canonicalPath: candidate.canonicalPath,
+    })),
+  };
   const authority = new TerminalAuthorityIssuer({ connector, states, store });
   const reservation = new ApprovalReservationProvider({
     registry: liveStates,
@@ -133,6 +144,48 @@ export function apply(ctx: Context, config?: unknown): void {
       );
     },
     flush: (session) => ctx.sessions.flush(session),
+    setupFactory: (sessionId, context) => {
+      const adapter = createTrustedExecutionAdapter({
+        repositoryId: context.repositoryId,
+        repositoryRoot: context.repositoryPath,
+      });
+      const scoped = {
+        repositories: [
+          { id: context.repositoryId, canonicalPath: context.repositoryPath },
+        ],
+      };
+      return createPolicyAgentSetup({
+        agentId: sessionId,
+        ...scoped,
+        resolveAction: (execution) => {
+          const resolved = adapter(execution);
+          if (resolved === undefined) return undefined;
+          const full = execution as unknown as {
+            agent?: Agent;
+            callId?: unknown;
+          };
+          if (full.agent !== undefined && full.callId !== undefined) {
+            try {
+              const decision = classifyAction(resolved.action, scoped, {
+                provenance: resolved.provenance,
+              });
+              actions.register(full.agent, String(full.callId), {
+                jobId: context.jobId,
+                attempt: context.attempt,
+                toolName: resolved.action.toolName,
+                fingerprint: decision.fingerprint,
+                classification: decision.classification,
+                actionSummary: decision.actionSummary,
+                impactSummary: decision.impactSummary,
+              });
+            } catch {
+              // Registration is best effort; the guard still evaluates the call.
+            }
+          }
+          return resolved;
+        },
+      });
+    },
   });
   const approvals = new RemoteApprovalBroker({
     reserve: (input) => {

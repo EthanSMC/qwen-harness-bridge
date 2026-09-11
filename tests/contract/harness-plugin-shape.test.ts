@@ -25,6 +25,7 @@ describe("harness plugin shape", () => {
       "sessions",
       "sessionPersistence",
       "approval",
+      "tools",
     ]);
   });
 
