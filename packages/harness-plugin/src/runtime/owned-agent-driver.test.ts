@@ -8,7 +8,10 @@ import { ConnectorServerMessageSchema } from "@qhb/protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SqlitePluginStore } from "../store/plugin-store.js";
 import type { JobOfferMessage } from "./job-command-coordinator.js";
-import { OwnedAgentDriver } from "./owned-agent-driver.js";
+import {
+  OwnedAgentDriver,
+  type OwnedAgentDriverOptions,
+} from "./owned-agent-driver.js";
 
 const roots: string[] = [];
 const stores: SqlitePluginStore[] = [];
@@ -140,6 +143,10 @@ const build = (
     agents: { create },
     store,
     states: { observe },
+    authority: {
+      issue: vi.fn(),
+    } as unknown as OwnedAgentDriverOptions["authority"],
+    terminal: {} as unknown as OwnedAgentDriverOptions["terminal"],
     epoch: () => epoch,
     repositories: {
       resolve: (id) => (id === "example" ? "/repo/example" : undefined),
