@@ -1,5 +1,10 @@
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 
+/** better-sqlite3 waited this long for a busy database before reporting a lock
+ * conflict; node:sqlite defaults the busy timeout to zero, which would turn
+ * transient contention into an immediate failure. */
+export const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
+
 /** Result of a write statement, matching the shape the store already consumes. */
 export interface SqliteRunResult {
   readonly changes: number;
@@ -94,6 +99,8 @@ class NodeSqliteDatabase implements SqliteDatabase {
 
   constructor(path: string) {
     this.#database = new DatabaseSync(path);
+    // Per-connection, like the previous engine's default.
+    this.#database.exec(`PRAGMA busy_timeout = ${DEFAULT_BUSY_TIMEOUT_MS}`);
   }
 
   get inTransaction(): boolean {

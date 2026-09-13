@@ -37,6 +37,20 @@ it("reads and writes pragmas", () => {
   }
 });
 
+it("waits for a busy database instead of failing immediately", () => {
+  const database = openDatabase(":memory:");
+  try {
+    // better-sqlite3 waited five seconds before reporting a lock conflict, and
+    // the standalone store relies on that under transient contention;
+    // node:sqlite defaults the busy timeout to zero.
+    expect(Number(database.pragma("busy_timeout", { simple: true }))).toBe(
+      5000,
+    );
+  } finally {
+    database.close();
+  }
+});
+
 it("commits, rolls back and exposes transaction state", () => {
   const database = openDatabase(":memory:");
   try {
