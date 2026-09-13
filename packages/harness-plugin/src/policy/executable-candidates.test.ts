@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { executableCandidates, executableName } from "./action-classifier.js";
 import type { CanonicalAction } from "./types.js";
@@ -7,12 +8,21 @@ const named = (executable: string): CanonicalAction =>
 
 describe("executableName", () => {
   it.each([
-    ["C:\\\\Program Files\\\\Git\\\\cmd\\\\git.exe", "git"],
-    ["C:\\\\bin\\\\pnpm.cmd", "pnpm"],
-    ["/usr/local/bin/git", "git"],
-    ["/usr/local/bin/tsc.js", "tsc"],
+    [join("bin", "git.exe"), "git"],
+    [join("bin", "pnpm.cmd"), "pnpm"],
+    [join("bin", "git"), "git"],
+    [join("bin", "tsc.js"), "tsc"],
   ])("normalizes %s to %s", (executable, expected) => {
     expect(executableName(named(executable))).toBe(expected);
+  });
+
+  it("normalizes a Windows path on Windows", () => {
+    // `path.basename` is platform-specific, so an absolute Windows path only
+    // reads as a basename on Windows; the cases above cover the strip itself.
+    if (process.platform !== "win32") return;
+    expect(executableName(named("C:\\Program Files\\Git\\cmd\\git.exe"))).toBe(
+      "git",
+    );
   });
 });
 
