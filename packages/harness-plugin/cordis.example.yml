@@ -1,0 +1,27 @@
+# Sample Cordis wiring for the Qwen Harness Bridge Connector.
+# Copy this block into your Harness root cordis.yml and replace every placeholder.
+# The bootstrap credential is NEVER stored here: it lives in the macOS Keychain
+# under keychainService/keychainAccount and is exchanged for a short-lived token.
+plugin: "@qhb/harness-plugin"
+config:
+  # Stable connector identity issued by the Control Plane.
+  connectorId: 00000000-0000-4000-8000-000000000000
+  # wss:// endpoint. The HTTPS session-token exchange is derived from it by
+  # replacing the scheme and appending /session to the path.
+  controlPlaneUrl: wss://control-plane.example.com/connector/v1
+  # Keychain coordinates read with /usr/bin/security find-generic-password.
+  keychainService: qhb-connector
+  keychainAccount: qhb-connector-bootstrap
+  # Absolute path of the local journal database. The parent directory must
+  # already exist, the path must not traverse a symlink, and "~" is NOT
+  # expanded -- write the full path.
+  databasePath: /Users/<account>/Library/Application Support/qhb/connector.sqlite
+  # This release supports exactly one repository root; more than one fails
+  # closed before any effect runs.
+  repositories:
+    - id: example
+      displayName: Example repository
+      # Absolute canonical repository root. A symlinked path is rejected.
+      canonicalPath: /path/to/repository
+      # Bounded approval window in seconds (60-1800).
+      approvalTimeoutSeconds: 300

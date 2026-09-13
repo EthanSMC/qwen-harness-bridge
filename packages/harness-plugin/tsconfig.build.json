@@ -4,7 +4,8 @@
     "noEmit": false,
     "declaration": true,
     "declarationMap": false,
-    "sourceMap": false,
+    "sourceMap": true,
+    "inlineSources": true,
     "rootDir": "src",
     "outDir": "dist",
     "paths": {

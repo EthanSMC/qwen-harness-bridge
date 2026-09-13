@@ -13,6 +13,9 @@
   },
   "scripts": {
     "build": "pnpm --filter @qhb/protocol build && rm -rf dist && tsc -p tsconfig.build.json && cp src/store/schema.sql dist/store/schema.sql",
+    "pack": "node scripts/package.mjs",
+    "pack:test": "vitest run src/packaging-smoke.test.ts",
+    "rehearse:install": "node scripts/rehearse-install.mjs",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
@@ -32,6 +35,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
-    "@types/ws": "^8.18.1"
+    "@types/ws": "^8.18.1",
+    "yaml": "^2.6.1"
   }
 }
