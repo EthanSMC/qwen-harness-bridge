@@ -58,10 +58,14 @@ const profile = flag("profile", "qhb-live-rehearsal");
 const dshHome = resolve(flag("dsh-home", join(homedir(), ".dsh")));
 const budgetMs = Number(flag("budget-ms", "360000"));
 const outFile = flag("out", undefined);
-const task = flag(
-  "task",
-  "Read the file job-marker.txt in this repository and reply with its single line of text.",
+/** The Control Plane job drives the Harness agent; a boot-time task would make
+ * the local agent answer it directly instead, so the default is no task. */
+const task = flag("task", "");
+const submitRequest = flag(
+  "request",
+  "Read README.md in this repository and reply with its first line.",
 );
+const onlineWaitMs = Number(flag("online-wait-ms", "120000"));
 
 const steps = [];
 const record = (name, status, detail) => {
@@ -120,6 +124,7 @@ const work = mkdtempSync(join(repositoryRoot, ".live-rehearsal-"));
 const profileDir = join(dshHome, "profiles", profile);
 let client;
 let boot;
+let bootOutput = "";
 try {
   if (existsSync(profileDir))
     rmSync(profileDir, { recursive: true, force: true });
@@ -175,25 +180,51 @@ try {
   );
   record("configure", "PASS", { sourceKind: "file" });
 
-  boot = spawn(
-    dshBin,
-    ["--expose-internals", dshCli, "--profile", profile, task],
-    { env: dshEnv, cwd: repositoryRoot, stdio: ["ignore", "pipe", "pipe"] },
-  );
-  let bootOutput = "";
+  const bootArgs = ["--expose-internals", dshCli, "--profile", profile];
+  if (task.length > 0) bootArgs.push(task);
+  boot = spawn(dshBin, bootArgs, {
+    env: dshEnv,
+    cwd: repositoryRoot,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
   boot.stdout.on("data", (chunk) => {
     bootOutput += String(chunk);
   });
   boot.stderr.on("data", (chunk) => {
     bootOutput += String(chunk);
   });
-  record("boot", "PASS", { task: "configured-request" });
+  record("boot", "PASS", { bootTask: task.length === 0 ? "none" : "cli-task" });
 
   client = await connect();
+  // The Control Plane only dispatches to an online connector; wait for the
+  // public gauge instead of guessing from job state.
+  const onlineDeadline = Date.now() + onlineWaitMs;
+  let connectorOnline = false;
+  while (Date.now() < onlineDeadline) {
+    try {
+      const response = await fetch(
+        `https://${acceptance.HOST}:${acceptance.PORT}/metrics`,
+      );
+      const text = response.ok ? await response.text() : "";
+      connectorOnline = /^qhb_connector_online 1$/mu.test(text);
+    } catch {
+      connectorOnline = false;
+    }
+    if (connectorOnline) break;
+    await sleep(3_000);
+  }
+  record("connector-online", connectorOnline ? "PASS" : "PARTIAL", {
+    waitedMs: onlineWaitMs,
+  });
+  if (!connectorOnline) {
+    throw new Error(
+      "connector did not report online before the job was submitted",
+    );
+  }
   const submitted = await call(client, "submit_task", {
     client_request_id: randomUUID(),
     repository_id: acceptance.QHB_REPOSITORY_ID,
-    request: task,
+    request: submitRequest,
   });
   const jobId = submitted.job_id;
   record("submit", "PASS", { jobIdPresent: typeof jobId === "string" });
@@ -234,19 +265,6 @@ try {
     const result = await call(client, "get_task_result", { job_id: jobId });
     record("result", "PASS", { bytes: JSON.stringify(result).length });
   }
-  const mask = (value) =>
-    value
-      .replace(/[A-Za-z]:\\[^\s"']+/gu, "<path>")
-      .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/gu, "<host>")
-      .replace(/[A-Za-z0-9_+/=-]{32,}/gu, "<token>");
-  const bootLines = bootOutput
-    .split(/\r?\n/u)
-    .filter((line) => line.trim().length > 0);
-  report.bootDiagnostics = {
-    sawMissingCredential: bootOutput.includes("MISSING_CREDENTIAL"),
-    sawConnectorFailure: /CONNECTOR_[A-Z_]+/u.test(bootOutput),
-    tail: bootLines.slice(-12).map((line) => mask(line).slice(0, 200)),
-  };
 } catch (error) {
   record("rehearsal", "FAIL", { message: error?.message ?? String(error) });
   report.status = "FAIL";
@@ -261,6 +279,21 @@ try {
   }
   rmSync(work, { recursive: true, force: true });
   rmSync(profileDir, { recursive: true, force: true });
+  const mask = (value) =>
+    value
+      .replace(/[A-Za-z]:\\[^\s"']+/gu, "<path>")
+      .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/gu, "<host>")
+      .replace(/[A-Za-z0-9_+/=-]{32,}/gu, "<token>");
+  // Recorded on every run so a failed boot still explains itself.
+  report.bootDiagnostics = {
+    sawMissingCredential: bootOutput.includes("MISSING_CREDENTIAL"),
+    sawConnectorFailure: /CONNECTOR_[A-Z_]+/u.test(bootOutput),
+    tail: bootOutput
+      .split(/\r?\n/u)
+      .filter((line) => line.trim().length > 0)
+      .slice(-12)
+      .map((line) => mask(line).slice(0, 200)),
+  };
   report.environment.finishedAt = new Date().toISOString();
   const text = `${JSON.stringify(report, null, 2)}\n`;
   process.stdout.write(text);
