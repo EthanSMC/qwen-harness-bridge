@@ -36,13 +36,13 @@
   },
   "dependencies": {
     "@qhb/protocol": "workspace:*",
-    "better-sqlite3": "^12.10.0",
     "ws": "^8.21.3",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/ws": "^8.18.1",
+    "better-sqlite3": "^12.10.0",
     "yaml": "^2.6.1"
   }
 }

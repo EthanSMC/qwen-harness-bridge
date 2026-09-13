@@ -4,7 +4,6 @@ import {
   ConnectorClientMessageSchema,
   ConnectorServerMessageSchema,
 } from "@qhb/protocol";
-import Database from "better-sqlite3";
 import { z } from "zod";
 import {
   assertTerminalAuthority,
@@ -47,6 +46,7 @@ import {
   terminalKey,
   validateTerminalProposal,
 } from "./owned-terminal.js";
+import { openDatabase, type SqliteDatabase } from "./sqlite-driver.js";
 
 export type { OwnedIntent, OwnedIntentOwner } from "./owned-intent.js";
 export { OwnedIntentError } from "./owned-intent.js";
@@ -309,7 +309,7 @@ type SchemaObjectRow = {
   sql: string | null;
 };
 
-const schemaObjects = (database: Database.Database): SchemaObjectRow[] => {
+const schemaObjects = (database: SqliteDatabase): SchemaObjectRow[] => {
   const rows = database
     .prepare(
       `SELECT type, name, tbl_name, sql
@@ -325,7 +325,7 @@ const schemaObjects = (database: Database.Database): SchemaObjectRow[] => {
 };
 
 const expectedSchemaObjects = (): SchemaObjectRow[] => {
-  const database = new Database(":memory:");
+  const database = openDatabase(":memory:");
   try {
     database.exec(SCHEMA_SQL);
     return schemaObjects(database);
@@ -336,19 +336,19 @@ const expectedSchemaObjects = (): SchemaObjectRow[] => {
 
 const EXPECTED_SCHEMA_OBJECTS = expectedSchemaObjects();
 
-const schemaMatches = (database: Database.Database): boolean =>
+const schemaMatches = (database: SqliteDatabase): boolean =>
   JSON.stringify(schemaObjects(database)) ===
   JSON.stringify(EXPECTED_SCHEMA_OBJECTS);
 
 export class SqlitePluginStore implements TerminalPluginStore {
   #terminalBusy = false;
-  #database: Database.Database | null = null;
+  #database: SqliteDatabase | null = null;
   #closed = false;
 
   constructor(databasePath: string) {
     assertNonEmpty(databasePath, "STORE_DATABASE_PATH_REQUIRED");
     try {
-      this.#database = new Database(databasePath);
+      this.#database = openDatabase(databasePath);
       this.#database.pragma("journal_mode = WAL");
       this.#database.pragma("synchronous = FULL");
       this.#database.pragma("foreign_keys = ON");
@@ -1863,7 +1863,7 @@ export class SqlitePluginStore implements TerminalPluginStore {
       throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
   }
 
-  private get database(): Database.Database {
+  private get database(): SqliteDatabase {
     if (this.#database === null) {
       throw new StoreError("STORE_CLOSED");
     }
