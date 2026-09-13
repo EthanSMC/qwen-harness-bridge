@@ -33,13 +33,13 @@ The archive is **self-contained**:
 | `package/package.json` | Installable manifest. `workspace:` specifiers are removed and the vendored runtime packages are listed in `qhbVendoredDependencies`; `qhbVendoredLicenses` lists every vendored license file and `qhbSchemaSha256` pins the shipped SQLite schema. |
 | `package/cordis.example.yml` | Credential-free sample wiring. |
 | `package/dist/**` | Compiled plugin with self-contained source maps. |
-| `package/node_modules/**` | Every pure-JavaScript runtime dependency, including the private workspace package `@qhb/protocol`, `zod` and `ws`. Native modules are never vendored. |
+| `package/node_modules/**` | Every runtime dependency, including the private workspace package `@qhb/protocol`, `zod`, `ws`, `better-sqlite3` and its transitive closure. |
 | `package/node_modules/<package>/LICENSE*` | The license text each vendored package publishes (`LICENSE`, `LICENSE.md`, `COPYING` or `NOTICE`, including variants such as `LICENSE.MIT`), retained even when the package's own `files` field omits it. |
 | `package/LICENSE` | Present only when the repository ships a root license; this repository ships none. |
 
 Host-provided peers are deliberately **not** vendored. Every `@deepseek-ai/*` package listed in `peerDependencies` comes from the Harness host. Packaging fails when a supplied credential value or a credential-looking assignment would enter the archive, and the credential guard also covers camelCase keys such as `bootstrapToken` and unquoted values.
 
-The archive carries no compiled binary, so a single build runs on any host platform the Harness supports.
+Because `better-sqlite3` ships a native binding, build the artifact on a machine whose platform and architecture match the target host.
 
 The packaged smoke test proves the archive installs and runs:
 
@@ -118,9 +118,16 @@ ELECTRON_RUN_AS_NODE=1 DSH_HOME=/absolute/isolated/home \
 
 ### Host runtime and native modules
 
-The connector has **no native runtime dependency**: the durable journal uses the Node built-in `node:sqlite`, so the artifact ships only pure-JavaScript runtime code (`@qhb/protocol`, `zod`, `ws`) and nothing in it is bound to a host ABI. A profile install therefore needs no compiler, no prebuilt binary and no `allowBuilds` entry.
+The archive vendors only pure-JavaScript runtime code (`@qhb/protocol`, `zod`, `ws`). Native runtime modules stay out of the artifact and are installed by the profile so the host can build them for the ABI it actually runs: a binary built on the packaging host cannot load under a different runtime, and the packaged manifest lists those packages in `qhbHostInstalledDependencies` while keeping them in `dependencies`.
 
-For a future native module, the packaging keeps the rule that no host-bound binary is ever vendored: the packaged manifest lists such packages in `qhbHostInstalledDependencies` while keeping them in `dependencies`, and the operator allows their build in the profile's `pnpm-workspace.yaml` (`allowBuilds: { <package>: true }`). Installing a native module needs either a prebuilt binary for the host runtime's ABI or a working toolchain (`node-gyp` plus a C++ compiler); a runtime ABI with neither cannot complete the install. This is why the connector moved to `node:sqlite`: while validating this runbook, `better-sqlite3` 12.11.1 published prebuilds only up to electron ABI 135 and node ABI 127/137, and this host's runtime ABI had no prebuild and no toolchain.
+pnpm ignores dependency build scripts by default. Allow the native build in the profile's `pnpm-workspace.yaml` before installing:
+
+```yaml
+allowBuilds:
+  better-sqlite3: true
+```
+
+Then `dsh plugin --profile <name> add <tarball>` installs and builds the module. This step needs either a prebuilt binary for the host runtime's ABI or a working native toolchain (`node-gyp` and a C++ compiler). Observed while validating this runbook: `better-sqlite3` 12.11.1 publishes prebuilds up to electron ABI 135 and node ABI 127/137, so a host whose runtime ABI has no prebuild and no toolchain cannot complete the install; the connector then cannot open its journal and the plugin fails closed. A host in that situation must supply an ABI-matching build, install the native toolchain, or the packaging strategy must drop the native dependency (see ADR 0008's follow-up decision).
 
 ## 4. Wire the plugin
 

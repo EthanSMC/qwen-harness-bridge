@@ -3,10 +3,8 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
-  readdirSync,
   readFileSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -40,31 +38,16 @@ const buildProject = (directory: string) => {
   });
 };
 
-const newestSourceMtime = (directory: string): number => {
-  let newest = 0;
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    const full = join(directory, entry.name);
-    if (entry.isDirectory()) {
-      newest = Math.max(newest, newestSourceMtime(full));
-    } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
-      newest = Math.max(newest, statSync(full).mtimeMs);
-    }
-  }
-  return newest;
-};
-
-/** Compile what is missing or stale. Deleting a workspace `dist` here would
- * race sibling suites that resolve the same package during a full run. */
+/** Compile only what is missing. Deleting a workspace `dist` here would race
+ * sibling suites that resolve the same package during a full workspace run. */
 const ensureDist = () => {
   const protocolRoot = resolve(packageRoot, "../protocol");
   if (!existsSync(join(protocolRoot, "dist/index.js"))) {
     buildProject(protocolRoot);
   }
-  const built = join(packageRoot, "dist/index.js");
   if (
-    !existsSync(built) ||
-    !existsSync(join(packageRoot, "dist/index.js.map")) ||
-    newestSourceMtime(join(packageRoot, "src")) > statSync(built).mtimeMs
+    !existsSync(join(packageRoot, "dist/index.js")) ||
+    !existsSync(join(packageRoot, "dist/index.js.map"))
   ) {
     buildProject(packageRoot);
   }
@@ -178,10 +161,10 @@ it("packages a self-contained artifact that installs outside the repository", as
     for (const name of ["@qhb/protocol", "zod", "ws"]) {
       expect(artifact.vendoredDependencies).toContain(name);
     }
-    // The connector has no native runtime dependency: the durable store uses
-    // the built-in node:sqlite, so nothing has to be built for the host ABI.
+    // Native runtime modules stay host-installed: a binary built here cannot
+    // load under the operator's runtime ABI.
     expect(artifact.vendoredDependencies).not.toContain("better-sqlite3");
-    expect(artifact.hostInstalledDependencies).toEqual([]);
+    expect(artifact.hostInstalledDependencies).toContain("better-sqlite3");
     expect(artifact.entries).not.toContain(
       "package/node_modules/better-sqlite3/package.json",
     );

@@ -19,14 +19,11 @@ const packageRoot = resolve(here, "..");
 export const HOST_PEER_PREFIX = "@deepseek-ai/";
 /**
  * Runtime packages whose compiled binary is bound to the running host ABI. The
- * artifact never vendors them: a binary built here cannot load under the
- * operator's runtime, so the profile's package manager builds them for the host.
- *
- * The durable store now uses the built-in `node:sqlite`, so the connector has
- * no native runtime dependency; the list stays empty and the mechanism remains
- * for any future native module.
+ * artifact must not vendor them (a binary built here cannot load under the
+ * operator's runtime), so the profile's package manager installs and builds
+ * them for the host that actually runs the connector.
  */
-export const HOST_INSTALLED_NATIVE = Object.freeze([]);
+export const HOST_INSTALLED_NATIVE = Object.freeze(["better-sqlite3"]);
 /** Where vendored runtime packages live inside the artifact. */
 export const VENDOR_PREFIX = "package/node_modules/";
 /** Vendored build-time sources that a runtime never loads. */
