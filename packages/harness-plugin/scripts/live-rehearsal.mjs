@@ -28,9 +28,11 @@ import { buildArtifact } from "./package.mjs";
  * The operator supplies the DSH launcher explicitly:
  *   --dsh-bin <harness executable>   (or DSH_BIN)
  *   --dsh-cli <app.asar/lib/desktop-cli.js>   (or DSH_CLI)
- * `--dsh-home` defaults to the current user's DSH home so the boot can reuse
- * the operator's own agent credentials; the rehearsal profile is removed
- * afterwards.
+ * `--dsh-home` defaults to the current user's DSH home so a one-shot task boot
+ * can reuse the operator's own agent credentials; the rehearsal profile is
+ * removed afterwards. `--serve` requires an explicit `--dsh-home` instead: a
+ * resident host shares the home's sessions, storages and credentials with any
+ * runtime already using it, so it is never booted against the default home.
  *
  * --serve creates the profile from the shipped web template and boots it
  * resident (dsh --profile <name> --port 0 --no-open) so the connector stays
@@ -77,7 +79,9 @@ const acceptance = JSON.parse(readFileSync(envPath, "utf8"));
 const dshBin = required(flag("dsh-bin", process.env.DSH_BIN), "DSH_BIN");
 const dshCli = required(flag("dsh-cli", process.env.DSH_CLI), "DSH_CLI");
 const profile = flag("profile", "qhb-live-rehearsal");
-const dshHome = resolve(flag("dsh-home", join(homedir(), ".dsh")));
+const dshHomeFlag = flag("dsh-home", undefined);
+const explicitHome = typeof dshHomeFlag === "string" && dshHomeFlag.length > 0;
+const dshHome = resolve(explicitHome ? dshHomeFlag : join(homedir(), ".dsh"));
 const budgetMs = Number(flag("budget-ms", "360000"));
 const outFile = flag("out", undefined);
 /** The Control Plane job drives the Harness agent; a boot-time task would make
@@ -113,6 +117,7 @@ const report = {
     startedAt: new Date().toISOString(),
     credentialSourceKind: "file",
     stateDirectoryKind: persistentState ? "persistent" : "ephemeral",
+    dshHomeSource: explicitHome ? "explicit" : "default",
   },
   steps,
   status: "PASS",
@@ -184,6 +189,13 @@ let client;
 let boot;
 let bootOutput = "";
 try {
+  if (serve && !explicitHome) {
+    // A resident host shares the home's sessions, storages and credentials with
+    // any runtime already using it, so --serve must never inherit the default.
+    throw new Error(
+      "--serve requires an explicit --dsh-home: a resident host must not boot against the operator's live DSH home",
+    );
+  }
   if (existsSync(profileDir))
     rmSync(profileDir, { recursive: true, force: true });
   execFileSync(
