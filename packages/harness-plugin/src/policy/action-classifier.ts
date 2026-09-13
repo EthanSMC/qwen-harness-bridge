@@ -55,6 +55,29 @@ export type TrustedActionContext = Readonly<{
   provenance: "local_tool" | "cloud_command";
 }>;
 
+/** Standard Windows executable extensions when `PATHEXT` is unset. */
+const WINDOWS_EXECUTABLE_EXTENSIONS = ".COM;.EXE;.BAT;.CMD";
+
+/** Candidate paths for one PATH entry. Windows addresses an executable through
+ * its extension, so the bare name alone can never resolve there; every
+ * `PATHEXT` variant is tried after it. Exported for its platform behaviour. */
+export const executableCandidates = (
+  directory: string,
+  executable: string,
+  platform: NodeJS.Platform = process.platform,
+  pathExt: string | undefined = process.env.PATHEXT,
+): readonly string[] => {
+  if (platform !== "win32") return [join(directory, executable)];
+  const extensions = (pathExt ?? WINDOWS_EXECUTABLE_EXTENSIONS)
+    .split(";")
+    .map((extension) => extension.trim())
+    .filter((extension) => extension.length > 0);
+  return [
+    join(directory, executable),
+    ...extensions.map((extension) => join(directory, `${executable}${extension}`)),
+  ];
+};
+
 const resolveExecutableFromPath: TrustedExecutableResolver = (
   executable,
   cwd,
@@ -63,12 +86,13 @@ const resolveExecutableFromPath: TrustedExecutableResolver = (
     const directory = isAbsolute(searchDirectory)
       ? searchDirectory
       : resolve(cwd, searchDirectory);
-    const candidate = join(directory, executable);
-    try {
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch {
-      // PATH selects a candidate, but only registration can authorize it.
+    for (const candidate of executableCandidates(directory, executable)) {
+      try {
+        accessSync(candidate, constants.X_OK);
+        return candidate;
+      } catch {
+        // PATH selects a candidate, but only registration can authorize it.
+      }
     }
   }
   return undefined;
@@ -456,7 +480,10 @@ export function fingerprintAction(
     .digest("hex");
 }
 
-const executableName = (action: CanonicalAction): string => {
+/** Windows addresses its wrappers by extension, so the command identity is
+ * the basename without it: `git.exe`, `pnpm.cmd`. Exported for that rule. */
+const WINDOWS_EXECUTABLE_SUFFIX = /\.(?:exe|cmd|bat|com)$/u;
+export const executableName = (action: CanonicalAction): string => {
   const resolvedName = basename(action.executable ?? "").toLowerCase();
   if (resolvedName === "pnpm.cjs" || resolvedName === "pnpm.mjs") {
     return "pnpm";
@@ -465,7 +492,7 @@ const executableName = (action: CanonicalAction): string => {
   if (resolvedName === "npx-cli.js") return "npx";
   if (resolvedName === "vitest.mjs") return "vitest";
   if (resolvedName === "tsc.js") return "tsc";
-  return resolvedName;
+  return resolvedName.replace(WINDOWS_EXECUTABLE_SUFFIX, "");
 };
 
 const denialForCommand = (action: CanonicalAction): string | undefined => {

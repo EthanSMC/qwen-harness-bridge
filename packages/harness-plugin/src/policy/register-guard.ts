@@ -15,6 +15,10 @@ type PolicyExecution = Pick<Readonly<ToolExecution>, "arguments" | "name">;
 export type TrustedPolicyAction = Readonly<{
   action: CanonicalAction;
   provenance: TrustedActionContext["provenance"];
+  /** The host tool the action was resolved from. A canonical action is named
+   * after its semantics (`git_push`, `write_file`), so the guard's identity
+   * check reads this instead of the canonical name. */
+  sourceTool?: string;
 }>;
 export type PolicyGuardRegistrationOptions = ActionPolicyOptions &
   Readonly<{
@@ -73,7 +77,7 @@ const classify = (
     const resolved = options.resolveAction(execution);
     if (
       !resolved ||
-      resolved.action?.toolName !== execution.name ||
+      (resolved.sourceTool ?? resolved.action?.toolName) !== execution.name ||
       !["local_tool", "cloud_command"].includes(resolved.provenance)
     )
       return undefined;
