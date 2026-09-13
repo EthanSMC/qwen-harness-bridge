@@ -234,9 +234,18 @@ try {
     const result = await call(client, "get_task_result", { job_id: jobId });
     record("result", "PASS", { bytes: JSON.stringify(result).length });
   }
+  const mask = (value) =>
+    value
+      .replace(/[A-Za-z]:\\[^\s"']+/gu, "<path>")
+      .replace(/\b\d{1,3}(?:\.\d{1,3}){3}\b/gu, "<host>")
+      .replace(/[A-Za-z0-9_+/=-]{32,}/gu, "<token>");
+  const bootLines = bootOutput
+    .split(/\r?\n/u)
+    .filter((line) => line.trim().length > 0);
   report.bootDiagnostics = {
     sawMissingCredential: bootOutput.includes("MISSING_CREDENTIAL"),
-    sawConnectorFailure: /CONNECTOR_[A-Z_]+/.test(bootOutput),
+    sawConnectorFailure: /CONNECTOR_[A-Z_]+/u.test(bootOutput),
+    tail: bootLines.slice(-12).map((line) => mask(line).slice(0, 200)),
   };
 } catch (error) {
   record("rehearsal", "FAIL", { message: error?.message ?? String(error) });
