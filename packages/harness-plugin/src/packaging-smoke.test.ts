@@ -162,6 +162,23 @@ it("packages a self-contained artifact that installs outside the repository", as
       expect(artifact.vendoredDependencies).toContain(name);
     }
 
+    // Vendored third-party license text must travel with the artifact.
+    expect(artifact.vendoredLicenses).toEqual(
+      [...artifact.vendoredLicenses].sort(),
+    );
+    for (const expected of [
+      "better-sqlite3/LICENSE",
+      "ws/LICENSE",
+      "zod/LICENSE",
+    ]) {
+      expect(artifact.vendoredLicenses, expected).toContain(expected);
+    }
+    for (const license of artifact.vendoredLicenses) {
+      expect(artifact.entries, license).toContain(
+        `package/node_modules/${license}`,
+      );
+    }
+
     const packageManifest = JSON.parse(
       entries
         .find((item) => item.name === "package/package.json")

@@ -35,6 +35,8 @@ export interface BuiltArtifact {
   readonly version: string;
   readonly entries: readonly string[];
   readonly vendoredDependencies: readonly string[];
+  /** `<package>/<file>` for every vendored license text in the archive. */
+  readonly vendoredLicenses: readonly string[];
   readonly manifest: Record<string, unknown>;
   readonly sha256: string;
 }

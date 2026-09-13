@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createTar } from "./tar.mjs";
 
@@ -25,6 +25,8 @@ const SKIP_DIRECTORIES = new Set(["node_modules", ".git", ".github"]);
 /** Vendored test material is never loaded at runtime and may hold fixtures. */
 const VENDOR_EXCLUDE_PATH =
   /(?:^|\/)(?:__tests__|tests?)\/|\.(?:test|spec)\.[^/]+$/iu;
+/** License text that npm publishes regardless of a package's `files` field. */
+const LICENSE_FILE = /^(?:LICEN[CS]E|COPYING|NOTICE)(?:\.[^/]*)?$/iu;
 const TEXT_ENTRY =
   /\.(?:cjs|mjs|mts|js|json|map|ts|yml|yaml|sql|md|txt|toml|ini)$/iu;
 
@@ -87,6 +89,7 @@ const isIncluded = (relativePath, includes) =>
   relativePath.endsWith(".node") ||
   relativePath === "build" ||
   relativePath.startsWith("build/") ||
+  LICENSE_FILE.test(basename(relativePath)) ||
   includes.some((pattern) => pattern.test(relativePath));
 
 const collectFiles = (directory, prefix, options = {}) => {
@@ -225,6 +228,23 @@ export function buildArtifact(options) {
   }
   const closure = runtimeClosure(manifest, packageRoot);
   const vendored = [...closure.keys()].sort();
+  const vendoredEntries = vendored.flatMap((name) => {
+    const info = closure.get(name);
+    const declared = Array.isArray(info.manifest.files)
+      ? info.manifest.files.filter((value) => typeof value === "string")
+      : undefined;
+    return collectFiles(info.directory, `${VENDOR_PREFIX}${name}`, {
+      skip: VENDOR_SKIP,
+      root: info.directory,
+      ...(declared === undefined
+        ? {}
+        : { includes: declared.map(globToRegExp) }),
+    });
+  });
+  const vendoredLicenses = vendoredEntries
+    .filter((entry) => LICENSE_FILE.test(basename(entry.name)))
+    .map((entry) => entry.name.slice(VENDOR_PREFIX.length))
+    .sort();
   const schema = readFileSync(join(dist, "store/schema.sql"));
   const {
     devDependencies: _devDependencies,
@@ -239,6 +259,7 @@ export function buildArtifact(options) {
       ),
     ),
     qhbVendoredDependencies: vendored,
+    qhbVendoredLicenses: vendoredLicenses,
     qhbSchemaSha256: createHash("sha256").update(schema).digest("hex"),
   };
   const license = existsSync(join(packageRoot, "../../LICENSE"))
@@ -257,19 +278,7 @@ export function buildArtifact(options) {
       data: readFileSync(join(packageRoot, "cordis.example.yml")),
     },
     ...collectFiles(dist, "package/dist"),
-    ...vendored.flatMap((name) => {
-      const info = closure.get(name);
-      const declared = Array.isArray(info.manifest.files)
-        ? info.manifest.files.filter((value) => typeof value === "string")
-        : undefined;
-      return collectFiles(info.directory, `${VENDOR_PREFIX}${name}`, {
-        skip: VENDOR_SKIP,
-        root: info.directory,
-        ...(declared === undefined
-          ? {}
-          : { includes: declared.map(globToRegExp) }),
-      });
-    }),
+    ...vendoredEntries,
     ...(license === undefined
       ? []
       : [{ name: "package/LICENSE", data: readFileSync(license) }]),
@@ -282,6 +291,7 @@ export function buildArtifact(options) {
     version: manifest.version,
     entries: entries.map((entry) => entry.name),
     vendoredDependencies: vendored,
+    vendoredLicenses,
     manifest: packagedManifest,
     sha256: createHash("sha256").update(readFileSync(outFile)).digest("hex"),
   };
@@ -296,7 +306,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     credentials: [process.env.QHB_BOOTSTRAP_CREDENTIAL ?? ""],
   });
   process.stdout.write(
-    `packaged ${result.entries.length} entries at version ${result.version} with ${result.vendoredDependencies.length} vendored runtime packages`,
+    `packaged ${result.entries.length} entries at version ${result.version} with ${result.vendoredDependencies.length} vendored runtime packages and ${result.vendoredLicenses.length} vendored license files`,
   );
   process.stdout.write(`\nsha256 ${result.sha256}\n`);
 }
