@@ -23,6 +23,7 @@
     "pack": "node scripts/package.mjs",
     "pack:test": "vitest run src/packaging-smoke.test.ts",
     "rehearse:install": "node scripts/rehearse-install.mjs",
+    "rehearse:live": "node scripts/live-rehearsal.mjs",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
