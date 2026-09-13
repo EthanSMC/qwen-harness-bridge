@@ -239,7 +239,10 @@ it("replays an unacknowledged claim after a socket kill", async () => {
       timeoutMs: 15_000,
     });
     expect(frameIdentity(replayed)).toEqual(frameIdentity(firstClaim));
-    expect(wired.creates()).toBe(0);
+    // The replay proves the transport re-sends the same durable frame. It does
+    // not require admission to stay blocked: a coordination response may now
+    // resolve its waiter before the pump records it.
+    expect(wired.creates()).toBeLessThanOrEqual(1);
     expect(
       new Set(
         plane.inbound
@@ -271,7 +274,7 @@ it("replays an unacknowledged claim after a socket kill", async () => {
  * Marked `fails` so the suite stays green while the fix is designed; the
  * assertion is the behaviour a real Control Plane must eventually observe.
  */
-it.fails("admits a socket-delivered offer without blocking the receive pump", async () => {
+it("admits a socket-delivered offer without blocking the receive pump", async () => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-admit-")));
   const store = new SqlitePluginStore(join(directory, "store.sqlite"));
   const plane = await startLoopbackControlPlane();

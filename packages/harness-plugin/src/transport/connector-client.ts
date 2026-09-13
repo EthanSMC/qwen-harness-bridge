@@ -390,6 +390,8 @@ export class DurableConnectorClient implements TerminalConnectorClient {
   #heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   #sendPump: Promise<void> = Promise.resolve();
   #receivePump: Promise<void> = Promise.resolve();
+  /** State frames already dispatched before their durable, ordered recording. */
+  #earlyState = new Set<string>();
   #welcomeWaiter: Promise<void> | undefined;
   #resolveWelcome: (() => void) | undefined;
   #helloMessage: PendingMessage | undefined;
@@ -865,6 +867,11 @@ export class DurableConnectorClient implements TerminalConnectorClient {
       });
       socket.on("message", (data) => {
         const serialized = typeof data === "string" ? data : data.toString();
+        // A coordination response resolves its waiter before the serialized
+        // pump records it: a command handler that awaits one (job admission)
+        // would otherwise wait for the pump that is waiting for the handler.
+        // The frame is still recorded in order by the pump.
+        this.#deliverStateEarly(context, serialized);
         this.#receivePump = this.#receivePump
           .then(() => this.#handleIncoming(context, serialized, signal))
           .catch(() => {
@@ -972,6 +979,45 @@ export class DurableConnectorClient implements TerminalConnectorClient {
         ],
       }),
     );
+  }
+
+  /** Deliver a `job.state` response to its coordination waiter ahead of the
+   * pump's ordered recording. Only the already-durable receipt gate and the
+   * live epoch are checked; the pump still performs every durable check and
+   * records the frame, skipping only the duplicate dispatch. */
+  #deliverStateEarly(context: SocketEpoch, serialized: string): void {
+    if (!this.#active(context) || !context.eligible) return;
+    if (!isCoordinatingStore(this.#options.store)) return;
+    let message: Extract<ConnectorServerMessage, { type: "job.state" }>;
+    try {
+      const parsed: ConnectorServerMessage = ConnectorServerMessageSchema.parse(
+        JSON.parse(serialized),
+      );
+      if (parsed.type !== "job.state") return;
+      if (Date.parse(parsed.expires_at) <= this.#now().getTime()) return;
+      message = parsed;
+    } catch {
+      return;
+    }
+    if (this.#options.store.inboundMessage(message.message_id) !== undefined)
+      return;
+    // The durable receipt for this frame is written when the pump records it,
+    // so validate the response against the stored request instead. The waiter
+    // still performs its own request/nonce/epoch correlation.
+    try {
+      if (this.#coordinationEvidence(message) === undefined) return;
+    } catch {
+      return;
+    }
+    this.#earlyState.add(message.message_id);
+    const delivery = Object.freeze({
+      epoch: context.epoch,
+      recovered: false,
+    });
+    for (const handler of [...this.#stateHandlers]) {
+      if (!this.#active(context)) return;
+      this.#invokeCoordination(() => handler(message, delivery));
+    }
   }
 
   async #handleIncoming(
@@ -1311,6 +1357,9 @@ export class DurableConnectorClient implements TerminalConnectorClient {
         );
         if (receipt?.responseType !== "job.state")
           throw new Error("CONNECTOR_STORED_INBOUND_INVALID");
+        // An early delivery already resolved the waiter; the durable pass still
+        // records the frame in order but must not dispatch it twice.
+        if (this.#earlyState.delete(message.message_id)) return;
         const delivery = Object.freeze({
           epoch: recovered ? null : context.epoch,
           recovered,
