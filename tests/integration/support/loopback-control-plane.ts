@@ -50,6 +50,8 @@ export interface LoopbackControlPlane {
   readonly state: LoopbackJobState;
   connections(): number;
   ackedSequences(): number[];
+  /** When enabled every durable client frame is acknowledged in arrival order. */
+  setAcknowledge(value: boolean): void;
   sendOffer(overrides?: Partial<LoopbackJobState>): void;
   sendCancel(): void;
   sendApprovalDecision(overrides?: Record<string, unknown>): void;
@@ -91,6 +93,7 @@ export const startLoopbackControlPlane = async (
   const outbound: RecordedFrame[] = [];
   const tokenRequests: LoopbackControlPlane["tokenRequests"] = [];
   const acked = new Set<number>();
+  let acknowledge = false;
   let sequence = 0;
   let connectionCount = 0;
   const state: LoopbackJobState = {
@@ -159,6 +162,19 @@ export const startLoopbackControlPlane = async (
     const raw = JSON.stringify(envelope);
     for (const socket of sockets.clients) socket.send(raw);
     record(outbound, raw, envelope);
+    serverLog.push({ envelope, raw });
+    return { envelope, raw };
+  };
+
+  /** The server keeps its own durable log; a reconnect replays those exact
+   * frames in sequence order instead of minting new ones, which the client
+   * would reject as a stored-inbound conflict or a sequence gap. */
+  const serverLog: { envelope: ConnectorServerMessage; raw: string }[] = [];
+  const replayServerLog = () => {
+    for (const entry of serverLog) {
+      for (const socket of sockets.clients) socket.send(entry.raw);
+      record(outbound, entry.raw, entry.envelope);
+    }
   };
 
   const sendState = (request: RecordedFrame["message"]) => {
@@ -201,21 +217,27 @@ export const startLoopbackControlPlane = async (
       const frame: RecordedFrame = { type: message.type, raw, message };
       inbound.push(frame);
       if (message.type === "connector.hello") {
-        const payload = message.payload as { connector_id: string };
-        send(
-          "connector.welcome",
-          {
-            connector_id: payload.connector_id,
-            capabilities: ["durable-receipts-v1", "job-coordination-v1"],
-            server_sequence: sequence + 1,
-            replay_from: 1,
-          },
-          message.correlation_id,
-        );
+        if (serverLog.length === 0) {
+          const payload = message.payload as { connector_id: string };
+          send(
+            "connector.welcome",
+            {
+              connector_id: payload.connector_id,
+              capabilities: ["durable-receipts-v1", "job-coordination-v1"],
+              server_sequence: sequence + 1,
+              replay_from: 1,
+            },
+            message.correlation_id,
+          );
+        } else {
+          replayServerLog();
+        }
       }
       if (message.type === "job.sync") sendState(message);
       if (message.type === "ack") {
         acked.add((message.payload as { sequence: number }).sequence);
+      } else if (acknowledge && message.type !== "connector.hello") {
+        send("ack", { sequence: message.sequence }, message.correlation_id);
       }
     });
   });
@@ -233,6 +255,9 @@ export const startLoopbackControlPlane = async (
     state,
     connections: () => connectionCount,
     ackedSequences: () => [...acked].sort((left, right) => left - right),
+    setAcknowledge: (value: boolean) => {
+      acknowledge = value;
+    },
     sendOffer: (overrides = {}) => {
       send("job.offer", {
         job_id: overrides.jobId ?? state.jobId,
@@ -260,8 +285,14 @@ export const startLoopbackControlPlane = async (
         decision: "approve",
         ...overrides,
       }),
+    /** Acknowledge every durable client frame received so far, on the wire. */
     ackInbound: () => {
-      for (const frame of inbound) acked.add(frame.message.sequence);
+      for (const frame of inbound) {
+        if (frame.type === "connector.hello" || frame.type === "ack") continue;
+        if (acked.has(frame.message.sequence)) continue;
+        acked.add(frame.message.sequence);
+        send("ack", { sequence: frame.message.sequence });
+      }
     },
     killSockets: () => {
       for (const socket of sockets.clients) socket.terminate();
