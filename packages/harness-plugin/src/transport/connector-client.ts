@@ -1220,6 +1220,10 @@ export class DurableConnectorClient implements TerminalConnectorClient {
           this.#serverCursor.accept(message.sequence);
           this.#pruneArrived();
         }
+        // The awaited response is in the journal now, so the request can no
+        // longer be blocking a command handler.
+        if (evidence !== undefined)
+          this.#commandRequests.delete(evidence.coordinationRequestSequence);
       } catch {
         this.#rejectIncoming(context, "STORE_INBOUND_WRITE_FAILED");
         return;
@@ -1511,9 +1515,6 @@ export class DurableConnectorClient implements TerminalConnectorClient {
     const prefix = this.#options.store.provenClientSequence();
     for (const candidate of this.#outboundBySequence.keys()) {
       if (candidate <= prefix) this.#outboundBySequence.delete(candidate);
-    }
-    for (const candidate of this.#commandRequests) {
-      if (candidate <= prefix) this.#commandRequests.delete(candidate);
     }
     for (const candidate of this.#unconfirmed.keys()) {
       if (candidate <= prefix) {
