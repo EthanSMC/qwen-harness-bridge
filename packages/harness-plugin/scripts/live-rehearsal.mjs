@@ -15,6 +15,11 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { buildArtifact } from "./package.mjs";
+import {
+  harnessModelLines,
+  modelRoutePatchLines,
+  parseModelRoute,
+} from "./rehearsal-options.mjs";
 
 /**
  * Live rehearsal of the packaged connector against a real Control Plane.
@@ -108,35 +113,12 @@ const onlineWaitMs = Number(flag("online-wait-ms", "120000"));
  * configuration only: the credential value must already exist in the isolated
  * home's credential store under this variable name, and is never written by
  * this script. */
-const modelProvider = flag("model-provider", "");
-const modelId = flag("model", "");
-const modelApiKeyEnv = flag("model-api-key-env", "");
-const modelBaseUrl = flag("model-base-url", "");
-const modelRequested = [
-  modelProvider,
-  modelId,
-  modelApiKeyEnv,
-  modelBaseUrl,
-].some((value) => value.length > 0);
-if (modelRequested) {
-  if (
-    modelProvider.length === 0 ||
-    modelId.length === 0 ||
-    modelApiKeyEnv.length === 0
-  ) {
-    throw new Error(
-      "--model-provider, --model and --model-api-key-env must be given together",
-    );
-  }
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(modelProvider))
-    throw new Error("--model-provider must be a plain provider id");
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(modelId))
-    throw new Error("--model must be a plain model id");
-  if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u.test(modelApiKeyEnv))
-    throw new Error("--model-api-key-env must be an environment variable name");
-  if (modelBaseUrl.length > 0 && !/^https?:\/\//u.test(modelBaseUrl))
-    throw new Error("--model-base-url must be an http(s) URL");
-}
+const modelRoute = parseModelRoute({
+  provider: flag("model-provider", ""),
+  model: flag("model", ""),
+  apiKeyEnv: flag("model-api-key-env", ""),
+  baseUrl: flag("model-base-url", ""),
+});
 /** The Control Plane marks a connector stale after 20s, so this bounds the wait
  * for the previous generation's gauge sample to clear. */
 const warmupWaitMs = Number(flag("warmup-wait-ms", "120000"));
@@ -279,28 +261,7 @@ try {
   writeFileSync(credentialFile, acceptance.QHB_CONNECTOR_BOOTSTRAP_CREDENTIAL, {
     mode: 0o600,
   });
-  const patchLines = [];
-  if (modelRequested) {
-    // The provider and the default model both have to be declared for the
-    // owned attempt to reach an endpoint at all.
-    patchLines.push(
-      "- id: llm-pi-ai",
-      "  config:",
-      "    providers:",
-      `      ${modelProvider}:`,
-      `        apiKeyEnv: ${modelApiKeyEnv}`,
-      "        displayName: Live rehearsal route",
-      "        api: openai-completions",
-      ...(modelBaseUrl.length > 0 ? [`        baseURL: ${modelBaseUrl}`] : []),
-      "        models:",
-      `          - id: ${modelId}`,
-      `            name: ${modelId}`,
-      "- id: agent-default-model",
-      "  config:",
-      `    provider: ${modelProvider}`,
-      `    model: ${modelId}`,
-    );
-  }
+  const patchLines = modelRoutePatchLines(modelRoute);
   patchLines.push(
     "- id: qwen-harness-bridge",
     "  config:",
@@ -308,13 +269,7 @@ try {
     `    controlPlaneUrl: wss://${acceptance.HOST}:${acceptance.PORT}/connector/v1`,
     "    keychainService: qhb-connector-live",
     `    keychainAccount: ${acceptance.QHB_CONNECTOR_CREDENTIAL_ID}`,
-    ...(modelRequested
-      ? [
-          "    harnessModel:",
-          `      provider: ${modelProvider}`,
-          `      model: ${modelId}`,
-        ]
-      : []),
+    ...harnessModelLines(modelRoute),
     `    databasePath: ${join(journalDirectory, "connector.sqlite")}`,
     "    credentialSource:",
     "      kind: file",
@@ -340,7 +295,7 @@ try {
   record("configure", "PASS", {
     sourceKind: "file",
     profileTemplate: template,
-    modelRoute: modelRequested ? "operator-supplied" : "none",
+    modelRoute: modelRoute.requested ? "operator-supplied" : "none",
     tools: toolsEnabled ? "enabled" : "profile-default",
   });
 
