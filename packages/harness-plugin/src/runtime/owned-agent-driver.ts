@@ -95,6 +95,9 @@ export type OwnedAgentDriverOptions = Readonly<{
   ) => () => void;
   /** Terminal/cancel/teardown hook: revoke the per-Agent trusted projection. */
   onAttemptEnded?: (agent: Agent) => void;
+  /** How long the factory may take to commit the initial input before the
+   * attempt fails closed. Defaults to {@link INITIAL_INPUT_PROOF_TIMEOUT_MS}. */
+  initialInputProofTimeoutMs?: number;
   now?: () => number;
   randomUUID?: () => string;
   signal?: AbortSignal;
@@ -137,6 +140,38 @@ export function initialEventSequence(
     return undefined;
   }
   return undefined;
+}
+
+/** How long the factory may take to commit the initial input before the driver
+ * fails closed. The Harness appends the user message asynchronously, so a
+ * single read immediately after \`followup\` races the turn and reports an input
+ * that is merely not visible yet as unproven. */
+export const INITIAL_INPUT_PROOF_TIMEOUT_MS = 5_000;
+const INITIAL_INPUT_PROOF_INTERVAL_MS = 10;
+
+/** Wait for the agent's own durable history to hold the exact preallocated
+ * initial user message. Resolves to its sequence, or \`undefined\` once the
+ * deadline passes. */
+export async function awaitInitialEventSequence(
+  session: Session,
+  messageId: string,
+  options: Readonly<{
+    timeoutMs?: number;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+  }> = {},
+): Promise<number | undefined> {
+  const now = options.now ?? Date.now;
+  const sleep =
+    options.sleep ??
+    ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = now() + (options.timeoutMs ?? INITIAL_INPUT_PROOF_TIMEOUT_MS);
+  for (;;) {
+    const sequence = initialEventSequence(session, messageId);
+    if (sequence !== undefined) return sequence;
+    if (now() >= deadline) return undefined;
+    await sleep(INITIAL_INPUT_PROOF_INTERVAL_MS);
+  }
 }
 
 /** ADR 0006/0007 native driver for one owned attempt. It owns exactly one
@@ -401,12 +436,21 @@ export class OwnedAgentDriver implements OwnedJobStarter {
         const flushed = await this.#options.flush(handle.agent.session);
         if (flushed !== true)
           throw new OwnedDriverError("HARNESS_PERSISTENCE_UNAVAILABLE");
-        const eventSequence = initialEventSequence(
+        const eventSequence = await awaitInitialEventSequence(
           handle.agent.session,
           initialMessageId,
+          {
+            timeoutMs:
+              this.#options.initialInputProofTimeoutMs ??
+              INITIAL_INPUT_PROOF_TIMEOUT_MS,
+          },
         );
         if (eventSequence === undefined)
           throw new OwnedDriverError("HARNESS_INITIAL_INPUT_UNPROVEN");
+        // The proof is only useful once the input is durable, so checkpoint the
+        // history that now contains it before recording the attempt as started.
+        if ((await this.#options.flush(handle.agent.session)) !== true)
+          throw new OwnedDriverError("HARNESS_PERSISTENCE_UNAVAILABLE");
         const started = this.#options.store.advanceOwnedIntent(
           intent.owner,
           intent.version,
