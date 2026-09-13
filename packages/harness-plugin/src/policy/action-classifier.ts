@@ -472,14 +472,15 @@ export function canonicalActionJson(
   return stableJson(canonicalFingerprintRecord(action, context));
 }
 
-/** SHA-256 of the canonical, machine-readable action record. */
+/** SHA-256 of the canonical, machine-readable action record, in the
+ * `sha256:<hex>` form the approval protocol requires for a fingerprint. */
 export function fingerprintAction(
   action: CanonicalAction,
   context: TrustedActionContext = localToolContext,
 ): string {
-  return createHash("sha256")
+  return `sha256:${createHash("sha256")
     .update(canonicalActionJson(action, context))
-    .digest("hex");
+    .digest("hex")}`;
 }
 
 /** Windows addresses its wrappers by extension, so the command identity is
