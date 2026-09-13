@@ -165,7 +165,8 @@ export async function awaitInitialEventSequence(
   const sleep =
     options.sleep ??
     ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const deadline = now() + (options.timeoutMs ?? INITIAL_INPUT_PROOF_TIMEOUT_MS);
+  const deadline =
+    now() + (options.timeoutMs ?? INITIAL_INPUT_PROOF_TIMEOUT_MS);
   for (;;) {
     const sequence = initialEventSequence(session, messageId);
     if (sequence !== undefined) return sequence;
