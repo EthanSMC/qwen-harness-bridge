@@ -271,8 +271,10 @@ it("replays an unacknowledged claim after a socket kill", async () => {
  * `harness-connector-e2e.test.ts` never sees this because it invokes
  * `coordinator.handle` directly instead of through the transport.
  *
- * Marked `fails` so the suite stays green while the fix is designed; the
- * assertion is the behaviour a real Control Plane must eventually observe.
+ * The transport takes a coordination `job.state` response off the socket and
+ * runs its durable pass ahead of the pump whenever the request it answers was
+ * published by the command handler the pump is awaiting. The offer handler can
+ * therefore complete admission, and the frame is still recorded in order.
  */
 it("admits a socket-delivered offer without blocking the receive pump", async () => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-admit-")));
