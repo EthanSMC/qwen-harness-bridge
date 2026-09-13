@@ -50,6 +50,18 @@ import { buildArtifact } from "./package.mjs";
  * The directory is never deleted and no absolute path is written into the
  * report.
  *
+ * --tools enables the shipped pwsh and filesystem tool plugins on the
+ * rehearsal profile. Without them the owned attempt carries no tools, so the
+ * job can only complete without an approval; with them a tool request from the
+ * model reaches the real approval path.
+ *
+ * --model-provider, --model and --model-api-key-env (with the optional
+ * --model-base-url) declare an operator-supplied model route in the rehearsal
+ * profile, so the owned attempt can reach an endpoint and the job can leave
+ * "queued". The runner writes endpoint configuration only: the credential value
+ * must already exist in the isolated home's credential store under that
+ * variable name, and the script never reads or writes a credential value.
+ *
  * Before booting, the runner waits for the Control Plane's public
  * qhb_connector_online gauge to read 0, because that gauge counts every
  * connector: only against a cleared baseline does a later 1 prove that this
@@ -92,11 +104,47 @@ const submitRequest = flag(
   "Read README.md in this repository and reply with its first line.",
 );
 const onlineWaitMs = Number(flag("online-wait-ms", "120000"));
+/** Optional operator-supplied model route. The runner writes endpoint
+ * configuration only: the credential value must already exist in the isolated
+ * home's credential store under this variable name, and is never written by
+ * this script. */
+const modelProvider = flag("model-provider", "");
+const modelId = flag("model", "");
+const modelApiKeyEnv = flag("model-api-key-env", "");
+const modelBaseUrl = flag("model-base-url", "");
+const modelRequested = [
+  modelProvider,
+  modelId,
+  modelApiKeyEnv,
+  modelBaseUrl,
+].some((value) => value.length > 0);
+if (modelRequested) {
+  if (
+    modelProvider.length === 0 ||
+    modelId.length === 0 ||
+    modelApiKeyEnv.length === 0
+  ) {
+    throw new Error(
+      "--model-provider, --model and --model-api-key-env must be given together",
+    );
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(modelProvider))
+    throw new Error("--model-provider must be a plain provider id");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(modelId))
+    throw new Error("--model must be a plain model id");
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/u.test(modelApiKeyEnv))
+    throw new Error("--model-api-key-env must be an environment variable name");
+  if (modelBaseUrl.length > 0 && !/^https?:\/\//u.test(modelBaseUrl))
+    throw new Error("--model-base-url must be an http(s) URL");
+}
 /** The Control Plane marks a connector stale after 20s, so this bounds the wait
  * for the previous generation's gauge sample to clear. */
 const warmupWaitMs = Number(flag("warmup-wait-ms", "120000"));
 /** A resident web host is the only boot mode that keeps the connector up. */
 const serve = process.argv.includes("--serve");
+/** The shipped web template leaves the tool plugins off, and an owned attempt
+ * without tools can never reach the approval path. --tools turns them on. */
+const toolsEnabled = process.argv.includes("--tools");
 const stateDirFlag = flag("state-dir", process.env.QHB_REHEARSAL_STATE_DIR);
 /** Resolved once so the report and the profile config agree. */
 const stateDirectory =
@@ -231,30 +279,69 @@ try {
   writeFileSync(credentialFile, acceptance.QHB_CONNECTOR_BOOTSTRAP_CREDENTIAL, {
     mode: 0o600,
   });
+  const patchLines = [];
+  if (modelRequested) {
+    // The provider and the default model both have to be declared for the
+    // owned attempt to reach an endpoint at all.
+    patchLines.push(
+      "- id: llm-pi-ai",
+      "  config:",
+      "    providers:",
+      `      ${modelProvider}:`,
+      `        apiKeyEnv: ${modelApiKeyEnv}`,
+      "        displayName: Live rehearsal route",
+      "        api: openai-completions",
+      ...(modelBaseUrl.length > 0 ? [`        baseURL: ${modelBaseUrl}`] : []),
+      "        models:",
+      `          - id: ${modelId}`,
+      `            name: ${modelId}`,
+      "- id: agent-default-model",
+      "  config:",
+      `    provider: ${modelProvider}`,
+      `    model: ${modelId}`,
+    );
+  }
+  patchLines.push(
+    "- id: qwen-harness-bridge",
+    "  config:",
+    `    connectorId: ${acceptance.QHB_CONNECTOR_ID}`,
+    `    controlPlaneUrl: wss://${acceptance.HOST}:${acceptance.PORT}/connector/v1`,
+    "    keychainService: qhb-connector-live",
+    `    keychainAccount: ${acceptance.QHB_CONNECTOR_CREDENTIAL_ID}`,
+    ...(modelRequested
+      ? [
+          "    harnessModel:",
+          `      provider: ${modelProvider}`,
+          `      model: ${modelId}`,
+        ]
+      : []),
+    `    databasePath: ${join(journalDirectory, "connector.sqlite")}`,
+    "    credentialSource:",
+    "      kind: file",
+    `      path: ${credentialFile}`,
+    "    repositories:",
+    `      - id: ${acceptance.QHB_REPOSITORY_ID}`,
+    "        displayName: Live rehearsal repository",
+    `        canonicalPath: ${acceptance.QHB_REPOSITORY_ROOT}`,
+    "        approvalTimeoutSeconds: 300",
+  );
+  if (toolsEnabled) {
+    patchLines.push(
+      "- id: tool-pwsh",
+      "  disabled: false",
+      "- id: tool-fs",
+      "  disabled: false",
+    );
+  }
   writeFileSync(
     join(profileDir, "cordis.patch.yml"),
-    [
-      "- id: qwen-harness-bridge",
-      "  config:",
-      `    connectorId: ${acceptance.QHB_CONNECTOR_ID}`,
-      `    controlPlaneUrl: wss://${acceptance.HOST}:${acceptance.PORT}/connector/v1`,
-      "    keychainService: qhb-connector-live",
-      `    keychainAccount: ${acceptance.QHB_CONNECTOR_CREDENTIAL_ID}`,
-      `    databasePath: ${join(journalDirectory, "connector.sqlite")}`,
-      "    credentialSource:",
-      "      kind: file",
-      `      path: ${credentialFile}`,
-      "    repositories:",
-      `      - id: ${acceptance.QHB_REPOSITORY_ID}`,
-      "        displayName: Live rehearsal repository",
-      `        canonicalPath: ${acceptance.QHB_REPOSITORY_ROOT}`,
-      "        approvalTimeoutSeconds: 300",
-      "",
-    ].join("\n"),
+    `${patchLines.join("\n")}\n`,
   );
   record("configure", "PASS", {
     sourceKind: "file",
     profileTemplate: template,
+    modelRoute: modelRequested ? "operator-supplied" : "none",
+    tools: toolsEnabled ? "enabled" : "profile-default",
   });
 
   // The gauge counts every connector, so wait for the previous generation to
