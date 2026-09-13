@@ -4,7 +4,7 @@ import { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { RemoteApprovalBroker } from "./approvals/approval-broker.js";
 import { registerAnswerer } from "./approvals/register-answerer.js";
-import { parsePluginConfig } from "./config.js";
+import { agentOptionsFor, parsePluginConfig } from "./config.js";
 import { createCredentialReader } from "./credential-source.js";
 import type { HarnessContext } from "./harness/types.js";
 import { classifyAction } from "./policy/action-classifier.js";
@@ -122,6 +122,7 @@ export function apply(ctx: Context, config?: unknown): void {
       parsed.repositories.find((candidate) => candidate.id === id)
         ?.canonicalPath,
   };
+  const agentOptions = agentOptionsFor(parsed);
   const driver = new OwnedAgentDriver({
     agents: ctx.agents,
     store,
@@ -130,6 +131,7 @@ export function apply(ctx: Context, config?: unknown): void {
     terminal: connector,
     epoch: () => connector.currentEpoch(),
     repositories,
+    ...(agentOptions === undefined ? {} : { agentOptions }),
     publishClaim: async (offer) => {
       await connector.publish(
         "job.claim",

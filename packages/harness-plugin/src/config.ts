@@ -103,6 +103,20 @@ export type PluginConfig = Readonly<{
   >;
 }>;
 
+/** The per-Agent model route the owned Agent must use. The Harness
+ * `AgentOptions` seam accepts exactly these two fields, so a configured
+ * `harnessModel` pins the route instead of leaving the owned attempt on the
+ * host default. */
+export const agentOptionsFor = (
+  config: PluginConfig,
+): Readonly<{ provider: string; model: string }> | undefined =>
+  config.harnessModel === undefined
+    ? undefined
+    : Object.freeze({
+        provider: config.harnessModel.provider,
+        model: config.harnessModel.model,
+      });
+
 export type ConfigValidationCode =
   | "INVALID_PLUGIN_CONFIG"
   | "INVALID_DATABASE_PATH"
