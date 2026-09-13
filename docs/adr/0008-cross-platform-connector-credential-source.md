@@ -1,6 +1,6 @@
 # ADR 0008: Platform-general Connector bootstrap credential source
 
-Status: Proposed under Issue #72. The accountable owner must approve this ADR before the credential-source implementation lands; the Spec §7.4 and §13.1 amendments in the same pull request take effect only with that approval.
+Status: **Accepted.** The accountable owner approved this ADR and the Spec §7.4 / §13.1 amendments in the review thread for the Issue #72 pull request ([decision comment](https://github.com/EthanSMC/qwen-harness-bridge/pull/73#issuecomment-5652064803)), and the implementation lands under that approval.
 
 ## Context
 
