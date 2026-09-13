@@ -27,15 +27,32 @@ export type PolicyAgentSetupOptions = PolicyGuardRegistrationOptions &
 
 // Only the bridge's identity-bound setup capability can authorize registration.
 const ownedContexts = new WeakSet<Context>();
+/** The Agent this setup context belongs to. The factory passes the exact
+ * Agent it prepared; a factory that passes only the context is served by the
+ * scope carrier. The scoped `agent` service is deliberately not used here:
+ * declaring it in `inject` would keep the plugin from ever activating (the
+ * service only exists while an Agent is being created) and Cordis rejects an
+ * undeclared service read. */
+const resolveAgentScope = (
+  ctx: Context,
+  passed: Agent | undefined,
+): Agent | undefined => {
+  if (passed !== undefined) return passed;
+  const key: unknown = scopeOf(ctx);
+  return typeof key === "object" && key !== null && (key as Agent).ctx === ctx
+    ? (key as Agent)
+    : undefined;
+};
 function assertAgentSetupContext(
   ctx: Context,
+  passed?: Agent,
 ): asserts ctx is Context & { agent: Agent } {
+  const agent = resolveAgentScope(ctx, passed);
   if (
     !Context.is(ctx) ||
     ctx === ctx.root ||
-    !ctx.agent ||
-    ctx.agent.ctx !== ctx ||
-    scopeOf(ctx) !== ctx.agent
+    agent === undefined ||
+    agent.ctx !== ctx
   ) {
     throw new Error("POLICY_AGENT_SCOPE_REQUIRED");
   }
@@ -72,11 +89,13 @@ const classify = (
 export function registerPolicyGuard(
   ctx: Context,
   options: PolicyGuardRegistrationOptions,
+  passedAgent?: Agent,
 ): () => void {
-  assertAgentSetupContext(ctx);
+  assertAgentSetupContext(ctx, passedAgent);
   if (!ownedContexts.has(ctx)) throw new Error("POLICY_BRIDGE_SETUP_REQUIRED");
   options = snapshotRegistration(options);
-  const agent = ctx.agent;
+  const agent = resolveAgentScope(ctx, passedAgent);
+  if (agent === undefined) throw new Error("POLICY_AGENT_SCOPE_REQUIRED");
   // Neither ask intent nor a caller-provided snapshot can mint these proofs.
   const proofs = new WeakMap<
     object,
@@ -159,18 +178,20 @@ export function createPolicyAgentSetup(
   const registration = snapshotRegistration(options);
   let owner: Agent | undefined;
   const disposers: (() => void)[] = [];
-  const setup: AgentSetup = (ctx) => {
-    assertAgentSetupContext(ctx);
+  const setup: AgentSetup = (ctx: Context, passedAgent?: Agent) => {
+    assertAgentSetupContext(ctx, passedAgent);
+    const agent = resolveAgentScope(ctx, passedAgent);
+    if (agent === undefined) throw new Error("POLICY_AGENT_SCOPE_REQUIRED");
     if (
-      String(ctx.agent.id) !== agentId ||
-      (owner !== undefined && owner !== ctx.agent)
+      String(agent.id) !== agentId ||
+      (owner !== undefined && owner !== agent)
     )
       throw new Error("POLICY_BRIDGE_AGENT_MISMATCH");
     if (owner !== undefined) throw new Error("POLICY_ALREADY_REGISTERED");
-    owner = ctx.agent;
+    owner = agent;
     ownedContexts.add(ctx);
     try {
-      disposers.push(registerPolicyGuard(ctx, registration));
+      disposers.push(registerPolicyGuard(ctx, registration, agent));
     } finally {
       ownedContexts.delete(ctx);
     }
