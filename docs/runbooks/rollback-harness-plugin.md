@@ -26,6 +26,10 @@ cp -- "$databasePath" "$databasePath.backup-$(date -u +%Y%m%dT%H%M%SZ)"
 5. Verify reconnection and no duplicate execution: the connector returns online, owned jobs are re-admitted from `databasePath` through the attempt journal, and each job reaches exactly one terminal outcome.
 6. If the rollback target predates a schema change, do not open a database written by a newer build against it. Restore the matching backup taken in step 2 instead of guessing.
 
+## Platform-general rehearsal
+
+`pnpm --filter @qhb/harness-plugin rehearse:install` performs the artifact-level rollback on any supported platform: it reinstalls the same artifact over an already-created journal and reopens it from a clean extension root, then reports the before/after journal size. It does not exercise a live Control Plane reconnect, so a full rollback drill still belongs to the release verification window.
+
 ## Verification
 
 - Harness starts with the previous artifact and no `ConfigValidationError`.

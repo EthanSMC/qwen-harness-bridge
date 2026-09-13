@@ -1,6 +1,8 @@
 import { Buffer } from "node:buffer";
 
 const BLOCK = 512;
+const NAME_LENGTH = 100;
+const PREFIX_LENGTH = 155;
 
 const writeOctal = (value, length) => {
   const text = value.toString(8);
@@ -15,6 +17,25 @@ const writeString = (value, length) => {
   return field;
 };
 
+/** Split a long entry name into the ustar name/prefix pair. */
+const splitEntryName = (name) => {
+  if (Buffer.byteLength(name, "utf8") <= NAME_LENGTH) {
+    return { name, prefix: "" };
+  }
+  for (let index = name.length - 1; index > 0; index -= 1) {
+    if (name[index] !== "/") continue;
+    const prefix = name.slice(0, index);
+    const tail = name.slice(index + 1);
+    if (
+      Buffer.byteLength(tail, "utf8") <= NAME_LENGTH &&
+      Buffer.byteLength(prefix, "utf8") <= PREFIX_LENGTH
+    ) {
+      return { name: tail, prefix };
+    }
+  }
+  throw new Error("tar entry name too long");
+};
+
 /** Create a deterministic (mtime 0, uid/gid 0, sorted) ustar archive. */
 export function createTar(entries) {
   const ordered = [...entries].sort((a, b) =>
@@ -25,8 +46,9 @@ export function createTar(entries) {
     const data = Buffer.isBuffer(entry.data)
       ? entry.data
       : Buffer.from(entry.data, "utf8");
+    const { name, prefix } = splitEntryName(entry.name);
     const header = Buffer.alloc(BLOCK);
-    writeString(entry.name, 100).copy(header, 0);
+    writeString(name, NAME_LENGTH).copy(header, 0);
     writeString(writeOctal(0o644, 8), 8).copy(header, 100);
     writeString(writeOctal(0, 8), 8).copy(header, 108);
     writeString(writeOctal(0, 8), 8).copy(header, 116);
@@ -40,6 +62,7 @@ export function createTar(entries) {
     writeString("root", 32).copy(header, 297);
     writeString(writeOctal(0, 8), 8).copy(header, 329);
     writeString(writeOctal(0, 8), 8).copy(header, 337);
+    writeString(prefix, PREFIX_LENGTH).copy(header, 345);
     let sum = 0;
     for (const byte of header) sum += byte;
     writeString(writeOctal(sum, 8), 8).copy(header, 148);
@@ -58,16 +81,22 @@ export function readTar(buffer) {
   while (offset + BLOCK <= buffer.length) {
     const header = buffer.subarray(offset, offset + BLOCK);
     if (header.every((byte) => byte === 0)) break;
-    const name = header.subarray(0, 100).toString("utf8").replace(/\0.*$/u, "");
-    const size = parseInt(
-      header.subarray(124, 136).toString("utf8").replace(/\0.*$/u, "").trim(),
-      8,
-    );
+    const read = (start, length) =>
+      header
+        .subarray(start, start + length)
+        .toString("utf8")
+        .replace(/\0.*$/u, "");
+    const name = read(0, NAME_LENGTH);
+    const prefix = read(345, PREFIX_LENGTH);
+    const size = parseInt(read(124, 12).trim(), 8);
     if (!Number.isSafeInteger(size) || size < 0)
       throw new Error("invalid tar entry size");
     const start = offset + BLOCK;
     const data = buffer.subarray(start, start + size);
-    entries.push({ name, data: Buffer.from(data) });
+    entries.push({
+      name: prefix === "" ? name : `${prefix}/${name}`,
+      data: Buffer.from(data),
+    });
     offset = start + Math.ceil(size / BLOCK) * BLOCK;
   }
   return entries;

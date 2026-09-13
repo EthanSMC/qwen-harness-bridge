@@ -30,6 +30,10 @@ test -n "$(security find-generic-password -s "$service" -a "$account" -w)"
 5. Revoke the previous credential in the Control Plane only after the new exchange is observed.
 6. Confirm no job was lost: jobs that were queued or owned are re-admitted from the local journal database at `databasePath`, and no job is executed twice.
 
+## Platform-general rehearsal
+
+The mechanical part of a rotation is rehearsed on any supported platform by `pnpm --filter @qhb/harness-plugin rehearse:install`: it installs the artifact into a clean root, rotates the credential source, and proves the journal survives with the same mapping. Off macOS the step reports `PARTIAL`, and the credential read reports `FAIL-CLOSED` with `CONNECTOR_CREDENTIAL_UNAVAILABLE`; record which outcome you observed instead of assuming the Keychain path ran.
+
 ## Verification
 
 - The connector is online with the new credential.

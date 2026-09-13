@@ -20,11 +20,11 @@ This entry describes the prepared M1 connector-installation scope; it does not a
 
 ### Added
 
-- Deterministic packaged Harness Connector artifact built by `pnpm --filter @qhb/harness-plugin pack`, containing compiled code with self-contained source maps, the SQLite schema, the license when present, and a credential-free sample Cordis wiring.
-- Packaged smoke test (`pnpm --filter @qhb/harness-plugin pack:test`) that extracts the artifact into a temporary Harness extension root, imports the plugin entry, asserts the Cordis plugin identity, and fails packaging when a credential value or credential-looking assignment would be included.
+- Deterministic, self-contained packaged Harness Connector artifact built by `pnpm --filter @qhb/harness-plugin pack`: compiled code with self-contained source maps, the SQLite schema and its digest, the license when present, a credential-free sample Cordis wiring, and the vendored runtime closure (including the private workspace package `@qhb/protocol`, `zod`, `ws`, and `better-sqlite3`). Host-provided `@deepseek-ai/*` peers stay external.
+- Packaged smoke test (`pnpm --filter @qhb/harness-plugin pack:test`) that installs the artifact into a clean temporary root outside the repository with no monorepo `node_modules` in its ancestry, links only the host peers, imports the packaged entry in a separate process, validates the sample wiring against the packaged config schema, opens the journal, fails packaging when a credential value or credential-looking assignment would be included, and asserts that removing the vendored protocol makes the same import fail closed.
 - Credential-free `cordis.example.yml` sample wiring that references Keychain service/account names and one canonical repository root, with no token and no user-specific absolute repository path.
-- macOS install, credential-rotation, and plugin-rollback runbooks under `docs/runbooks/`.
-- `docs/product/v0.2.0-acceptance.md` acceptance record for M1 Spec items 2, 3, 5, 6, 7, and 10, including its unverified manual macOS steps.
+- Cross-platform install, credential-rotation, and plugin-rollback rehearsal (`pnpm --filter @qhb/harness-plugin rehearse:install`) with a JSON report, plus the macOS-oriented runbooks under `docs/runbooks/`.
+- `docs/product/v0.2.0-acceptance.md` acceptance record for M1 Spec items 2, 3, 5, 6, 7, and 10 at an exact environment and artifact digest.
 
 ## 0.1.0 — pending publication
 
