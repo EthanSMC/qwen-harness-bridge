@@ -245,7 +245,15 @@ export function apply(ctx: Context, config?: unknown): void {
     approvals,
     driver,
     store,
-    report: () => undefined,
+    // Local operability signal: a fixed stage and, only when the failure is a
+    // bounded connector code, that code. Never a message, path or value.
+    report: (error, stage) => {
+      const message = error instanceof Error ? error.message : "";
+      const code = /^[A-Z][A-Z0-9_]{2,63}$/u.test(message)
+        ? message
+        : "UNAVAILABLE";
+      process.stderr.write(`qwen-harness-bridge ${stage}: ${code}\n`);
+    },
   });
   ctx.effect(() => {
     composition.connect();
