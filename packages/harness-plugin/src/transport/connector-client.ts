@@ -350,25 +350,6 @@ export const buildConnectorHello = (input: {
     input.messageId ?? nodeRandomUUID(),
   );
 
-/** Frames the pump may run while a command handler is in flight: they are the
- * responses that handler is waiting for, or frames that invent no command
- * order. Everything else keeps the serialized pump. */
-const isPumpBypassFrame = (serialized: string): boolean => {
-  try {
-    const parsed: unknown = JSON.parse(serialized);
-    if (parsed === null || typeof parsed !== "object") return false;
-    const type = (parsed as { type?: unknown }).type;
-    return (
-      type === "connector.welcome" ||
-      type === "job.state" ||
-      type === "ack" ||
-      type === "protocol.error"
-    );
-  } catch {
-    return false;
-  }
-};
-
 const isCommand = (
   message: ConnectorServerMessage,
 ): message is Extract<
@@ -409,7 +390,6 @@ export class DurableConnectorClient implements TerminalConnectorClient {
   #heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   #sendPump: Promise<void> = Promise.resolve();
   #receivePump: Promise<void> = Promise.resolve();
-  #pumpQueueDepth = 0;
   #welcomeWaiter: Promise<void> | undefined;
   #resolveWelcome: (() => void) | undefined;
   #helloMessage: PendingMessage | undefined;
@@ -885,29 +865,13 @@ export class DurableConnectorClient implements TerminalConnectorClient {
       });
       socket.on("message", (data) => {
         const serialized = typeof data === "string" ? data : data.toString();
-        const run = () => this.#handleIncoming(context, serialized, signal);
-        const failed = () => {
-          if (context.requested && this.#socket === socket)
-            this.#fatal("CONNECTOR_STORED_INBOUND_INVALID");
-          this.#closeSocket(socket);
-        };
-        // A response may not queue behind a command handler that is itself
-        // waiting for that response (admission waits for job.state, approvals
-        // wait for approval.decision). Only commands keep the serialized pump;
-        // a response still queues when another command is already waiting, so
-        // the recorded sequence can never be overtaken.
-        if (this.#pumpQueueDepth === 0 && isPumpBypassFrame(serialized)) {
-          void run().catch(failed);
-          return;
-        }
-        this.#pumpQueueDepth += 1;
         this.#receivePump = this.#receivePump
-          .then(() => {
-            const pending = run();
-            this.#pumpQueueDepth -= 1;
-            return pending;
-          })
-          .catch(failed);
+          .then(() => this.#handleIncoming(context, serialized, signal))
+          .catch(() => {
+            if (context.requested && this.#socket === socket)
+              this.#fatal("CONNECTOR_STORED_INBOUND_INVALID");
+            this.#closeSocket(socket);
+          });
       });
       socket.once("error", (error) => {
         this.#closeSocket(socket);
