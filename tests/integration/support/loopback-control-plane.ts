@@ -281,7 +281,7 @@ export const startLoopbackControlPlane = async (
         job_id: state.jobId,
         attempt: state.attempt,
         job_revision: state.jobRevision,
-        action_fingerprint: "a".repeat(64),
+        action_fingerprint: `sha256:${"a".repeat(64)}`,
         decision: "approve",
         ...overrides,
       }),

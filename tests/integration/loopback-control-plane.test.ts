@@ -7,6 +7,7 @@ import type { Agent, AgentHandle } from "@deepseek-ai/dsh-agent";
 import type { Session } from "@deepseek-ai/dsh-session";
 import { expect, it } from "vitest";
 import WebSocket from "ws";
+import { RemoteApprovalBroker } from "../../packages/harness-plugin/src/approvals/approval-broker.js";
 import { JobCommandCoordinator } from "../../packages/harness-plugin/src/runtime/job-command-coordinator.js";
 import { JobStateClient } from "../../packages/harness-plugin/src/runtime/job-state-client.js";
 import { OwnedAgentDriver } from "../../packages/harness-plugin/src/runtime/owned-agent-driver.js";
@@ -116,11 +117,15 @@ const wireOwnedExecution = ({
   directory,
   store,
   client,
+  approvals = { acceptDecision: () => "ignored" },
 }: {
   plane: Awaited<ReturnType<typeof startLoopbackControlPlane>>;
   directory: string;
   store: SqlitePluginStore;
   client: DurableConnectorClient;
+  approvals?: ConstructorParameters<
+    typeof JobCommandCoordinator
+  >[0]["approvals"];
 }) => {
   let creates = 0;
   const states = new JobStateClient({ connector: client });
@@ -187,7 +192,7 @@ const wireOwnedExecution = ({
   const coordinator = new JobCommandCoordinator({
     starter: driver,
     cancel: { handle: async () => "ignored" },
-    approvals: { acceptDecision: () => "ignored" },
+    approvals,
     repositories: { resolve: resolveRepository },
   });
   const unsubscribe = client.onCommand((command) =>
@@ -320,3 +325,124 @@ it("admits a socket-delivered offer without blocking the receive pump", async ()
     rmSync(directory, { recursive: true, force: true });
   }
 }, 30_000);
+/** Approval round trip over the real transport: the connector publishes its
+ * durable `approval.requested` through the outbox, an unacknowledged request is
+ * replayed with its original identity after a socket kill, and the Control
+ * Plane's decision is applied once. No credential material reaches the wire. */
+it("carries an approval request out and a single decision back", async () => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-approval-")));
+  const store = new SqlitePluginStore(join(directory, "store.sqlite"));
+  const plane = await startLoopbackControlPlane();
+  const lifecycle = new AbortController();
+  const sentinel = "approval-credential-sentinel-6d13";
+  const client = new DurableConnectorClient({
+    connectorId: randomUUID(),
+    controlPlaneUrl: plane.url,
+    store,
+    requireJobCoordination: true,
+    requireOwnedTerminal: true,
+    sessionTokenClient: {
+      exchange: async () => ({
+        token: "fixture",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      }),
+    },
+    bootstrapCredentialProvider: async () => sentinel,
+    webSocketFactory: (target, options) =>
+      new WebSocket(target, { ...options, ca: plane.ca }),
+  });
+  // The reservation stands in for the plugin's durable action authority: it
+  // outlives a reconnect the way a committed generation does.
+  const authority = new AbortController();
+  const broker = new RemoteApprovalBroker({
+    reserve: () => ({
+      requestedRevision: plane.state.jobRevision + 1,
+      deadline: Date.now() + 120_000,
+      approvalTimeoutSeconds: 300,
+      signal: authority.signal,
+      isCurrent: () => !authority.signal.aborted,
+      release: () => undefined,
+    }),
+    publish: (type, payload, correlationId) =>
+      client.publish(type, payload, correlationId),
+  });
+  const wired = wireOwnedExecution({
+    plane,
+    directory,
+    store,
+    client,
+    approvals: broker,
+  });
+  const running = client.start(lifecycle.signal);
+  try {
+    await plane.waitForInbound("connector.hello");
+    // The durable outbox only accepts coordination traffic once the negotiated
+    // epoch exists, which the welcome establishes.
+    const epochDeadline = Date.now() + 5_000;
+    while (client.currentEpoch() === undefined && Date.now() < epochDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(client.currentEpoch()).toBeDefined();
+    const outcome = broker.request({
+      jobId: plane.state.jobId,
+      attempt: plane.state.attempt,
+      fingerprint: `sha256:${"a".repeat(64)}`,
+      actionSummary: "apply the fixture action",
+      impactSummary: "fixture impact",
+      riskClass: "approval_required",
+    });
+    const requested = await plane.waitForInbound("approval.requested");
+    expect(requested.raw).not.toContain(sentinel);
+    const payload = requested.message.payload as {
+      approval_id: string;
+      job_id: string;
+      attempt: number;
+      job_revision: number;
+      action_fingerprint: string;
+    };
+    // Nothing acknowledged the request, so the reconnect must resend the exact
+    // durable frame instead of minting a new approval identity.
+    plane.killSockets();
+    await plane.waitForConnection(2);
+    const replayed = await plane.waitForInbound("approval.requested", {
+      after: plane.inbound.indexOf(requested) + 1,
+    });
+    expect(frameIdentity(replayed)).toEqual(frameIdentity(requested));
+    const decision = {
+      approval_id: payload.approval_id,
+      job_id: payload.job_id,
+      attempt: payload.attempt,
+      job_revision: payload.job_revision,
+      action_fingerprint: payload.action_fingerprint,
+      decision: "approve",
+    };
+    plane.sendApprovalDecision(decision);
+    await expect(outcome).resolves.toBe("allowed-once");
+    // A repeated decision has no waiter and must change nothing.
+    plane.sendApprovalDecision(decision);
+    await expect(outcome).resolves.toBe("allowed-once");
+    const decisions = plane.outbound.filter(
+      (frame) => frame.type === "approval.decision",
+    );
+    expect(decisions).toHaveLength(2);
+    // The connector acknowledges a command only after its handler succeeded, so
+    // the ACK is the durable proof that the decision was applied exactly once.
+    const decisionSequence = decisions[0]?.message.sequence ?? -1;
+    const ackDeadline = Date.now() + 5_000;
+    while (
+      !plane.ackedSequences().includes(decisionSequence) &&
+      Date.now() < ackDeadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(plane.ackedSequences()).toContain(decisionSequence);
+  } finally {
+    authority.abort();
+    wired.unsubscribe();
+    lifecycle.abort();
+    await running.catch(() => undefined);
+    await plane.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 60_000);
