@@ -118,7 +118,16 @@ ELECTRON_RUN_AS_NODE=1 DSH_HOME=/absolute/isolated/home \
 
 ### Host runtime and native modules
 
-The archive vendors its runtime closure, including the compiled `better-sqlite3` binding of the host that produced it. A Harness runtime that loads the plugin under a different Node ABI rejects that binary with `NODE_MODULE_VERSION` mismatch. When the reported ABI differs, either build the artifact on a host whose runtime matches the operator's, or install an ABI-matching `better-sqlite3` build into the profile before booting. Never patch the vendored binary by hand.
+The archive vendors only pure-JavaScript runtime code (`@qhb/protocol`, `zod`, `ws`). Native runtime modules stay out of the artifact and are installed by the profile so the host can build them for the ABI it actually runs: a binary built on the packaging host cannot load under a different runtime, and the packaged manifest lists those packages in `qhbHostInstalledDependencies` while keeping them in `dependencies`.
+
+pnpm ignores dependency build scripts by default. Allow the native build in the profile's `pnpm-workspace.yaml` before installing:
+
+```yaml
+allowBuilds:
+  better-sqlite3: true
+```
+
+Then `dsh plugin --profile <name> add <tarball>` installs and builds the module. This step needs either a prebuilt binary for the host runtime's ABI or a working native toolchain (`node-gyp` and a C++ compiler). Observed while validating this runbook: `better-sqlite3` 12.11.1 publishes prebuilds up to electron ABI 135 and node ABI 127/137, so a host whose runtime ABI has no prebuild and no toolchain cannot complete the install; the connector then cannot open its journal and the plugin fails closed. A host in that situation must supply an ABI-matching build, install the native toolchain, or the packaging strategy must drop the native dependency (see ADR 0008's follow-up decision).
 
 ## 4. Wire the plugin
 

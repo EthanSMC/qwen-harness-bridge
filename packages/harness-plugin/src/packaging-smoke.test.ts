@@ -158,19 +158,24 @@ it("packages a self-contained artifact that installs outside the repository", as
     expect(JSON.stringify(artifact.manifest.dependencies ?? {})).not.toContain(
       "workspace:",
     );
-    for (const name of ["@qhb/protocol", "zod", "ws", "better-sqlite3"]) {
+    for (const name of ["@qhb/protocol", "zod", "ws"]) {
       expect(artifact.vendoredDependencies).toContain(name);
     }
+    // Native runtime modules stay host-installed: a binary built here cannot
+    // load under the operator's runtime ABI.
+    expect(artifact.vendoredDependencies).not.toContain("better-sqlite3");
+    expect(artifact.hostInstalledDependencies).toContain("better-sqlite3");
+    expect(artifact.entries).not.toContain(
+      "package/node_modules/better-sqlite3/package.json",
+    );
 
     // Vendored third-party license text must travel with the artifact.
     expect(artifact.vendoredLicenses).toEqual(
       [...artifact.vendoredLicenses].sort(),
     );
-    for (const expected of [
-      "better-sqlite3/LICENSE",
-      "ws/LICENSE",
-      "zod/LICENSE",
-    ]) {
+    // Host-installed native modules bring their own license with the profile
+    // install; only vendored packages are inventoried here.
+    for (const expected of ["ws/LICENSE", "zod/LICENSE"]) {
       expect(artifact.vendoredLicenses, expected).toContain(expected);
     }
     for (const license of artifact.vendoredLicenses) {
@@ -206,7 +211,12 @@ it("packages a self-contained artifact that installs outside the repository", as
     expect(hasNodeModulesAncestor(dirname(extensionRoot))).toBe(false);
     expect(hasRepositoryAncestor(dirname(extensionRoot))).toBe(false);
 
-    linkHostPeers({ extensionRoot, packageRoot, peers });
+    // Host peers and host-built native modules are supplied the same way.
+    linkHostPeers({
+      extensionRoot,
+      packageRoot,
+      peers: [...peers, ...artifact.hostInstalledDependencies],
+    });
 
     // The dsh bundle patch inserts the plugin entry; the operator profile patch
     // supplies the environment-specific config by id.
@@ -274,7 +284,11 @@ it("packages a self-contained artifact that installs outside the repository", as
       ),
       controlExtension,
     );
-    linkHostPeers({ extensionRoot: controlExtension, packageRoot, peers });
+    linkHostPeers({
+      extensionRoot: controlExtension,
+      packageRoot,
+      peers: [...peers, ...artifact.hostInstalledDependencies],
+    });
     expect(() => runProbe(controlRoot, controlExtension, config)).toThrow(
       /Cannot find package '@qhb\/protocol'/u,
     );

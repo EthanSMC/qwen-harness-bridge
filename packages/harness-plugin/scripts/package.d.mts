@@ -1,5 +1,6 @@
 export declare const HOST_PEER_PREFIX: string;
 export declare const VENDOR_PREFIX: string;
+export declare const HOST_INSTALLED_NATIVE: readonly string[];
 export declare const CREDENTIAL_ASSIGNMENT: RegExp;
 export declare const findCredentialAssignment: (text: string) => string | null;
 
@@ -12,6 +13,7 @@ export interface RuntimePackage {
 export declare const runtimeClosure: (
   manifest: { dependencies?: Record<string, string> },
   fromDirectory: string,
+  hostInstalled?: readonly string[],
 ) => Map<string, RuntimePackage>;
 
 export interface TarEntryLike {
@@ -35,6 +37,8 @@ export interface BuiltArtifact {
   readonly version: string;
   readonly entries: readonly string[];
   readonly vendoredDependencies: readonly string[];
+  /** Host-built runtime packages the artifact must not vendor. */
+  readonly hostInstalledDependencies: readonly string[];
   /** `<package>/<file>` for every vendored license text in the archive. */
   readonly vendoredLicenses: readonly string[];
   readonly manifest: Record<string, unknown>;

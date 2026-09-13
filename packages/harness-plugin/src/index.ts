@@ -5,8 +5,8 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import { RemoteApprovalBroker } from "./approvals/approval-broker.js";
 import { registerAnswerer } from "./approvals/register-answerer.js";
 import { parsePluginConfig } from "./config.js";
+import { createCredentialReader } from "./credential-source.js";
 import type { HarnessContext } from "./harness/types.js";
-import { MacOSKeychainCredentialReader } from "./keychain.js";
 import { classifyAction } from "./policy/action-classifier.js";
 import { createPolicyAgentSetup } from "./policy/register-guard.js";
 import { createTrustedExecutionAdapter } from "./policy/trusted-execution-adapter.js";
@@ -34,6 +34,7 @@ export const inject = [
 ] as const;
 
 export * from "./config.js";
+export * from "./credential-source.js";
 export {
   AgentAdapter,
   HarnessAgentAdapterImpl,
@@ -83,7 +84,9 @@ export function apply(ctx: Context, config?: unknown): void {
     throw new Error("MULTI_REPOSITORY_UNSUPPORTED");
   const repository = parsed.repositories[0];
   const store = new SqlitePluginStore(parsed.databasePath);
-  const credentials = new MacOSKeychainCredentialReader();
+  // ADR 0008: Keychain stays the default; an explicit bounded file or
+  // environment source is opt-in and every source fails closed when unreadable.
+  const credentials = createCredentialReader(parsed);
   const tokenClient = new HttpsSessionTokenClient({
     endpoint: sessionEndpoint(parsed.controlPlaneUrl),
     credentialId: parsed.keychainAccount,
@@ -100,7 +103,7 @@ export function apply(ctx: Context, config?: unknown): void {
     },
     sessionTokenClient: tokenClient,
     bootstrapCredentialProvider: () =>
-      credentials.read(parsed.keychainService, parsed.keychainAccount),
+      credentials.reader.read(parsed.keychainService, parsed.keychainAccount),
   });
   const states = new JobStateClient({ connector });
   const liveStates = new LiveStateRegistry({ connector });

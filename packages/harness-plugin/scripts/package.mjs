@@ -17,6 +17,13 @@ const packageRoot = resolve(here, "..");
 
 /** Packages the Harness host must provide; they are peers, never vendored. */
 export const HOST_PEER_PREFIX = "@deepseek-ai/";
+/**
+ * Runtime packages whose compiled binary is bound to the running host ABI. The
+ * artifact must not vendor them (a binary built here cannot load under the
+ * operator's runtime), so the profile's package manager installs and builds
+ * them for the host that actually runs the connector.
+ */
+export const HOST_INSTALLED_NATIVE = Object.freeze(["better-sqlite3"]);
 /** Where vendored runtime packages live inside the artifact. */
 export const VENDOR_PREFIX = "package/node_modules/";
 /** Vendored build-time sources that a runtime never loads. */
@@ -150,12 +157,17 @@ const resolvePackage = (specifier, fromDirectory) => {
  * Throws when the closure needs two versions of the same package because the
  * artifact installs a flat `node_modules` tree.
  */
-export const runtimeClosure = (manifest, fromDirectory) => {
+export const runtimeClosure = (
+  manifest,
+  fromDirectory,
+  hostInstalled = HOST_INSTALLED_NATIVE,
+) => {
   const resolved = new Map();
   const queue = [];
+  const hostProvided = new Set(hostInstalled);
   const enqueue = (dependencies, from) => {
     for (const name of Object.keys(dependencies ?? {})) {
-      if (name.startsWith(HOST_PEER_PREFIX)) continue;
+      if (name.startsWith(HOST_PEER_PREFIX) || hostProvided.has(name)) continue;
       queue.push({ name, from });
     }
   };
@@ -228,6 +240,9 @@ export function buildArtifact(options) {
   }
   const closure = runtimeClosure(manifest, packageRoot);
   const vendored = [...closure.keys()].sort();
+  const hostInstalled = HOST_INSTALLED_NATIVE.filter(
+    (name) => manifest.dependencies?.[name] !== undefined,
+  );
   const vendoredEntries = vendored.flatMap((name) => {
     const info = closure.get(name);
     const declared = Array.isArray(info.manifest.files)
@@ -259,6 +274,7 @@ export function buildArtifact(options) {
       ),
     ),
     qhbVendoredDependencies: vendored,
+    qhbHostInstalledDependencies: hostInstalled,
     qhbVendoredLicenses: vendoredLicenses,
     qhbSchemaSha256: createHash("sha256").update(schema).digest("hex"),
   };
@@ -295,6 +311,7 @@ export function buildArtifact(options) {
     version: manifest.version,
     entries: entries.map((entry) => entry.name),
     vendoredDependencies: vendored,
+    hostInstalledDependencies: hostInstalled,
     vendoredLicenses,
     manifest: packagedManifest,
     sha256: createHash("sha256").update(readFileSync(outFile)).digest("hex"),
