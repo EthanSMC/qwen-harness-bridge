@@ -141,6 +141,11 @@ const TOKEN_REFRESH_SKEW_MS = 60_000;
 const SOCKET_CLOSE_TIMEOUT_MS = 1_000;
 const ABORTED = Symbol("CONNECTOR_ABORTED");
 
+/** The redaction contract accepts a POSIX (`/...`) or Windows (`X:\...`)
+ * absolute root, so the connector starts wherever the Harness runtime boots. */
+const isAbsoluteRedactionRoot = (value: string): boolean =>
+  value.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(value);
+
 function captureOptions(input: ConnectorClientOptions): ConnectorClientOptions {
   try {
     const captured = {
@@ -256,9 +261,9 @@ function captureOptions(input: ConnectorClientOptions): ConnectorClientOptions {
       const secrets = redaction.secrets;
       if (
         typeof repositoryRoot !== "string" ||
-        !repositoryRoot.startsWith("/") ||
+        !isAbsoluteRedactionRoot(repositoryRoot) ||
         typeof homeDirectory !== "string" ||
-        !homeDirectory.startsWith("/") ||
+        !isAbsoluteRedactionRoot(homeDirectory) ||
         /\p{Cc}/u.test(repositoryRoot + homeDirectory)
       )
         throw new Error();
