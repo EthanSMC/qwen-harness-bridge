@@ -1,6 +1,6 @@
 # Install the Qwen Harness Bridge Connector
 
-This runbook installs the packaged Connector plugin into a Harness host that supports Cordis plugins. It covers the self-contained artifact, the Keychain credential, the sample wiring, the startup checks, and a platform-general rehearsal.
+This runbook installs the packaged Connector plugin into a Harness host that supports Cordis plugins. It covers the self-contained artifact, the Keychain credential, the sample wiring, the startup checks, a platform-general rehearsal, and a live Control Plane rehearsal.
 
 Scope: one Harness host, one configured repository root, and one Control Plane connector identity. It does not cover Control Plane deployment (see `control-plane-local.md`) or release tagging.
 
@@ -178,7 +178,41 @@ The script builds, packs, installs into a clean root outside the repository, lin
 - `credential-read` reports `PASS` on macOS when a Keychain item is present and `FAIL-CLOSED` with `CONNECTOR_CREDENTIAL_UNAVAILABLE` on any host without `/usr/bin/security`. Both outcomes are correct; record which one you observed.
 - `rotate-credential` is `PARTIAL` off macOS: the credential source is rotated and the journal is preserved, but the live Keychain item and the Control Plane exchange cannot be exercised there.
 
-## 6. Load and verify
+## 6. Live rehearsal against a real Control Plane
+
+`packages/harness-plugin/scripts/live-rehearsal.mjs` installs the packaged artifact into a fresh profile, boots the global Harness CLI, waits for the Control Plane's own connector gauge, and then drives `submit_task`, `list_pending_approvals`, `decide_approval`, `get_task` and `get_task_result` over MCP. Connection material is read only from the out-of-band JSON file named by `QHB_ACCEPTANCE_ENV` (or `--env`); nothing read there reaches the report, the repository or the artifact.
+
+```bash
+export NODE_EXTRA_CA_CERTS=<control-plane CA bundle>   # only for a private CA
+cd packages/harness-plugin
+node scripts/live-rehearsal.mjs \
+  --env <env json> \
+  --dsh-bin <harness executable> --dsh-cli <app.asar/lib/desktop-cli.js> \
+  --dsh-home <isolated DSH home> --serve [--tools] \
+  --state-dir <connector journal directory> \
+  --model-provider <id> --model <id> --model-api-key-env <NAME> [--model-base-url <url>] \
+  --out <report json>
+```
+
+| Flag | Effect |
+|---|---|
+| `--serve` | Creates the profile from the shipped `web` template and boots it resident, which is what keeps the connector online. It requires an explicit `--dsh-home`: a resident host shares the home's sessions, storages and credentials with any runtime already using it, so the runner refuses to boot one against the default home. |
+| `--task <text>` | Boots the shipped `headless` template for one task instead. The host exits when the task ends, so the connector is online only for its duration. |
+| `--state-dir <path>` | Keeps the connector journal in a caller-owned directory. The Control Plane consumes a connector's first `hello` as a one-time birth, so reuse this directory for every rehearsal against the same connector; a fresh journal against a consumed birth fails at the online step. |
+| `--model-provider`, `--model`, `--model-api-key-env`, `--model-base-url` | Declare an operator-supplied model route so the owned attempt can run. The credential value must already exist in the isolated home's credential store under that variable name; the runner writes endpoint configuration only. |
+| `--tools` | Enables the shipped `tool-pwsh` and `tool-fs` plugins. Without them the owned attempt carries no tools, so a job can only complete without an approval. |
+| `--warmup-wait-ms`, `--online-wait-ms`, `--budget-ms`, `--out` | Bound the gauge-baseline wait, the online wait and the job observation, and write the report to a file. |
+
+The report records the environment, the credential source kind, every step with its observed status, and the masked boot tail. A `PARTIAL` lifecycle is a real result, not a harness failure: an approved job cannot reach a terminal state until the Control Plane returns the job to `running` after the decision (finding 7 in `docs/product/v0.2.0-acceptance.md`).
+
+The transport-level rehearsal needs no Control Plane and runs in CI:
+
+```bash
+node node_modules/vitest/vitest.mjs run --project integration \
+  tests/integration/loopback-control-plane.test.ts
+```
+
+## 7. Load and verify
 
 Start Harness with the plugin enabled and confirm the outbound connection from the Control Plane side, not from local log content.
 
@@ -196,7 +230,7 @@ Then run the repository gates on the installing host:
 pnpm check && pnpm test
 ```
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 - `Cannot find package '@qhb/protocol'` while importing the packaged entry: the artifact is not self-contained. Rebuild it with `pnpm --filter @qhb/harness-plugin pack` and confirm the failure stops; the packaged smoke test covers this case.
 - `CONNECTOR_CREDENTIAL_UNAVAILABLE`: the Keychain item is missing, the account differs, the login Keychain is locked, or the host is not macOS. Re-run step 3 and re-check the service/account pair.
@@ -205,7 +239,7 @@ pnpm check && pnpm test
 - Startup succeeds but no job is claimed: confirm the Control Plane sees the connector as online and that the repository `id` matches the issued identity.
 - A policy denial for a search or executable action: the action domain rules are authoritative (see ADR 0002). Do not widen the configuration to bypass a denial.
 
-## 8. Uninstall
+## 9. Uninstall
 
 Stop Harness, remove the plugin block from the Harness root `cordis.yml`, delete the extracted extension directory, and keep or delete `databasePath` deliberately. To remove the credential, delete the Keychain item:
 
