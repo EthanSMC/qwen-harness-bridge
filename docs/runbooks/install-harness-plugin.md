@@ -30,11 +30,12 @@ The archive is **self-contained**:
 
 | Archive path | Contents |
 |---|---|
-| `package/package.json` | Installable manifest. `workspace:` specifiers are removed and the vendored runtime packages are listed in `qhbVendoredDependencies`; `qhbSchemaSha256` pins the shipped SQLite schema. |
+| `package/package.json` | Installable manifest. `workspace:` specifiers are removed and the vendored runtime packages are listed in `qhbVendoredDependencies`; `qhbVendoredLicenses` lists every vendored license file and `qhbSchemaSha256` pins the shipped SQLite schema. |
 | `package/cordis.example.yml` | Credential-free sample wiring. |
 | `package/dist/**` | Compiled plugin with self-contained source maps. |
 | `package/node_modules/**` | Every runtime dependency, including the private workspace package `@qhb/protocol`, `zod`, `ws`, `better-sqlite3` and its transitive closure. |
-| `package/LICENSE` | Present only when the repository ships a root license. |
+| `package/node_modules/<package>/LICENSE*` | The license text each vendored package publishes (`LICENSE`, `LICENSE.md`, `COPYING` or `NOTICE`, including variants such as `LICENSE.MIT`), retained even when the package's own `files` field omits it. |
+| `package/LICENSE` | Present only when the repository ships a root license; this repository ships none. |
 
 Host-provided peers are deliberately **not** vendored. Every `@deepseek-ai/*` package listed in `peerDependencies` comes from the Harness host. Packaging fails when a supplied credential value or a credential-looking assignment would enter the archive, and the credential guard also covers camelCase keys such as `bootstrapToken` and unquoted values.
 

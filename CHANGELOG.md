@@ -25,6 +25,11 @@ This entry describes the prepared M1 connector-installation scope; it does not a
 - Credential-free `cordis.example.yml` sample wiring that references Keychain service/account names and one canonical repository root, with no token and no user-specific absolute repository path.
 - Cross-platform install, credential-rotation, and plugin-rollback rehearsal (`pnpm --filter @qhb/harness-plugin rehearse:install`) with a JSON report, plus the macOS-oriented runbooks under `docs/runbooks/`.
 - `docs/product/v0.2.0-acceptance.md` acceptance record for M1 Spec items 2, 3, 5, 6, 7, and 10 at an exact environment and artifact digest.
+- Vendored third-party license text travels with the packaged artifact (42 files for the current closure, listed in `qhbVendoredLicenses`); the repository still ships no root LICENSE, so no root license entry is added.
+
+### Changed
+
+- Proposed [ADR 0008](docs/adr/0008-cross-platform-connector-credential-source.md) with the Spec §7.4 and §13.1 amendment for a platform-general Connector bootstrap credential source; the credential-source implementation and the live Harness rehearsal remain pending accountable-owner approval of that ADR.
 
 ## 0.1.0 — pending publication
 
