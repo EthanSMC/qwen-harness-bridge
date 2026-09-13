@@ -74,7 +74,9 @@ export const executableCandidates = (
     .filter((extension) => extension.length > 0);
   return [
     join(directory, executable),
-    ...extensions.map((extension) => join(directory, `${executable}${extension}`)),
+    ...extensions.map((extension) =>
+      join(directory, `${executable}${extension}`),
+    ),
   ];
 };
 
