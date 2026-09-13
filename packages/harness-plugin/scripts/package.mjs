@@ -277,6 +277,10 @@ export function buildArtifact(options) {
       name: "package/cordis.example.yml",
       data: readFileSync(join(packageRoot, "cordis.example.yml")),
     },
+    {
+      name: "package/cordis.patch.yml",
+      data: readFileSync(join(packageRoot, "cordis.patch.yml")),
+    },
     ...collectFiles(dist, "package/dist"),
     ...vendoredEntries,
     ...(license === undefined

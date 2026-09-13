@@ -73,6 +73,53 @@ test -n "$(security find-generic-password -s "$service" -a "$account" -w)"
 
 A missing or unreadable item makes the plugin raise `CONNECTOR_CREDENTIAL_UNAVAILABLE` and fail closed instead of connecting unauthenticated.
 
+## 3b. Install into a DSH profile
+
+The artifact is a DSH plugin bundle: its manifest declares `dsh.bundle.patch`, so a profile activates it as a layer as soon as the package is installed.
+
+```bash
+set -euo pipefail
+dsh --from-default-profile headless --profile qhb-rehearsal
+dsh plugin --profile qhb-rehearsal add ./qhb-harness-plugin.tar
+```
+
+`dsh plugin ... add` forwards to pnpm inside the profile directory. After the install the composed tree contains the connector entry:
+
+```bash
+dsh --profile qhb-rehearsal --dump-config | grep -A2 '@qhb/harness-plugin'
+```
+
+Supply the environment-specific configuration from the profile's own patch layer, `<profile>/cordis.patch.yml`, as an id-targeted override:
+
+```yaml
+- id: qwen-harness-bridge
+  config:
+    connectorId: 00000000-0000-4000-8000-000000000000
+    controlPlaneUrl: wss://control-plane.example.com/connector/v1
+    keychainService: qhb-connector
+    keychainAccount: qhb-connector-bootstrap
+    databasePath: /absolute/path/connector.sqlite
+    repositories:
+      - id: example
+        displayName: Example repository
+        canonicalPath: /absolute/repository
+        approvalTimeoutSeconds: 300
+```
+
+`dsh --profile qhb-rehearsal --dump-config` marks the entry as `patched by <profile>/cordis.patch.yml` once the override is in place.
+
+To rehearse without touching the operator's real `~/.dsh`, point the launcher at an isolated home. The packaged `dsh` shim pins `DSH_HOME`, so invoke the same entry point directly with your own value:
+
+```bash
+ELECTRON_RUN_AS_NODE=1 DSH_HOME=/absolute/isolated/home \
+  "<dsh-application>" --expose-internals "<app.asar>/lib/desktop-cli.js" \
+  --profile qhb-rehearsal --dump-config
+```
+
+### Host runtime and native modules
+
+The archive vendors its runtime closure, including the compiled `better-sqlite3` binding of the host that produced it. A Harness runtime that loads the plugin under a different Node ABI rejects that binary with `NODE_MODULE_VERSION` mismatch. When the reported ABI differs, either build the artifact on a host whose runtime matches the operator's, or install an ABI-matching `better-sqlite3` build into the profile before booting. Never patch the vendored binary by hand.
+
 ## 4. Wire the plugin
 
 1. Create the local database directory: `databasePath` must be an absolute path whose parent directory already exists and is not reached through a symlink.

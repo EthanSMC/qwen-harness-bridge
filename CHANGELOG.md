@@ -26,6 +26,7 @@ This entry describes the prepared M1 connector-installation scope; it does not a
 - Cross-platform install, credential-rotation, and plugin-rollback rehearsal (`pnpm --filter @qhb/harness-plugin rehearse:install`) with a JSON report, plus the macOS-oriented runbooks under `docs/runbooks/`.
 - `docs/product/v0.2.0-acceptance.md` acceptance record for M1 Spec items 2, 3, 5, 6, 7, and 10 at an exact environment and artifact digest.
 - Vendored third-party license text travels with the packaged artifact (42 files for the current closure, listed in `qhbVendoredLicenses`); the repository still ships no root LICENSE, so no root license entry is added.
+- DSH bundle metadata (`dsh.bundle.patch`) and a shipped `cordis.patch.yml`, so `dsh plugin --profile <name> add <tarball>` activates the connector as a profile layer instead of a plain dependency.
 
 ### Changed
 

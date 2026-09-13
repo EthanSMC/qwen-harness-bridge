@@ -185,6 +185,9 @@ it("packages a self-contained artifact that installs outside the repository", as
         ?.data.toString("utf8") ?? "{}",
     );
     const peers = Object.keys(packageManifest.peerDependencies ?? {});
+    // The artifact must install as a DSH profile layer, not a plain dependency.
+    expect(packageManifest.dsh?.bundle?.patch).toBe("./cordis.patch.yml");
+    expect(artifact.entries).toContain("package/cordis.patch.yml");
 
     const extensionRoot = join(root, "extension");
     extract(entries, extensionRoot);
@@ -204,6 +207,17 @@ it("packages a self-contained artifact that installs outside the repository", as
     expect(hasRepositoryAncestor(dirname(extensionRoot))).toBe(false);
 
     linkHostPeers({ extensionRoot, packageRoot, peers });
+
+    // The dsh bundle patch inserts the plugin entry; the operator profile patch
+    // supplies the environment-specific config by id.
+    const bundlePatch = parseYaml(
+      readFileSync(join(extensionRoot, "cordis.patch.yml"), "utf8"),
+    );
+    expect(bundlePatch).toEqual([
+      {
+        insert: [{ id: "qwen-harness-bridge", name: "@qhb/harness-plugin" }],
+      },
+    ]);
 
     // Load the packaged sample wiring: the YAML is parsed here and validated by
     // the packaged config schema inside the probe process.
