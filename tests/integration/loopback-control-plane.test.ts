@@ -256,3 +256,62 @@ it("replays an unacknowledged claim after a socket kill", async () => {
     rmSync(directory, { recursive: true, force: true });
   }
 }, 60_000);
+/** Reproduces a blocking transport defect found by the live rehearsal.
+ *
+ * The connector's receive pump serializes inbound frames and awaits every
+ * command handler. `JobCommandCoordinator.handle` awaits
+ * `OwnedAgentDriver.start`, whose admission performs `states.observe` and
+ * therefore needs the Control Plane's `job.state` response. That response can
+ * only be delivered by the same receive pump, which is still awaiting the
+ * offer handler, so admission cannot complete: the coordination waiter expires
+ * after 2 s, `admit` returns undefined, and no Agent is created. The in-process
+ * `harness-connector-e2e.test.ts` never sees this because it invokes
+ * `coordinator.handle` directly instead of through the transport.
+ *
+ * Marked `fails` so the suite stays green while the fix is designed; the
+ * assertion is the behaviour a real Control Plane must eventually observe.
+ */
+it.fails("admits a socket-delivered offer without blocking the receive pump", async () => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-admit-")));
+  const store = new SqlitePluginStore(join(directory, "store.sqlite"));
+  const plane = await startLoopbackControlPlane();
+  plane.setAcknowledge(true);
+  const lifecycle = new AbortController();
+  const client = new DurableConnectorClient({
+    connectorId: randomUUID(),
+    controlPlaneUrl: plane.url,
+    store,
+    requireJobCoordination: true,
+    requireOwnedTerminal: true,
+    sessionTokenClient: {
+      exchange: async () => ({
+        token: "fixture",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      }),
+    },
+    bootstrapCredentialProvider: async () => "fixture",
+    webSocketFactory: (target, options) =>
+      new WebSocket(target, { ...options, ca: plane.ca }),
+  });
+  const wired = wireOwnedExecution({ plane, directory, store, client });
+  const running = client.start(lifecycle.signal);
+  try {
+    await plane.waitForInbound("connector.hello");
+    plane.sendOffer();
+    const deadline = Date.now() + 6_000;
+    while (wired.creates() === 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(
+      wired.creates(),
+      `inbound=${plane.inbound.map((f) => f.type).join(",")} outbound=${plane.outbound.map((f) => f.type).join(",")}`,
+    ).toBe(1);
+  } finally {
+    wired.unsubscribe();
+    lifecycle.abort();
+    await running.catch(() => undefined);
+    await plane.close();
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}, 30_000);
