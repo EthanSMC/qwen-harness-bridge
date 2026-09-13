@@ -108,6 +108,31 @@ Supply the environment-specific configuration from the profile's own patch layer
 
 `dsh --profile qhb-rehearsal --dump-config` marks the entry as `patched by <profile>/cordis.patch.yml` once the override is in place.
 
+### Bootstrap credential source (ADR 0008)
+
+`credentialSource` names a bounded location for the Connector bootstrap credential; it never carries the value itself. On macOS the default is the Keychain entry built from `keychainService` and `keychainAccount`. On every other platform that default cannot resolve (the reader invokes `/usr/bin/security`), so the boot fails closed until one of these is configured:
+
+```yaml
+- id: qwen-harness-bridge
+  config:
+    credentialSource:
+      kind: file
+      path: /absolute/path/to/connector-bootstrap-credential
+```
+
+```yaml
+- id: qwen-harness-bridge
+  config:
+    credentialSource:
+      kind: environment
+      variable: QHB_CONNECTOR_BOOTSTRAP_CREDENTIAL
+```
+
+- `file` must be an absolute path to an existing, non-symlinked regular file whose parent directory is also canonical. The reader accepts at most 16 KiB and trims exactly one trailing newline (`\n` or `\r\n`).
+- `environment` names a variable matching `[A-Za-z_][A-Za-z0-9_]{0,127}` that is present in the runtime's environment.
+- A missing, empty, oversized, symlinked, relative or ambiguous source aborts startup with `CONNECTOR_CREDENTIAL_UNAVAILABLE`; a malformed block is rejected earlier as the config error `INVALID_CREDENTIAL_SOURCE`. The connector never falls back to another source.
+- Rotation replaces the value at the configured location and then restarts the profile, because the connector reads the source at bootstrap. The value and its resolved location never appear in the configuration, the logs, the rehearsal JSON report or the artifact.
+
 To rehearse without touching the operator's real `~/.dsh`, point the launcher at an isolated home. The packaged `dsh` shim pins `DSH_HOME`, so invoke the same entry point directly with your own value:
 
 ```bash
@@ -126,7 +151,7 @@ For a future native module, the packaging keeps the rule that no host-bound bina
 
 1. Create the local database directory: `databasePath` must be an absolute path whose parent directory already exists and is not reached through a symlink.
 2. Merge the `plugin` block from `packages/harness-plugin/cordis.example.yml` into the Harness root `cordis.yml`.
-3. Replace `connectorId`, `controlPlaneUrl`, `keychainService`, `keychainAccount`, `databasePath`, the repository `id`, `displayName`, and `canonicalPath`.
+3. Replace `connectorId`, `controlPlaneUrl`, `databasePath`, the repository `id`, `displayName`, and `canonicalPath`. Keep `keychainService` and `keychainAccount` for the macOS default, and add the `credentialSource` block above on any other platform.
 4. Keep exactly one entry under `repositories`. Two or more entries abort startup with `MULTI_REPOSITORY_UNSUPPORTED` before any effect is registered.
 
 Configuration is validated before the plugin opens the database or the socket. Validation failures surface as `ConfigValidationError` codes:
