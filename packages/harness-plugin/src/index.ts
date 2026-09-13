@@ -164,7 +164,7 @@ export function apply(ctx: Context, config?: unknown): void {
           { id: context.repositoryId, canonicalPath: context.repositoryPath },
         ],
       };
-      return createPolicyAgentSetup({
+      const policySetup = createPolicyAgentSetup({
         agentId: sessionId,
         ...scoped,
         resolveAction: (execution) => {
@@ -183,6 +183,7 @@ export function apply(ctx: Context, config?: unknown): void {
                 jobId: context.jobId,
                 attempt: context.attempt,
                 toolName: resolved.action.toolName,
+                sourceTool: resolved.sourceTool ?? resolved.action.toolName,
                 fingerprint: decision.fingerprint,
                 classification: decision.classification,
                 actionSummary: decision.actionSummary,
@@ -195,6 +196,15 @@ export function apply(ctx: Context, config?: unknown): void {
           return resolved;
         },
       });
+      // The approval answerer looks the owned Agent up by id, and the registry
+      // refuses to record an action for an Agent it does not own, so ownership
+      // is taken the moment the factory publishes the Agent.
+      return ((agentCtx: Context, agent?: Agent) => {
+        if (agent !== undefined) actions.registerOwner(agent);
+        return (
+          policySetup as unknown as (ctx: Context, agent?: Agent) => unknown
+        )(agentCtx, agent);
+      }) as unknown as ReturnType<typeof createPolicyAgentSetup>;
     },
   });
   const approvals = new RemoteApprovalBroker({
