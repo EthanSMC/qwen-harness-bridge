@@ -31,6 +31,28 @@ import { buildArtifact } from "./package.mjs";
  * `--dsh-home` defaults to the current user's DSH home so the boot can reuse
  * the operator's own agent credentials; the rehearsal profile is removed
  * afterwards.
+ *
+ * --serve creates the profile from the shipped web template and boots it
+ * resident (dsh --profile <name> --port 0 --no-open) so the connector stays
+ * connected while the job is submitted and observed; the host is killed when
+ * the run ends. Without --serve and without --task the booted profile answers
+ * nothing and exits immediately, so no connection can be observed.
+ *
+ * --state-dir <path> (or QHB_REHEARSAL_STATE_DIR) keeps the connector
+ * journal in a caller-owned directory instead of a per-run temporary one. The
+ * Control Plane keeps per-connector durable sequence state and a connector
+ * birth is one-time, so a first run against a connector consumes it; a later
+ * run must present the same journal to resume from its durable client
+ * sequence. Without --state-dir every run starts a fresh journal and is
+ * therefore only valid for a connector whose birth has not been consumed.
+ * The directory is never deleted and no absolute path is written into the
+ * report.
+ *
+ * Before booting, the runner waits for the Control Plane's public
+ * qhb_connector_online gauge to read 0, because that gauge counts every
+ * connector: only against a cleared baseline does a later 1 prove that this
+ * run's connector connected. --warmup-wait-ms bounds that wait; if the
+ * baseline never clears, the online step is recorded as PARTIAL.
  */
 const here = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(here, "..");
@@ -66,6 +88,18 @@ const submitRequest = flag(
   "Read README.md in this repository and reply with its first line.",
 );
 const onlineWaitMs = Number(flag("online-wait-ms", "120000"));
+/** The Control Plane marks a connector stale after 20s, so this bounds the wait
+ * for the previous generation's gauge sample to clear. */
+const warmupWaitMs = Number(flag("warmup-wait-ms", "120000"));
+/** A resident web host is the only boot mode that keeps the connector up. */
+const serve = process.argv.includes("--serve");
+const stateDirFlag = flag("state-dir", process.env.QHB_REHEARSAL_STATE_DIR);
+/** Resolved once so the report and the profile config agree. */
+const stateDirectory =
+  typeof stateDirFlag === "string" && stateDirFlag.length > 0
+    ? resolve(stateDirFlag)
+    : undefined;
+const persistentState = stateDirectory !== undefined;
 
 const steps = [];
 const record = (name, status, detail) => {
@@ -78,6 +112,7 @@ const report = {
     node: process.version,
     startedAt: new Date().toISOString(),
     credentialSourceKind: "file",
+    stateDirectoryKind: persistentState ? "persistent" : "ephemeral",
   },
   steps,
   status: "PASS",
@@ -92,6 +127,29 @@ const dsh = (args) =>
     stdio: ["ignore", "pipe", "pipe"],
   });
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+/** The Control Plane's public connector gauge: whether *any* connector is
+ * fresh. It is not per-run, so it is only meaningful against a known baseline.
+ * `null` means the sample itself failed (unreachable or certificate). */
+const gaugeOnline = async () => {
+  try {
+    const response = await fetch(
+      `https://${acceptance.HOST}:${acceptance.PORT}/metrics`,
+    );
+    const text = response.ok ? await response.text() : "";
+    return /^qhb_connector_online 1$/mu.test(text);
+  } catch {
+    return null;
+  }
+};
+const waitForGauge = async (expected, windowMs) => {
+  const deadline = Date.now() + windowMs;
+  for (;;) {
+    if ((await gaugeOnline()) === expected) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(3_000);
+  }
+};
 
 const connect = async () => {
   const transport = new StreamableHTTPClientTransport(
@@ -145,14 +203,18 @@ try {
     hostInstalledDependencies: artifact.hostInstalledDependencies.length,
   });
 
-  dsh(["--from-default-profile", "headless", "--profile", profile, "--help"]);
+  const template = serve ? "web" : "headless";
+  dsh(["--from-default-profile", template, "--profile", profile, "--help"]);
   dsh(["plugin", "--profile", profile, "add", artifact.outFile]);
   record("install", "PASS", {
     artifactBytes: statSync(artifact.outFile).size,
   });
 
-  const stateDirectory = join(work, "state");
-  mkdirSync(stateDirectory, { recursive: true });
+  const journalDirectory = stateDirectory ?? join(work, "state");
+  mkdirSync(journalDirectory, { recursive: true });
+  record("state", "PASS", {
+    kind: persistentState ? "persistent" : "ephemeral",
+  });
   const credentialFile = join(work, "bootstrap.secret");
   writeFileSync(credentialFile, acceptance.QHB_CONNECTOR_BOOTSTRAP_CREDENTIAL, {
     mode: 0o600,
@@ -166,7 +228,7 @@ try {
       `    controlPlaneUrl: wss://${acceptance.HOST}:${acceptance.PORT}/connector/v1`,
       "    keychainService: qhb-connector-live",
       `    keychainAccount: ${acceptance.QHB_CONNECTOR_CREDENTIAL_ID}`,
-      `    databasePath: ${join(stateDirectory, "connector.sqlite")}`,
+      `    databasePath: ${join(journalDirectory, "connector.sqlite")}`,
       "    credentialSource:",
       "      kind: file",
       `      path: ${credentialFile}`,
@@ -178,10 +240,31 @@ try {
       "",
     ].join("\n"),
   );
-  record("configure", "PASS", { sourceKind: "file" });
+  record("configure", "PASS", {
+    sourceKind: "file",
+    profileTemplate: template,
+  });
+
+  // The gauge counts every connector, so wait for the previous generation to
+  // expire first: only then does a later online sample prove that *this* run's
+  // connector connected. A baseline that never clears is recorded as PARTIAL
+  // and weakens the online step below instead of quietly reinforcing it.
+  const idleBaseline = await waitForGauge(false, warmupWaitMs);
+  record("gauge-idle", idleBaseline ? "PASS" : "PARTIAL", {
+    waitedMs: warmupWaitMs,
+  });
 
   const bootArgs = ["--expose-internals", dshCli, "--profile", profile];
-  if (task.length > 0) bootArgs.push(task);
+  let bootMode = "none";
+  if (serve) {
+    // The web app's own flags follow the launcher flags; a resident host is
+    // what keeps the connector connected until the run ends.
+    bootArgs.push("--port", "0", "--no-open");
+    bootMode = "serve";
+  } else if (task.length > 0) {
+    bootArgs.push(task);
+    bootMode = "cli-task";
+  }
   boot = spawn(dshBin, bootArgs, {
     env: dshEnv,
     cwd: repositoryRoot,
@@ -193,28 +276,15 @@ try {
   boot.stderr.on("data", (chunk) => {
     bootOutput += String(chunk);
   });
-  record("boot", "PASS", { bootTask: task.length === 0 ? "none" : "cli-task" });
+  record("boot", "PASS", { mode: bootMode });
 
   client = await connect();
   // The Control Plane only dispatches to an online connector; wait for the
   // public gauge instead of guessing from job state.
-  const onlineDeadline = Date.now() + onlineWaitMs;
-  let connectorOnline = false;
-  while (Date.now() < onlineDeadline) {
-    try {
-      const response = await fetch(
-        `https://${acceptance.HOST}:${acceptance.PORT}/metrics`,
-      );
-      const text = response.ok ? await response.text() : "";
-      connectorOnline = /^qhb_connector_online 1$/mu.test(text);
-    } catch {
-      connectorOnline = false;
-    }
-    if (connectorOnline) break;
-    await sleep(3_000);
-  }
+  const connectorOnline = await waitForGauge(true, onlineWaitMs);
   record("connector-online", connectorOnline ? "PASS" : "PARTIAL", {
     waitedMs: onlineWaitMs,
+    baselineCleared: idleBaseline,
   });
   if (!connectorOnline) {
     throw new Error(
