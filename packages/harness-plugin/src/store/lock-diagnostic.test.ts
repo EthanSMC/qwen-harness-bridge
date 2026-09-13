@@ -25,7 +25,9 @@ it("diagnostic: external writer lock", () => {
     ).database;
     observations.platform = process.platform;
     observations.node = process.version;
-    observations.storeJournal = adapter.pragma("journal_mode", { simple: true });
+    observations.storeJournal = adapter.pragma("journal_mode", {
+      simple: true,
+    });
     observations.rawJournal = raw.pragma("journal_mode", { simple: true });
     adapter.pragma("busy_timeout = 1");
     observations.storeBusy = adapter.pragma("busy_timeout", { simple: true });
