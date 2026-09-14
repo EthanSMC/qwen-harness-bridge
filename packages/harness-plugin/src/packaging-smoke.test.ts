@@ -19,6 +19,7 @@ import {
   CREDENTIAL_ASSIGNMENT,
   findCredentialAssignment,
   HOST_PEER_PREFIX,
+  runtimeClosure,
 } from "../scripts/package.mjs";
 import {
   createCleanRoot,
@@ -146,6 +147,24 @@ it("detects credential-looking assignments without flagging code", () => {
       { name: "package/dist/index.js", data: Buffer.from("token: z.string()") },
     ]),
   ).not.toThrow();
+});
+
+/** The option-A mechanism, kept for any future native runtime dependency: a
+ * package bound to the host ABI is skipped by the vendored closure, so the
+ * profile installs it for the operator's runtime instead of shipping a binary
+ * built here. */
+it("keeps a host-installed native module and its closure out of the vendored tree", () => {
+  const closure = runtimeClosure(
+    { dependencies: { "better-sqlite3": "^12.10.0", ws: "^8.21.3" } },
+    packageRoot,
+    ["better-sqlite3"],
+  );
+  const names = [...closure.keys()];
+  expect(names).toContain("ws");
+  expect(names).not.toContain("better-sqlite3");
+  // Nothing native-only may arrive through the skipped package's own closure.
+  expect(names).not.toContain("bindings");
+  expect(names).not.toContain("prebuild-install");
 });
 
 it("packages a self-contained artifact that installs outside the repository", async () => {
