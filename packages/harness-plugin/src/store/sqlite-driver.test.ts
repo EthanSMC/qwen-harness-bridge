@@ -2,7 +2,7 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
-import { openDatabase } from "./sqlite-driver.js";
+import { openDatabase, SqliteUnavailableError } from "./sqlite-driver.js";
 
 it("executes statements and reports bounded row results", () => {
   const database = openDatabase(":memory:");
@@ -35,6 +35,23 @@ it("reads and writes pragmas", () => {
   } finally {
     database.close();
   }
+});
+
+/** A host without the built-in module must fail closed with a bounded domain
+ * code instead of an engine-level module-resolution crash during plugin load. */
+it("fails closed with a bounded error when the host lacks node:sqlite", () => {
+  expect(() =>
+    openDatabase(":memory:", {
+      load: () => {
+        throw new Error("ERR_UNKNOWN_BUILTIN_MODULE");
+      },
+    }),
+  ).toThrow(SqliteUnavailableError);
+  expect(() =>
+    openDatabase(":memory:", {
+      load: () => ({}) as never,
+    }),
+  ).toThrow("STORE_SQLITE_UNAVAILABLE");
 });
 
 it("waits for a busy database instead of failing immediately", () => {

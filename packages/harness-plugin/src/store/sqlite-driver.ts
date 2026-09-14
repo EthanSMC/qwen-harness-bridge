@@ -1,4 +1,33 @@
-import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { createRequire } from "node:module";
+import type { DatabaseSync, StatementSync } from "node:sqlite";
+
+/** Bounded failure when the running host does not provide the built-in
+ * `node:sqlite` module (an older runtime, or one started without the module's
+ * experimental flag). The plugin must fail closed with a domain code instead of
+ * crashing during module resolution. */
+export class SqliteUnavailableError extends Error {
+  static readonly code = "STORE_SQLITE_UNAVAILABLE" as const;
+  readonly code = SqliteUnavailableError.code;
+
+  constructor() {
+    super(SqliteUnavailableError.code);
+    this.name = "SqliteUnavailableError";
+  }
+}
+
+/** Structural view of the built-in module, so the host check stays testable. */
+export interface SqliteModule {
+  readonly DatabaseSync: new (path: string) => DatabaseSync;
+}
+
+const require = createRequire(import.meta.url);
+const loadBuiltinSqlite = (): SqliteModule => {
+  const loaded = require("node:sqlite") as Partial<SqliteModule> | undefined;
+  if (typeof loaded?.DatabaseSync !== "function") {
+    throw new SqliteUnavailableError();
+  }
+  return loaded as SqliteModule;
+};
 
 /** better-sqlite3 waited this long for a busy database before reporting a lock
  * conflict; node:sqlite defaults the busy timeout to zero, which would turn
@@ -97,8 +126,11 @@ class NodeSqliteDatabase implements SqliteDatabase {
   readonly #database: DatabaseSync;
   #savepoints = 0;
 
-  constructor(path: string) {
-    this.#database = new DatabaseSync(path);
+  constructor(
+    path: string,
+    DatabaseSyncConstructor: SqliteModule["DatabaseSync"],
+  ) {
+    this.#database = new DatabaseSyncConstructor(path);
     // Per-connection, like the previous engine's default.
     this.#database.exec(`PRAGMA busy_timeout = ${DEFAULT_BUSY_TIMEOUT_MS}`);
   }
@@ -186,5 +218,23 @@ class NodeSqliteDatabase implements SqliteDatabase {
   }
 }
 
-export const openDatabase = (path: string): SqliteDatabase =>
-  new NodeSqliteDatabase(path);
+/** Open the durable journal, or fail closed with a bounded code when the host
+ * does not provide `node:sqlite`. `load` is injectable so the unavailable-host
+ * path is covered without needing such a runtime. */
+export const openDatabase = (
+  path: string,
+  options: Readonly<{ load?: () => SqliteModule }> = {},
+): SqliteDatabase => {
+  const load = options.load ?? loadBuiltinSqlite;
+  let module: SqliteModule;
+  try {
+    module = load();
+  } catch (error) {
+    if (error instanceof SqliteUnavailableError) throw error;
+    throw new SqliteUnavailableError();
+  }
+  if (typeof module?.DatabaseSync !== "function") {
+    throw new SqliteUnavailableError();
+  }
+  return new NodeSqliteDatabase(path, module.DatabaseSync);
+};
