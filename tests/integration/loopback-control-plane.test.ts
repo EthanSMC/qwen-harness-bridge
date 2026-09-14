@@ -436,6 +436,13 @@ it("carries an approval request out and a single decision back", async () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     expect(plane.ackedSequences()).toContain(decisionSequence);
+    // Wire hygiene over the whole conversation, not just the request frame: once
+    // the job, approval and ACK traffic has flowed, the bootstrap credential
+    // sentinel must not appear in any recorded frame in either direction.
+    expect(plane.inbound.length + plane.outbound.length).toBeGreaterThan(0);
+    for (const frame of [...plane.inbound, ...plane.outbound]) {
+      expect(frame.raw, frame.type).not.toContain(sentinel);
+    }
   } finally {
     authority.abort();
     wired.unsubscribe();
