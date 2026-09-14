@@ -10,6 +10,7 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { OwnedIntentSchema } from "./owned-intent.js";
 import { SqlitePluginStore } from "./plugin-store.js";
+import { openDatabase } from "./sqlite-driver.js";
 
 const id = (n: number) =>
   `aaaaaaaa-aaaa-4aaa-8aaa-${String(n).padStart(12, "0")}`;
@@ -1045,22 +1046,30 @@ describe("durable initial-attempt journal", () => {
   );
 
   it("sanitizes SQLite lock failures from an independent writer", () => {
-    const { store, raw } = setup();
+    const { store, raw, path } = setup();
     receipt(store);
     (store as unknown as { database: Database.Database }).database.pragma(
       "busy_timeout = 1",
     );
     const before = snapshot(raw);
-    raw.exec("BEGIN IMMEDIATE");
+    // The lock holder uses the store's own engine. A different SQLite build can
+    // hold BEGIN IMMEDIATE without the store's engine observing the conflict on
+    // some hosts, which would make this invariant untestable rather than false.
+    const locker = openDatabase(path);
     try {
-      expect(() => store.prepareOwnedIntent(input())).toThrow(
-        "OWNED_INTENT_UNAVAILABLE",
-      );
+      locker.exec("BEGIN IMMEDIATE");
+      try {
+        expect(() => store.prepareOwnedIntent(input())).toThrow(
+          "OWNED_INTENT_UNAVAILABLE",
+        );
+      } finally {
+        locker.exec("ROLLBACK");
+      }
+      expect(snapshot(raw)).toEqual(before);
+      expect(store.prepareOwnedIntent(input()).phase).toBe("prepared");
     } finally {
-      raw.exec("ROLLBACK");
+      locker.close();
     }
-    expect(snapshot(raw)).toEqual(before);
-    expect(store.prepareOwnedIntent(input()).phase).toBe("prepared");
   });
 
   it("preserves progressed duplicate state and detaches supplied started evidence", () => {

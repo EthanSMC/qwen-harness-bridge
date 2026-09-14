@@ -20,11 +20,23 @@ This entry describes the prepared M1 connector-installation scope; it does not a
 
 ### Added
 
-- Deterministic, self-contained packaged Harness Connector artifact built by `pnpm --filter @qhb/harness-plugin pack`: compiled code with self-contained source maps, the SQLite schema and its digest, the license when present, a credential-free sample Cordis wiring, and the vendored runtime closure (including the private workspace package `@qhb/protocol`, `zod`, `ws`, and `better-sqlite3`). Host-provided `@deepseek-ai/*` peers stay external.
+- Deterministic, self-contained packaged Harness Connector artifact built by `pnpm --filter @qhb/harness-plugin pack`: compiled code with self-contained source maps, the SQLite schema and its digest, the license when present, a credential-free sample Cordis wiring, and the vendored runtime closure (the private workspace package `@qhb/protocol`, `zod`, and `ws`). Host-provided `@deepseek-ai/*` peers stay external, and the artifact vendors no native module.
 - Packaged smoke test (`pnpm --filter @qhb/harness-plugin pack:test`) that installs the artifact into a clean temporary root outside the repository with no monorepo `node_modules` in its ancestry, links only the host peers, imports the packaged entry in a separate process, validates the sample wiring against the packaged config schema, opens the journal, fails packaging when a credential value or credential-looking assignment would be included, and asserts that removing the vendored protocol makes the same import fail closed.
 - Credential-free `cordis.example.yml` sample wiring that references Keychain service/account names and one canonical repository root, with no token and no user-specific absolute repository path.
 - Cross-platform install, credential-rotation, and plugin-rollback rehearsal (`pnpm --filter @qhb/harness-plugin rehearse:install`) with a JSON report, plus the macOS-oriented runbooks under `docs/runbooks/`.
 - `docs/product/v0.2.0-acceptance.md` acceptance record for M1 Spec items 2, 3, 5, 6, 7, and 10 at an exact environment and artifact digest.
+- Vendored third-party license text travels with the packaged artifact: the license files of the vendored runtime packages are retained and listed in `qhbVendoredLicenses` even when a package's `files` field omits them. The repository ships no root LICENSE, so no root license entry is added.
+- DSH bundle metadata (`dsh.bundle.patch`) and a shipped `cordis.patch.yml`, so `dsh plugin --profile <name> add <tarball>` activates the connector as a profile layer instead of a plain dependency.
+- Cross-platform Connector bootstrap credential source ([ADR 0008](docs/adr/0008-cross-platform-connector-credential-source.md), Spec §7.4/§13.1): Darwin keeps the macOS Keychain default, other platforms select a controlled `file` or `environment` source, and a missing, ambiguous, oversized or symlinked source fails closed without echoing the credential value or its resolved location.
+- Loopback Control-Plane fixture and a live rehearsal runner (`pnpm --filter @qhb/harness-plugin rehearse:live`) that installs the packaged artifact into a fresh DSH profile, boots the global Harness CLI, and drives task submission, approval and result collection over MCP with a redacted JSON report.
+
+### Changed
+
+- The durable journal uses the built-in `node:sqlite` instead of the vendored `better-sqlite3`, so the artifact carries no native module and one build runs on any host the Harness supports.
+
+### Fixed
+
+- The receive pump no longer deadlocks when a command handler awaits a Coordination `job.state` response that only the pump can deliver: a response answering a request published by the command handler the pump is awaiting is recorded and delivered ahead of the pump, while replays, replacements, gaps and every other frame keep the strictly ordered validation path.
 
 ## 0.1.0 — pending publication
 

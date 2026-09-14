@@ -34,6 +34,7 @@ describe("trusted execution adapter", () => {
       "edit",
       "glob",
       "grep",
+      "pwsh",
       "read",
       "write",
     ]);
@@ -45,6 +46,8 @@ describe("trusted execution adapter", () => {
       arguments: { command: "pnpm test" },
     });
     expect(resolved?.provenance).toBe("local_tool");
+    // The guard's identity check reads the host tool, not the canonical name.
+    expect(resolved?.sourceTool).toBe("bash");
     expect(resolved?.action.toolName).toBe("test");
     expect(resolved?.action.executable).toBe("pnpm");
     expect(resolved?.action.argv).toEqual(["test"]);
@@ -65,6 +68,17 @@ describe("trusted execution adapter", () => {
     ).toBe("package_install");
     expect(
       a({ name: "bash", arguments: { command: "git status" } }),
+    ).toBeUndefined();
+    // The Harness's Windows shell tool carries the same command semantics, so an
+    // approval-classified command must resolve through it as well.
+    const pwshPush = a({
+      name: "pwsh",
+      arguments: { command: "git push origin main" },
+    });
+    expect(pwshPush?.action.toolName).toBe("git_push");
+    expect(pwshPush?.sourceTool).toBe("pwsh");
+    expect(
+      a({ name: "pwsh", arguments: { command: "git status" } }),
     ).toBeUndefined();
   });
 

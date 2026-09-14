@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID as nodeRandomUUID } from "node:crypto";
 import {
   type ConnectorClientMessage,
@@ -141,6 +142,11 @@ const TOKEN_REFRESH_SKEW_MS = 60_000;
 const SOCKET_CLOSE_TIMEOUT_MS = 1_000;
 const ABORTED = Symbol("CONNECTOR_ABORTED");
 
+/** The redaction contract accepts a POSIX (`/...`) or Windows (`X:\...`)
+ * absolute root, so the connector starts wherever the Harness runtime boots. */
+const isAbsoluteRedactionRoot = (value: string): boolean =>
+  value.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(value);
+
 function captureOptions(input: ConnectorClientOptions): ConnectorClientOptions {
   try {
     const captured = {
@@ -256,9 +262,9 @@ function captureOptions(input: ConnectorClientOptions): ConnectorClientOptions {
       const secrets = redaction.secrets;
       if (
         typeof repositoryRoot !== "string" ||
-        !repositoryRoot.startsWith("/") ||
+        !isAbsoluteRedactionRoot(repositoryRoot) ||
         typeof homeDirectory !== "string" ||
-        !homeDirectory.startsWith("/") ||
+        !isAbsoluteRedactionRoot(homeDirectory) ||
         /\p{Cc}/u.test(repositoryRoot + homeDirectory)
       )
         throw new Error();
@@ -360,6 +366,12 @@ type PendingMessage = Readonly<{
   message: ConnectorClientMessage;
 }>;
 
+/** The wire fields an ahead coordination delivery inspects before it accepts
+ * the full schema parse. */
+interface FrameHint {
+  readonly type: unknown;
+}
+
 export class DurableConnectorClient implements TerminalConnectorClient {
   readonly #options: ConnectorClientOptions;
   readonly #now: () => Date;
@@ -385,6 +397,20 @@ export class DurableConnectorClient implements TerminalConnectorClient {
   #heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   #sendPump: Promise<void> = Promise.resolve();
   #receivePump: Promise<void> = Promise.resolve();
+  /** Sequences that reached this client before the receive pump recorded them.
+   * An ahead delivery is only safe while every skipped frame is already here,
+   * because the pump still owns their in-order recording. */
+  #arrived = new Set<number>();
+
+  /** Marks the asynchronous work of an in-flight command handler, so a
+   * coordination request published by that handler can be recognized while the
+   * pump that dispatched the handler is still awaiting it. */
+  #commandScope = new AsyncLocalStorage<true>();
+
+  /** Coordination request sequences published by an in-flight command handler.
+   * Only those responses are taken ahead of the pump, because only they can be
+   * blocking the pump that dispatched their handler. */
+  #commandRequests = new Set<number>();
   #welcomeWaiter: Promise<void> | undefined;
   #resolveWelcome: (() => void) | undefined;
   #helloMessage: PendingMessage | undefined;
@@ -688,6 +714,8 @@ export class DurableConnectorClient implements TerminalConnectorClient {
       nonce: message.payload.nonce,
       epoch,
     });
+    if (this.#commandScope.getStore() === true)
+      this.#commandRequests.add(message.sequence);
     // No pump scheduling or yield may precede this registration: SQLite has
     // committed the exact request and original receipt profile at this point.
     this.#invokeCoordination(() => onPersisted(request));
@@ -860,6 +888,12 @@ export class DurableConnectorClient implements TerminalConnectorClient {
       });
       socket.on("message", (data) => {
         const serialized = typeof data === "string" ? data : data.toString();
+        const hint = this.#noteArrival(serialized);
+        // A coordination response resolves its waiter before the serialized
+        // pump records it: a command handler that awaits one (job admission)
+        // would otherwise wait for the pump that is waiting for the handler.
+        // The frame is still queued below and recorded in order.
+        this.#deliverStateEarly(context, serialized, signal, hint);
         this.#receivePump = this.#receivePump
           .then(() => this.#handleIncoming(context, serialized, signal))
           .catch(() => {
@@ -969,10 +1003,113 @@ export class DurableConnectorClient implements TerminalConnectorClient {
     );
   }
 
+  /** Take a coordination `job.state` response off the socket and run its
+   * durable pass immediately, so a command handler that is blocking the
+   * serialized receive pump can resolve its waiter. The frame stays queued for
+   * the pump, which records it in order and advances the server cursor.
+   *
+   * Only a brand-new response to a durable coordination request may be taken,
+   * and only while every predecessor sequence has already arrived on the wire
+   * (the pump simply has not recorded it yet). Replays, replacements, gaps,
+   * other frame types and missing receipts keep the pump's ordered validation.
+   */
+  #deliverStateEarly(
+    context: SocketEpoch,
+    serialized: string,
+    signal: AbortSignal,
+    hint: FrameHint | undefined,
+  ): boolean {
+    if (hint?.type !== "job.state") return false;
+    if (!this.#active(context) || !context.eligible) return false;
+    if (!isCoordinatingStore(this.#options.store)) return false;
+    let message: Extract<ConnectorServerMessage, { type: "job.state" }>;
+    try {
+      const parsed: ConnectorServerMessage = ConnectorServerMessageSchema.parse(
+        JSON.parse(serialized),
+      );
+      if (parsed.type !== "job.state") return false;
+      if (Date.parse(parsed.expires_at) <= this.#now().getTime()) return false;
+      message = parsed;
+    } catch {
+      return false;
+    }
+    if (this.#options.store.inboundMessage(message.message_id) !== undefined)
+      return false;
+    if (
+      this.#options.store.inboundMessageBySequence(message.sequence) !==
+      undefined
+    )
+      return false;
+    if (message.sequence <= this.#serverCursor.lastSequence) return false;
+    if (!this.#predecessorsArrived(message.sequence)) return false;
+    // Only a response to a request published by the command handler that is
+    // currently blocking the pump can be part of a transport deadlock. A
+    // coordination response published elsewhere is still pumped in order.
+    if (!this.#commandRequests.has(message.payload.request_sequence))
+      return false;
+    // The durable receipt validates the response against the stored request
+    // (correlation, nonce, attempt, identity) when the frame is recorded, so a
+    // response that the ordered pump would reject never reaches a handler.
+    try {
+      if (this.#coordinationEvidence(message) === undefined) return false;
+    } catch {
+      return false;
+    }
+    void this.#handleIncoming(context, serialized, signal, true).catch(() => {
+      if (context.requested && this.#socket === context.socket)
+        this.#fatal("CONNECTOR_STORED_INBOUND_INVALID");
+      this.#closeSocket(context.socket);
+    });
+    return true;
+  }
+
+  /** Read only the fields an ahead delivery needs to decide, and record that
+   * the frame reached the socket before the receive pump could record it, so a
+   * skipped predecessor can be proven to be already here. */
+  #noteArrival(serialized: string): FrameHint | undefined {
+    try {
+      const parsed: unknown = JSON.parse(serialized);
+      if (typeof parsed !== "object" || parsed === null) return undefined;
+      const { type, sequence } = parsed as {
+        type?: unknown;
+        sequence?: unknown;
+      };
+      if (
+        typeof sequence === "number" &&
+        Number.isSafeInteger(sequence) &&
+        sequence > 0
+      )
+        this.#arrived.add(sequence);
+      return { type };
+    } catch {
+      // Malformed frames fail closed inside the ordered pump.
+      return undefined;
+    }
+  }
+
+  #predecessorsArrived(sequence: number): boolean {
+    for (
+      let candidate = this.#serverCursor.lastSequence + 1;
+      candidate < sequence;
+      candidate += 1
+    ) {
+      if (!this.#arrived.has(candidate)) return false;
+    }
+    return true;
+  }
+
+  #pruneArrived(): void {
+    const { lastSequence } = this.#serverCursor;
+    for (const sequence of this.#arrived) {
+      if (sequence <= lastSequence) this.#arrived.delete(sequence);
+    }
+  }
+
   async #handleIncoming(
     context: SocketEpoch,
     serialized: string,
     signal: AbortSignal,
+    direct = false,
   ): Promise<void> {
     const { socket } = context;
     if (!this.#active(context)) return;
@@ -1047,10 +1184,20 @@ export class DurableConnectorClient implements TerminalConnectorClient {
     if (
       existing === undefined &&
       !replacement &&
-      message.sequence !== this.#serverCursor.lastSequence + 1
+      message.sequence !== this.#serverCursor.lastSequence + 1 &&
+      !direct
     ) {
       this.#rejectIncoming(context);
       return;
+    }
+    // A response delivered ahead of the pump was recorded without advancing the
+    // cursor. The pump still advances it here, in arrival order.
+    if (
+      existing !== undefined &&
+      message.sequence === this.#serverCursor.lastSequence + 1
+    ) {
+      this.#serverCursor.accept(message.sequence);
+      this.#pruneArrived();
     }
     if (
       message.type === "connector.welcome" &&
@@ -1069,7 +1216,14 @@ export class DurableConnectorClient implements TerminalConnectorClient {
           serialized,
           evidence,
         );
-        this.#serverCursor.accept(message.sequence);
+        if (!direct) {
+          this.#serverCursor.accept(message.sequence);
+          this.#pruneArrived();
+        }
+        // The awaited response is in the journal now, so the request can no
+        // longer be blocking a command handler.
+        if (evidence !== undefined)
+          this.#commandRequests.delete(evidence.coordinationRequestSequence);
       } catch {
         this.#rejectIncoming(context, "STORE_INBOUND_WRITE_FAILED");
         return;
@@ -1334,7 +1488,7 @@ export class DurableConnectorClient implements TerminalConnectorClient {
             this.#enqueueAck(message.sequence);
             return;
           }
-          await handler(message);
+          await this.#commandScope.run(true, () => handler(message));
           // start() does not await uncooperative application handlers on abort.
           // A late completion retains the unfinished receipt for recovery and
           // must never invoke another handler or touch a possibly closed store.

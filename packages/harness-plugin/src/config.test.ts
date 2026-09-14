@@ -12,7 +12,11 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ConfigValidationError, parsePluginConfig } from "./config.js";
+import {
+  agentOptionsFor,
+  ConfigValidationError,
+  parsePluginConfig,
+} from "./config.js";
 import {
   CredentialUnavailableError,
   MacOSKeychainCredentialReader,
@@ -81,6 +85,19 @@ describe("Harness plugin configuration", () => {
       });
     },
   );
+
+  it("derives the per-Agent model route from the configured harnessModel", () => {
+    const configured = parsePluginConfig(
+      makeConfig(makeFixture(), {
+        harnessModel: { provider: "mock", model: "mock-model" },
+      }),
+    );
+    const options = agentOptionsFor(configured);
+    expect(options).toEqual({ provider: "mock", model: "mock-model" });
+    expect(Object.isFrozen(options)).toBe(true);
+    const absent = parsePluginConfig(makeConfig(makeFixture()));
+    expect(agentOptionsFor(absent)).toBeUndefined();
+  });
 
   it("preserves the exact legacy shape when the route is absent", () => {
     const fixture = makeFixture();

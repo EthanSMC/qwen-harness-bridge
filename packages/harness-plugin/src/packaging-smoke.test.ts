@@ -3,8 +3,11 @@ import {
   cpSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -17,6 +20,7 @@ import {
   CREDENTIAL_ASSIGNMENT,
   findCredentialAssignment,
   HOST_PEER_PREFIX,
+  runtimeClosure,
 } from "../scripts/package.mjs";
 import {
   createCleanRoot,
@@ -38,16 +42,31 @@ const buildProject = (directory: string) => {
   });
 };
 
-/** Compile only what is missing. Deleting a workspace `dist` here would race
- * sibling suites that resolve the same package during a full workspace run. */
+const newestSourceMtime = (directory: string): number => {
+  let newest = 0;
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const full = join(directory, entry.name);
+    if (entry.isDirectory()) {
+      newest = Math.max(newest, newestSourceMtime(full));
+    } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
+      newest = Math.max(newest, statSync(full).mtimeMs);
+    }
+  }
+  return newest;
+};
+
+/** Compile what is missing or stale. Deleting a workspace `dist` here would
+ * race sibling suites that resolve the same package during a full run. */
 const ensureDist = () => {
   const protocolRoot = resolve(packageRoot, "../protocol");
   if (!existsSync(join(protocolRoot, "dist/index.js"))) {
     buildProject(protocolRoot);
   }
+  const built = join(packageRoot, "dist/index.js");
   if (
-    !existsSync(join(packageRoot, "dist/index.js")) ||
-    !existsSync(join(packageRoot, "dist/index.js.map"))
+    !existsSync(built) ||
+    !existsSync(join(packageRoot, "dist/index.js.map")) ||
+    newestSourceMtime(join(packageRoot, "src")) > statSync(built).mtimeMs
   ) {
     buildProject(packageRoot);
   }
@@ -131,6 +150,49 @@ it("detects credential-looking assignments without flagging code", () => {
   ).not.toThrow();
 });
 
+/** The option-A mechanism, kept for any future native runtime dependency: a
+ * package bound to the host ABI is skipped by the vendored closure, so the
+ * profile installs it for the operator's runtime instead of shipping a binary
+ * built here. */
+it("keeps a host-installed native module and its closure out of the vendored tree", () => {
+  const closure = runtimeClosure(
+    { dependencies: { "better-sqlite3": "^12.10.0", ws: "^8.21.3" } },
+    packageRoot,
+    ["better-sqlite3"],
+  );
+  const names = [...closure.keys()];
+  expect(names).toContain("ws");
+  expect(names).not.toContain("better-sqlite3");
+  // Nothing native-only may arrive through the skipped package's own closure.
+  expect(names).not.toContain("bindings");
+  expect(names).not.toContain("prebuild-install");
+});
+
+/** The option-A stand-in for a host-bound package: the smoke root links the
+ * host's own build of the native package, so the artifact is proven to resolve
+ * it from the host instead of shipping a binary compiled for another ABI. */
+it("links the host's native stand-in build instead of a vendored copy", () => {
+  const root = createCleanRoot({
+    repositoryRoot,
+    label: "qhb-native-stand-in",
+  });
+  try {
+    const linked = linkHostPeers({
+      extensionRoot: root,
+      packageRoot,
+      peers: ["better-sqlite3"],
+    });
+    expect(linked).toEqual(["better-sqlite3"]);
+    const linkPath = join(root, "node_modules", "better-sqlite3");
+    expect(existsSync(join(linkPath, "package.json"))).toBe(true);
+    expect(realpathSync.native(linkPath)).toBe(
+      realpathSync.native(join(packageRoot, "node_modules", "better-sqlite3")),
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it("packages a self-contained artifact that installs outside the repository", async () => {
   ensureDist();
   const sentinel = "smoke-credential-sentinel-value";
@@ -158,8 +220,30 @@ it("packages a self-contained artifact that installs outside the repository", as
     expect(JSON.stringify(artifact.manifest.dependencies ?? {})).not.toContain(
       "workspace:",
     );
-    for (const name of ["@qhb/protocol", "zod", "ws", "better-sqlite3"]) {
+    for (const name of ["@qhb/protocol", "zod", "ws"]) {
       expect(artifact.vendoredDependencies).toContain(name);
+    }
+    // The connector has no native runtime dependency: the durable store uses
+    // the built-in node:sqlite, so nothing has to be built for the host ABI.
+    expect(artifact.vendoredDependencies).not.toContain("better-sqlite3");
+    expect(artifact.hostInstalledDependencies).toEqual([]);
+    expect(artifact.entries).not.toContain(
+      "package/node_modules/better-sqlite3/package.json",
+    );
+
+    // Vendored third-party license text must travel with the artifact.
+    expect(artifact.vendoredLicenses).toEqual(
+      [...artifact.vendoredLicenses].sort(),
+    );
+    // Host-installed native modules bring their own license with the profile
+    // install; only vendored packages are inventoried here.
+    for (const expected of ["ws/LICENSE", "zod/LICENSE"]) {
+      expect(artifact.vendoredLicenses, expected).toContain(expected);
+    }
+    for (const license of artifact.vendoredLicenses) {
+      expect(artifact.entries, license).toContain(
+        `package/node_modules/${license}`,
+      );
     }
 
     const packageManifest = JSON.parse(
@@ -168,6 +252,9 @@ it("packages a self-contained artifact that installs outside the repository", as
         ?.data.toString("utf8") ?? "{}",
     );
     const peers = Object.keys(packageManifest.peerDependencies ?? {});
+    // The artifact must install as a DSH profile layer, not a plain dependency.
+    expect(packageManifest.dsh?.bundle?.patch).toBe("./cordis.patch.yml");
+    expect(artifact.entries).toContain("package/cordis.patch.yml");
 
     const extensionRoot = join(root, "extension");
     extract(entries, extensionRoot);
@@ -182,11 +269,33 @@ it("packages a self-contained artifact that installs outside the repository", as
         join(extensionRoot, "node_modules", HOST_PEER_PREFIX.slice(0, -1)),
       ),
     ).toBe(false);
+    // The absent-native proof the packaging decision requires: this clean root
+    // has no better-sqlite3 anywhere, so the journal the probe opens below can
+    // only come from the host's built-in node:sqlite.
+    expect(
+      existsSync(join(extensionRoot, "node_modules", "better-sqlite3")),
+    ).toBe(false);
     // Only the artifact's own node_modules may exist below the clean root.
     expect(hasNodeModulesAncestor(dirname(extensionRoot))).toBe(false);
     expect(hasRepositoryAncestor(dirname(extensionRoot))).toBe(false);
 
-    linkHostPeers({ extensionRoot, packageRoot, peers });
+    // Host peers and host-built native modules are supplied the same way.
+    linkHostPeers({
+      extensionRoot,
+      packageRoot,
+      peers: [...peers, ...artifact.hostInstalledDependencies],
+    });
+
+    // The dsh bundle patch inserts the plugin entry; the operator profile patch
+    // supplies the environment-specific config by id.
+    const bundlePatch = parseYaml(
+      readFileSync(join(extensionRoot, "cordis.patch.yml"), "utf8"),
+    );
+    expect(bundlePatch).toEqual([
+      {
+        insert: [{ id: "qwen-harness-bridge", name: "@qhb/harness-plugin" }],
+      },
+    ]);
 
     // Load the packaged sample wiring: the YAML is parsed here and validated by
     // the packaged config schema inside the probe process.
@@ -243,7 +352,11 @@ it("packages a self-contained artifact that installs outside the repository", as
       ),
       controlExtension,
     );
-    linkHostPeers({ extensionRoot: controlExtension, packageRoot, peers });
+    linkHostPeers({
+      extensionRoot: controlExtension,
+      packageRoot,
+      peers: [...peers, ...artifact.hostInstalledDependencies],
+    });
     expect(() => runProbe(controlRoot, controlExtension, config)).toThrow(
       /Cannot find package '@qhb\/protocol'/u,
     );

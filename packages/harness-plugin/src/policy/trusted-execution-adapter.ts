@@ -8,6 +8,9 @@ export type DeclaredToolRole = "command" | "read" | "write" | "search";
 export const DECLARED_TOOL_ROLES: Readonly<Record<string, DeclaredToolRole>> =
   Object.freeze({
     bash: "command",
+    // The Harness exposes its shell tool as `pwsh` on Windows and `bash` on
+    // POSIX; both carry the same command semantics.
+    pwsh: "command",
     read: "read",
     write: "write",
     edit: "write",
@@ -155,7 +158,11 @@ export function createTrustedExecutionAdapter(
                 )
               : fileAction(execution, options, "search", "none", false);
       if (action === undefined) return undefined;
-      return { action: Object.freeze(action), provenance: "local_tool" };
+      return {
+        action: Object.freeze(action),
+        provenance: "local_tool",
+        sourceTool: execution.name,
+      };
     } catch {
       return undefined;
     }
