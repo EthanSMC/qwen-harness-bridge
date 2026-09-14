@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -165,6 +166,31 @@ it("keeps a host-installed native module and its closure out of the vendored tre
   // Nothing native-only may arrive through the skipped package's own closure.
   expect(names).not.toContain("bindings");
   expect(names).not.toContain("prebuild-install");
+});
+
+/** The option-A stand-in for a host-bound package: the smoke root links the
+ * host's own build of the native package, so the artifact is proven to resolve
+ * it from the host instead of shipping a binary compiled for another ABI. */
+it("links the host's native stand-in build instead of a vendored copy", () => {
+  const root = createCleanRoot({
+    repositoryRoot,
+    label: "qhb-native-stand-in",
+  });
+  try {
+    const linked = linkHostPeers({
+      extensionRoot: root,
+      packageRoot,
+      peers: ["better-sqlite3"],
+    });
+    expect(linked).toEqual(["better-sqlite3"]);
+    const linkPath = join(root, "node_modules", "better-sqlite3");
+    expect(existsSync(join(linkPath, "package.json"))).toBe(true);
+    expect(realpathSync.native(linkPath)).toBe(
+      realpathSync.native(join(packageRoot, "node_modules", "better-sqlite3")),
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 it("packages a self-contained artifact that installs outside the repository", async () => {
