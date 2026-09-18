@@ -42,7 +42,7 @@ describe("harness plugin shape", () => {
   it.skipIf(!POSIX_REDACTION_SUPPORTED)(
     "fails closed when more than one repository root is configured",
     () => {
-      const root = realpathSync(
+      const root = realpathSync.native(
         mkdtempSync(join(tmpdir(), "qhb-shape-multi-")),
       );
       const first = join(root, "first");
@@ -89,7 +89,9 @@ describe("harness plugin shape", () => {
     "composes and tears down the outbound connector under the fiber",
     { timeout: 20_000 },
     async () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "qhb-shape-")));
+      const root = realpathSync.native(
+        mkdtempSync(join(tmpdir(), "qhb-shape-")),
+      );
       const repository = join(root, "repository");
       mkdirSync(repository);
       const effects: Array<() => unknown> = [];

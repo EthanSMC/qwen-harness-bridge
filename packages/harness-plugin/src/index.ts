@@ -4,9 +4,9 @@ import { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { RemoteApprovalBroker } from "./approvals/approval-broker.js";
 import { registerAnswerer } from "./approvals/register-answerer.js";
-import { parsePluginConfig } from "./config.js";
+import { agentOptionsFor, parsePluginConfig } from "./config.js";
+import { createCredentialReader } from "./credential-source.js";
 import type { HarnessContext } from "./harness/types.js";
-import { MacOSKeychainCredentialReader } from "./keychain.js";
 import { classifyAction } from "./policy/action-classifier.js";
 import { createPolicyAgentSetup } from "./policy/register-guard.js";
 import { createTrustedExecutionAdapter } from "./policy/trusted-execution-adapter.js";
@@ -34,6 +34,7 @@ export const inject = [
 ] as const;
 
 export * from "./config.js";
+export * from "./credential-source.js";
 export {
   AgentAdapter,
   HarnessAgentAdapterImpl,
@@ -83,7 +84,9 @@ export function apply(ctx: Context, config?: unknown): void {
     throw new Error("MULTI_REPOSITORY_UNSUPPORTED");
   const repository = parsed.repositories[0];
   const store = new SqlitePluginStore(parsed.databasePath);
-  const credentials = new MacOSKeychainCredentialReader();
+  // ADR 0008: Keychain stays the default; an explicit bounded file or
+  // environment source is opt-in and every source fails closed when unreadable.
+  const credentials = createCredentialReader(parsed);
   const tokenClient = new HttpsSessionTokenClient({
     endpoint: sessionEndpoint(parsed.controlPlaneUrl),
     credentialId: parsed.keychainAccount,
@@ -100,7 +103,7 @@ export function apply(ctx: Context, config?: unknown): void {
     },
     sessionTokenClient: tokenClient,
     bootstrapCredentialProvider: () =>
-      credentials.read(parsed.keychainService, parsed.keychainAccount),
+      credentials.reader.read(parsed.keychainService, parsed.keychainAccount),
   });
   const states = new JobStateClient({ connector });
   const liveStates = new LiveStateRegistry({ connector });
@@ -119,6 +122,7 @@ export function apply(ctx: Context, config?: unknown): void {
       parsed.repositories.find((candidate) => candidate.id === id)
         ?.canonicalPath,
   };
+  const agentOptions = agentOptionsFor(parsed);
   const driver = new OwnedAgentDriver({
     agents: ctx.agents,
     store,
@@ -127,6 +131,7 @@ export function apply(ctx: Context, config?: unknown): void {
     terminal: connector,
     epoch: () => connector.currentEpoch(),
     repositories,
+    ...(agentOptions === undefined ? {} : { agentOptions }),
     publishClaim: async (offer) => {
       await connector.publish(
         "job.claim",
@@ -159,7 +164,7 @@ export function apply(ctx: Context, config?: unknown): void {
           { id: context.repositoryId, canonicalPath: context.repositoryPath },
         ],
       };
-      return createPolicyAgentSetup({
+      const policySetup = createPolicyAgentSetup({
         agentId: sessionId,
         ...scoped,
         resolveAction: (execution) => {
@@ -178,6 +183,7 @@ export function apply(ctx: Context, config?: unknown): void {
                 jobId: context.jobId,
                 attempt: context.attempt,
                 toolName: resolved.action.toolName,
+                sourceTool: resolved.sourceTool ?? resolved.action.toolName,
                 fingerprint: decision.fingerprint,
                 classification: decision.classification,
                 actionSummary: decision.actionSummary,
@@ -190,6 +196,15 @@ export function apply(ctx: Context, config?: unknown): void {
           return resolved;
         },
       });
+      // The approval answerer looks the owned Agent up by id, and the registry
+      // refuses to record an action for an Agent it does not own, so ownership
+      // is taken the moment the factory publishes the Agent.
+      return ((agentCtx: Context, agent?: Agent) => {
+        if (agent !== undefined) actions.registerOwner(agent);
+        return (
+          policySetup as unknown as (ctx: Context, agent?: Agent) => unknown
+        )(agentCtx, agent);
+      }) as unknown as ReturnType<typeof createPolicyAgentSetup>;
     },
   });
   const approvals = new RemoteApprovalBroker({
@@ -242,7 +257,15 @@ export function apply(ctx: Context, config?: unknown): void {
     approvals,
     driver,
     store,
-    report: () => undefined,
+    // Local operability signal: a fixed stage and, only when the failure is a
+    // bounded connector code, that code. Never a message, path or value.
+    report: (error, stage) => {
+      const message = error instanceof Error ? error.message : "";
+      const code = /^[A-Z][A-Z0-9_]{2,63}$/u.test(message)
+        ? message
+        : "UNAVAILABLE";
+      process.stderr.write(`qwen-harness-bridge ${stage}: ${code}\n`);
+    },
   });
   ctx.effect(() => {
     composition.connect();

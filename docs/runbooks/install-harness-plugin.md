@@ -1,6 +1,6 @@
 # Install the Qwen Harness Bridge Connector
 
-This runbook installs the packaged Connector plugin into a Harness host that supports Cordis plugins. It covers the self-contained artifact, the Keychain credential, the sample wiring, the startup checks, and a platform-general rehearsal.
+This runbook installs the packaged Connector plugin into a Harness host that supports Cordis plugins. It covers the self-contained artifact, the Keychain credential, the sample wiring, the startup checks, a platform-general rehearsal, and a live Control Plane rehearsal.
 
 Scope: one Harness host, one configured repository root, and one Control Plane connector identity. It does not cover Control Plane deployment (see `control-plane-local.md`) or release tagging.
 
@@ -30,15 +30,16 @@ The archive is **self-contained**:
 
 | Archive path | Contents |
 |---|---|
-| `package/package.json` | Installable manifest. `workspace:` specifiers are removed and the vendored runtime packages are listed in `qhbVendoredDependencies`; `qhbSchemaSha256` pins the shipped SQLite schema. |
+| `package/package.json` | Installable manifest. `workspace:` specifiers are removed and the vendored runtime packages are listed in `qhbVendoredDependencies`; `qhbVendoredLicenses` lists every vendored license file and `qhbSchemaSha256` pins the shipped SQLite schema. |
 | `package/cordis.example.yml` | Credential-free sample wiring. |
 | `package/dist/**` | Compiled plugin with self-contained source maps. |
-| `package/node_modules/**` | Every runtime dependency, including the private workspace package `@qhb/protocol`, `zod`, `ws`, `better-sqlite3` and its transitive closure. |
-| `package/LICENSE` | Present only when the repository ships a root license. |
+| `package/node_modules/**` | Every pure-JavaScript runtime dependency, including the private workspace package `@qhb/protocol`, `zod` and `ws`. Native modules are never vendored. |
+| `package/node_modules/<package>/LICENSE*` | The license text each vendored package publishes (`LICENSE`, `LICENSE.md`, `COPYING` or `NOTICE`, including variants such as `LICENSE.MIT`), retained even when the package's own `files` field omits it. |
+| `package/LICENSE` | Present only when the repository ships a root license; this repository ships none. |
 
 Host-provided peers are deliberately **not** vendored. Every `@deepseek-ai/*` package listed in `peerDependencies` comes from the Harness host. Packaging fails when a supplied credential value or a credential-looking assignment would enter the archive, and the credential guard also covers camelCase keys such as `bootstrapToken` and unquoted values.
 
-Because `better-sqlite3` ships a native binding, build the artifact on a machine whose platform and architecture match the target host.
+The archive carries no compiled binary, so a single build runs on any host platform the Harness supports.
 
 The packaged smoke test proves the archive installs and runs:
 
@@ -72,11 +73,85 @@ test -n "$(security find-generic-password -s "$service" -a "$account" -w)"
 
 A missing or unreadable item makes the plugin raise `CONNECTOR_CREDENTIAL_UNAVAILABLE` and fail closed instead of connecting unauthenticated.
 
+## 3b. Install into a DSH profile
+
+The artifact is a DSH plugin bundle: its manifest declares `dsh.bundle.patch`, so a profile activates it as a layer as soon as the package is installed.
+
+```bash
+set -euo pipefail
+dsh --from-default-profile headless --profile qhb-rehearsal
+dsh plugin --profile qhb-rehearsal add ./qhb-harness-plugin.tar
+```
+
+`dsh plugin ... add` forwards to pnpm inside the profile directory. After the install the composed tree contains the connector entry:
+
+```bash
+dsh --profile qhb-rehearsal --dump-config | grep -A2 '@qhb/harness-plugin'
+```
+
+Supply the environment-specific configuration from the profile's own patch layer, `<profile>/cordis.patch.yml`, as an id-targeted override:
+
+```yaml
+- id: qwen-harness-bridge
+  config:
+    connectorId: 00000000-0000-4000-8000-000000000000
+    controlPlaneUrl: wss://control-plane.example.com/connector/v1
+    keychainService: qhb-connector
+    keychainAccount: qhb-connector-bootstrap
+    databasePath: /absolute/path/connector.sqlite
+    repositories:
+      - id: example
+        displayName: Example repository
+        canonicalPath: /absolute/repository
+        approvalTimeoutSeconds: 300
+```
+
+`dsh --profile qhb-rehearsal --dump-config` marks the entry as `patched by <profile>/cordis.patch.yml` once the override is in place.
+
+### Bootstrap credential source (ADR 0008)
+
+`credentialSource` names a bounded location for the Connector bootstrap credential; it never carries the value itself. On macOS the default is the Keychain entry built from `keychainService` and `keychainAccount`. On every other platform that default cannot resolve (the reader invokes `/usr/bin/security`), so the boot fails closed until one of these is configured:
+
+```yaml
+- id: qwen-harness-bridge
+  config:
+    credentialSource:
+      kind: file
+      path: /absolute/path/to/connector-bootstrap-credential
+```
+
+```yaml
+- id: qwen-harness-bridge
+  config:
+    credentialSource:
+      kind: environment
+      variable: QHB_CONNECTOR_BOOTSTRAP_CREDENTIAL
+```
+
+- `file` must be an absolute path to an existing, non-symlinked regular file whose parent directory is also canonical. The reader accepts at most 16 KiB and trims exactly one trailing newline (`\n` or `\r\n`).
+- `environment` names a variable matching `[A-Za-z_][A-Za-z0-9_]{0,127}` that is present in the runtime's environment.
+- A missing, empty, oversized, symlinked, relative or ambiguous source aborts startup with `CONNECTOR_CREDENTIAL_UNAVAILABLE`. A relative `file` path or a malformed `environment` variable name is rejected earlier as `INVALID_CREDENTIAL_SOURCE`, while an unknown kind, an extra field or a malformed block is rejected by the strict schema as `INVALID_PLUGIN_CONFIG`. The connector never falls back to another source.
+- Rotation replaces the value at the configured location and then restarts the profile, because the connector reads the source at bootstrap. The **value** never appears in the configuration, the logs, the rehearsal JSON report or the artifact. The **location** is configuration by design for the `file` source (the variable name for `environment`), and never appears in the logs, the rehearsal JSON report or the artifact.
+
+To rehearse without touching the operator's real `~/.dsh`, point the launcher at an isolated home. The packaged `dsh` shim pins `DSH_HOME`, so invoke the same entry point directly with your own value:
+
+```bash
+ELECTRON_RUN_AS_NODE=1 DSH_HOME=/absolute/isolated/home \
+  "<dsh-application>" --expose-internals "<app.asar>/lib/desktop-cli.js" \
+  --profile qhb-rehearsal --dump-config
+```
+
+### Host runtime and native modules
+
+The connector has **no native runtime dependency**: the durable journal uses the Node built-in `node:sqlite`, so the artifact ships only pure-JavaScript runtime code (`@qhb/protocol`, `zod`, `ws`) and nothing in it is bound to a host ABI. A profile install therefore needs no compiler, no prebuilt binary and no `allowBuilds` entry.
+
+For a future native module, the packaging keeps the rule that no host-bound binary is ever vendored: the packaged manifest lists such packages in `qhbHostInstalledDependencies` while keeping them in `dependencies`, and the operator allows their build in the profile's `pnpm-workspace.yaml` (`allowBuilds: { <package>: true }`). Installing a native module needs either a prebuilt binary for the host runtime's ABI or a working toolchain (`node-gyp` plus a C++ compiler); a runtime ABI with neither cannot complete the install. This is why the connector moved to `node:sqlite`: while validating this runbook, `better-sqlite3` 12.11.1 published prebuilds only up to electron ABI 135 and node ABI 127/137, and this host's runtime ABI had no prebuild and no toolchain.
+
 ## 4. Wire the plugin
 
 1. Create the local database directory: `databasePath` must be an absolute path whose parent directory already exists and is not reached through a symlink.
 2. Merge the `plugin` block from `packages/harness-plugin/cordis.example.yml` into the Harness root `cordis.yml`.
-3. Replace `connectorId`, `controlPlaneUrl`, `keychainService`, `keychainAccount`, `databasePath`, the repository `id`, `displayName`, and `canonicalPath`.
+3. Replace `connectorId`, `controlPlaneUrl`, `databasePath`, the repository `id`, `displayName`, and `canonicalPath`. Keep `keychainService` and `keychainAccount` for the macOS default, and add the `credentialSource` block above on any other platform.
 4. Keep exactly one entry under `repositories`. Two or more entries abort startup with `MULTI_REPOSITORY_UNSUPPORTED` before any effect is registered.
 
 Configuration is validated before the plugin opens the database or the socket. Validation failures surface as `ConfigValidationError` codes:
@@ -103,7 +178,41 @@ The script builds, packs, installs into a clean root outside the repository, lin
 - `credential-read` reports `PASS` on macOS when a Keychain item is present and `FAIL-CLOSED` with `CONNECTOR_CREDENTIAL_UNAVAILABLE` on any host without `/usr/bin/security`. Both outcomes are correct; record which one you observed.
 - `rotate-credential` is `PARTIAL` off macOS: the credential source is rotated and the journal is preserved, but the live Keychain item and the Control Plane exchange cannot be exercised there.
 
-## 6. Load and verify
+## 6. Live rehearsal against a real Control Plane
+
+`packages/harness-plugin/scripts/live-rehearsal.mjs` installs the packaged artifact into a fresh profile, boots the global Harness CLI, waits for the Control Plane's own connector gauge, and then drives `submit_task`, `list_pending_approvals`, `decide_approval`, `get_task` and `get_task_result` over MCP. Connection material is read only from the out-of-band JSON file named by `QHB_ACCEPTANCE_ENV` (or `--env`); nothing read there reaches the report, the repository or the artifact.
+
+```bash
+export NODE_EXTRA_CA_CERTS=<control-plane CA bundle>   # only for a private CA
+cd packages/harness-plugin
+node scripts/live-rehearsal.mjs \
+  --env <env json> \
+  --dsh-bin <harness executable> --dsh-cli <app.asar/lib/desktop-cli.js> \
+  --dsh-home <isolated DSH home> --serve [--tools] \
+  --state-dir <connector journal directory> \
+  --model-provider <id> --model <id> --model-api-key-env <NAME> [--model-base-url <url>] \
+  --out <report json>
+```
+
+| Flag | Effect |
+|---|---|
+| `--serve` | Creates the profile from the shipped `web` template and boots it resident, which is what keeps the connector online. It requires an explicit `--dsh-home`: a resident host shares the home's sessions, storages and credentials with any runtime already using it, so the runner refuses to boot one against the default home. |
+| `--task <text>` | Boots the shipped `headless` template for one task instead. The host exits when the task ends, so the connector is online only for its duration. |
+| `--state-dir <path>` | Keeps the connector journal in a caller-owned directory. The Control Plane consumes a connector's first `hello` as a one-time birth, so reuse this directory for every rehearsal against the same connector; a fresh journal against a consumed birth fails at the online step. |
+| `--model-provider`, `--model`, `--model-api-key-env`, `--model-base-url` | Declare an operator-supplied model route so the owned attempt can run. The credential value must already exist in the isolated home's credential store under that variable name; the runner writes endpoint configuration only. |
+| `--tools` | Enables the shipped `tool-pwsh` and `tool-fs` plugins. Without them the owned attempt carries no tools, so a job can only complete without an approval. |
+| `--warmup-wait-ms`, `--online-wait-ms`, `--budget-ms`, `--out` | Bound the gauge-baseline wait, the online wait and the job observation, and write the report to a file. |
+
+The report records the environment, the credential source kind, every step with its observed status, and the masked boot tail. A `PARTIAL` lifecycle is a real result, not a harness failure: an approved job cannot reach a terminal state until the Control Plane returns the job to `running` after the decision (finding 7 in `docs/product/v0.2.0-acceptance.md`).
+
+The transport-level rehearsal needs no Control Plane and runs in CI:
+
+```bash
+node node_modules/vitest/vitest.mjs run --project integration \
+  tests/integration/loopback-control-plane.test.ts
+```
+
+## 7. Load and verify
 
 Start Harness with the plugin enabled and confirm the outbound connection from the Control Plane side, not from local log content.
 
@@ -121,7 +230,7 @@ Then run the repository gates on the installing host:
 pnpm check && pnpm test
 ```
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 - `Cannot find package '@qhb/protocol'` while importing the packaged entry: the artifact is not self-contained. Rebuild it with `pnpm --filter @qhb/harness-plugin pack` and confirm the failure stops; the packaged smoke test covers this case.
 - `CONNECTOR_CREDENTIAL_UNAVAILABLE`: the Keychain item is missing, the account differs, the login Keychain is locked, or the host is not macOS. Re-run step 3 and re-check the service/account pair.
@@ -130,7 +239,7 @@ pnpm check && pnpm test
 - Startup succeeds but no job is claimed: confirm the Control Plane sees the connector as online and that the repository `id` matches the issued identity.
 - A policy denial for a search or executable action: the action domain rules are authoritative (see ADR 0002). Do not widen the configuration to bypass a denial.
 
-## 8. Uninstall
+## 9. Uninstall
 
 Stop Harness, remove the plugin block from the Harness root `cordis.yml`, delete the extracted extension directory, and keep or delete `databasePath` deliberately. To remove the credential, delete the Keychain item:
 

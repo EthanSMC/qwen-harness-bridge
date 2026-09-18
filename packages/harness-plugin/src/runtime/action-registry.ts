@@ -6,7 +6,10 @@ import type { PolicyClass } from "../policy/types.js";
 export type TrustedActionRegistration = Readonly<{
   jobId: string;
   attempt: number;
+  /** The canonical policy tool the action was classified as. */
   toolName: string;
+  /** The host tool that produced the execution, as the Host names it. */
+  sourceTool?: string;
   fingerprint: string;
   classification: PolicyClass;
   actionSummary: string;

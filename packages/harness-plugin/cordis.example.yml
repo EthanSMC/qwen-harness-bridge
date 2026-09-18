@@ -1,7 +1,10 @@
 # Sample Cordis wiring for the Qwen Harness Bridge Connector.
 # Copy this block into your Harness root cordis.yml and replace every placeholder.
-# The bootstrap credential is NEVER stored here: it lives in the macOS Keychain
-# under keychainService/keychainAccount and is exchanged for a short-lived token.
+# The bootstrap credential is NEVER stored here. On macOS the connector reads the
+# Keychain item named by keychainService/keychainAccount and exchanges it for a
+# short-lived session token. On a host without /usr/bin/security, uncomment
+# exactly one credentialSource form below; an absent source keeps failing closed
+# with CONNECTOR_CREDENTIAL_UNAVAILABLE.
 plugin: "@qhb/harness-plugin"
 config:
   # Stable connector identity issued by the Control Plane.
@@ -10,8 +13,21 @@ config:
   # replacing the scheme and appending /session to the path.
   controlPlaneUrl: wss://control-plane.example.com/connector/v1
   # Keychain coordinates read with /usr/bin/security find-generic-password.
+  # These are the default on darwin and stay valid wherever that tool exists.
   keychainService: qhb-connector
   keychainAccount: qhb-connector-bootstrap
+  # Bounded, credential-free alternative for hosts without /usr/bin/security:
+  # exactly one source, naming a location and never a value. Give the file mode
+  # 0600, or set the environment variable on the host; either source is read
+  # once at bootstrap and trims exactly one trailing newline.
+  #
+  # credentialSource:
+  #   kind: file
+  #   path: /run/secrets/qhb-connector-bootstrap
+  #
+  # credentialSource:
+  #   kind: environment
+  #   variable: QHB_CONNECTOR_BOOTSTRAP_CREDENTIAL
   # Absolute path of the local journal database. The parent directory must
   # already exist, the path must not traverse a symlink, and "~" is NOT
   # expanded -- write the full path.

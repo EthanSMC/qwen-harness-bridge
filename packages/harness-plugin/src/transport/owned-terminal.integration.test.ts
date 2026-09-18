@@ -38,7 +38,7 @@ it.each([
   "live shared terminal persistence and delivery: %s",
   async (scenario) => {
     const legacy = scenario.startsWith("generic-legacy");
-    const directory = realpathSync(
+    const directory = realpathSync.native(
       mkdtempSync(join(tmpdir(), "owned-terminal-tls-")),
     );
     const store = new SqlitePluginStore(join(directory, "store.sqlite"));
