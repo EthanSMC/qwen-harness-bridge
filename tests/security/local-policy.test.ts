@@ -45,17 +45,19 @@ import type {
 
 const temporaryDirectories: string[] = [];
 // Mandatory interoperability prerequisite: fail visibly if the real rg is absent.
-const actualRipgrep = realpathSync(
+const actualRipgrep = realpathSync.native(
   execFileSync("which", ["rg"], { encoding: "utf8" }).trim(),
 );
 const actualNpmRoot = dirname(
   dirname(
-    realpathSync(execFileSync("which", ["npm"], { encoding: "utf8" }).trim()),
+    realpathSync.native(
+      execFileSync("which", ["npm"], { encoding: "utf8" }).trim(),
+    ),
   ),
 );
 // The package-manager launcher may select a different installed version. Supply
 // its 10.15.1 CLI explicitly in that case; never download or silently skip it.
-const actualPnpmCli = realpathSync(
+const actualPnpmCli = realpathSync.native(
   process.env.QHB_POLICY_PNPM_CLI ??
     process.env.npm_execpath ??
     execFileSync("which", ["pnpm"], { encoding: "utf8" }).trim(),
@@ -185,7 +187,7 @@ const makeFixture = () => {
     outsidePath,
     repository: {
       id: "repo-one",
-      canonicalPath: realpathSync(repositoryPath),
+      canonicalPath: realpathSync.native(repositoryPath),
     } satisfies RepositoryPolicy,
   };
 };
@@ -234,7 +236,7 @@ describe("accepted complete-range findings", () => {
       const file = join(fixture.executableDirectory, name);
       writeFileSync(file, "fixture\n", { mode: 0o755 });
       if (name === "rg") copyFileSync(actualRipgrep, file);
-      trustedExecutables[name] = realpathSync(file);
+      trustedExecutables[name] = realpathSync.native(file);
     }
     return {
       ...fixture,
@@ -518,7 +520,7 @@ const runtimeFixture = (
     trustedExecutables: Object.fromEntries(
       ["pnpm", "npm", "git", "vercel", "rg"].map((name) => [
         name,
-        realpathSync(join(fixture.executableDirectory, name)),
+        realpathSync.native(join(fixture.executableDirectory, name)),
       ]),
     ),
     agentId: agent.id,
@@ -553,7 +555,7 @@ describe("R1 native installation path semantics", () => {
     trustedExecutables: Object.fromEntries(
       ["npm", "pnpm", "git", "vercel", "grep"].map((name) => [
         name,
-        realpathSync(join(fixture.executableDirectory, name)),
+        realpathSync.native(join(fixture.executableDirectory, name)),
       ]),
     ),
   });
@@ -778,7 +780,7 @@ describe("N1-N4 deterministic corrective wave", () => {
     trustedExecutables: Object.fromEntries(
       ["pnpm", "npm", "git", "vercel", "grep", "rg"].map((name) => [
         name,
-        realpathSync(join(f.executableDirectory, name)),
+        realpathSync.native(join(f.executableDirectory, name)),
       ]),
     ),
   });
@@ -1062,7 +1064,7 @@ describe("N1 administrative argument scope transitions", () => {
         classifyAction(makeAction(fixture, { toolName, executable, argv }), {
           repositories: [fixture.repository],
           trustedExecutables: {
-            [executable]: realpathSync(
+            [executable]: realpathSync.native(
               join(fixture.executableDirectory, executable),
             ),
           },
@@ -1369,7 +1371,7 @@ describe("N5 actual ripgrep search domain", () => {
           {
             ...f.options,
             trustedExecutables: {
-              grep: realpathSync(join(f.executableDirectory, "grep")),
+              grep: realpathSync.native(join(f.executableDirectory, "grep")),
             },
           },
         ),
@@ -1775,7 +1777,7 @@ const trustedPolicyOptions = (
   trustedExecutables: Object.fromEntries(
     ["pnpm", "rg", "rm"].map((name) => [
       name,
-      join(realpathSync(fixture.executableDirectory), name),
+      join(realpathSync.native(fixture.executableDirectory), name),
     ]),
   ),
   resolveAction(execution) {
@@ -1823,7 +1825,7 @@ describe("local repository policy boundary", () => {
     const options = {
       repositories: [fixture.repository],
       trustedExecutables: {
-        rg: realpathSync(join(fixture.executableDirectory, "rg")),
+        rg: realpathSync.native(join(fixture.executableDirectory, "rg")),
       },
     };
     expect(classifyAction(action, options).classification).toBe("denied");
@@ -1887,7 +1889,7 @@ describe("local repository policy boundary", () => {
         symlinkSync(executable, join(fixture.executableDirectory, identity));
       const options = {
         repositories: [fixture.repository],
-        trustedExecutables: { [identity]: realpathSync(executable) },
+        trustedExecutables: { [identity]: realpathSync.native(executable) },
       };
       for (const spelling of [identity, executable]) {
         expect(
@@ -1913,7 +1915,7 @@ describe("local repository policy boundary", () => {
     writeFileSync(path, "fixture\n");
     const options = {
       repositories: [fixture.repository],
-      trustedExecutables: { [executable]: realpathSync(path) },
+      trustedExecutables: { [executable]: realpathSync.native(path) },
     };
     expect(
       classifyAction(
@@ -1965,7 +1967,9 @@ describe("local repository policy boundary", () => {
     const fixture = makeFixture();
     const attacker = join(fixture.outsidePath, "rg");
     writeFileSync(attacker, "attacker fixture\n");
-    const trusted = realpathSync(join(fixture.executableDirectory, "rg"));
+    const trusted = realpathSync.native(
+      join(fixture.executableDirectory, "rg"),
+    );
     const trustedActions = new WeakMap<object, TrustedPolicyAction>();
     const options = {
       ...trustedPolicyOptions(fixture, trustedActions),
@@ -1974,19 +1978,19 @@ describe("local repository policy boundary", () => {
     const { agentContext, guards } = makeAgentScope();
     installPolicy(agentContext, options);
     const repositoryId = fixture.repository.id;
-    fixture.repository.canonicalPath = realpathSync(fixture.outsidePath);
-    options.trustedExecutables.rg = realpathSync(attacker);
+    fixture.repository.canonicalPath = realpathSync.native(fixture.outsidePath);
+    options.trustedExecutables.rg = realpathSync.native(attacker);
     options.repositories = [
       {
         id: fixture.repository.id,
-        canonicalPath: realpathSync(fixture.outsidePath),
+        canonicalPath: realpathSync.native(fixture.outsidePath),
       },
     ];
     const action = makeAction(fixture, {
       toolName: "search",
       executable: "rg",
       argv: ["--files"],
-      cwd: realpathSync(fixture.repositoryPath),
+      cwd: realpathSync.native(fixture.repositoryPath),
       repositoryId,
     });
     const execution = makeExecution(action);

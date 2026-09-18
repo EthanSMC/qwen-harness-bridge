@@ -278,7 +278,7 @@ describe("connector public projection", () => {
     secrets?: readonly string[];
   };
   beforeEach(() => {
-    root = realpathSync(mkdtempSync(join(tmpdir(), "qhb-redaction-")));
+    root = realpathSync.native(mkdtempSync(join(tmpdir(), "qhb-redaction-")));
     mkdirSync(join(root, "src"));
     writeFileSync(join(root, "src/file.ts"), "");
     options = { repositoryRoot: root, homeDirectory: "/Users/synthetic" };

@@ -114,6 +114,20 @@ const removeRoot = (root: string) => {
   });
 };
 
+/** True when any entry named `segment` exists anywhere below `root`. */
+const containsPathSegment = (root: string, segment: string): boolean => {
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (entry.name === segment) return true;
+    if (
+      entry.isDirectory() &&
+      containsPathSegment(join(root, entry.name), segment)
+    ) {
+      return true;
+    }
+  }
+  return false;
+};
+
 it("detects credential-looking assignments without flagging code", () => {
   for (const text of [
     'bootstrapToken: "abcdefgh"',
@@ -269,12 +283,11 @@ it("packages a self-contained artifact that installs outside the repository", as
         join(extensionRoot, "node_modules", HOST_PEER_PREFIX.slice(0, -1)),
       ),
     ).toBe(false);
-    // The absent-native proof the packaging decision requires: this clean root
-    // has no better-sqlite3 anywhere, so the journal the probe opens below can
-    // only come from the host's built-in node:sqlite.
-    expect(
-      existsSync(join(extensionRoot, "node_modules", "better-sqlite3")),
-    ).toBe(false);
+    // The absent-native proof the packaging decision requires: a recursive scan
+    // finds no better-sqlite3 entry anywhere below this clean root, so the
+    // journal the probe opens below can only come from the host's built-in
+    // node:sqlite.
+    expect(containsPathSegment(extensionRoot, "better-sqlite3")).toBe(false);
     // Only the artifact's own node_modules may exist below the clean root.
     expect(hasNodeModulesAncestor(dirname(extensionRoot))).toBe(false);
     expect(hasRepositoryAncestor(dirname(extensionRoot))).toBe(false);

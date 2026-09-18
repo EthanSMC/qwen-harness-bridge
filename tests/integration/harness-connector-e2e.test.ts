@@ -28,7 +28,9 @@ import { LOCALHOST_TLS } from "./support/tls.js";
  * the Linux runner.
  */
 it("drives one owned execution across a restart", async () => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-e2e-")));
+  const directory = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "qhb-e2e-")),
+  );
   const storePath = join(directory, "store.sqlite");
   const store = new SqlitePluginStore(storePath);
   const server = createServer(LOCALHOST_TLS);
