@@ -98,7 +98,9 @@ it("commits, rolls back and exposes transaction state", () => {
 });
 
 it("persists to a file and closes", () => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-sqlite-")));
+  const directory = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "qhb-sqlite-")),
+  );
   const path = join(directory, "store.sqlite");
   try {
     const first = openDatabase(path);

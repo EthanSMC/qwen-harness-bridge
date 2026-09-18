@@ -130,7 +130,7 @@ Supply the environment-specific configuration from the profile's own patch layer
 
 - `file` must be an absolute path to an existing, non-symlinked regular file whose parent directory is also canonical. The reader accepts at most 16 KiB and trims exactly one trailing newline (`\n` or `\r\n`).
 - `environment` names a variable matching `[A-Za-z_][A-Za-z0-9_]{0,127}` that is present in the runtime's environment.
-- A missing, empty, oversized, symlinked, relative or ambiguous source aborts startup with `CONNECTOR_CREDENTIAL_UNAVAILABLE`; a malformed block is rejected earlier as the config error `INVALID_CREDENTIAL_SOURCE`. The connector never falls back to another source.
+- A missing, empty, oversized, symlinked, relative or ambiguous source aborts startup with `CONNECTOR_CREDENTIAL_UNAVAILABLE`. A relative `file` path or a malformed `environment` variable name is rejected earlier as `INVALID_CREDENTIAL_SOURCE`, while an unknown kind, an extra field or a malformed block is rejected by the strict schema as `INVALID_PLUGIN_CONFIG`. The connector never falls back to another source.
 - Rotation replaces the value at the configured location and then restarts the profile, because the connector reads the source at bootstrap. The value and its resolved location never appear in the configuration, the logs, the rehearsal JSON report or the artifact.
 
 To rehearse without touching the operator's real `~/.dsh`, point the launcher at an isolated home. The packaged `dsh` shim pins `DSH_HOME`, so invoke the same entry point directly with your own value:

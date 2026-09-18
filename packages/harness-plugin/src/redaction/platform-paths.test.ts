@@ -9,7 +9,9 @@ import { redactEvent } from "./redact-event.js";
  * asserts the host's own spelling, because the connector must start wherever
  * the Harness runtime boots. */
 it("accepts the host absolute roots and redacts paths beneath them", () => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-redact-")));
+  const directory = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "qhb-redact-")),
+  );
   const repository = join(directory, "repo");
   const home = join(directory, "home");
   mkdirSync(repository, { recursive: true });

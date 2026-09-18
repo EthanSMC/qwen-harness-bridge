@@ -22,7 +22,9 @@ import { startLoopbackControlPlane } from "./support/loopback-control-plane.js";
  * mid-run socket kill, and the rule that no credential material reaches the
  * wire. The job lifecycle itself is driven by the packaged live rehearsal. */
 it("authenticates, survives a socket kill and keeps credentials off the wire", async () => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-loopback-")));
+  const directory = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "qhb-loopback-")),
+  );
   const store = new SqlitePluginStore(join(directory, "store.sqlite"));
   const plane = await startLoopbackControlPlane();
   const sentinel = "loopback-credential-sentinel-8f2a41";
@@ -209,7 +211,9 @@ const frameIdentity = (frame: { message: unknown }) => {
 /** Ordered replay: an unacknowledged durable claim must be re-sent with its
  * original identity after a mid-run socket kill, never reallocated. */
 it("replays an unacknowledged claim after a socket kill", async () => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-replay-")));
+  const directory = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "qhb-replay-")),
+  );
   const store = new SqlitePluginStore(join(directory, "store.sqlite"));
   const plane = await startLoopbackControlPlane();
   const lifecycle = new AbortController();
@@ -282,7 +286,9 @@ it("replays an unacknowledged claim after a socket kill", async () => {
  * therefore complete admission, and the frame is still recorded in order.
  */
 it("admits a socket-delivered offer without blocking the receive pump", async () => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-admit-")));
+  const directory = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "qhb-admit-")),
+  );
   const store = new SqlitePluginStore(join(directory, "store.sqlite"));
   const plane = await startLoopbackControlPlane();
   plane.setAcknowledge(true);
@@ -330,7 +336,9 @@ it("admits a socket-delivered offer without blocking the receive pump", async ()
  * replayed with its original identity after a socket kill, and the Control
  * Plane's decision is applied once. No credential material reaches the wire. */
 it("carries an approval request out and a single decision back", async () => {
-  const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-approval-")));
+  const directory = realpathSync.native(
+    mkdtempSync(join(tmpdir(), "qhb-approval-")),
+  );
   const store = new SqlitePluginStore(join(directory, "store.sqlite"));
   const plane = await startLoopbackControlPlane();
   const lifecycle = new AbortController();

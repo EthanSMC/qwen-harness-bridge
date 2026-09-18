@@ -13,7 +13,7 @@ import { ConfigValidationError, parsePluginConfig } from "./config.js";
 import { createCredentialReader } from "./credential-source.js";
 import { CredentialUnavailableError } from "./keychain.js";
 
-const directory = realpathSync(mkdtempSync(join(tmpdir(), "qhb-cred-")));
+const directory = realpathSync.native(mkdtempSync(join(tmpdir(), "qhb-cred-")));
 const repository = join(directory, "repository");
 mkdirSync(repository, { recursive: true });
 
@@ -121,22 +121,21 @@ it("fails closed for missing, empty, non-regular, symlinked and oversized files"
 
   const symlinkTarget = secretFile("real.secret", "value-3\n");
   const linkPath = join(directory, "link.secret");
+  let symlinkCreated = false;
   try {
     symlinkSync(symlinkTarget, linkPath, "file");
+    symlinkCreated = true;
   } catch {
-    // Windows without developer mode cannot create file symlinks; skip only this case.
+    // Windows without developer mode cannot create file symlinks; skip only this
+    // case, and never swallow an assertion failure for a symlink that did exist.
   }
-  if (linkPath !== undefined) {
-    try {
-      const linked = createCredentialReader(
-        parsePluginConfig(baseConfig({ kind: "file", path: linkPath })),
-      );
-      await expect(linked.reader.read("a", "b")).rejects.toBeInstanceOf(
-        CredentialUnavailableError,
-      );
-    } catch {
-      // Symlink creation was unavailable; the other bounded cases still ran.
-    }
+  if (symlinkCreated) {
+    const linked = createCredentialReader(
+      parsePluginConfig(baseConfig({ kind: "file", path: linkPath })),
+    );
+    await expect(linked.reader.read("a", "b")).rejects.toBeInstanceOf(
+      CredentialUnavailableError,
+    );
   }
 
   const oversized = createCredentialReader(

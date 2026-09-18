@@ -46,7 +46,12 @@ import {
   terminalKey,
   validateTerminalProposal,
 } from "./owned-terminal.js";
-import { openDatabase, type SqliteDatabase } from "./sqlite-driver.js";
+import {
+  openDatabase,
+  type SqliteDatabase,
+  type SqliteModule,
+  SqliteUnavailableError,
+} from "./sqlite-driver.js";
 
 export type { OwnedIntent, OwnedIntentOwner } from "./owned-intent.js";
 export { OwnedIntentError } from "./owned-intent.js";
@@ -345,10 +350,13 @@ export class SqlitePluginStore implements TerminalPluginStore {
   #database: SqliteDatabase | null = null;
   #closed = false;
 
-  constructor(databasePath: string) {
+  constructor(
+    databasePath: string,
+    options: Readonly<{ load?: () => SqliteModule }> = {},
+  ) {
     assertNonEmpty(databasePath, "STORE_DATABASE_PATH_REQUIRED");
     try {
-      this.#database = openDatabase(databasePath);
+      this.#database = openDatabase(databasePath, options);
       this.#database.pragma("journal_mode = WAL");
       this.#database.pragma("synchronous = FULL");
       this.#database.pragma("foreign_keys = ON");
@@ -381,6 +389,10 @@ export class SqlitePluginStore implements TerminalPluginStore {
         // Preserve the safe store error below.
       }
       if (error instanceof StoreError) throw error;
+      // Keep the bounded built-in-module code reachable through the plugin path:
+      // an unsupported host must be diagnosable as STORE_SQLITE_UNAVAILABLE, not
+      // flattened into the generic initialization failure.
+      if (error instanceof SqliteUnavailableError) throw error;
       throw new StoreError("STORE_INITIALIZATION_FAILED");
     }
   }

@@ -51,7 +51,7 @@ const makeConfig = (
       {
         id: "repo-one",
         displayName: "Repository One",
-        canonicalPath: realpathSync(fixture.repository),
+        canonicalPath: realpathSync.native(fixture.repository),
         approvalTimeoutSeconds: 300,
       },
     ],
@@ -103,7 +103,10 @@ describe("Harness plugin configuration", () => {
     const fixture = makeFixture();
     const input = JSON.parse(
       makeConfig(fixture, {
-        databasePath: join(realpathSync(fixture.directory), "state.sqlite"),
+        databasePath: join(
+          realpathSync.native(fixture.directory),
+          "state.sqlite",
+        ),
       }),
     );
     const config = parsePluginConfig(input);
@@ -420,7 +423,7 @@ describe("Harness plugin configuration", () => {
 
     expect(config.connectorId).toBe("connector-1");
     expect(config.repositories[0]?.canonicalPath).toBe(
-      realpathSync(fixture.repository),
+      realpathSync.native(fixture.repository),
     );
     expect(Object.isFrozen(config)).toBe(true);
     expect(Object.isFrozen(config.repositories)).toBe(true);

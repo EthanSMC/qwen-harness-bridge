@@ -2015,3 +2015,16 @@ describe("SQLite Harness plugin store", () => {
     reopened.close();
   });
 });
+
+/** The bounded code the packaging decision requires must survive the plugin's own
+ * store path, not only the driver's. */
+it("surfaces STORE_SQLITE_UNAVAILABLE when the host lacks node:sqlite", () => {
+  expect(
+    () =>
+      new SqlitePluginStore(":memory:", {
+        load: () => {
+          throw new Error("ERR_UNKNOWN_BUILTIN_MODULE");
+        },
+      }),
+  ).toThrow("STORE_SQLITE_UNAVAILABLE");
+});

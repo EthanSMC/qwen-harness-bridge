@@ -148,7 +148,9 @@ describe.skipIf(process.platform === "win32")(
   "declared tool classification",
   () => {
     const fixture = () => {
-      const root = realpathSync(mkdtempSync(join(tmpdir(), "qhb-adapter-")));
+      const root = realpathSync.native(
+        mkdtempSync(join(tmpdir(), "qhb-adapter-")),
+      );
       fixtureRoots.push(root);
       const repository = join(root, "repository");
       const bin = join(root, "bin");
@@ -160,7 +162,7 @@ describe.skipIf(process.platform === "win32")(
       for (const name of ["pnpm", "git", "npm", "vercel", "vitest", "tsc"]) {
         const file = join(bin, name);
         writeFileSync(file, "fixture\n", { mode: 0o755 });
-        trustedExecutables[name] = realpathSync(file);
+        trustedExecutables[name] = realpathSync.native(file);
       }
       vi.stubEnv("PATH", bin);
       const options = {

@@ -338,7 +338,8 @@ it("packages a self-contained artifact that installs outside the repository", as
     expect(probe.repositoryCount).toBe(1);
     expect(probe.canonicalPath).toBe(repositoryDirectory);
     expect(probe.approvalTimeoutSeconds).toBe(300);
-    // The vendored native runtime opened the journal from the clean root.
+    // The probe opened the journal from the clean root with the host's built-in
+    // node:sqlite; no native module is vendored or host-installed.
     expect(probe.databasePath).toBe(journal);
     expect(existsSync(journal)).toBe(true);
 

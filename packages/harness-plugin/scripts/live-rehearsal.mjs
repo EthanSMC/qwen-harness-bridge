@@ -5,11 +5,12 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, platform, release } from "node:os";
+import { homedir, platform, release, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -213,7 +214,12 @@ const call = async (client, name, args = {}) => {
   return result.structuredContent ?? {};
 };
 
-const work = mkdtempSync(join(repositoryRoot, ".live-rehearsal-"));
+/** The scratch tree holds the bootstrap credential file, so it lives in the OS
+ * temporary directory: never an untracked, committable file inside the checkout,
+ * and canonicalized so a short (8.3) TEMP path cannot confuse later reads. */
+const work = mkdtempSync(
+  join(realpathSync.native(tmpdir()), "qhb-live-rehearsal-"),
+);
 const profileDir = join(dshHome, "profiles", profile);
 let client;
 let boot;
