@@ -34,9 +34,19 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends ripgrep
+          sudo apt-get install --yes --no-install-recommends ripgrep postgresql
           command -v rg
           rg --version
+          # The runner image no longer ships PostgreSQL 16 at the versioned path the
+          # integration suites used to find. Export the installed server's bin
+          # directory through the documented PG_BINDIR hook instead of pinning the
+          # image, because tests/contract/runtime-build.test.ts requires
+          # runs-on: ubuntu-latest.
+          pg_bin="$(dirname "$(find /usr/lib/postgresql -type f -name initdb | sort -V | tail -n 1)")"
+          test -n "$pg_bin"
+          test -x "$pg_bin/initdb"
+          test -x "$pg_bin/pg_ctl"
+          printf 'PG_BINDIR=%s\n' "$pg_bin" >> "$GITHUB_ENV"
 
       - name: Generate ephemeral runtime material
         shell: bash
