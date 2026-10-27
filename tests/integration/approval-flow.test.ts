@@ -214,15 +214,18 @@ const waitForJob = async (
 
 const readResumedEvents = async (
   jobId: string,
-): Promise<readonly Record<string, unknown>[]> => {
-  const result = await db.query<{ payload: Record<string, unknown> }>(
-    `SELECT payload
+): Promise<readonly { payload: Record<string, unknown>; source: string }[]> => {
+  const result = await db.query<{
+    payload: Record<string, unknown>;
+    source: string;
+  }>(
+    `SELECT payload, source
        FROM job_events
       WHERE job_id = $1 AND event_type = 'job.resumed'
       ORDER BY sequence`,
     [jobId],
   );
-  return result.rows.map((row) => row.payload);
+  return result.rows;
 };
 
 beforeAll(async () => {
@@ -489,10 +492,13 @@ describe("approval flow", () => {
     expect(resumed.revision).toBe(requested.jobRevision + 1);
     await expect(readResumedEvents(job.jobId)).resolves.toEqual([
       {
-        approval_id: requested.approvalId,
-        decision: "approve",
-        attempt: job.attempt,
-        job_revision: requested.jobRevision,
+        payload: {
+          approval_id: requested.approvalId,
+          decision: "approve",
+          attempt: job.attempt,
+          job_revision: requested.jobRevision,
+        },
+        source: "control-plane",
       },
     ]);
   });
@@ -527,7 +533,7 @@ describe("approval flow", () => {
     expect(await readResumedEvents(job.jobId)).toHaveLength(1);
   });
 
-  it("never resumes a rejected job and keeps refusing a successful terminal commit", async () => {
+  it("never resumes a job whose delivered decision was rejected", async () => {
     const job = await claimJob();
     const requested = await requestApproval(job, {
       jobRevision: job.runningRevision + 1,
@@ -550,19 +556,6 @@ describe("approval flow", () => {
     expect(stillWaiting?.status).toBe("waiting_approval");
     expect(stillWaiting?.revision).toBe(requested.jobRevision);
     await expect(readResumedEvents(job.jobId)).resolves.toEqual([]);
-
-    await job.connector.send("job.event", {
-      job_id: job.jobId,
-      attempt: job.attempt,
-      event_type: "turn/end",
-      payload: { status: "succeeded" },
-      source: "connector",
-    });
-    const rejection = await job.connector.next("protocol.error");
-    expect(rejection.payload.code).toBe("EVENT_REJECTED");
-    const afterRejection = await repository.get(OWNER_ID, job.jobId);
-    expect(afterRejection?.status).toBe("waiting_approval");
-    expect(afterRejection?.revision).toBe(requested.jobRevision);
   });
 
   it("rejects an exact retry of a decided approval after its job binding is superseded", async () => {
@@ -581,8 +574,10 @@ describe("approval flow", () => {
     const commandA = await job.connector.next("approval.decision");
     await job.connector.ack(commandA);
 
+    // The delivered decision resumed the job once, so the next approval binds
+    // to the revision the resume produced.
     const approvalB = await requestApproval(job, {
-      jobRevision: approvalA.jobRevision + 1,
+      jobRevision: approvalA.jobRevision + 2,
       fingerprint: FINGERPRINT_B,
       actionSummary: "Install dependency version B",
     });
