@@ -1807,7 +1807,10 @@ describe("release runtime build contract", () => {
       "jobs",
       "runtime",
     );
-    expect(runtimeJob).toMatch(/runs-on:\s*ubuntu-latest/);
+    // The gate is pinned to the image this contract was written for: on
+    // ubuntu-latest (Ubuntu 26 since 2026-10-19) the offline pnpm store cannot
+    // satisfy the fresh-build install, so the gate would not be reproducible.
+    expect(runtimeJob).toMatch(/runs-on:\s*ubuntu-24\.04/);
     const name = "Install native test prerequisites";
     const step = workflowStep(runtimeJob, name);
     expect(workflowStepIndex(runtimeJob, name)).toBeLessThan(

@@ -9,7 +9,12 @@ permissions:
 jobs:
   runtime:
     name: runtime
-    runs-on: ubuntu-latest
+    # ubuntu-latest moved to Ubuntu 26 on 2026-10-19. On that image the gate is
+    # not reproducible: the offline pnpm store cannot satisfy the fresh-build
+    # install in tests/contract/runtime-build.test.ts (ERR_PNPM_NO_OFFLINE_TARBALL).
+    # Pin the image the release runtime build contract was authored for, and port
+    # the gate to Ubuntu 26 deliberately in its own change.
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -34,19 +39,9 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends ripgrep postgresql
+          sudo apt-get install --yes --no-install-recommends ripgrep
           command -v rg
           rg --version
-          # The runner image no longer ships PostgreSQL 16 at the versioned path the
-          # integration suites used to find. Export the installed server's bin
-          # directory through the documented PG_BINDIR hook instead of pinning the
-          # image, because tests/contract/runtime-build.test.ts requires
-          # runs-on: ubuntu-latest.
-          pg_bin="$(dirname "$(find /usr/lib/postgresql -type f -name initdb | sort -V | tail -n 1)")"
-          test -n "$pg_bin"
-          test -x "$pg_bin/initdb"
-          test -x "$pg_bin/pg_ctl"
-          printf 'PG_BINDIR=%s\n' "$pg_bin" >> "$GITHUB_ENV"
 
       - name: Generate ephemeral runtime material
         shell: bash
