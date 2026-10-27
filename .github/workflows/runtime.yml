@@ -9,7 +9,12 @@ permissions:
 jobs:
   runtime:
     name: runtime
-    runs-on: ubuntu-latest
+    # ubuntu-latest moved to Ubuntu 26 on 2026-10-19. On that image the gate is
+    # not reproducible: the offline pnpm store cannot satisfy the fresh-build
+    # install in tests/contract/runtime-build.test.ts (ERR_PNPM_NO_OFFLINE_TARBALL).
+    # Pin the image the release runtime build contract was authored for, and port
+    # the gate to Ubuntu 26 deliberately in its own change.
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

@@ -21,7 +21,7 @@ import {
 import type { CanonicalAction, RepositoryPolicy } from "./types.js";
 
 const temporaryDirectories: string[] = [];
-const actualRipgrep = realpathSync(
+const actualRipgrep = realpathSync.native(
   execFileSync("which", ["rg"], { encoding: "utf8" }).trim(),
 );
 
@@ -68,14 +68,14 @@ const makeFixture = () => {
 
   const repository: RepositoryPolicy = {
     id: "repo-one",
-    canonicalPath: realpathSync(repositoryPath),
+    canonicalPath: realpathSync.native(repositoryPath),
   };
   return {
     directory,
     executableDirectory,
     repository,
-    outsidePath: realpathSync(outsidePath),
-    outsideDataPath: join(realpathSync(outsidePath), "ordinary.txt"),
+    outsidePath: realpathSync.native(outsidePath),
+    outsideDataPath: join(realpathSync.native(outsidePath), "ordinary.txt"),
     sourcePath: join(repository.canonicalPath, "src", "index.ts"),
   };
 };
@@ -85,7 +85,7 @@ const trustedOptions = (fixture: ReturnType<typeof makeFixture>) => ({
   trustedExecutables: Object.fromEntries(
     readdirSync(fixture.executableDirectory).map((name) => [
       name,
-      realpathSync(join(fixture.executableDirectory, name)),
+      realpathSync.native(join(fixture.executableDirectory, name)),
     ]),
   ),
 });

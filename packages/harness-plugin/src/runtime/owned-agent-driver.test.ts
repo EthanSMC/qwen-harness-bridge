@@ -61,6 +61,12 @@ const build = (
     flushResult?: boolean;
     stateOverrides?: Record<string, unknown>;
     onAttemptEnded?: (agent: { id: unknown }) => void;
+    /** Append the initial user message this many milliseconds after followup,
+     * the way the real Harness commits it. */
+    deferInitialInputMs?: number;
+    /** Never append it, to exercise the bounded proof wait. */
+    neverProveInitialInput?: boolean;
+    initialInputProofTimeoutMs?: number;
     setupFactory?: (
       sessionId: string,
       context: {
@@ -111,8 +117,15 @@ const build = (
         id: String(input.sessionId),
         session,
         followup: (message: unknown) => {
-          captured = message;
           followup(message);
+          if (options.neverProveInitialInput === true) return;
+          if (options.deferInitialInputMs === undefined) {
+            captured = message;
+            return;
+          }
+          setTimeout(() => {
+            captured = message;
+          }, options.deferInitialInputMs);
         },
         status: "running",
         whenIdle: async () => {},
@@ -182,6 +195,9 @@ const build = (
     },
     publishClaim,
     flush,
+    ...(options.initialInputProofTimeoutMs === undefined
+      ? {}
+      : { initialInputProofTimeoutMs: options.initialInputProofTimeoutMs }),
     onSessionEvent: (handler) => {
       sessionHandler = handler as unknown as (
         sessionId: string,
@@ -237,7 +253,8 @@ describe("OwnedAgentDriver.start", () => {
       intent?.owner.sessionId,
     );
     expect(harness.followup).toHaveBeenCalledTimes(1);
-    expect(harness.flush).toHaveBeenCalledTimes(1);
+    // One checkpoint after followup, one after the initial input is proven.
+    expect(harness.flush).toHaveBeenCalledTimes(2);
   });
 
   it("derives a per-Agent policy setup from the preallocated session id", async () => {
@@ -314,6 +331,35 @@ describe("OwnedAgentDriver.start", () => {
     const harness = build(offer, { flushResult: false });
     await expect(harness.driver.start(offer)).rejects.toThrow(
       "HARNESS_PERSISTENCE_UNAVAILABLE",
+    );
+    const intent = harness.store.ownedIntent(
+      offer.payload.job_id,
+      offer.payload.attempt,
+    );
+    expect(intent?.phase).toBe("submitting");
+    expect(intent?.startedEvidence).toBeNull();
+  });
+
+  it("waits for an initial input the factory commits asynchronously", async () => {
+    const offer = offerOf();
+    const harness = build(offer, { deferInitialInputMs: 25 });
+    await harness.driver.start(offer);
+    const intent = harness.store.ownedIntent(
+      offer.payload.job_id,
+      offer.payload.attempt,
+    );
+    expect(intent?.phase).toBe("started");
+    expect(intent?.startedEvidence).not.toBeNull();
+  });
+
+  it("fails closed when the initial input never becomes provable", async () => {
+    const offer = offerOf();
+    const harness = build(offer, {
+      neverProveInitialInput: true,
+      initialInputProofTimeoutMs: 40,
+    });
+    await expect(harness.driver.start(offer)).rejects.toThrow(
+      "HARNESS_INITIAL_INPUT_UNPROVEN",
     );
     const intent = harness.store.ownedIntent(
       offer.payload.job_id,

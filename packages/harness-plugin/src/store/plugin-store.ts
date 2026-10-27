@@ -4,7 +4,6 @@ import {
   ConnectorClientMessageSchema,
   ConnectorServerMessageSchema,
 } from "@qhb/protocol";
-import Database from "better-sqlite3";
 import { z } from "zod";
 import {
   assertTerminalAuthority,
@@ -47,6 +46,12 @@ import {
   terminalKey,
   validateTerminalProposal,
 } from "./owned-terminal.js";
+import {
+  openDatabase,
+  type SqliteDatabase,
+  type SqliteModule,
+  SqliteUnavailableError,
+} from "./sqlite-driver.js";
 
 export type { OwnedIntent, OwnedIntentOwner } from "./owned-intent.js";
 export { OwnedIntentError } from "./owned-intent.js";
@@ -104,6 +109,10 @@ export interface PluginStore {
     evidence?: Readonly<{ coordinationRequestSequence: number }>,
   ): "new" | "duplicate";
   maxInboundSequence(): number;
+  /** Highest server sequence durably contiguous from 1: no lower sequence is
+   * missing from the journal. `connector.hello` reports this frontier, never the
+   * bare maximum, so a frame persisted above a gap is not claimed as received. */
+  contiguousInboundSequence(): number;
   inboundMessage(messageId: string): StoredInboundMessage | undefined;
   inboundMessageBySequence(sequence: number): StoredInboundMessage | undefined;
   replaceInbound(replacement: InboundReplacement): void;
@@ -309,7 +318,7 @@ type SchemaObjectRow = {
   sql: string | null;
 };
 
-const schemaObjects = (database: Database.Database): SchemaObjectRow[] => {
+const schemaObjects = (database: SqliteDatabase): SchemaObjectRow[] => {
   const rows = database
     .prepare(
       `SELECT type, name, tbl_name, sql
@@ -325,7 +334,7 @@ const schemaObjects = (database: Database.Database): SchemaObjectRow[] => {
 };
 
 const expectedSchemaObjects = (): SchemaObjectRow[] => {
-  const database = new Database(":memory:");
+  const database = openDatabase(":memory:");
   try {
     database.exec(SCHEMA_SQL);
     return schemaObjects(database);
@@ -336,19 +345,22 @@ const expectedSchemaObjects = (): SchemaObjectRow[] => {
 
 const EXPECTED_SCHEMA_OBJECTS = expectedSchemaObjects();
 
-const schemaMatches = (database: Database.Database): boolean =>
+const schemaMatches = (database: SqliteDatabase): boolean =>
   JSON.stringify(schemaObjects(database)) ===
   JSON.stringify(EXPECTED_SCHEMA_OBJECTS);
 
 export class SqlitePluginStore implements TerminalPluginStore {
   #terminalBusy = false;
-  #database: Database.Database | null = null;
+  #database: SqliteDatabase | null = null;
   #closed = false;
 
-  constructor(databasePath: string) {
+  constructor(
+    databasePath: string,
+    options: Readonly<{ load?: () => SqliteModule }> = {},
+  ) {
     assertNonEmpty(databasePath, "STORE_DATABASE_PATH_REQUIRED");
     try {
-      this.#database = new Database(databasePath);
+      this.#database = openDatabase(databasePath, options);
       this.#database.pragma("journal_mode = WAL");
       this.#database.pragma("synchronous = FULL");
       this.#database.pragma("foreign_keys = ON");
@@ -381,6 +393,10 @@ export class SqlitePluginStore implements TerminalPluginStore {
         // Preserve the safe store error below.
       }
       if (error instanceof StoreError) throw error;
+      // Keep the bounded built-in-module code reachable through the plugin path:
+      // an unsupported host must be diagnosable as STORE_SQLITE_UNAVAILABLE, not
+      // flattened into the generic initialization failure.
+      if (error instanceof SqliteUnavailableError) throw error;
       throw new StoreError("STORE_INITIALIZATION_FAILED");
     }
   }
@@ -1099,6 +1115,19 @@ export class SqlitePluginStore implements TerminalPluginStore {
       .prepare("SELECT MAX(sequence) AS sequence FROM inbound_messages")
       .get() as { sequence: number | null };
     return row.sequence ?? 0;
+  }
+
+  contiguousInboundSequence(): number {
+    this.assertOpen();
+    const rows = this.database
+      .prepare("SELECT sequence FROM inbound_messages ORDER BY sequence")
+      .all() as { sequence: number }[];
+    let frontier = 0;
+    for (const row of rows) {
+      if (row.sequence !== frontier + 1) break;
+      frontier = row.sequence;
+    }
+    return frontier;
   }
 
   inboundMessage(messageId: string): StoredInboundMessage | undefined {
@@ -1863,7 +1892,7 @@ export class SqlitePluginStore implements TerminalPluginStore {
       throw new OwnedIntentError("OWNED_INTENT_UNAVAILABLE");
   }
 
-  private get database(): Database.Database {
+  private get database(): SqliteDatabase {
     if (this.#database === null) {
       throw new StoreError("STORE_CLOSED");
     }

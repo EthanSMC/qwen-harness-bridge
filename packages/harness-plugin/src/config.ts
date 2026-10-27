@@ -29,6 +29,19 @@ const harnessModelSchema = z
   })
   .strict();
 
+const credentialSourceSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("keychain") }).strict(),
+  z
+    .object({ kind: z.literal("file"), path: z.string().trim().min(1) })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("environment"),
+      variable: z.string().trim().min(1),
+    })
+    .strict(),
+]);
+
 const pluginConfigSchema = z
   .object({
     connectorId: z.string().trim().min(1),
@@ -57,6 +70,7 @@ const pluginConfigSchema = z
     databasePath: z.string().trim().min(1),
     repositories: z.array(repositorySchema).min(1),
     harnessModel: harnessModelSchema.optional(),
+    credentialSource: credentialSourceSchema.optional(),
   })
   .strict()
   .refine(
@@ -65,6 +79,12 @@ const pluginConfigSchema = z
 
 export type HarnessModelRoute = Readonly<{ provider: string; model: string }>;
 
+/** ADR 0008: exactly one opt-in source; Keychain stays the platform default. */
+export type CredentialSourceConfig =
+  | Readonly<{ kind: "keychain" }>
+  | Readonly<{ kind: "file"; path: string }>
+  | Readonly<{ kind: "environment"; variable: string }>;
+
 export type PluginConfig = Readonly<{
   connectorId: string;
   controlPlaneUrl: `wss://${string}`;
@@ -72,6 +92,7 @@ export type PluginConfig = Readonly<{
   keychainAccount: string;
   databasePath: string;
   harnessModel?: HarnessModelRoute;
+  credentialSource?: CredentialSourceConfig;
   repositories: ReadonlyArray<
     Readonly<{
       id: string;
@@ -82,12 +103,27 @@ export type PluginConfig = Readonly<{
   >;
 }>;
 
+/** The per-Agent model route the owned Agent must use. The Harness
+ * `AgentOptions` seam accepts exactly these two fields, so a configured
+ * `harnessModel` pins the route instead of leaving the owned attempt on the
+ * host default. */
+export const agentOptionsFor = (
+  config: PluginConfig,
+): Readonly<{ provider: string; model: string }> | undefined =>
+  config.harnessModel === undefined
+    ? undefined
+    : Object.freeze({
+        provider: config.harnessModel.provider,
+        model: config.harnessModel.model,
+      });
+
 export type ConfigValidationCode =
   | "INVALID_PLUGIN_CONFIG"
   | "INVALID_DATABASE_PATH"
   | "DATABASE_PATH_UNAVAILABLE"
   | "DATABASE_PATH_NOT_CANONICAL"
   | "DUPLICATE_REPOSITORY_ID"
+  | "INVALID_CREDENTIAL_SOURCE"
   | "REPOSITORY_PATH_UNAVAILABLE"
   | "REPOSITORY_PATH_NOT_CANONICAL";
 
@@ -189,6 +225,23 @@ const canonicalDatabasePath = (databasePath: string): string => {
   return resolvedPath;
 };
 
+/** ADR 0008: configuration names a bounded location, never a credential value. */
+const canonicalCredentialSource = (
+  source: z.infer<typeof credentialSourceSchema>,
+): CredentialSourceConfig => {
+  if (source.kind === "keychain") return Object.freeze({ kind: "keychain" });
+  if (source.kind === "file") {
+    if (!isAbsolute(source.path)) {
+      throw new ConfigValidationError("INVALID_CREDENTIAL_SOURCE");
+    }
+    return Object.freeze({ kind: "file", path: source.path });
+  }
+  if (!/^[A-Za-z_][A-Za-z0-9_]{0,127}$/u.test(source.variable)) {
+    throw new ConfigValidationError("INVALID_CREDENTIAL_SOURCE");
+  }
+  return Object.freeze({ kind: "environment", variable: source.variable });
+};
+
 export function parsePluginConfig(input: string | unknown): PluginConfig {
   let parsed: ReturnType<typeof pluginConfigSchema.safeParse>;
   try {
@@ -218,6 +271,13 @@ export function parsePluginConfig(input: string | unknown): PluginConfig {
     ...(parsed.data.harnessModel === undefined
       ? {}
       : { harnessModel: parsed.data.harnessModel }),
+    ...(parsed.data.credentialSource === undefined
+      ? {}
+      : {
+          credentialSource: canonicalCredentialSource(
+            parsed.data.credentialSource,
+          ),
+        }),
     repositories: parsed.data.repositories.map((repository) => ({
       id: repository.id,
       displayName: repository.displayName,

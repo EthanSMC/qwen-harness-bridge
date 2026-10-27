@@ -3,8 +3,15 @@
   "version": "0.1.0",
   "type": "module",
   "files": [
-    "dist"
+    "dist",
+    "cordis.example.yml",
+    "cordis.patch.yml"
   ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -16,6 +23,7 @@
     "pack": "node scripts/package.mjs",
     "pack:test": "vitest run src/packaging-smoke.test.ts",
     "rehearse:install": "node scripts/rehearse-install.mjs",
+    "rehearse:live": "node scripts/live-rehearsal.mjs",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
@@ -29,13 +37,13 @@
   },
   "dependencies": {
     "@qhb/protocol": "workspace:*",
-    "better-sqlite3": "^12.10.0",
     "ws": "^8.21.3",
     "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/ws": "^8.18.1",
+    "better-sqlite3": "^12.10.0",
     "yaml": "^2.6.1"
   }
 }

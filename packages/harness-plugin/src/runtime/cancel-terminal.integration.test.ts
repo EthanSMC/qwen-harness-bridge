@@ -25,7 +25,7 @@ import {
 it.each(["cancel", "result", "retry", "remote"] as const)(
   "actual CancelHandler shares the durable sink: %s",
   async (scenario) => {
-    const directory = realpathSync(
+    const directory = realpathSync.native(
       mkdtempSync(join(tmpdir(), "cancel-terminal-tls-")),
     );
     const path = join(directory, "store.sqlite");

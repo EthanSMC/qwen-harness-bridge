@@ -17,7 +17,11 @@ import type { ApprovalBroker } from "./approval-broker.js";
 export type AnswererAction = Readonly<{
   jobId: string;
   attempt: number;
+  /** The canonical policy tool the action was classified as. */
   toolName: string;
+  /** The host tool the action was resolved from (`pwsh`, `write`). The Host
+   * names its own tool in an approval request, so identity is compared here. */
+  sourceTool?: string;
   fingerprint: string;
   classification: PolicyClass;
   actionSummary: string;
@@ -46,16 +50,20 @@ export function registerAnswerer(
       try {
         const owner = options.findOwner(String(req.agent.id));
         if (!owner) return next();
+        // The scope carrier is the identity assertion: reading the scoped
+        // `agent` service here would throw for a Host-owned Agent context.
         if (
           owner !== req.agent ||
-          owner.ctx.agent !== owner ||
           scopeOf(owner.ctx) !== owner ||
           !req.callId ||
           lifetime.signal.aborted
         )
           return "unavailable";
         const resolved = options.resolveAction(owner, req.callId);
-        if (!resolved || resolved.toolName !== req.toolName)
+        if (
+          !resolved ||
+          (resolved.sourceTool ?? resolved.toolName) !== req.toolName
+        )
           return "unavailable";
         const action = Object.freeze({ ...resolved });
         if (action.classification === "denied") return "rejected";
@@ -102,7 +110,6 @@ export function registerAnswerer(
         if (
           signal.aborted ||
           currentOwner !== owner ||
-          owner.ctx.agent !== owner ||
           scopeOf(owner.ctx) !== owner
         )
           return "unavailable";

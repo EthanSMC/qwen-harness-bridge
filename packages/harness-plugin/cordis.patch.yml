@@ -1,0 +1,26 @@
+# The dsh bundle patch for the Qwen Harness Bridge Connector.
+#
+# A dsh profile composes its plugin tree from the bundle patches of its installed
+# dependencies (package.json `dsh.bundle.patch`). This layer inserts the
+# connector entry; the environment-specific configuration is supplied by the
+# operator's own profile patch (`cordis.patch.yml` under the profile directory)
+# as an id-targeted override, for example:
+#
+#   - id: qwen-harness-bridge
+#     config:
+#       connectorId: 00000000-0000-4000-8000-000000000000
+#       controlPlaneUrl: wss://control-plane.example.com/connector/v1
+#       keychainService: qhb-connector
+#       keychainAccount: qhb-connector-bootstrap
+#       databasePath: /absolute/path/connector.sqlite
+#       repositories:
+#         - id: example
+#           displayName: Example repository
+#           canonicalPath: /absolute/repository
+#           approvalTimeoutSeconds: 300
+#
+# See cordis.example.yml for the annotated sample and docs/runbooks for the
+# install procedure.
+- insert:
+    - id: qwen-harness-bridge
+      name: '@qhb/harness-plugin'

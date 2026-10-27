@@ -178,7 +178,7 @@ PostgreSQL is authoritative for jobs, events, approvals, connectors, repository 
 
 The TypeScript DeepSeek Harness extension exports `apply(ctx)` and starts an embedded Connector client. It:
 
-- Retrieves its long-lived bootstrap credential from macOS Keychain.
+- Retrieves its long-lived bootstrap credential from the selected platform credential source: macOS Keychain on darwin (the default), or one explicitly configured bounded file or environment source on other platforms (ADR 0008).
 - Exchanges the credential for a short-lived session token.
 - Establishes an outbound TLS WebSocket and maintains heartbeat, ACK, reconnect, and replay cursors.
 - Validates every command envelope, expiry, nonce, protocol version, and job attempt.
@@ -421,7 +421,7 @@ Internal errors carry correlation IDs in logs but not verbose stack traces on th
 ### 13.1 Authentication
 
 - Qwen MCP calls use a dedicated high-entropy Bearer credential bound to the single owner.
-- Connector bootstrap uses a separate per-device credential stored in macOS Keychain.
+- Connector bootstrap uses a separate per-device credential stored in macOS Keychain on darwin, or in one explicitly configured bounded file or environment source on other platforms; configuration names the source location, never the value (ADR 0008).
 - Bootstrap credential exchanges for a short-lived 15-minute Connector session token.
 - All traffic uses TLS. WebSocket envelopes include expiry and unique message IDs.
 - Credentials are independently revocable and never reused across Qwen and Connector trust domains.

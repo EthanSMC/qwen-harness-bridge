@@ -88,7 +88,7 @@ async function withDriver(
   options: Readonly<{ redaction?: boolean }>,
   run: (context: Context) => Promise<void>,
 ): Promise<void> {
-  const directory = realpathSync(
+  const directory = realpathSync.native(
     mkdtempSync(join(tmpdir(), "driver-terminal-tls-")),
   );
   const store = new SqlitePluginStore(join(directory, "store.sqlite"));

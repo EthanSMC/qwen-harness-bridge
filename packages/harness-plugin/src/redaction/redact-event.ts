@@ -1,4 +1,4 @@
-import { relative } from "node:path";
+import { relative, sep } from "node:path";
 import { JobEventPayloadSchema } from "@qhb/protocol";
 import {
   canonicalizePath,
@@ -29,6 +29,10 @@ const reject = (): never => {
 };
 const bytes = (value: string): number => Buffer.byteLength(value, "utf8");
 const controls = /\p{Cc}/u;
+
+/** Absolute home directory in the host's own spelling: POSIX or Windows. */
+const isAbsoluteHomeDirectory = (value: string): boolean =>
+  value.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(value);
 const credentials =
   /\b(?:bearer|basic)\s+\S+|["']?(?:access[_-]?tokens?|api[_-]?keys?|authorization|client[_-]?secrets?|cookies?|credentials?|passwords?|passwd|secrets?|tokens?)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)|\b(?:AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9]{12,}|xox[baprs]-[A-Za-z0-9-]{12,})\b|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gi;
 const privateText =
@@ -38,6 +42,9 @@ const environmentAssignment =
 const structuredBody =
   /\{\s*(?:["'}]|[\w-]+\s*:)|\[\s*(?:["'[\]{}]|-?\d|true\b|false\b|null\b)/u;
 const invalidFilename = /[\u2028\u2029\\]|^[A-Za-z]:|^~|^file:/u;
+/** Input spellings may be absolute (including a Windows drive); the emitted
+ * projection never is, which `invalidFilename` enforces after conversion. */
+const invalidInputPath = /[\u2028\u2029]|^~|^file:/u;
 type Replacement = { start: number; end: number; value: string };
 
 // Surrounding quotes belong to prose. For unquoted URLs, quote-bearing data
@@ -205,7 +212,7 @@ export function redactEvent(
     const root = canonicalizeRepositoryRoot(options.repositoryRoot);
     if (
       typeof options.homeDirectory !== "string" ||
-      !options.homeDirectory.startsWith("/") ||
+      !isAbsoluteHomeDirectory(options.homeDirectory) ||
       controls.test(options.homeDirectory)
     )
       return reject();
@@ -275,18 +282,25 @@ export function redactEvent(
       return normalized;
     };
     const file = (value: string): string => {
+      // Accept the host's own spelling on input; emit a forward-slash relative
+      // path so the projection is identical on every platform.
+      const candidate = value.replace(/\\/gu, "/");
       if (
-        !value ||
-        controls.test(value) ||
-        invalidFilename.test(value) ||
-        hasSecret(value) ||
-        value.replace(credentials, "[redacted]") !== value
+        !candidate ||
+        controls.test(candidate) ||
+        invalidInputPath.test(candidate) ||
+        hasSecret(candidate) ||
+        candidate.replace(credentials, "[redacted]") !== candidate
       )
         return reject();
+      // Public projections use forward slashes on every host; the canonical
+      // containment check above already guarantees the path stays in the root.
       const path = relative(
         root,
-        canonicalizePath(root, value, { basePath: root }),
-      );
+        canonicalizePath(root, candidate, { basePath: root }),
+      )
+        .split(sep)
+        .join("/");
       if (
         !path ||
         bytes(path) > 500 ||
@@ -340,6 +354,7 @@ export function redactEvent(
             if (
               token === options.homeDirectory ||
               token.startsWith(`${options.homeDirectory}/`) ||
+              token.startsWith(`${options.homeDirectory}\\`) ||
               token.startsWith("~/")
             )
               replacement.value = "[home]";
