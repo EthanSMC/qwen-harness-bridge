@@ -190,6 +190,41 @@ const readDecisionEffects = async (
   return row;
 };
 
+type ObservedJob = NonNullable<Awaited<ReturnType<JobRepository["get"]>>>;
+
+const waitForJob = async (
+  jobId: string,
+  predicate: (job: ObservedJob) => boolean,
+  timeoutMs = 5_000,
+): Promise<ObservedJob> => {
+  const deadline = Date.now() + timeoutMs;
+  let observed: ObservedJob | undefined;
+  while (Date.now() < deadline) {
+    const job = await repository.get(OWNER_ID, jobId);
+    if (job !== null) {
+      observed = job;
+      if (predicate(job)) return job;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(
+    `Job ${jobId} did not reach the expected state: ${JSON.stringify(observed)}`,
+  );
+};
+
+const readResumedEvents = async (
+  jobId: string,
+): Promise<readonly Record<string, unknown>[]> => {
+  const result = await db.query<{ payload: Record<string, unknown> }>(
+    `SELECT payload
+       FROM job_events
+      WHERE job_id = $1 AND event_type = 'job.resumed'
+      ORDER BY sequence`,
+    [jobId],
+  );
+  return result.rows.map((row) => row.payload);
+};
+
 beforeAll(async () => {
   await db.start();
   await db.query(
@@ -423,6 +458,111 @@ describe("approval flow", () => {
     expect(commandRows.rows).toEqual([
       { connector_id: job.connectorId, payload: command.payload },
     ]);
+  });
+
+  it("resumes an owned waiting_approval job to running when the delivered decision is acknowledged", async () => {
+    const job = await claimJob();
+    const requested = await requestApproval(job, {
+      jobRevision: job.runningRevision + 1,
+      fingerprint: FINGERPRINT_A,
+    });
+    const waiting = await repository.get(OWNER_ID, job.jobId);
+    expect(waiting?.status).toBe("waiting_approval");
+    expect(waiting?.revision).toBe(requested.jobRevision);
+
+    await coordinator.decideApproval(
+      { id: OWNER_ID },
+      {
+        approval_id: requested.approvalId,
+        decision: "approve",
+        expected_job_revision: requested.jobRevision,
+      },
+    );
+    const decision = await job.connector.next("approval.decision");
+    expect(decision.payload.decision).toBe("approve");
+    await job.connector.ack(decision);
+
+    const resumed = await waitForJob(
+      job.jobId,
+      (candidate) => candidate.status === "running",
+    );
+    expect(resumed.revision).toBe(requested.jobRevision + 1);
+    await expect(readResumedEvents(job.jobId)).resolves.toEqual([
+      {
+        approval_id: requested.approvalId,
+        decision: "approve",
+        attempt: job.attempt,
+        job_revision: requested.jobRevision,
+      },
+    ]);
+  });
+
+  it("keeps the resume idempotent when the delivered decision is acknowledged again", async () => {
+    const job = await claimJob();
+    const requested = await requestApproval(job, {
+      jobRevision: job.runningRevision + 1,
+      fingerprint: FINGERPRINT_A,
+    });
+    await coordinator.decideApproval(
+      { id: OWNER_ID },
+      {
+        approval_id: requested.approvalId,
+        decision: "approve",
+        expected_job_revision: requested.jobRevision,
+      },
+    );
+    const decision = await job.connector.next("approval.decision");
+    await job.connector.ack(decision);
+    const resumed = await waitForJob(
+      job.jobId,
+      (candidate) => candidate.status === "running",
+    );
+
+    await job.connector.ack(decision);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const repeated = await repository.get(OWNER_ID, job.jobId);
+    expect(repeated?.status).toBe("running");
+    expect(repeated?.revision).toBe(resumed.revision);
+    expect(await readResumedEvents(job.jobId)).toHaveLength(1);
+  });
+
+  it("never resumes a rejected job and keeps refusing a successful terminal commit", async () => {
+    const job = await claimJob();
+    const requested = await requestApproval(job, {
+      jobRevision: job.runningRevision + 1,
+      fingerprint: FINGERPRINT_A,
+    });
+    await coordinator.decideApproval(
+      { id: OWNER_ID },
+      {
+        approval_id: requested.approvalId,
+        decision: "reject",
+        expected_job_revision: requested.jobRevision,
+      },
+    );
+    const decision = await job.connector.next("approval.decision");
+    expect(decision.payload.decision).toBe("reject");
+    await job.connector.ack(decision);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    const stillWaiting = await repository.get(OWNER_ID, job.jobId);
+    expect(stillWaiting?.status).toBe("waiting_approval");
+    expect(stillWaiting?.revision).toBe(requested.jobRevision);
+    await expect(readResumedEvents(job.jobId)).resolves.toEqual([]);
+
+    await job.connector.send("job.event", {
+      job_id: job.jobId,
+      attempt: job.attempt,
+      event_type: "turn/end",
+      payload: { status: "succeeded" },
+      source: "connector",
+    });
+    const rejection = await job.connector.next("protocol.error");
+    expect(rejection.payload.code).toBe("EVENT_REJECTED");
+    const afterRejection = await repository.get(OWNER_ID, job.jobId);
+    expect(afterRejection?.status).toBe("waiting_approval");
+    expect(afterRejection?.revision).toBe(requested.jobRevision);
   });
 
   it("rejects an exact retry of a decided approval after its job binding is superseded", async () => {
