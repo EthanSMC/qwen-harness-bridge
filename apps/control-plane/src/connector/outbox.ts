@@ -1412,6 +1412,86 @@ const statusForEvent = (
   return current;
 };
 
+/** A delivered approval decision resolves the owning attempt: the job returns to
+ * running so the connector can publish a terminal outcome. Delivery is the
+ * owning connector's acknowledgement of the queued approval.decision. The resume
+ * is fenced by status, attempt and the approval's job revision, so a duplicate or
+ * replayed delivery cannot transition twice and a terminal job is never
+ * re-opened. A rejected decision keeps the job in waiting_approval: from there the
+ * connector may only publish a failed or unavailable outcome.
+ */
+const resumeDeliveredApproval = async (
+  database: QueryDatabase,
+  serverMessage: ConnectorMessageRow,
+  now: Date,
+): Promise<void> => {
+  if (serverMessage.type !== "approval.decision") return;
+  const payload = asRecord(serverMessage.payload);
+  if (payload === null || payload.decision !== "approve") return;
+  const jobId = payload.job_id;
+  const attempt = payload.attempt;
+  const jobRevision = payload.job_revision;
+  if (
+    typeof jobId !== "string" ||
+    typeof attempt !== "number" ||
+    !Number.isSafeInteger(attempt) ||
+    typeof jobRevision !== "number" ||
+    !Number.isSafeInteger(jobRevision)
+  ) {
+    return;
+  }
+
+  const jobRows = await database
+    .select()
+    .from(jobs)
+    .where(eq(jobs.id, jobId))
+    .for("update");
+  const job = jobRows[0];
+  if (
+    job === undefined ||
+    job.status !== "waiting_approval" ||
+    job.attempt !== attempt ||
+    job.revision !== jobRevision ||
+    job.expiresAt.getTime() <= now.getTime()
+  ) {
+    return;
+  }
+  try {
+    assertTransition(job.status, "running");
+  } catch {
+    return;
+  }
+  const updated = await database
+    .update(jobs)
+    .set({
+      status: "running",
+      currentStage: "running",
+      revision: sql`${jobs.revision} + 1`,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(jobs.id, job.id),
+        eq(jobs.status, "waiting_approval"),
+        eq(jobs.attempt, attempt),
+        eq(jobs.revision, job.revision),
+        sql`${jobs.expiresAt} > clock_timestamp()`,
+      ),
+    )
+    .returning({ id: jobs.id });
+  if (updated.length !== 1) return;
+  await appendJobEvent(database, job.id, {
+    type: "job.resumed",
+    payload: {
+      approval_id: payload.approval_id,
+      decision: "approve",
+      attempt,
+      job_revision: jobRevision,
+    },
+    source: "control-plane",
+  });
+};
+
 const ingestJobEvent = async (
   database: QueryDatabase,
   message: Extract<ConnectorClientMessage, { type: "job.event" }>,
@@ -1705,9 +1785,10 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
       ) {
         throw new ConnectorStoreError("CLIENT_REPLAY_MISMATCH");
       }
+      let acknowledgedServerMessage: ConnectorMessageRow | undefined;
       if (message.type === "ack") {
         const serverRows = await tx
-          .select({ id: connectorMessages.id })
+          .select()
           .from(connectorMessages)
           .where(
             and(
@@ -1717,7 +1798,8 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
             ),
           )
           .limit(1);
-        if (serverRows[0] === undefined) {
+        acknowledgedServerMessage = serverRows[0];
+        if (acknowledgedServerMessage === undefined) {
           throw new ConnectorStoreError(
             "CLIENT_REPLAY_MISMATCH",
             "ACK references a missing server message",
@@ -1811,6 +1893,13 @@ export class PostgresConnectorStore implements ConnectorCredentialStore {
                 eq(connectorMessages.sequence, message.payload.sequence),
               ),
             );
+          if (acknowledgedServerMessage !== undefined) {
+            await resumeDeliveredApproval(
+              businessTx,
+              acknowledgedServerMessage,
+              currentTime,
+            );
+          }
         }
       };
       if (durable) {

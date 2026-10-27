@@ -4154,6 +4154,72 @@ describe("PostgreSQL Connector outbox", () => {
     );
   });
 
+  it("refuses a successful terminal commit while the job reports waiting_approval", async () => {
+    const store = new PostgresConnectorStore(database.client);
+    const testIdentity = await insertConnector();
+    const job = await insertConnectedJob(
+      testIdentity.connectorId,
+      "waiting_approval",
+      await expiryAfter(60_000),
+      1,
+      null,
+      null,
+    );
+    const before = await database.query<{
+      status: string;
+      revision: number;
+      terminal_events: string;
+      resumed_events: string;
+    }>(
+      `SELECT j.status, j.revision,
+              (SELECT count(*)::text
+                 FROM job_events
+                WHERE job_id = j.id AND event_type = 'succeeded') AS terminal_events,
+              (SELECT count(*)::text
+                 FROM job_events
+                WHERE job_id = j.id AND event_type = 'job.resumed') AS resumed_events
+         FROM jobs j
+        WHERE j.id = $1`,
+      [job.jobId],
+    );
+    await expect(
+      store.acceptClientMessage(
+        testIdentity,
+        envelope("job.event", 1, {
+          job_id: job.jobId,
+          attempt: 1,
+          event_type: "succeeded",
+          payload: { status: "succeeded" },
+          source: "connector",
+        }),
+      ),
+    ).rejects.toMatchObject({ code: "EVENT_REJECTED" });
+    const after = await database.query<{
+      status: string;
+      revision: number;
+      terminal_events: string;
+      resumed_events: string;
+    }>(
+      `SELECT j.status, j.revision,
+              (SELECT count(*)::text
+                 FROM job_events
+                WHERE job_id = j.id AND event_type = 'succeeded') AS terminal_events,
+              (SELECT count(*)::text
+                 FROM job_events
+                WHERE job_id = j.id AND event_type = 'job.resumed') AS resumed_events
+         FROM jobs j
+        WHERE j.id = $1`,
+      [job.jobId],
+    );
+    expect(after.rows).toEqual(before.rows);
+    expect(after.rows[0]).toEqual({
+      status: "waiting_approval",
+      revision: 0,
+      terminal_events: "0",
+      resumed_events: "0",
+    });
+  });
+
   it.each([
     ["job.claim", "dispatched", 0, "CLAIM_REJECTED"],
     ["job.event", "running", 1, "EVENT_REJECTED"],
