@@ -195,6 +195,7 @@ function captureOptions(input: ConnectorClientOptions): ConnectorClientOptions {
     const methods = [
       "recordInbound",
       "maxInboundSequence",
+      "contiguousInboundSequence",
       "inboundMessage",
       "inboundMessageBySequence",
       "replaceInbound",
@@ -430,7 +431,13 @@ export class DurableConnectorClient implements TerminalConnectorClient {
     this.#socketFactory =
       options.webSocketFactory ??
       ((url, socketOptions) => new WebSocket(url, socketOptions));
-    this.#serverCursor = new SequenceCursor(options.store.maxInboundSequence());
+    // A crash can leave an early-delivered frame persisted above a gap the
+    // ordered pump never recorded, so the hello cursor is seeded from the
+    // contiguous frontier: reporting the bare maximum would tell the server to
+    // replay above the hole and the unpersisted predecessors would be lost.
+    this.#serverCursor = new SequenceCursor(
+      options.store.contiguousInboundSequence(),
+    );
     this.#clientSequence = options.store.maxOutboundSequence();
     const pending = options.store.pendingEvents(0);
     for (const event of pending) {
@@ -1005,8 +1012,10 @@ export class DurableConnectorClient implements TerminalConnectorClient {
 
   /** Take a coordination `job.state` response off the socket and run its
    * durable pass immediately, so a command handler that is blocking the
-   * serialized receive pump can resolve its waiter. The frame stays queued for
-   * the pump, which records it in order and advances the server cursor.
+   * serialized receive pump can resolve its waiter. The frame is persisted now,
+   * while the pump still advances the server cursor in arrival order when it
+   * reaches the frame; the reported durable cursor therefore only advances over
+   * a contiguous journal, never over a persisted frame above a gap.
    *
    * Only a brand-new response to a durable coordination request may be taken,
    * and only while every predecessor sequence has already arrived on the wire

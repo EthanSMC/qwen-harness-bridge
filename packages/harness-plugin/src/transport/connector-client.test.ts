@@ -320,6 +320,7 @@ it.each([
 const baseMethodNames = [
   "recordInbound",
   "maxInboundSequence",
+  "contiguousInboundSequence",
   "inboundMessage",
   "inboundMessageBySequence",
   "replaceInbound",
@@ -345,8 +346,8 @@ function setupPortCapture() {
   const close = store.close.bind(store);
   const raw = new Database(join(directory, "state.sqlite"));
   const counts = { allocation: 0, operation: 0, getter: 0 };
-  const original = store.maxInboundSequence.bind(store);
-  store.maxInboundSequence = () => {
+  const original = store.contiguousInboundSequence.bind(store);
+  store.contiguousInboundSequence = () => {
     counts.operation++;
     return original();
   };
@@ -3170,6 +3171,7 @@ describe("authenticated connector transport", () => {
         return baseStore.recordInbound(...args);
       },
       maxInboundSequence: () => baseStore.maxInboundSequence(),
+      contiguousInboundSequence: () => baseStore.contiguousInboundSequence(),
       maxOutboundSequence: () => baseStore.maxOutboundSequence(),
       inboundMessage: (messageId) => baseStore.inboundMessage(messageId),
       inboundMessageBySequence: (sequence) =>
@@ -3254,6 +3256,48 @@ describe("authenticated connector transport", () => {
     controller.abort();
     await running;
     expect(cursorAfterGap).toBe(1);
+  });
+
+  it("reports the contiguous durable frontier, not the maximum, above an early frame", async () => {
+    const fixture = await startFixture();
+    fixture.autoWelcome = false;
+    fixtures.push(fixture);
+    const { store, directory } = makeStore();
+    stores.push({ store, directory });
+    const frame = (sequence: number): string =>
+      JSON.stringify({
+        type: "job.offer",
+        sequence,
+        payload: { request: "replay" },
+      });
+    store.recordInbound("pred-2", 2, frame(2));
+    store.recordInbound("pred-3", 3, frame(3));
+    // The early-delivery path persists a frame and does not advance the cursor;
+    // this is the durable state a crash in that window leaves behind.
+    store.recordInbound("early-state", 5, frame(5));
+
+    const controller = new AbortController();
+    const running = makeClient(fixture, store).start(controller.signal);
+    await waitFor(() =>
+      fixture.clientMessages.some((item) => item.type === "connector.hello"),
+    );
+    const hello = fixture.clientMessages.find(
+      (item) => item.type === "connector.hello",
+    );
+    if (hello === undefined) throw new Error("hello missing");
+    expect(hello.type).toBe("connector.hello");
+    // Without the contiguous frontier this reports 5, the server replays only
+    // above the hole and sequences 1 and 4 are never recovered.
+    expect(
+      (hello.payload as { last_server_sequence: number }).last_server_sequence,
+    ).toBe(0);
+    controller.abort();
+    await running;
+    expect(store.maxInboundSequence()).toBe(5);
+    expect(store.inboundMessageBySequence(4)).toBeUndefined();
+    store.recordInbound("fill-1", 1, frame(1));
+    store.recordInbound("fill-4", 4, frame(4));
+    expect(store.contiguousInboundSequence()).toBe(5);
   });
 
   it.each(["correlation", "connector"] as const)(

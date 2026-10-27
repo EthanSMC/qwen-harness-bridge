@@ -1576,6 +1576,22 @@ describe("SQLite Harness plugin store", () => {
     reopened.close();
   });
 
+  it("reports the highest contiguous durable inbound sequence, not the maximum", () => {
+    const databasePath = makeDatabasePath();
+    const contiguous = new SqlitePluginStore(databasePath);
+
+    expect(contiguous.contiguousInboundSequence()).toBe(0);
+    contiguous.recordInbound("message-1", 1, "body-1");
+    contiguous.recordInbound("message-2", 2, "body-2");
+    expect(contiguous.contiguousInboundSequence()).toBe(2);
+    contiguous.recordInbound("message-4", 4, "body-4");
+    expect(contiguous.maxInboundSequence()).toBe(4);
+    expect(contiguous.contiguousInboundSequence()).toBe(2);
+    contiguous.recordInbound("message-3", 3, "body-3");
+    expect(contiguous.contiguousInboundSequence()).toBe(4);
+    contiguous.close();
+  });
+
   it("restores the maximum durable inbound sequence after reopen", () => {
     const databasePath = makeDatabasePath();
     const first = new SqlitePluginStore(databasePath);

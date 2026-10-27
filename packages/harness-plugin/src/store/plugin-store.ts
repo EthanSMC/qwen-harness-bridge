@@ -109,6 +109,10 @@ export interface PluginStore {
     evidence?: Readonly<{ coordinationRequestSequence: number }>,
   ): "new" | "duplicate";
   maxInboundSequence(): number;
+  /** Highest server sequence durably contiguous from 1: no lower sequence is
+   * missing from the journal. `connector.hello` reports this frontier, never the
+   * bare maximum, so a frame persisted above a gap is not claimed as received. */
+  contiguousInboundSequence(): number;
   inboundMessage(messageId: string): StoredInboundMessage | undefined;
   inboundMessageBySequence(sequence: number): StoredInboundMessage | undefined;
   replaceInbound(replacement: InboundReplacement): void;
@@ -1111,6 +1115,19 @@ export class SqlitePluginStore implements TerminalPluginStore {
       .prepare("SELECT MAX(sequence) AS sequence FROM inbound_messages")
       .get() as { sequence: number | null };
     return row.sequence ?? 0;
+  }
+
+  contiguousInboundSequence(): number {
+    this.assertOpen();
+    const rows = this.database
+      .prepare("SELECT sequence FROM inbound_messages ORDER BY sequence")
+      .all() as { sequence: number }[];
+    let frontier = 0;
+    for (const row of rows) {
+      if (row.sequence !== frontier + 1) break;
+      frontier = row.sequence;
+    }
+    return frontier;
   }
 
   inboundMessage(messageId: string): StoredInboundMessage | undefined {
