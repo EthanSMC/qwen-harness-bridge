@@ -9,7 +9,13 @@ permissions:
 jobs:
   runtime:
     name: runtime
-    runs-on: ubuntu-latest
+    # ubuntu-latest migrated to Ubuntu 26 on 2026-10-19. On that image the gate
+    # fails before any docker step: the PostgreSQL suites cannot resolve
+    # initdb/pg_ctl/createdb (no preinstalled PostgreSQL 16) and the offline pnpm
+    # store is incomplete for tests/contract/runtime-build.test.ts. The last
+    # green run of this job (2026-09-18) used the Ubuntu 24.04 image, so pin it
+    # until the gate is ported to Ubuntu 26 deliberately.
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
