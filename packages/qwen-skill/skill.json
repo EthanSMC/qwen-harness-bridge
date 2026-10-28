@@ -1,0 +1,11 @@
+{
+  "name": "qwen-harness-bridge",
+  "display_name": "眼镜任务台",
+  "version": "0.3.0",
+  "visibility": "private",
+  "language": "zh-CN",
+  "stable_mode": true,
+  "rtc_mode": false,
+  "mcp_import": "mcp.import.example.json",
+  "transcript_schema": "src/transcript-schema.ts"
+}

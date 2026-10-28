@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "name": "qwen-harness-bridge",
+      "type": "streamable-http",
+      "url": "https://control-plane.example.com/mcp",
+      "auth": {
+        "type": "bearer",
+        "token_secret_ref": "${QWEN_MCP_BEARER_TOKEN}"
+      },
+      "tools": [
+        "submit_task",
+        "list_tasks",
+        "get_task",
+        "cancel_task",
+        "list_pending_approvals",
+        "decide_approval",
+        "get_task_result"
+      ]
+    }
+  ]
+}
