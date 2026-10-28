@@ -424,6 +424,31 @@ describe("static skill lint", () => {
     }
   });
 
+  it("fails for Markdown- and CJK-wrapped or UNC absolute paths", () => {
+    const backtick = String.fromCharCode(96);
+    const backslash = String.fromCharCode(92);
+    const fullWidthColon = String.fromCharCode(0xff1a);
+    const posix = ["", "Users", "alice", "project"].join("/");
+    const windowsBackslash = ["C:", "Users", "alice", "project"].join(
+      backslash,
+    );
+    const cases = [
+      backtick + posix + backtick,
+      backtick + windowsBackslash + backtick,
+      fullWidthColon + posix,
+      backslash + backslash + ["server", "share", "file"].join(backslash),
+      ["", "", "server", "share", "file"].join("/"),
+      ["file:", "//", posix].join(""),
+    ];
+    for (const value of cases) {
+      const root = copyPackage();
+      writeFileSync(join(root, "notes.md"), `${value}\n`);
+      const result = runLint(root);
+      expect(result.status, value).toBe(1);
+      expect(result.stderr, value).toMatch(/absolute local path/u);
+    }
+  });
+
   it("does not flag an ordinary https endpoint as an absolute path", () => {
     const root = copyPackage();
     writeFileSync(

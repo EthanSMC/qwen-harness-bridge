@@ -236,12 +236,22 @@ const TEXT_EXTENSIONS = new Set([
   ".yml",
   ".yaml",
 ]);
+// A path is rejected unless it is preceded by a character that makes it part of
+// a URL scheme. This keeps Markdown backticks, CJK punctuation, quotes, brackets
+// and prose separators working instead of enumerating them as allowed prefixes.
 const ABSOLUTE_PATH_PATTERNS = [
-  // A Windows drive path with either separator. The boundary lookbehind keeps a
-  // URL scheme such as https:// from being read as a drive letter.
-  /(?<=^|[\s"'(=:[{,]|\n)[A-Za-z]:[\\/][^\s"']+/u,
-  // POSIX absolute paths under the documented roots.
-  /(?<=^|[\s"'(=:[{,]|\n)\/(?:Users|home|root|private|tmp|var|Volumes)\/[^\s"']+/u,
+  // Windows drive path with either separator (the scheme letter of https:// is
+  // preceded by a letter, so a URL never matches).
+  /(?<![A-Za-z0-9+.-])[A-Za-z]:[\\/][^\s"']+/u,
+  // POSIX absolute paths under the documented roots (a double slash keeps a URL
+  // host such as https://Users from matching).
+  /(?<![A-Za-z0-9/])\/(?:Users|home|root|private|tmp|var|Volumes)\/[^\s"']+/u,
+  // Windows UNC share.
+  /(?<![A-Za-z0-9\\])\\\\[A-Za-z0-9._$-]+\\[^\s"']+/u,
+  // Forward-slash UNC form; a URL scheme is excluded because its "//" follows ":".
+  /(?<![A-Za-z0-9:])\/\/[A-Za-z0-9._-]+\/[^\s"']+/u,
+  // Local file URLs are absolute by construction.
+  /file:\/\/\/[^\s"']+/u,
 ];
 const CREDENTIAL_PATTERNS = [
   /\bsk-[A-Za-z0-9_-]{8,}/u,
