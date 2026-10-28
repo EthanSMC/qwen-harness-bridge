@@ -144,6 +144,17 @@ describe("seven-tool MCP import template", () => {
     }
   });
 
+  it("keeps the seven tools aligned with the Control Plane MCP registration", () => {
+    const toolsSource = readFileSync(
+      join(repositoryRoot, "apps/control-plane/src/mcp/tools.ts"),
+      "utf8",
+    );
+    const registered = [...toolsSource.matchAll(/server,\s*"([a-z_]+)"/gu)].map(
+      (match) => match[1],
+    );
+    expect([...registered].sort()).toEqual([...MCP_TOOL_NAMES].sort());
+  });
+
   it("references the Bearer token through an environment secret, never a literal", () => {
     const raw = mcpImport() as {
       servers: { auth: { token_secret_ref: string } }[];
@@ -393,16 +404,64 @@ describe("static skill lint", () => {
     expect(result.stderr).toMatch(/secret/u);
   });
 
-  it("fails when an absolute local path appears in the package", () => {
+  it("fails for Windows and POSIX absolute local paths", () => {
+    const paths = [
+      ["C:", "Users", "someone", "project"].join("\\"),
+      ["C:", "Users", "someone", "project"].join("/"),
+      ["", "Users", "someone", "project"].join("/"),
+      ["", "home", "someone", "project"].join("/"),
+      ["", "root", "project"].join("/"),
+    ];
+    for (const localPath of paths) {
+      const root = copyPackage();
+      writeFileSync(
+        join(root, "notes.md"),
+        `local checkout lives at ${localPath}\n`,
+      );
+      const result = runLint(root);
+      expect(result.status, localPath).toBe(1);
+      expect(result.stderr, localPath).toMatch(/absolute local path/u);
+    }
+  });
+
+  it("does not flag an ordinary https endpoint as an absolute path", () => {
     const root = copyPackage();
-    const localCheckout = ["C:", "Users", "someone", "project"].join("\\");
     writeFileSync(
       join(root, "notes.md"),
-      `local checkout lives at ${localCheckout}\n`,
+      "endpoint: https://control-plane.example.com/mcp\n",
+    );
+    const result = runLint(root);
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  it("fails when a credential literal appears in the package", () => {
+    const root = copyPackage();
+    writeFileSync(
+      join(root, "notes.md"),
+      `authorization: ${["Bearer", "abcdefgh12345678"].join(" ")}\n`,
     );
     const result = runLint(root);
     expect(result.status).toBe(1);
-    expect(result.stderr).toMatch(/absolute local path/u);
+    expect(result.stderr).toMatch(/credential literal/u);
+  });
+
+  it("fails when the package claims an unsupported push route", () => {
+    const root = copyPackage();
+    writeFileSync(join(root, "notes.md"), `${["后台", "推送"].join("")}\n`);
+    const result = runLint(root);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/push route/u);
+  });
+
+  it("fails when an RTC route appears while rtc_mode is false", () => {
+    const root = copyPackage();
+    writeFileSync(
+      join(root, "notes.md"),
+      `${["rtc", "url: wss://example.com/rtc"].join("_")}\n`,
+    );
+    const result = runLint(root);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/RTC route/u);
   });
 
   it("activates the SKILL.md front-matter rule as soon as the file lands", () => {

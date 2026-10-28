@@ -237,8 +237,11 @@ const TEXT_EXTENSIONS = new Set([
   ".yaml",
 ]);
 const ABSOLUTE_PATH_PATTERNS = [
-  /[A-Za-z]:\\[^\s"']+/u,
-  //(?:Users|home|root)\/[^\s"']+/u,
+  // A Windows drive path with either separator. The boundary lookbehind keeps a
+  // URL scheme such as https:// from being read as a drive letter.
+  /(?<=^|[\s"'(=:[{,]|\n)[A-Za-z]:[\\/][^\s"']+/u,
+  // POSIX absolute paths under the documented roots.
+  /(?<=^|[\s"'(=:[{,]|\n)\/(?:Users|home|root|private|tmp|var|Volumes)\/[^\s"']+/u,
 ];
 const CREDENTIAL_PATTERNS = [
   /\bsk-[A-Za-z0-9_-]{8,}/u,
