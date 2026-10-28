@@ -111,6 +111,12 @@ importers:
         specifier: ^3.25.76
         version: 3.25.76
 
+  packages/qwen-skill:
+    dependencies:
+      zod:
+        specifier: ^3.25.76
+        version: 3.25.76
+
 packages:
 
   '@biomejs/biome@2.5.11':
