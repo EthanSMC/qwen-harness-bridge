@@ -245,7 +245,7 @@ const ABSOLUTE_PATH_PATTERNS = [
   /(?<![A-Za-z0-9+.-])[A-Za-z]:[\\/][^\s"']+/u,
   // POSIX absolute paths under the documented roots (a double slash keeps a URL
   // host such as https://Users from matching).
-  /(?<![A-Za-z0-9/])\/(?:Users|home|root|private|tmp|var|Volumes)\/[^\s"']+/u,
+  /(?<![A-Za-z0-9/])\/(?:Users|home|root|private|tmp|var|Volumes|opt|srv|mnt|data|etc|media|snap|run|boot|usr\/local)\/[^\s"']+/u,
   // Windows UNC share.
   /(?<![A-Za-z0-9\\])\\\\[A-Za-z0-9._$-]+\\[^\s"']+/u,
   // Forward-slash UNC form; a URL scheme is excluded because its "//" follows ":".

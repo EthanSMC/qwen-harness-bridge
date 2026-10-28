@@ -411,6 +411,9 @@ describe("static skill lint", () => {
       ["", "Users", "someone", "project"].join("/"),
       ["", "home", "someone", "project"].join("/"),
       ["", "root", "project"].join("/"),
+      ["", "opt", "secret", "file"].join("/"),
+      ["", "srv", "data", "file"].join("/"),
+      ["", "mnt", "disk", "file"].join("/"),
     ];
     for (const localPath of paths) {
       const root = copyPackage();
