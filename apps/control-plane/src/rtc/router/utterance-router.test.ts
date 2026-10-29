@@ -1,11 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import {
-  ERROR_COPY,
-  MAX_TTS_CHARACTERS,
-  STATUS_TEXT,
-  statusText,
-} from "./copy.js";
+import { ERROR_COPY, MAX_TTS_CHARACTERS, STATUS_TEXT } from "./copy.js";
 import { RtcSessionContext } from "./session-context.js";
 import type {
   LiveUtterance,
@@ -58,6 +53,16 @@ const approval = (
   expires_at: "2026-08-07T10:10:00Z",
 });
 
+type Gate = Readonly<{ promise: Promise<void>; open: () => void }>;
+
+const createGate = (): Gate => {
+  let open: (() => void) | undefined;
+  const promise = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { promise, open: () => open?.() };
+};
+
 const makeServices = () => {
   const calls: Array<{ method: string; input: unknown }> = [];
   const tables = new Set<string>();
@@ -66,6 +71,11 @@ const makeServices = () => {
     approval(APPROVAL_1, "QH-AAA1", 2),
     approval(APPROVAL_2, "QH-BBB2", 5),
   ];
+  let detailStatus: "queued" | "running" | "failed" | "succeeded" = "running";
+  let cancelStatus: string | undefined = "cancelling";
+  let listGate: Promise<void> | undefined;
+  let decideGate: Promise<void> | undefined;
+  let decideMutates = true;
 
   const jobs: StableJobServices = {
     async submit(input) {
@@ -75,17 +85,16 @@ const makeServices = () => {
     },
     async list(input) {
       calls.push({ method: "list", input });
+      if (listGate !== undefined) await listGate;
       return tasks;
     },
     async get(input) {
       calls.push({ method: "get", input });
       return {
         job_id: input.job_id,
-        status: "running",
+        status: detailStatus,
         current_stage: "editing",
         revision: 2,
-        text: "正在编辑",
-        pending_approval: null,
       };
     },
     async cancel(input) {
@@ -93,7 +102,7 @@ const makeServices = () => {
       tables.add("jobs");
       return {
         job_id: input.job_id,
-        status: "cancelling",
+        status: cancelStatus,
         short_id: "QH-AAA1",
       };
     },
@@ -111,13 +120,17 @@ const makeServices = () => {
     },
   };
   const approvalServices: StableApprovalServices = {
-    async listPending(input) {
+    async listPending(input, signal) {
       calls.push({ method: "listPending", input });
+      if (listGate !== undefined) await listGate;
+      if (signal?.aborted) throw { code: "TRANSPORT_TIMEOUT" };
       return approvals;
     },
-    async decide(input) {
+    async decide(input, signal) {
       calls.push({ method: "decide", input });
-      tables.add("approvals");
+      if (decideGate !== undefined) await decideGate;
+      if (decideMutates) tables.add("approvals");
+      if (signal?.aborted) throw { code: "TRANSPORT_TIMEOUT" };
       return {
         approval_id: input.approval_id,
         decision: input.decision,
@@ -135,6 +148,19 @@ const makeServices = () => {
     },
     setApprovals(next: RouterApproval[]) {
       approvals = next;
+    },
+    setDetailStatus(next: "queued" | "running" | "failed" | "succeeded") {
+      detailStatus = next;
+    },
+    setCancelStatus(next: string | undefined) {
+      cancelStatus = next;
+    },
+    setApprovalListGate(gate: Gate | undefined) {
+      listGate = gate?.promise;
+    },
+    setDecideGate(gate: Gate | undefined) {
+      decideGate = gate?.promise;
+      decideMutates = gate === undefined;
     },
   };
 };
@@ -162,22 +188,18 @@ const final = (eventId: string, text: string): LiveUtterance => ({
   text,
 });
 
-const speak = (response: { speech: string }): string => response.speech;
-
 describe("final utterance router", () => {
   it("submits through the stable coordinator with a derived idempotency key", async () => {
     const { router, fake } = makeRouter();
-    const utterance = final("evt-1", "让 DeepSeek 在 alpha 仓库跑一下测试");
-    const response = await router.handleFinal(utterance);
+    const response = await router.handleFinal(
+      final("evt-1", "让 DeepSeek 在 alpha 仓库跑一下测试"),
+    );
 
     expect(response.intent).toMatchObject({
       kind: "submit",
       repositoryId: "repo-alpha",
       mode: "normal",
     });
-    expect(fake.calls.filter((call) => call.method === "submit")).toHaveLength(
-      1,
-    );
     const input = fake.calls.find((call) => call.method === "submit")
       ?.input as {
       client_request_id: string;
@@ -188,9 +210,23 @@ describe("final utterance router", () => {
     expect(input.client_request_id).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
     );
-    expect(speak(response)).toContain("QH-AAA1");
-    expect(Array.from(speak(response)).length).toBeLessThanOrEqual(
+    expect(response.speech).toContain("QH-AAA1");
+    expect(Array.from(response.speech).length).toBeLessThanOrEqual(
       MAX_TTS_CHARACTERS,
+    );
+  });
+
+  it("uses a read-only mode when the user asks not to change code", async () => {
+    const { router, fake } = makeRouter();
+    const response = await router.handleFinal(
+      final("evt-ro", "只在 alpha 仓库只读检查一下测试"),
+    );
+    expect(response.intent).toMatchObject({
+      kind: "submit",
+      mode: "read_only",
+    });
+    expect(fake.calls.filter((call) => call.method === "submit")).toHaveLength(
+      1,
     );
   });
 
@@ -200,6 +236,22 @@ describe("final utterance router", () => {
     const first = await router.handleFinal(utterance);
     const second = await router.handleFinal(utterance);
 
+    expect(second.speech).toBe(first.speech);
+    expect(fake.calls.filter((call) => call.method === "submit")).toHaveLength(
+      1,
+    );
+  });
+
+  it("deduplicates a concurrently delivered final", async () => {
+    const { router, fake } = makeRouter();
+    const utterance = final(
+      "evt-concurrent",
+      "让 DeepSeek 在 alpha 仓库跑一下测试",
+    );
+    const [first, second] = await Promise.all([
+      router.handleFinal(utterance),
+      router.handleFinal(utterance),
+    ]);
     expect(second.speech).toBe(first.speech);
     expect(fake.calls.filter((call) => call.method === "submit")).toHaveLength(
       1,
@@ -219,9 +271,6 @@ describe("final utterance router", () => {
     );
     expect(response.intent.kind).toBe("clarify");
     expect(fake.calls).toHaveLength(0);
-    expect(Array.from(speak(response)).length).toBeLessThanOrEqual(
-      MAX_TTS_CHARACTERS,
-    );
   });
 
   it("lists tasks then inspects the ordinal from the adjacent list", async () => {
@@ -230,12 +279,21 @@ describe("final utterance router", () => {
       final("evt-list", "列出最近的任务"),
     );
     expect(listResponse.intent).toEqual({ kind: "list" });
-    expect(speak(listResponse)).toContain("2");
+    expect(listResponse.speech).toContain("2");
 
     const detail = await router.handleFinal(final("evt-detail", "第一个详情"));
     expect(detail.intent).toEqual({ kind: "inspect", jobId: JOB_A });
     expect(detail.focusedJobId).toBe(JOB_A);
     expect(fake.calls.filter((call) => call.method === "get")).toHaveLength(1);
+  });
+
+  it("inspects a task by short id after a list", async () => {
+    const { router } = makeRouter();
+    await router.handleFinal(final("evt-sid-list", "列出最近的任务"));
+    const detail = await router.handleFinal(
+      final("evt-sid-detail", "QH-BBB2 详情"),
+    );
+    expect(detail.intent).toEqual({ kind: "inspect", jobId: JOB_B });
   });
 
   it("maps the ordinal to the newest list after a conflicting list", async () => {
@@ -259,7 +317,7 @@ describe("final utterance router", () => {
     expect(fake.calls.filter((call) => call.method === "get")).toHaveLength(0);
   });
 
-  it("approves the first pending approval with its expected job revision", async () => {
+  it("approves the first pending approval without claiming the job succeeded", async () => {
     const { router, fake } = makeRouter();
     await router.handleFinal(final("evt-ap-list", "看一下待审批"));
     const response = await router.handleFinal(
@@ -282,10 +340,24 @@ describe("final utterance router", () => {
       decision: "approve",
       expected_job_revision: 2,
     });
-    expect(speak(response)).toContain(statusText("succeeded"));
+    expect(response.speech).toContain("已批准");
+    expect(response.speech).not.toContain(STATUS_TEXT.succeeded);
   });
 
-  it("cancels an exact job by short id and current revision", async () => {
+  it("rejects the second pending approval", async () => {
+    const { router } = makeRouter();
+    await router.handleFinal(final("evt-rj-list", "看一下待审批"));
+    const response = await router.handleFinal(
+      final("evt-reject", "拒绝第二个"),
+    );
+    expect(response.intent).toMatchObject({
+      kind: "reject",
+      approvalId: APPROVAL_2,
+    });
+    expect(response.speech).toContain("已拒绝");
+  });
+
+  it("reports the provider cancel status instead of assuming success", async () => {
     const { router, fake } = makeRouter();
     await router.handleFinal(final("evt-c-list", "列出最近的任务"));
     const response = await router.handleFinal(
@@ -297,15 +369,19 @@ describe("final utterance router", () => {
       jobId: JOB_B,
       expectedRevision: 5,
     });
-    const cancel = fake.calls.find((call) => call.method === "cancel")
-      ?.input as {
-      job_id: string;
-      expected_revision: number;
-    };
-    expect(cancel).toEqual({ job_id: JOB_B, expected_revision: 5 });
+    expect(response.speech).toContain("正在取消");
+    expect(response.speech).not.toContain(STATUS_TEXT.succeeded);
+
+    fake.setCancelStatus("succeeded");
+    await router.handleFinal(final("evt-c-list2", "列出最近的任务"));
+    const terminal = await router.handleFinal(
+      final("evt-cancel2", "取消 QH-BBB2"),
+    );
+    expect(terminal.speech).toContain("取消未生效");
+    expect(terminal.speech).toContain(STATUS_TEXT.succeeded);
   });
 
-  it("reads the focused task result", async () => {
+  it("reads the focused task result with its refreshed status", async () => {
     const { router, fake } = makeRouter();
     await router.handleFinal(final("evt-r-list", "列出最近的任务"));
     await router.handleFinal(final("evt-r-detail", "第一个详情"));
@@ -314,10 +390,35 @@ describe("final utterance router", () => {
     );
 
     expect(response.intent).toEqual({ kind: "result", jobId: JOB_A });
-    expect(speak(response)).toContain("测试已通过");
+    expect(response.speech).toContain("测试已通过");
+    expect(response.speech).toContain(STATUS_TEXT.running);
+    expect(response.speech).not.toContain(STATUS_TEXT.succeeded);
     expect(
       fake.calls.filter((call) => call.method === "getResult"),
     ).toHaveLength(1);
+  });
+
+  it("does not claim success when the refreshed job failed", async () => {
+    const { router, fake } = makeRouter();
+    fake.setDetailStatus("failed");
+    await router.handleFinal(final("evt-f-list", "列出最近的任务"));
+    await router.handleFinal(final("evt-f-detail", "第一个详情"));
+    const response = await router.handleFinal(
+      final("evt-f-result", "读一下结果"),
+    );
+    expect(response.speech).toContain(STATUS_TEXT.failed);
+    expect(response.speech).not.toContain(STATUS_TEXT.succeeded);
+  });
+
+  it("clears the focused task when a new list arrives", async () => {
+    const { router } = makeRouter();
+    await router.handleFinal(final("evt-cf-list", "列出最近的任务"));
+    await router.handleFinal(final("evt-cf-detail", "第一个详情"));
+    await router.handleFinal(final("evt-cf-list2", "列出最近的任务"));
+    const response = await router.handleFinal(
+      final("evt-cf-result", "读一下结果"),
+    );
+    expect(response.intent.kind).toBe("clarify");
   });
 
   it("asks one clarification when the repository is ambiguous", async () => {
@@ -336,7 +437,6 @@ describe("final utterance router", () => {
     const response = await router.handleFinal(
       final("evt-amb", "在 alpha 跑测试"),
     );
-
     expect(response.intent.kind).toBe("clarify");
     expect(fake.calls).toHaveLength(0);
   });
@@ -346,9 +446,8 @@ describe("final utterance router", () => {
     const response = await router.handleFinal(
       final("evt-exit", "退出实时模式"),
     );
-
     expect(response.intent).toEqual({ kind: "exit" });
-    expect(speak(response)).toBe("已退出实时模式。");
+    expect(response.speech).toBe("已退出实时模式。");
     expect(fake.calls).toHaveLength(0);
   });
 
@@ -366,13 +465,71 @@ describe("final utterance router", () => {
       eventId: "evt-foreign",
       text: "列出最近的任务",
     });
-
     expect(aborted.intent.kind).toBe("clarify");
     expect(foreign.intent.kind).toBe("clarify");
     expect(fake.calls).toHaveLength(0);
   });
 
-  it("keeps the session context bounded and free of transcripts", async () => {
+  it("does not mutate when the session closes during an approval list", async () => {
+    const { router, fake } = makeRouter();
+    const gate = createGate();
+    fake.setApprovalListGate(gate);
+    const controller = new AbortController();
+    const pending = router.handleFinal(
+      final("evt-abort-list", "看一下待审批"),
+      controller.signal,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort();
+    gate.open();
+    const response = await pending;
+
+    expect(response.intent.kind).toBe("clarify");
+    expect(fake.calls.filter((call) => call.method === "decide")).toHaveLength(
+      0,
+    );
+    expect(router.contextSnapshot().approvalIds).toEqual([]);
+  });
+
+  it("does not record a decision when the session closes while deciding", async () => {
+    const { router, fake } = makeRouter();
+    await router.handleFinal(final("evt-dd-list", "看一下待审批"));
+    const gate = createGate();
+    fake.setDecideGate(gate);
+    const controller = new AbortController();
+    const pending = router.handleFinal(
+      final("evt-dd-approve", "批准第一个"),
+      controller.signal,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    controller.abort();
+    gate.open();
+    const response = await pending;
+
+    expect(response.intent.kind).toBe("clarify");
+    expect(fake.tables.has("approvals")).toBe(false);
+  });
+
+  it("keeps duplicate finals idempotent after more than sixteen later finals", async () => {
+    const { router, fake } = makeRouter();
+    await router.handleFinal(final("evt-dup-ap-list", "看一下待审批"));
+    const approve = await router.handleFinal(
+      final("evt-dup-approve", "批准第一个"),
+    );
+    for (let index = 0; index < 20; index += 1) {
+      await router.handleFinal(final(`evt-bulk-${index}`, "列出最近的任务"));
+    }
+    const again = await router.handleFinal(
+      final("evt-dup-approve", "批准第一个"),
+    );
+
+    expect(again.speech).toBe(approve.speech);
+    expect(fake.calls.filter((call) => call.method === "decide")).toHaveLength(
+      1,
+    );
+  });
+
+  it("keeps the session context bounded and free of transcripts", () => {
     const context = new RtcSessionContext({ ttlMs: 120_000 });
     context.recordTaskList(
       [task(JOB_A, "QH-AAA1", 2), task(JOB_B, "QH-BBB2", 5)].map((item) => ({

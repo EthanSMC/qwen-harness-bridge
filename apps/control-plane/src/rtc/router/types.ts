@@ -82,32 +82,51 @@ export type RouterCancelResult = Readonly<{
   short_id?: string;
 }>;
 
-/** Stable job/task/result services also used by MCP; the router never touches SQL. */
+export type ApprovalDecisionResult = Readonly<{
+  approval_id: string;
+  decision: "approve" | "reject";
+  revision: number;
+}>;
+
+/**
+ * Stable job/task/result services also used by MCP; the router never touches SQL.
+ * Each call accepts the live-session signal so a closing session can stop a call
+ * that has not completed yet.
+ */
 export type StableJobServices = Readonly<{
-  submit: (input: SubmitTaskInput) => Promise<JobReceipt>;
-  list: (input: ListTasksInput) => Promise<readonly RouterTask[]>;
-  get: (input: { job_id: string }) => Promise<RouterTaskDetail>;
-  cancel: (input: {
-    job_id: string;
-    expected_revision: number;
-  }) => Promise<RouterCancelResult>;
-  getResult: (input: { job_id: string }) => Promise<RouterTaskResult>;
+  submit: (input: SubmitTaskInput, signal?: AbortSignal) => Promise<JobReceipt>;
+  list: (
+    input: ListTasksInput,
+    signal?: AbortSignal,
+  ) => Promise<readonly RouterTask[]>;
+  get: (
+    input: { job_id: string },
+    signal?: AbortSignal,
+  ) => Promise<RouterTaskDetail>;
+  cancel: (
+    input: { job_id: string; expected_revision: number },
+    signal?: AbortSignal,
+  ) => Promise<RouterCancelResult>;
+  getResult: (
+    input: { job_id: string },
+    signal?: AbortSignal,
+  ) => Promise<RouterTaskResult>;
 }>;
 
 /** Approval service port backed by the same ApprovalService used by MCP. */
 export type StableApprovalServices = Readonly<{
   listPending: (
     input: ListPendingApprovalsInput,
+    signal?: AbortSignal,
   ) => Promise<readonly RouterApproval[]>;
-  decide: (input: {
-    approval_id: string;
-    decision: "approve" | "reject";
-    expected_job_revision: number;
-  }) => Promise<{
-    approval_id: string;
-    decision: "approve" | "reject";
-    revision: number;
-  }>;
+  decide: (
+    input: {
+      approval_id: string;
+      decision: "approve" | "reject";
+      expected_job_revision: number;
+    },
+    signal?: AbortSignal,
+  ) => Promise<ApprovalDecisionResult>;
 }>;
 
 export type RepositoryOption = Readonly<{

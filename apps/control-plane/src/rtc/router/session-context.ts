@@ -80,6 +80,11 @@ export class RtcSessionContext {
     return this.#focusedJobId;
   }
 
+  /** A new list, exit or session close invalidates the focused task. */
+  clearFocus(): void {
+    this.#focusedJobId = undefined;
+  }
+
   recordFinalDigest(digest: string): void {
     this.#lastFinalDigest = digest;
   }

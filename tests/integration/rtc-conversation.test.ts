@@ -212,7 +212,7 @@ describe("rtc conversation integration", () => {
     expect(count(stable.calls, "submit")).toBe(1);
     expect(count(stable.calls, "decide")).toBe(1);
     expect(count(stable.calls, "cancel")).toBe(1);
-    expect(count(stable.calls, "get")).toBe(1);
+    expect(count(stable.calls, "get")).toBe(2);
     expect(count(stable.calls, "getResult")).toBe(1);
 
     const tables = new Set(stable.writes.map((write) => write.table));
@@ -224,7 +224,7 @@ describe("rtc conversation integration", () => {
     const snapshot = router.contextSnapshot();
     expect(snapshot.taskIds).toEqual([JOB_A, JOB_B]);
     expect(snapshot.approvalIds).toEqual([APPROVAL_1]);
-    expect(snapshot.focusedJobId).toBe(JOB_A);
+    expect(snapshot.focusedJobId).toBeUndefined();
     expect(snapshot.lastFinalDigest).toBeDefined();
     expect(Object.keys(snapshot)).not.toContain("text");
     expect(JSON.stringify(snapshot)).not.toContain("跑一下测试");
