@@ -9,12 +9,14 @@ import {
   createAliyunRtcConsumer,
 } from "./aliyun-rtc-consumer.js";
 import {
+  type AsrProviderEvent,
   createDashScopeAsr,
   type DashScopeAsrClient,
 } from "./dashscope-asr.js";
 import {
   type AudioFrame,
   createProviderResources,
+  RtcAudioError,
   type RtcAudioInputFrame,
   RtcProviderError,
 } from "./types.js";
@@ -504,5 +506,162 @@ describe("provider resource integration", () => {
       expect(text).not.toMatch(/console\.(?:log|debug|info)/u);
       expect(text).not.toMatch(/pcm16le\s*[:=]\s*Buffer/u);
     }
+  });
+});
+
+describe("consumer audio error propagation", () => {
+  it("preserves RTC_AUDIO_GAP instead of mapping it to a consumer failure", async () => {
+    const source = manualSource();
+    const sub = subscription("consumer_001", source);
+    const client: AliyunRtcClient = {
+      async join() {
+        return sub;
+      },
+    };
+    const consumer = createAliyunRtcConsumer({
+      client,
+      now: () => Date.parse("2026-08-06T10:00:00+08:00"),
+    });
+    const stream = await consumer.join(start(), new AbortController().signal);
+    const iterator = stream[Symbol.asyncIterator]();
+
+    source.push(inputFrame(0));
+    source.push(inputFrame(4));
+    await iterator.next();
+    try {
+      await iterator.next();
+      throw new Error("expected RTC_AUDIO_GAP");
+    } catch (error) {
+      expect(error).toBeInstanceOf(RtcAudioError);
+      expect((error as RtcAudioError).code).toBe("RTC_AUDIO_GAP");
+      expect((error as Error).message).not.toContain(
+        "short-lived-rtc-token-value",
+      );
+    }
+  });
+});
+
+const hangingEvents = {
+  [Symbol.asyncIterator]() {
+    return {
+      next: () =>
+        new Promise<IteratorResult<AsrProviderEvent>>(() => undefined),
+    };
+  },
+};
+
+const failingClient = (failure: "send" | "finish" | "events") => {
+  let aborts = 0;
+  const client: DashScopeAsrClient = {
+    async open() {
+      return {
+        async send() {
+          if (failure === "send") throw new Error("send failed");
+        },
+        async finish() {
+          if (failure === "finish") throw new Error("finish failed");
+        },
+        async abort() {
+          aborts += 1;
+        },
+        events:
+          failure === "events"
+            ? {
+                async *[Symbol.asyncIterator]() {
+                  yield {
+                    kind: "partial" as const,
+                    text: "a",
+                    startedAtMs: 0,
+                    endedAtMs: 1,
+                  };
+                  throw new Error("event stream failed");
+                },
+              }
+            : (hangingEvents as AsyncIterable<AsrProviderEvent>),
+      };
+    },
+  };
+  return { client, aborts: () => aborts };
+};
+
+describe("asr abort and failure boundaries", () => {
+  it("aborts immediately while waiting for the next provider event", async () => {
+    let aborts = 0;
+    const client: DashScopeAsrClient = {
+      async open() {
+        return {
+          async send() {},
+          async finish() {},
+          async abort() {
+            aborts += 1;
+          },
+          events: hangingEvents as AsyncIterable<AsrProviderEvent>,
+        };
+      },
+    };
+    const asr = createDashScopeAsr({ client, apiKey: "server-secret-api-key" });
+    const controller = new AbortController();
+    const iterator = asr
+      .recognize(framesSource([audioFrame(0)]), controller.signal)
+      [Symbol.asyncIterator]();
+    const pending = iterator.next();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    controller.abort();
+    const result = await pending;
+    expect(result.done).toBe(true);
+    expect(aborts).toBe(1);
+  });
+
+  it.each(["send", "finish"] as const)(
+    "fails closed when %s fails",
+    async (failure) => {
+      const fake = failingClient(failure);
+      const asr = createDashScopeAsr({
+        client: fake.client,
+        apiKey: "server-secret-api-key",
+      });
+      let rejection: unknown;
+      try {
+        for await (const _event of asr.recognize(
+          framesSource([audioFrame(0)]),
+          new AbortController().signal,
+        )) {
+          // drain
+        }
+      } catch (error) {
+        rejection = error;
+      }
+
+      expect(rejection).toBeInstanceOf(RtcProviderError);
+      expect((rejection as RtcProviderError).code).toBe("RTC_ASR_FAILED");
+      expect((rejection as Error).message).not.toContain(
+        "server-secret-api-key",
+      );
+      expect(fake.aborts()).toBe(1);
+    },
+  );
+
+  it("fails closed when the provider event stream throws", async () => {
+    const fake = failingClient("events");
+    const asr = createDashScopeAsr({
+      client: fake.client,
+      apiKey: "server-secret-api-key",
+    });
+    let rejection: unknown;
+    try {
+      for await (const _event of asr.recognize(
+        framesSource([audioFrame(0)]),
+        new AbortController().signal,
+      )) {
+        // drain
+      }
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toBeInstanceOf(RtcProviderError);
+    expect((rejection as RtcProviderError).code).toBe("RTC_ASR_FAILED");
+    expect((rejection as Error).message).not.toContain("server-secret-api-key");
   });
 });

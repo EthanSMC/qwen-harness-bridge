@@ -107,7 +107,7 @@ export class AudioNormalizer {
 
     const mono = downmix(readSamples(input.pcm16le), input.channels);
     const normalized = resample(mono, input.sampleRateHz);
-    if (normalized.length > MAX_BUFFER_SAMPLES) {
+    if (this.pending.length + normalized.length > MAX_BUFFER_SAMPLES) {
       throw new RtcAudioError("RTC_AUDIO_BUFFER_OVERFLOW");
     }
     this.pending.push(...normalized);

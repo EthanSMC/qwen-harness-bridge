@@ -2,6 +2,7 @@ import type { NormalizedRtcStart } from "../wire/qwen-rtc-schema.js";
 import { AudioNormalizer } from "./audio-normalizer.js";
 import {
   type AudioFrame,
+  RtcAudioError,
   type RtcAudioInputFrame,
   type RtcConsumer,
   RtcProviderError,
@@ -45,6 +46,7 @@ const nextWithAbort = <T>(
     };
     const onAbort = (): void => {
       cleanup();
+      void iterator.return?.().catch(() => undefined);
       resolve({ done: true, value: undefined });
     };
     signal.addEventListener("abort", onAbort, { once: true });
@@ -139,7 +141,11 @@ export const createAliyunRtcConsumer = (
               yield frame;
             }
           }
-        } catch {
+        } catch (error) {
+          if (error instanceof RtcAudioError) {
+            if (!signal.aborted) options.onDisconnect?.("stream_error");
+            throw error;
+          }
           if (!signal.aborted) {
             options.onDisconnect?.("stream_error");
             throw new RtcProviderError("RTC_CONSUMER_FAILED");

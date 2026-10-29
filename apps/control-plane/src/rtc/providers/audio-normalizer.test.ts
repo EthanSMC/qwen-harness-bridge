@@ -193,3 +193,20 @@ describe("audio normalizer sequencing", () => {
     expect(new Set(sequences).size).toBe(sequences.length);
   });
 });
+
+describe("audio normalizer buffer accounting", () => {
+  it("counts pending samples against the two second buffer", () => {
+    const normalizer = new AudioNormalizer();
+    normalizer.push(frame(tones(1_600, 16_000), { sequence: 0 }));
+    expectCode(
+      () => normalizer.push(frame(tones(32_000, 16_000), { sequence: 1 })),
+      "RTC_AUDIO_BUFFER_OVERFLOW",
+    );
+
+    const exact = new AudioNormalizer();
+    exact.push(frame(tones(1_600, 16_000), { sequence: 0 }));
+    expect(
+      exact.push(frame(tones(30_400, 16_000), { sequence: 1 })),
+    ).toHaveLength(10);
+  });
+});
