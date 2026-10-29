@@ -1,0 +1,50 @@
+{
+  "fixture_id": "inspect-offline",
+  "turns": [
+    {
+      "request_id": "33333333-3333-4333-8333-333333333333",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "QH-6C1F 怎么样了"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task",
+          "request_id": "33333333-3333-4333-8333-333333333333",
+          "arguments": {
+            "job_id": "223e4567-e89b-42d3-a456-426614174111"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task",
+          "request_id": "33333333-3333-4333-8333-333333333333",
+          "ok": false,
+          "text": "CONNECTOR_OFFLINE: connector is unreachable"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.all_text",
+          "request_id": "33333333-3333-4333-8333-333333333333",
+          "payload": {
+            "lines": [
+              "仓库：Novelty API · 短号：QH-6C1F",
+              "状态：正在执行",
+              "连接：连接中断，正在协调 · 最近更新：12 分钟前",
+              "进度：暂无进度详情"
+            ]
+          }
+        },
+        {
+          "kind": "assistant",
+          "text": "连接中断，正在协调，暂无新进度。"
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-6C1F 正在执行，连接中断，正在协调。"
+        }
+      ]
+    }
+  ]
+}

@@ -44,8 +44,8 @@ describe("skill submission contract fixtures", () => {
     const suite = runContractSuite(fixturesDirectory);
 
     expect(suite.violations).toEqual([]);
-    expect(suite.fixtureCount).toBe(6);
-    expect(suite.turnCount).toBeGreaterThanOrEqual(6);
+    expect(suite.fixtureCount).toBe(11);
+    expect(suite.turnCount).toBeGreaterThanOrEqual(11);
   });
 
   it("keeps every turn at zero or one mutation", () => {
@@ -53,7 +53,12 @@ describe("skill submission contract fixtures", () => {
 
     expect(suite.maxMutationsPerTurn).toBeLessThanOrEqual(1);
     expect(suite.mutationsByFixture).toEqual({
+      "inspect-offline": 0,
+      "inspect-running": 0,
+      "list-tasks": 0,
       "repository-ambiguous": 0,
+      "result-image": 0,
+      "result-text": 0,
       "submit-offline": 1,
       "submit-online": 1,
       "submit-read-only": 1,

@@ -72,7 +72,8 @@ utterance
 `UiTool.pic_and_text`（图文结果）。
 
 工具输入输出、错误码与重试矩阵见 `references/tool-contract.md`；意图与路由细则见
-`references/intents.md`。
+`references/intents.md`；列表、详情、结果与产物布局见 `references/ui-contract.md`；
+语音模板见 `references/speech-contract.md`。
 
 ## 显示与语音
 

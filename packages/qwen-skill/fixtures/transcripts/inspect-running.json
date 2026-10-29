@@ -1,0 +1,50 @@
+{
+  "fixture_id": "inspect-running",
+  "turns": [
+    {
+      "request_id": "22222222-2222-4222-8222-222222222222",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "看一下 QH-7M2P"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "ok": true,
+          "text": "running"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.all_text",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "payload": {
+            "lines": [
+              "仓库：Novelty Web · 短号：QH-7M2P",
+              "状态：正在执行 · 阶段：运行测试",
+              "连接：连接正常 · 最近更新：3 分钟前",
+              "进度：已拉取最新代码；正在运行测试套件"
+            ]
+          }
+        },
+        {
+          "kind": "assistant",
+          "text": "任务正在运行测试。"
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-7M2P 正在执行，阶段：运行测试。"
+        }
+      ]
+    }
+  ]
+}
