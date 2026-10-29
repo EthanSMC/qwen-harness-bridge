@@ -109,6 +109,8 @@ export async function start() {
               firstAudio: (sessionId) => rtcPlugin.observeAudio(sessionId),
               firstOutput: (sessionId) =>
                 rtcPlugin.observeOutput("speak", sessionId),
+              sessionCreated: (sessionId, writer) =>
+                rtcPlugin.composeSession(sessionId, writer),
             },
           });
     },

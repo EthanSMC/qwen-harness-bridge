@@ -46,6 +46,23 @@ export type RtcPluginOptions = Readonly<{
     recordRtcDisconnect?: (reason: string) => void;
   }>;
   telemetry?: RtcTelemetry;
+  /** Injectable composition entry points (fake providers in tests; real
+   * Task 3/5 adapters are constructed here when configured). */
+  composition?: Readonly<{
+    consumer?: (
+      sessionId: string,
+      callbacks: { onFirstAudio: () => void; close: () => Promise<void> },
+    ) => { close: () => Promise<void> };
+    asr?: (
+      sessionId: string,
+      callbacks: { onFinal: () => void; onFailure: () => void },
+    ) => { close?: () => Promise<void> };
+    output?: (
+      sessionId: string,
+      writer: import("./session/rtc-session.js").RtcSseWriter,
+      callbacks: { onFirstOutput: (kind: string) => void },
+    ) => { close?: () => Promise<void> };
+  }>;
   now?: () => number;
   drainMs?: number;
   maxConcurrentSessions?: number;
@@ -75,6 +92,10 @@ export type RtcPlugin = Readonly<{
     msSinceStart?: number,
   ) => void;
   observeAsr: (outcome: "failure" | "final", sessionId?: string) => void;
+  composeSession: (
+    sessionId: string,
+    writer: import("./session/rtc-session.js").RtcSseWriter,
+  ) => void;
   forceClose: (reason?: RtcCloseReason) => Promise<void>;
   drainAndClose: () => Promise<void>;
   readonly aborted: boolean;
@@ -293,6 +314,29 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
         return;
       }
       this.observeAsrFinal(sessionId);
+    },
+    composeSession(sessionId, writer) {
+      const record = sessions.get(sessionId);
+      if (record === undefined) return;
+      try {
+        options.composition?.consumer?.(sessionId, {
+          onFirstAudio: () => this.observeAudio(sessionId),
+          close: async () => undefined,
+        });
+        options.composition?.asr?.(sessionId, {
+          onFinal: () => this.observeAsrFinal(sessionId),
+          onFailure: () => this.observeAsr("failure", sessionId),
+        });
+        options.composition?.output?.(sessionId, writer, {
+          onFirstOutput: (kind) =>
+            this.observeOutput(
+              kind as (typeof RTC_TELEMETRY_COMMAND_TYPES)[number],
+              sessionId,
+            ),
+        });
+      } catch {
+        degrade("module_exception");
+      }
     },
     async forceClose(closeReason = "server_shutdown") {
       aborted = true;

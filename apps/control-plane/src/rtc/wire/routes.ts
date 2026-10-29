@@ -234,6 +234,11 @@ export type RtcLifecycleObserver = Readonly<{
   rejectionReason?: () => "concurrency_limit" | "circuit_open" | undefined;
   firstAudio?: (sessionId: string) => void;
   firstOutput?: (sessionId: string) => void;
+  /** Composition hook: construct provider adapters for the admitted session. */
+  sessionCreated?: (
+    sessionId: string,
+    writer: import("../session/rtc-session.js").RtcSseWriter,
+  ) => void;
 }>;
 
 export type RtcRouteOptions = Readonly<{
@@ -388,10 +393,17 @@ export const createRtcRouteSet = (
             .send({ error: { code: "RTC_CAPACITY" } });
         }
         let sessionStarted = false;
+        let sessionWriter:
+          | import("../session/rtc-session.js").RtcSseWriter
+          | undefined;
         try {
           const outcome = await registry.start({
             start: verified.start,
-            createTransport: () => createHttpTransport(reply),
+            createTransport: () => {
+              const transport = createHttpTransport(reply);
+              sessionWriter = transport.writer;
+              return transport;
+            },
           });
           if (!outcome.created) {
             // A duplicate identical start must receive the existing stream, so
@@ -409,6 +421,12 @@ export const createRtcRouteSet = (
             return reply;
           }
           sessionStarted = true;
+          if (sessionWriter !== undefined) {
+            options.lifecycle?.sessionCreated?.(
+              outcome.session.id,
+              sessionWriter,
+            );
+          }
           reply.raw.once("close", () => {
             void registry.close(outcome.session.id, "user_exit");
           });

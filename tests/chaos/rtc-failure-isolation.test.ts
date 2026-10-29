@@ -591,6 +591,20 @@ describe("real rtc lifecycle telemetry", () => {
       enabled: true,
       drainMs: 5,
       maxConcurrentSessions: 1,
+      composition: {
+        consumer: (_sessionId, callbacks) => {
+          callbacks.onFirstAudio();
+          return { close: async () => undefined };
+        },
+        asr: (_sessionId, callbacks) => {
+          callbacks.onFinal();
+          return { close: async () => undefined };
+        },
+        output: (_sessionId, _writer, callbacks) => {
+          callbacks.onFirstOutput("progress");
+          return { close: async () => undefined };
+        },
+      },
       build: async () => null,
     });
     const routeSet = createRtcRouteSet({
@@ -612,6 +626,8 @@ describe("real rtc lifecycle telemetry", () => {
         sessionRejected: (reason) => plugin.observeRejected(reason),
         firstAudio: (sessionId) => plugin.observeAudio(sessionId),
         firstOutput: (sessionId) => plugin.observeOutput("speak", sessionId),
+        sessionCreated: (sessionId, writer) =>
+          plugin.composeSession(sessionId, writer),
       },
     });
     if (routeSet === null) throw new Error("route set is disabled");
@@ -632,6 +648,11 @@ describe("real rtc lifecycle telemetry", () => {
     });
     expect(outcome.created).toBe(true);
     expect(routeSet.lifecycle?.sessionStart?.(outcome.session.id)).toBe(true);
+    routeSet.lifecycle?.sessionCreated?.(outcome.session.id, {
+      closed: false,
+      write: () => undefined,
+      end: () => undefined,
+    });
     expect(plugin.component().telemetry.active_sessions).toBe(1);
 
     outcome.session.touch("audio");
@@ -642,6 +663,10 @@ describe("real rtc lifecycle telemetry", () => {
     expect(
       Object.values(plugin.component().telemetry.first_output_bucket_ms),
     ).toContain(1);
+    expect(
+      Object.values(plugin.component().telemetry.first_asr_final_bucket_ms),
+    ).toContain(1);
+    expect(plugin.component().telemetry.output_commands.progress).toBe(1);
 
     expect(routeSet.lifecycle?.canStart?.()).toBe(false);
     routeSet.lifecycle?.sessionRejected?.(
