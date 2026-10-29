@@ -36,6 +36,7 @@ export class RtcSessionContext {
   #tasksAt: number | undefined;
   #approvalsAt: number | undefined;
   #focusedJobId: string | undefined;
+  #focusedShortId: string | undefined;
   #lastFinalDigest: string | undefined;
 
   constructor(options: SessionContextOptions = {}) {
@@ -72,17 +73,23 @@ export class RtcSessionContext {
     return this.#approvals;
   }
 
-  focus(jobId: string): void {
+  focus(jobId: string, shortId?: string): void {
     this.#focusedJobId = jobId;
+    this.#focusedShortId = shortId;
   }
 
   focusedJobId(): string | undefined {
     return this.#focusedJobId;
   }
 
+  focusedShortId(): string | undefined {
+    return this.#focusedShortId;
+  }
+
   /** A new list, exit or session close invalidates the focused task. */
   clearFocus(): void {
     this.#focusedJobId = undefined;
+    this.#focusedShortId = undefined;
   }
 
   recordFinalDigest(digest: string): void {

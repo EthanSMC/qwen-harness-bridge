@@ -258,6 +258,44 @@ describe("final utterance router", () => {
     );
   });
 
+  it("uses the submitted job as the focus for result, cancel and inspect", async () => {
+    const { router } = makeRouter();
+    await router.handleFinal(
+      final("evt-submit-focus", "让 DeepSeek 在 alpha 仓库跑一下测试"),
+    );
+
+    const result = await router.handleFinal(
+      final("evt-submit-result", "读一下结果"),
+    );
+    expect(result.intent).toEqual({ kind: "result", jobId: JOB_A });
+    expect(result.speech).toContain("测试已通过");
+
+    const cancel = await router.handleFinal(
+      final("evt-submit-cancel", "取消 QH-AAA1"),
+    );
+    expect(cancel.intent).toEqual({
+      kind: "cancel",
+      jobId: JOB_A,
+      expectedRevision: 2,
+    });
+
+    const inspect = await router.handleFinal(
+      final("evt-submit-inspect", "QH-AAA1 详情"),
+    );
+    expect(inspect.intent).toEqual({ kind: "inspect", jobId: JOB_A });
+  });
+
+  it("routes a result question through result instead of approval clarification", async () => {
+    const { router } = makeRouter();
+    await router.handleFinal(
+      final("evt-b7-submit", "让 DeepSeek 在 alpha 仓库跑一下测试"),
+    );
+    const response = await router.handleFinal(
+      final("evt-b7-result", "测试通过了吗"),
+    );
+    expect(response.intent).toEqual({ kind: "result", jobId: JOB_A });
+  });
+
   it("never mutates state from a partial hypothesis", async () => {
     const { router, fake } = makeRouter();
     expect(router.handlePartial("让 DeepSeek 在 alpha")).toBeNull();

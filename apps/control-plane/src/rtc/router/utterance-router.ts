@@ -48,7 +48,8 @@ const DECISION_PATTERN = /批准|同意|通过|拒绝|驳回/u;
 const LIST_PATTERN = /列出|列一下|有哪些|列表|最近.{0,4}(?:任务|审批)/u;
 const APPROVAL_LIST_PATTERN = /待审批|审批列表/u;
 const INSPECT_PATTERN = /详情|看看|是什么|状态|怎么样/u;
-const RESULT_PATTERN = /结果|读一下|总结|进展|完成没有/u;
+const RESULT_PATTERN =
+  /结果|读一下|总结|进展|完成没有|通过了吗|跑通|测试结果|成功了吗|完成了吗/u;
 const PRONOUN_PATTERN = /^(?:它|这个|那个|他)/u;
 const SUBMIT_PATTERN = /跑|执行|测试|修|改|提交|检查|打开/u;
 const READ_ONLY_PATTERN = /只读|别改|不要修改|不改代码/u;
@@ -182,14 +183,33 @@ export const createLiveUtteranceRouter = (
     const shortId = SHORT_ID_PATTERN.exec(text)?.[0];
     if (shortId !== undefined && CANCEL_PATTERN.test(text)) {
       const tasks = context.taskEntries(nowMs);
-      if (tasks === undefined) {
-        return clarify("请先列出任务，再说短号。");
-      }
-      const entry = tasks.find(
+      let entry = tasks?.find(
         (task) => task.shortId.toUpperCase() === shortId.toUpperCase(),
       );
       if (entry === undefined) {
-        return clarify("没有在最近的任务里找到这个短号。");
+        const focusedId = context.focusedJobId();
+        const focusedShort = context.focusedShortId();
+        if (
+          focusedId !== undefined &&
+          focusedShort !== undefined &&
+          focusedShort.toUpperCase() === shortId.toUpperCase()
+        ) {
+          if (isAborted()) return stopped();
+          const detail = await options.jobs.get({ job_id: focusedId }, signal);
+          if (isAborted()) return stopped();
+          entry = {
+            jobId: focusedId,
+            shortId: focusedShort,
+            revision: detail.revision,
+          };
+        }
+      }
+      if (entry === undefined) {
+        return clarify(
+          tasks === undefined
+            ? "请先列出任务，再说短号。"
+            : "没有在最近的任务里找到这个短号。",
+        );
       }
       if (isAborted()) return stopped();
       const result = await options.jobs.cancel(
@@ -216,7 +236,7 @@ export const createLiveUtteranceRouter = (
       );
     }
 
-    if (DECISION_PATTERN.test(text)) {
+    if (DECISION_PATTERN.test(text) && parseOrdinal(text) !== undefined) {
       const ordinal = parseOrdinal(text);
       if (ordinal === undefined) {
         return clarify("请说批准或拒绝第几个。");
@@ -320,7 +340,7 @@ export const createLiveUtteranceRouter = (
       if (isAborted()) return stopped();
       const detail = await options.jobs.get({ job_id: entry.jobId }, signal);
       if (isAborted()) return stopped();
-      context.focus(detail.job_id);
+      context.focus(detail.job_id, entry.shortId);
       return respond(
         { kind: "inspect", jobId: detail.job_id },
         `${entry.shortId} ${statusOf(detail.status)}，阶段 ${detail.current_stage}。`,
@@ -330,22 +350,33 @@ export const createLiveUtteranceRouter = (
 
     if (shortId !== undefined && INSPECT_PATTERN.test(text)) {
       const tasks = context.taskEntries(nowMs);
-      if (tasks === undefined) {
-        return clarify("请先列出任务，再说短号。");
-      }
-      const entry = tasks.find(
+      let jobId = tasks?.find(
         (task) => task.shortId.toUpperCase() === shortId.toUpperCase(),
-      );
-      if (entry === undefined) {
-        return clarify("没有在最近的任务里找到这个短号。");
+      )?.jobId;
+      if (jobId === undefined) {
+        const focusedId = context.focusedJobId();
+        const focusedShort = context.focusedShortId();
+        if (
+          focusedId !== undefined &&
+          focusedShort?.toUpperCase() === shortId.toUpperCase()
+        ) {
+          jobId = focusedId;
+        }
+      }
+      if (jobId === undefined) {
+        return clarify(
+          tasks === undefined
+            ? "请先列出任务，再说短号。"
+            : "没有在最近的任务里找到这个短号。",
+        );
       }
       if (isAborted()) return stopped();
-      const detail = await options.jobs.get({ job_id: entry.jobId }, signal);
+      const detail = await options.jobs.get({ job_id: jobId }, signal);
       if (isAborted()) return stopped();
-      context.focus(detail.job_id);
+      context.focus(detail.job_id, shortId);
       return respond(
         { kind: "inspect", jobId: detail.job_id },
-        `${entry.shortId} ${statusOf(detail.status)}，阶段 ${detail.current_stage}。`,
+        `${shortId} ${statusOf(detail.status)}，阶段 ${detail.current_stage}。`,
         { focusedJobId: detail.job_id },
       );
     }
@@ -362,7 +393,6 @@ export const createLiveUtteranceRouter = (
         .get({ job_id: focused }, signal)
         .catch(() => undefined as RouterTaskDetail | undefined);
       if (isAborted()) return stopped();
-      context.focus(focused);
       const prefix = detail === undefined ? "结果" : statusOf(detail.status);
       return respond(
         { kind: "result", jobId: focused },
@@ -403,6 +433,7 @@ export const createLiveUtteranceRouter = (
         signal,
       );
       if (isAborted()) return stopped();
+      context.focus(receipt.job_id, receipt.short_id);
       return respond(
         {
           kind: "submit",
