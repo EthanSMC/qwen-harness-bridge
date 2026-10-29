@@ -18,6 +18,7 @@ export default defineWorkspace([
         "tests/integration/readiness.test.ts",
         "tests/integration/harness-connector-e2e.test.ts",
         "tests/integration/loopback-control-plane.test.ts",
+        "tests/integration/rtc-conversation.test.ts",
       ],
     },
   },
