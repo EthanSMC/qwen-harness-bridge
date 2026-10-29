@@ -188,37 +188,45 @@ export const validateFixture = (
         const key = `${step.tool}|${step.request_id}`;
         expectedResults.set(key, (expectedResults.get(key) ?? 0) + 1);
         if (!MUTATION_TOOL_NAMES.has(step.tool)) continue;
-        const clientRequestId = step.arguments.client_request_id;
-        if (typeof clientRequestId !== "string") {
-          violations.push(
-            `${where}: submit_task must carry the client_request_id UUID`,
-          );
-        } else if (clientRequestId !== step.request_id) {
-          violations.push(
-            `${where}: client_request_id must match the turn request_id`,
-          );
+        let payload: string;
+        if (step.tool === "submit_task") {
+          const clientRequestId = step.arguments.client_request_id;
+          if (typeof clientRequestId !== "string") {
+            violations.push(
+              `${where}: submit_task must carry the client_request_id UUID`,
+            );
+          } else if (clientRequestId !== step.request_id) {
+            violations.push(
+              `${where}: client_request_id must match the turn request_id`,
+            );
+          }
+          const repositoryId = step.arguments.repository_id;
+          if (typeof repositoryId !== "string" || repositoryId.trim() === "") {
+            violations.push(
+              `${where}: submit_task must carry a configured repository_id`,
+            );
+          } else if (
+            !REPOSITORY_ID.test(repositoryId) ||
+            PATH_LIKE.test(repositoryId)
+          ) {
+            violations.push(
+              `${where}: repository_id must be a repository id, never a path-like string`,
+            );
+          } else if (
+            repositoryIds !== undefined &&
+            !repositoryIds.includes(repositoryId)
+          ) {
+            violations.push(
+              `${where}: repository_id ${repositoryId} is not present in the Skill configuration`,
+            );
+          }
+          payload = submissionPayload(step);
+        } else {
+          // cancel_task and decide_approval carry their own protocol fields
+          // (job_id plus expected_revision, or approval_id plus decision), so
+          // the submission-only field rules above must not apply to them.
+          payload = stableJson(step.arguments);
         }
-        const repositoryId = step.arguments.repository_id;
-        if (typeof repositoryId !== "string" || repositoryId.trim() === "") {
-          violations.push(
-            `${where}: submit_task must carry a configured repository_id`,
-          );
-        } else if (
-          !REPOSITORY_ID.test(repositoryId) ||
-          PATH_LIKE.test(repositoryId)
-        ) {
-          violations.push(
-            `${where}: repository_id must be a repository id, never a path-like string`,
-          );
-        } else if (
-          repositoryIds !== undefined &&
-          !repositoryIds.includes(repositoryId)
-        ) {
-          violations.push(
-            `${where}: repository_id ${repositoryId} is not present in the Skill configuration`,
-          );
-        }
-        const payload = submissionPayload(step);
         const previous = mutations.get(step.request_id);
         if (!previous) {
           const userRequested = turn.steps
@@ -229,7 +237,7 @@ export const validateFixture = (
               `${where}: mutation ${step.tool} is not preceded by a user request`,
             );
           }
-          submissions += 1;
+          if (step.tool === "submit_task") submissions += 1;
           mutations.set(step.request_id, {
             tool: step.tool,
             payload,
@@ -350,7 +358,7 @@ export const runContractSuite = (directory: string): ContractSuiteResult => {
         if (seen.has(step.request_id)) retries += 1;
         else {
           seen.add(step.request_id);
-          submissions += 1;
+          if (step.tool === "submit_task") submissions += 1;
         }
       }
       maxMutationsPerTurn = Math.max(maxMutationsPerTurn, mutationsInTurn);

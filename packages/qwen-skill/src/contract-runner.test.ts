@@ -271,3 +271,109 @@ describe("repository resolution configuration", () => {
     );
   });
 });
+
+describe("mutation tool scoping", () => {
+  const requestId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+  const jobId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+  const cancelTranscript = {
+    fixture_id: "cancel-decide",
+    turns: [
+      {
+        request_id: requestId,
+        steps: [
+          { kind: "user", text: "取消任务" },
+          {
+            kind: "mcp_call",
+            tool: "cancel_task",
+            request_id: requestId,
+            arguments: { job_id: jobId, expected_revision: 1 },
+          },
+          {
+            kind: "mcp_result",
+            tool: "cancel_task",
+            request_id: requestId,
+            ok: true,
+            text: "已取消",
+          },
+        ],
+      },
+      {
+        request_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        steps: [
+          { kind: "user", text: "批准这个审批" },
+          {
+            kind: "mcp_call",
+            tool: "decide_approval",
+            request_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            arguments: {
+              approval_id: jobId,
+              decision: "approve",
+              expected_job_revision: 1,
+            },
+          },
+          {
+            kind: "mcp_result",
+            tool: "decide_approval",
+            request_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            ok: true,
+            text: "已批准",
+          },
+        ],
+      },
+    ],
+  };
+  const repositoryIds = ["novelty-web", "novelty-api"];
+
+  it("accepts cancel_task and decide_approval without submission fields", () => {
+    const violations = validateFixture(
+      "cancel-decide",
+      JSON.stringify(cancelTranscript),
+      { repositoryIds },
+    );
+    expect(violations).toEqual([]);
+  });
+
+  it("still counts one mutation per cancel or decide turn", () => {
+    for (const turn of cancelTranscript.turns) {
+      const mutations = turn.steps.filter(
+        (step) =>
+          step.kind === "mcp_call" && mutationTools.includes(String(step.tool)),
+      );
+      expect(mutations).toHaveLength(1);
+    }
+  });
+
+  it("rejects a submit_task that omits the submission fields", () => {
+    const transcript = {
+      fixture_id: "submit-missing",
+      turns: [
+        {
+          request_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+          steps: [
+            { kind: "user", text: "跑测试" },
+            {
+              kind: "mcp_call",
+              tool: "submit_task",
+              request_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+              arguments: { request: "运行测试", mode: "normal" },
+            },
+            {
+              kind: "mcp_result",
+              tool: "submit_task",
+              request_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+              ok: true,
+              text: "已受理",
+            },
+          ],
+        },
+      ],
+    };
+    const violations = validateFixture(
+      "submit-missing",
+      JSON.stringify(transcript),
+      { repositoryIds },
+    );
+    expect(violations.join("\n")).toMatch(/client_request_id UUID/);
+    expect(violations.join("\n")).toMatch(/configured repository_id/);
+  });
+});
