@@ -1,0 +1,40 @@
+{
+  "fixture_id": "submit-offline",
+  "turns": [
+    {
+      "request_id": "55555555-5555-4555-8555-555555555555",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "让 DeepSeek 在 Novelty Web 修复登录缺陷"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "submit_task",
+          "request_id": "55555555-5555-4555-8555-555555555555",
+          "arguments": {
+            "client_request_id": "55555555-5555-4555-8555-555555555555",
+            "repository_id": "novelty-web",
+            "request": "修复登录缺陷并补充回归测试",
+            "mode": "normal"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "submit_task",
+          "request_id": "55555555-5555-4555-8555-555555555555",
+          "ok": false,
+          "text": "CONNECTOR_OFFLINE: submission queued locally until the connector reconnects"
+        },
+        {
+          "kind": "assistant",
+          "text": "连接器离线，任务已排队，恢复后会用同一个请求编号提交。"
+        },
+        {
+          "kind": "tts",
+          "text": "连接器离线，任务已排队，恢复后自动提交。"
+        }
+      ]
+    }
+  ]
+}

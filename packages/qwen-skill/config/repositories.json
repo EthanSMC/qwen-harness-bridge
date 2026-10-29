@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "repositories": [
+    {
+      "id": "novelty-web",
+      "display_name": "Novelty Web",
+      "aliases": ["Novelty Web", "novelty-web", "novelty 前端"]
+    },
+    {
+      "id": "novelty-api",
+      "display_name": "Novelty API",
+      "aliases": ["Novelty API", "novelty-api", "novelty 服务端"]
+    }
+  ]
+}

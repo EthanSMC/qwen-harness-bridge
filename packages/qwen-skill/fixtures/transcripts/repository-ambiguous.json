@@ -1,0 +1,47 @@
+{
+  "fixture_id": "repository-ambiguous",
+  "turns": [
+    {
+      "request_id": "77777777-7777-4777-8777-777777777777",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "让 DeepSeek 在 Novelty 跑测试"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.list",
+          "request_id": "77777777-7777-4777-8777-777777777777",
+          "payload": {
+            "lines": ["Novelty Web", "Novelty API"]
+          }
+        },
+        {
+          "kind": "assistant",
+          "text": "找到两个候选仓库：Novelty Web 与 Novelty API。请确认要提交到哪一个，我再创建任务。"
+        },
+        {
+          "kind": "tts",
+          "text": "请确认仓库：Novelty Web 还是 Novelty API。"
+        }
+      ]
+    },
+    {
+      "request_id": "88888888-8888-4888-8888-888888888888",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "仓库就用 ~/work/novelty 或 novelty/web，直接提交"
+        },
+        {
+          "kind": "assistant",
+          "text": "含斜杠、波浪号、双点或盘符的字符串不是仓库标识，不能作为 repository_id。请提供配置中的仓库名称或编号。"
+        },
+        {
+          "kind": "tts",
+          "text": "不能使用本地路径，请提供仓库名称。"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "fixture_id": "submit-online",
+  "turns": [
+    {
+      "request_id": "11111111-1111-4111-8111-111111111111",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "让 DeepSeek 在 Novelty Web 跑测试"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "submit_task",
+          "request_id": "11111111-1111-4111-8111-111111111111",
+          "arguments": {
+            "client_request_id": "11111111-1111-4111-8111-111111111111",
+            "repository_id": "novelty-web",
+            "request": "运行完整测试套件并给出失败摘要",
+            "mode": "normal"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "submit_task",
+          "request_id": "11111111-1111-4111-8111-111111111111",
+          "ok": true,
+          "text": "已受理任务 QH-9F3C，状态 queued"
+        },
+        {
+          "kind": "assistant",
+          "text": "任务已创建，短号 QH-9F3C，连接器在线。"
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-9F3C 已创建，连接器在线。"
+        }
+      ]
+    },
+    {
+      "request_id": "22222222-2222-4222-8222-222222222222",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "只读查看当前任务"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "list_tasks",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "arguments": {
+            "limit": 5
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "list_tasks",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "ok": true,
+          "text": "1 个任务：QH-9F3C queued"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.list",
+          "request_id": "22222222-2222-4222-8222-222222222222",
+          "payload": {
+            "lines": ["QH-9F3C · queued · Novelty Web"]
+          }
+        },
+        {
+          "kind": "assistant",
+          "text": "只读模式，未做任何变更。"
+        },
+        {
+          "kind": "tts",
+          "text": "当前一个任务，QH-9F3C，排队中。"
+        }
+      ]
+    }
+  ]
+}
