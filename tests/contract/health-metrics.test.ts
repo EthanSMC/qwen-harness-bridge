@@ -335,6 +335,7 @@ const METRIC_TYPES = {
   qhb_jobs: "gauge",
   qhb_connector_messages_total: "counter",
   qhb_errors_total: "counter",
+  qhb_rtc_enabled: "gauge",
 } as const;
 
 describe("bounded Prometheus metrics", () => {
@@ -442,6 +443,7 @@ describe("bounded Prometheus metrics", () => {
       qhb_jobs: ["status"],
       qhb_connector_messages_total: ["message_type"],
       qhb_errors_total: ["error_code"],
+      qhb_rtc_enabled: [],
     };
     for (const sample of samples) {
       const expected =
@@ -452,6 +454,7 @@ describe("bounded Prometheus metrics", () => {
       expect(sample.labelKeys).toEqual(expected);
     }
     expect(response.body).toContain("qhb_connector_online 1");
+    expect(response.body).toContain("qhb_rtc_enabled 0");
     expect(response.body).toContain("qhb_job_queue_age_seconds 12.5");
     for (const [status, count] of Object.entries(ALL_JOB_COUNTS)) {
       expect(response.body).toContain(`qhb_jobs{status="${status}"} ${count}`);

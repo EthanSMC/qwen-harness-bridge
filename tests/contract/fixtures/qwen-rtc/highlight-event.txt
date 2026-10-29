@@ -1,0 +1,10 @@
+{
+  "type": "SPEAK",
+  "payload": {
+    "speechId": "speech_001",
+    "index": 1,
+    "hasNext": true,
+    "text": "我先简单介绍一下，",
+    "textDisplayMode": "APPEND_HIGHLIGHT"
+  }
+}

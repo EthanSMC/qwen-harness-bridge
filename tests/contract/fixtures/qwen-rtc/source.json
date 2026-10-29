@@ -1,0 +1,37 @@
+{
+  "source_pages": [
+    {
+      "page_url": "https://device.qianwen.com/docs/qwen/6820210",
+      "title": "Qwen 硬件平台 — 会话流 API 与会话事件 API 接入",
+      "retrieved_at": "2026-10-29"
+    },
+    {
+      "page_url": "https://device.qianwen.com/docs/qwen/6817146",
+      "title": "Qwen 硬件平台 — 音视频推流完整交互协议",
+      "retrieved_at": "2026-10-29"
+    }
+  ],
+  "fixtures": {
+    "start-request.json": {
+      "bytes": 511,
+      "sha256": "9b7f6fa733e1836d4ee66ee6fd2f62f17a76d6f79e11350002940b5afbf90992"
+    },
+    "close-request.json": {
+      "bytes": 203,
+      "sha256": "0c9691fdd74e167d7571a97d11d8c7e8f866dcddc461b2eef214e13a4f22a612"
+    },
+    "speak-event.txt": {
+      "bytes": 489,
+      "sha256": "432661db6744499636c0f77cca1b9ec276284e947828b7743f5cf449ea6fd7f6"
+    },
+    "stop-output-event.txt": {
+      "bytes": 271,
+      "sha256": "2bd8dd22ed1c07a97e0fa8290ee0d44ec0d336781bbf9223a4a9fe03f5eae7ed"
+    },
+    "highlight-event.txt": {
+      "bytes": 194,
+      "sha256": "cbea87d0aee0ab76b0a633732514caacdbea75f7ca0240b7c06b3237f86ee173"
+    }
+  },
+  "note": "Fixtures are verbatim excerpts of the official documentation code samples; field names are not reinterpreted. consumerToken in start-request.json is the documented placeholder <RtcRoom.thirdToken>, never a real credential."
+}

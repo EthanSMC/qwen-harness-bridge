@@ -1,0 +1,10 @@
+{
+  "specVersion": "1.0",
+  "requestId": "req_close_001",
+  "sessionId": "ses_001",
+  "type": "SESSION_CLOSE",
+  "occurredAt": "2026-08-10T10:30:00+08:00",
+  "payload": {
+    "reason": "USER_EXIT"
+  }
+}

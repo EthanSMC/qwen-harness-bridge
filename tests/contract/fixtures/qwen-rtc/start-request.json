@@ -1,0 +1,20 @@
+{
+  "specVersion": "1.0",
+  "requestId": "req_start_001",
+  "sessionId": "ses_001",
+  "type": "SESSION_START",
+  "occurredAt": "2026-08-06T10:00:00+08:00",
+  "payload": {
+    "entryContext": {
+      "source": "VOICE_SKILL",
+      "rawUtterance": "进入语音闲聊"
+    },
+    "rtc": {
+      "provider": "ALIYUN_RTC",
+      "channelId": "channel_001",
+      "consumerUserId": "third_party_consumer_001",
+      "consumerToken": "<RtcRoom.thirdToken>",
+      "expiresAt": "2026-08-07T10:00:00+08:00"
+    }
+  }
+}
