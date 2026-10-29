@@ -24,6 +24,7 @@
 
 - [ ] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.
 - [ ] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.
+- [ ] Solo-maintainer same-thread self-review — the implementer records its own review on this same public thread; it is explicitly weaker than independent review and is never a GitHub approval. Available only when no distinct eligible direct GitHub collaborator exists.
 
 ### Mode-specific evidence (complete only for the selected mode)
 
@@ -32,6 +33,7 @@
 - Solo eligibility evidence URL or repository-status reference (required for solo mode):
 - Solo eligibility verification date (required for solo mode):
 - Independent review report URL (required for solo mode):
+- Same-thread self-review report URL (required for self-review mode):
 
 ### Reviewer identity and independence (required)
 
@@ -41,6 +43,7 @@
 - Reviewer is distinct from implementer: [ ] Yes
 - Fresh review of this exact commit range: [ ] Yes
 - Independent review (no author self-approval or fabricated evidence): [ ] Yes
+- Self-review is explicitly weaker than independent review and is not a GitHub approval: [ ] Yes
 
 ### Scope, findings, and verdict (required)
 
@@ -76,6 +79,7 @@
 - [ ] Reviewer is different from the implementer and reviewed the complete diff and commit range.
 - [ ] If a distinct eligible direct GitHub collaborator is available, that collaborator gave a formal GitHub Approve; the solo fallback was not used.
 - [ ] If no distinct eligible direct GitHub collaborator exists, a fresh independent subagent reviewer returned PASS and all required GitHub checks succeeded.
+- [ ] If same-thread self-review is selected, it is labelled weaker than independent review, never claims independent review or a GitHub approval, and all required current-head checks succeeded.
 - [ ] Review evidence records reviewer type/identity, commit range, verdict, findings, fix rounds, and CI evidence.
 - [ ] The author did not self-approve or fabricate review evidence.
 - [ ] No credentials, raw prompts/logs, source bodies, or absolute local paths are exposed.

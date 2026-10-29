@@ -195,6 +195,175 @@ export const verifyReviewReportComment = ({
     if (report[key] !== value) throw new Error(`Review report ${key} mismatch`);
   return report;
 };
+const selfReviewKeys = [...keys, "mode"];
+
+const validateSelfReview = (report) => {
+  exactKeys(report, selfReviewKeys);
+  if (report.schema_version !== 2)
+    throw new Error("Unsupported self-review report schema_version");
+  if (report.mode !== "self-review")
+    throw new Error("Self-review report mode must be self-review");
+  if (
+    typeof report.repository !== "string" ||
+    !/^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+$/.test(report.repository)
+  )
+    throw new Error("Invalid report repository");
+  positive(report.issue_number);
+  for (const key of ["base_sha", "head_sha"])
+    if (!/^[0-9a-f]{40}$/.test(report[key]))
+      throw new Error("Review report requires exact lowercase commit SHAs");
+  for (const key of ["implementer_id", "reviewer_id", "reviewer_identity"])
+    identity(report[key]);
+  if (
+    report.implementer_id.toLowerCase() !== report.reviewer_id.toLowerCase() ||
+    report.reviewer_identity.toLowerCase() !== report.reviewer_id.toLowerCase()
+  )
+    throw new Error(
+      "Self-review report identities must be one same-thread reviewer identity",
+    );
+  if (!["PASS", "FAIL"].includes(report.verdict))
+    throw new Error("Review report verdict must be PASS or FAIL");
+  if (
+    !Number.isSafeInteger(report.fix_rounds) ||
+    report.fix_rounds < 0 ||
+    report.fix_rounds > 100
+  )
+    throw new Error("Invalid review fix_rounds");
+  if (!Array.isArray(report.findings) || report.findings.length > 20)
+    throw new Error("Review report findings exceed bounds");
+  for (const finding of report.findings) {
+    exactKeys(finding, ["severity", "status", "summary"]);
+    if (
+      !["blocker", "non-blocker"].includes(finding.severity) ||
+      !["open", "resolved"].includes(finding.status)
+    )
+      throw new Error("Invalid finding severity/status");
+    summary(finding.summary);
+    if (
+      report.verdict === "PASS" &&
+      finding.severity === "blocker" &&
+      finding.status === "open"
+    )
+      throw new Error("PASS report has unresolved blockers");
+  }
+  if (
+    !Array.isArray(report.verification) ||
+    report.verification.length < 1 ||
+    report.verification.length > 20
+  )
+    throw new Error("Review verification summaries exceed bounds");
+  report.verification.forEach(summary);
+  return Object.fromEntries(
+    selfReviewKeys.map((key) => [
+      key,
+      key === "findings"
+        ? report.findings.map((f) => ({
+            severity: f.severity,
+            status: f.status,
+            summary: f.summary,
+          }))
+        : report[key],
+    ]),
+  );
+};
+
+const verifyReportCommentEnvelope = ({
+  url,
+  comment,
+  repository,
+  pullRequestNumber,
+  authorLogin,
+}) => {
+  const id = reviewCommentId(url, repository, pullRequestNumber);
+  if (
+    comment?.id !== id ||
+    comment.html_url !== url ||
+    comment.issue_url !==
+      `https://api.github.com/repos/${repository}/issues/${pullRequestNumber}`
+  )
+    throw new Error("Review comment repository/PR association mismatch");
+  if (
+    comment.user?.type !== "User" ||
+    comment.user?.login?.toLowerCase() !== authorLogin.toLowerCase()
+  )
+    throw new Error("Review comment must be posted by accountable PR author");
+  if (
+    typeof comment.created_at !== "string" ||
+    !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(comment.created_at) ||
+    !Number.isFinite(Date.parse(comment.created_at)) ||
+    new Date(comment.created_at).toISOString() !==
+      comment.created_at.replace("Z", ".000Z") ||
+    comment.updated_at !== comment.created_at
+  )
+    throw new Error("Review comment must have valid unedited timestamps");
+};
+
+export const formatSelfReviewReport = (report) => {
+  const json = JSON.stringify(validateSelfReview(report), null, 2);
+  const body = `<!-- qhb-self-review:v2 sha256:${digest(json)} -->\n\`\`\`json\n${json}\n\`\`\``;
+  if (Buffer.byteLength(body) > MAX_REPORT_BYTES)
+    throw new Error("Review report exceeds byte bound");
+  return body;
+};
+
+export const parseSelfReviewReport = (body) => {
+  if (typeof body !== "string" || Buffer.byteLength(body) > MAX_REPORT_BYTES)
+    throw new Error("Review report exceeds byte bound");
+  const match =
+    /^<!-- qhb-self-review:v2 sha256:([a-f0-9]{64}) -->\n```json\n([\s\S]+)\n```$/.exec(
+      body,
+    );
+  if (!match)
+    throw new Error(
+      "Invalid canonical self-review report comment: a same-thread self-review must not use the independent marker",
+    );
+  let report;
+  try {
+    report = JSON.parse(match[2]);
+  } catch {
+    throw new Error("Invalid review report JSON");
+  }
+  if (digest(match[2]) !== match[1] || formatSelfReviewReport(report) !== body)
+    throw new Error("Review report digest or canonical content mismatch");
+  return report;
+};
+
+export const verifySelfReviewReportComment = ({
+  url,
+  comment,
+  repository,
+  pullRequestNumber,
+  issueNumber,
+  authorLogin,
+  baseSha,
+  headSha,
+  implementer,
+  reviewer,
+  reviewerIdentity,
+}) => {
+  verifyReportCommentEnvelope({
+    url,
+    comment,
+    repository,
+    pullRequestNumber,
+    authorLogin,
+  });
+  const report = parseSelfReviewReport(comment.body);
+  const expected = {
+    repository,
+    issue_number: issueNumber,
+    base_sha: baseSha,
+    head_sha: headSha,
+    implementer_id: implementer,
+    reviewer_id: reviewer,
+    reviewer_identity: reviewerIdentity,
+    verdict: "PASS",
+  };
+  for (const [key, value] of Object.entries(expected))
+    if (report[key] !== value) throw new Error(`Review report ${key} mismatch`);
+  return report;
+};
+
 export const main = (args = process.argv.slice(2)) => {
   if (args.length !== 2)
     throw new Error(

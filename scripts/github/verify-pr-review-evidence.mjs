@@ -7,6 +7,7 @@ import { createGitHubClient } from "./github-api.mjs";
 import {
   reviewCommentId,
   verifyReviewReportComment,
+  verifySelfReviewReportComment,
 } from "./review-report.mjs";
 
 const FIELD_LABELS = {
@@ -34,6 +35,23 @@ const FIELD_LABELS = {
 const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 const linesOf = (body) => body.split(/\r?\n/);
+
+const SELF_REVIEW_URL_LABEL =
+  "Same-thread self-review report URL (required for self-review mode)";
+const SELF_REVIEW_DISCLOSURE_LABEL =
+  "Self-review is explicitly weaker than independent review and is not a GitHub approval";
+
+const optionalFieldValue = (body, label) => {
+  const pattern = new RegExp(
+    "^\\s*-\\s*" + escapeRegExp(label) + ":\\s*(.*?)\\s*$",
+  );
+  const matches = linesOf(body)
+    .map((line) => line.match(pattern))
+    .filter(Boolean);
+  if (matches.length > 1)
+    throw new Error(label + " must not appear more than once");
+  return matches.length === 1 ? matches[0][1].trim() : "";
+};
 
 const fieldValue = (body, label) => {
   const pattern = new RegExp(`^\\s*-\\s*${escapeRegExp(label)}:\\s*(.*?)\\s*$`);
@@ -81,6 +99,43 @@ const checkboxAnswer = (body, label) => {
   }
 };
 
+const checkboxAnswerNo = (body, label) => {
+  const pattern = new RegExp(
+    "^\\s*-\\s*" + escapeRegExp(label) + ":\\s*\\[([ xX])\\]\\s*(Yes|No)\\s*$",
+    "i",
+  );
+  const matches = linesOf(body)
+    .map((line) => line.match(pattern))
+    .filter(Boolean);
+  if (matches.length !== 1)
+    throw new Error(label + " must be answered with [x] Yes or [x] No");
+  if (
+    matches[0][1].toLowerCase() !== "x" ||
+    matches[0][2].toLowerCase() !== "no"
+  ) {
+    throw new Error(
+      label + " must be checked [x] No for a same-thread self-review",
+    );
+  }
+};
+
+const checkboxDeclaredUnchecked = (body, label) => {
+  const pattern = new RegExp(
+    "^\\s*-\\s*" + escapeRegExp(label) + ":\\s*\\[([ xX])\\]\\s*(Yes|No)\\s*$",
+    "i",
+  );
+  const matches = linesOf(body)
+    .map((line) => line.match(pattern))
+    .filter(Boolean);
+  if (matches.length > 1)
+    throw new Error(label + " must not appear more than once");
+  if (matches.length === 1 && matches[0][1].toLowerCase() === "x") {
+    throw new Error(
+      label + " must stay unchecked outside the explicit self-review mode",
+    );
+  }
+};
+
 const selectedReviewMode = (body) => {
   const lines = linesOf(body);
   const formal = lines.filter((line) =>
@@ -89,17 +144,26 @@ const selectedReviewMode = (body) => {
   const solo = lines.filter((line) =>
     /^\s*-\s*\[([ xX])\]\s+Solo-maintainer fallback\b/i.test(line),
   );
-  if (formal.length !== 1 || solo.length !== 1) {
-    throw new Error("exactly one review mode must be present: formal or solo");
-  }
-  const formalChecked = /^\s*-\s*\[x\]/i.test(formal[0]);
-  const soloChecked = /^\s*-\s*\[x\]/i.test(solo[0]);
-  if (formalChecked === soloChecked) {
+  const selfReview = lines.filter((line) =>
+    /^\s*-\s*\[([ xX])\]\s+Solo-maintainer same-thread self-review\b/i.test(
+      line,
+    ),
+  );
+  if (formal.length !== 1 || solo.length !== 1 || selfReview.length > 1) {
     throw new Error(
-      "exactly one review mode must be checked; do not select both modes",
+      "exactly one review mode must be present: formal, solo or self-review",
     );
   }
-  return formalChecked ? "formal" : "solo";
+  const checked = [formal[0], solo[0], selfReview[0]]
+    .filter(Boolean)
+    .filter((line) => /^\s*-\s*\[x\]/i.test(line));
+  if (checked.length !== 1) {
+    throw new Error(
+      "exactly one review mode must be checked; do not select more than one mode or leave every mode unchecked",
+    );
+  }
+  if (checked[0] === formal[0]) return "formal";
+  return checked[0] === solo[0] ? "solo" : "self-review";
 };
 
 const githubUrl = (value, label) => {
@@ -563,6 +627,31 @@ export async function validatePullRequestState({
       reviewer: bodyResult.fields.reviewer,
       reviewerIdentity: bodyResult.fields.reviewerIdentity,
     });
+  } else if (bodyResult.mode === "self-review") {
+    if (reviewMode === "formal")
+      throw new Error("solo mode is invalid while an eligible reviewer exists");
+    const issues = closingIssueNumbers(currentPullRequest.body);
+    if (issues.length !== 1)
+      throw new Error("Solo review report requires one primary closing Issue");
+    const selfReviewUrl = bodyResult.fields.selfReviewUrl;
+    const commentId = reviewCommentId(
+      selfReviewUrl,
+      repository,
+      eventPullRequest.number,
+    );
+    verifySelfReviewReportComment({
+      url: selfReviewUrl,
+      comment: await github.get(`/issues/comments/${commentId}`),
+      repository,
+      pullRequestNumber: eventPullRequest.number,
+      issueNumber: issues[0],
+      authorLogin: eventPullRequest.authorLogin,
+      baseSha: eventPullRequest.base.sha,
+      headSha: eventPullRequest.head.sha,
+      implementer: bodyResult.fields.implementer,
+      reviewer: bodyResult.fields.reviewer,
+      reviewerIdentity: bodyResult.fields.reviewerIdentity,
+    });
   } else {
     const formalIdentity = bodyResult.fields.formalIdentity;
     if (
@@ -598,7 +687,7 @@ export async function validatePullRequestState({
   };
 }
 
-const requiredCommonEvidence = (body, { authorLogin } = {}) => {
+const requiredCommonEvidence = (body, { authorLogin, mode = "solo" } = {}) => {
   const fields = Object.fromEntries(
     Object.entries(FIELD_LABELS).map(([key, label]) => [
       key,
@@ -616,7 +705,22 @@ const requiredCommonEvidence = (body, { authorLogin } = {}) => {
   }
   for (const key of ["implementer", "reviewer", "reviewerIdentity"])
     requiredIdentity(fields[key], FIELD_LABELS[key]);
-  if (fields.implementer.toLowerCase() === fields.reviewer.toLowerCase()) {
+  if (mode === "self-review") {
+    if (fields.implementer.toLowerCase() !== fields.reviewer.toLowerCase()) {
+      throw new Error(
+        "a same-thread self-review must use one implementer and reviewer agent ID",
+      );
+    }
+    if (
+      fields.reviewerIdentity.toLowerCase() !== fields.implementer.toLowerCase()
+    ) {
+      throw new Error(
+        "a same-thread self-review reviewer identity must name the same implementer agent ID",
+      );
+    }
+  } else if (
+    fields.implementer.toLowerCase() === fields.reviewer.toLowerCase()
+  ) {
     throw new Error("implementer and reviewer must use different agent IDs");
   }
   if (
@@ -628,8 +732,16 @@ const requiredCommonEvidence = (body, { authorLogin } = {}) => {
       "Reviewer identity must be different from the PR author; self-approve is forbidden",
     );
   }
-  for (const key of ["distinct", "fresh", "independent"])
-    checkboxAnswer(body, FIELD_LABELS[key]);
+  if (mode === "self-review") {
+    checkboxAnswerNo(body, FIELD_LABELS.distinct);
+    checkboxAnswer(body, FIELD_LABELS.fresh);
+    checkboxAnswerNo(body, FIELD_LABELS.independent);
+    checkboxAnswer(body, SELF_REVIEW_DISCLOSURE_LABEL);
+  } else {
+    for (const key of ["distinct", "fresh", "independent"])
+      checkboxAnswer(body, FIELD_LABELS[key]);
+    checkboxDeclaredUnchecked(body, SELF_REVIEW_DISCLOSURE_LABEL);
+  }
   if (fields.verdict.toUpperCase() !== "PASS")
     throw new Error("Final verdict must be PASS");
   if (/^base\.\.head$/i.test(fields.commitRange)) {
@@ -645,11 +757,12 @@ export function validatePullRequestBody(body, { authorLogin } = {}) {
   if (typeof body !== "string" || !body.trim())
     throw new Error("pull_request.body is required");
   const mode = selectedReviewMode(body);
-  const fields = requiredCommonEvidence(body, { authorLogin });
+  const fields = requiredCommonEvidence(body, { authorLogin, mode });
   const formalUrl = fields.formalUrl;
   const formalIdentity = fields.formalIdentity;
   const soloRef = fields.soloRef;
   const soloDate = fields.soloDate;
+  const selfReviewUrlValue = optionalFieldValue(body, SELF_REVIEW_URL_LABEL);
 
   if (mode === "formal") {
     requiredValue(formalUrl, FIELD_LABELS.formalUrl);
@@ -665,6 +778,44 @@ export function validatePullRequestBody(body, { authorLogin } = {}) {
     }
     if (soloRef || soloDate)
       throw new Error("formal mode must not include solo eligibility evidence");
+    if (selfReviewUrlValue)
+      throw new Error("formal mode must not include self-review evidence");
+  } else if (mode === "self-review") {
+    requiredValue(selfReviewUrlValue, SELF_REVIEW_URL_LABEL);
+    const selfReviewUrl = githubUrl(selfReviewUrlValue, SELF_REVIEW_URL_LABEL);
+    if (
+      !/^\/[^/]+\/[^/]+\/pull\/[1-9][0-9]*$/.test(selfReviewUrl.pathname) ||
+      !/^#issuecomment-[1-9][0-9]*$/.test(selfReviewUrl.hash) ||
+      selfReviewUrl.search ||
+      selfReviewUrl.username ||
+      selfReviewUrl.password ||
+      selfReviewUrl.port
+    )
+      throw new Error(
+        "Same-thread self-review report URL must identify one PR comment",
+      );
+    requiredValue(soloRef, FIELD_LABELS.soloRef);
+    requiredValue(soloDate, FIELD_LABELS.soloDate);
+    if (
+      !/(repository-status(?:\\.md)?|collaborator|repos\/[^/]+\/[^/]+\/collaborators)/i.test(
+        soloRef,
+      )
+    ) {
+      throw new Error(
+        "Solo eligibility evidence must reference repository-status or collaborator evidence",
+      );
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(soloDate)) {
+      throw new Error("Solo eligibility verification date must use YYYY-MM-DD");
+    }
+    if (fields.reportUrl)
+      throw new Error(
+        "self-review mode must not include independent review evidence",
+      );
+    if (formalUrl || formalIdentity)
+      throw new Error(
+        "self-review mode must not include formal review evidence",
+      );
   } else {
     requiredValue(fields.reportUrl, FIELD_LABELS.reportUrl);
     const reportUrl = githubUrl(fields.reportUrl, FIELD_LABELS.reportUrl);
@@ -695,7 +846,11 @@ export function validatePullRequestBody(body, { authorLogin } = {}) {
     }
     if (formalUrl || formalIdentity)
       throw new Error("solo mode must not include formal review evidence");
+    if (selfReviewUrlValue)
+      throw new Error("solo mode must not include self-review evidence");
   }
+
+  if (mode === "self-review") fields.selfReviewUrl = selfReviewUrlValue;
 
   return { mode, fields };
 }
