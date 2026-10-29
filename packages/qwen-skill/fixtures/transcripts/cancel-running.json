@@ -57,10 +57,7 @@
           "tool": "UiTool.all_text",
           "request_id": "00000016-0000-4000-8000-000000160000",
           "payload": {
-            "lines": [
-              "仓库：Novelty API · 短号：QH-9F3C",
-              "状态：正在取消"
-            ]
+            "lines": ["仓库：Novelty API · 短号：QH-9F3C", "状态：正在取消"]
           }
         },
         {
