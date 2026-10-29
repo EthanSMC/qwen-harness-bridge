@@ -231,10 +231,7 @@ export type RtcLifecycleObserver = Readonly<{
   sessionRejected?: (
     reason: "registry_full" | "concurrency_limit" | "circuit_open",
   ) => void;
-  rejectionReason?: () =>
-    | "concurrency_limit"
-    | "circuit_open"
-    | undefined;
+  rejectionReason?: () => "concurrency_limit" | "circuit_open" | undefined;
   firstAudio?: () => void;
   firstOutput?: () => void;
 }>;
