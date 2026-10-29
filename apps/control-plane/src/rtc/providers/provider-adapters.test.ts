@@ -665,3 +665,41 @@ describe("asr abort and failure boundaries", () => {
     expect((rejection as Error).message).not.toContain("server-secret-api-key");
   });
 });
+
+describe("consumer buffer overflow propagation", () => {
+  it("preserves RTC_AUDIO_BUFFER_OVERFLOW from the normalizer", async () => {
+    const source = manualSource();
+    const sub = subscription("consumer_001", source);
+    const client: AliyunRtcClient = {
+      async join() {
+        return sub;
+      },
+    };
+    const consumer = createAliyunRtcConsumer({
+      client,
+      now: () => Date.parse("2026-08-06T10:00:00+08:00"),
+    });
+    const stream = await consumer.join(start(), new AbortController().signal);
+    const iterator = stream[Symbol.asyncIterator]();
+
+    source.push({
+      pcm16le: pcm16(new Array(1_600).fill(1_000)),
+      sampleRateHz: 16_000,
+      channels: 1,
+      sequence: 0,
+    });
+    source.push({
+      pcm16le: pcm16(new Array(32_000).fill(1_000)),
+      sampleRateHz: 16_000,
+      channels: 1,
+      sequence: 1,
+    });
+    try {
+      await iterator.next();
+      throw new Error("expected RTC_AUDIO_BUFFER_OVERFLOW");
+    } catch (error) {
+      expect(error).toBeInstanceOf(RtcAudioError);
+      expect((error as RtcAudioError).code).toBe("RTC_AUDIO_BUFFER_OVERFLOW");
+    }
+  });
+});

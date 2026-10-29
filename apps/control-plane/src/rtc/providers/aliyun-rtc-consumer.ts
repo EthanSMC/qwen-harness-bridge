@@ -70,7 +70,9 @@ const nextWithAbort = <T>(
 /**
  * Aliyun RTC consumer adapter. Joins with the session's short-lived token,
  * subscribes only to the owner audio track, rejects any other publisher, and
- * exposes bounded first-frame/disconnect telemetry. Frame bytes and the provider
+ * exposes bounded first-frame/disconnect telemetry. One consumer instance is
+ * bound to one RTC session and must not be reused for a second join. Frame
+ * bytes and the provider
  * token never appear in an error, event or log.
  */
 export const createAliyunRtcConsumer = (
