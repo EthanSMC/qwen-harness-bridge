@@ -1,0 +1,78 @@
+{
+  "fixture_id": "approval-confirm",
+  "turns": [
+    {
+      "request_id": "0000000c-0000-4000-8000-0000000c0000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "有哪些待审批"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "list_pending_approvals",
+          "request_id": "0000000c-0000-4000-8000-0000000c0000",
+          "arguments": {
+            "limit": 5
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "list_pending_approvals",
+          "request_id": "0000000c-0000-4000-8000-0000000c0000",
+          "ok": true,
+          "text": "{\"approvals\":[{\"approval_id\":\"00000001-0000-4000-8000-000000010000\",\"short_id\":\"QH-2K7M\",\"action\":\"运行数据库迁移\",\"impact\":\"改动生产库结构\",\"risk\":\"approval_required\",\"expires_at\":\"2026-10-30T10:30:00.000Z\",\"job_revision\":4},{\"approval_id\":\"00000002-0000-4000-8000-000000020000\",\"short_id\":\"QH-8P4C\",\"action\":\"删除构建缓存\",\"impact\":\"需要重新构建\",\"risk\":\"approval_required\",\"expires_at\":\"2026-10-30T10:40:00.000Z\",\"job_revision\":6}]}"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.list",
+          "request_id": "0000000c-0000-4000-8000-0000000c0000",
+          "payload": {
+            "lines": [
+              "1. QH-2K7M · 运行数据库迁移 · 影响：改动生产库结构 · 需要确认 · 有效期至 10-30 10:30 UTC",
+              "2. QH-8P4C · 删除构建缓存 · 影响：需要重新构建 · 需要确认 · 有效期至 10-30 10:40 UTC"
+            ]
+          }
+        },
+        {
+          "kind": "tts",
+          "text": "有两个待审批任务，第二个是删除构建缓存，影响是需要重新构建。"
+        }
+      ]
+    },
+    {
+      "request_id": "0000000d-0000-4000-8000-0000000d0000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "批准第二个"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "decide_approval",
+          "request_id": "0000000d-0000-4000-8000-0000000d0000",
+          "arguments": {
+            "approval_id": "00000002-0000-4000-8000-000000020000",
+            "decision": "approve",
+            "expected_job_revision": 6
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "decide_approval",
+          "request_id": "0000000d-0000-4000-8000-0000000d0000",
+          "ok": true,
+          "text": "{\"approval_id\":\"00000002-0000-4000-8000-000000020000\",\"short_id\":\"QH-8P4C\",\"status\":\"approved\",\"job_revision\":7}"
+        },
+        {
+          "kind": "assistant",
+          "text": "已批准 QH-8P4C：删除构建缓存，将需要重新构建。"
+        },
+        {
+          "kind": "tts",
+          "text": "已批准 QH-8P4C。"
+        }
+      ]
+    }
+  ]
+}

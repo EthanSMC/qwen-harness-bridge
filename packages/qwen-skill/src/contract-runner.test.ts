@@ -44,7 +44,7 @@ describe("skill submission contract fixtures", () => {
     const suite = runContractSuite(fixturesDirectory);
 
     expect(suite.violations).toEqual([]);
-    expect(suite.fixtureCount).toBe(11);
+    expect(suite.fixtureCount).toBe(19);
     expect(suite.turnCount).toBeGreaterThanOrEqual(11);
   });
 
@@ -53,6 +53,14 @@ describe("skill submission contract fixtures", () => {
 
     expect(suite.maxMutationsPerTurn).toBeLessThanOrEqual(1);
     expect(suite.mutationsByFixture).toEqual({
+      "approval-ambiguous": 0,
+      "approval-confirm": 0,
+      "approval-expired": 0,
+      "approval-list": 0,
+      "approval-stale": 0,
+      "cancel-race": 0,
+      "cancel-running": 0,
+      errors: 1,
       "inspect-offline": 0,
       "inspect-running": 0,
       "list-tasks": 0,
