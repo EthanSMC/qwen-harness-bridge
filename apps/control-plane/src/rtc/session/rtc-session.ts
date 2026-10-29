@@ -12,6 +12,9 @@ export type RtcCloseReason =
 
 export type RtcActivityKind = "audio" | "control" | "output";
 
+/** Extra detail for an activity event; output only counts when it succeeded. */
+export type RtcActivityDetail = Readonly<{ succeeded?: boolean }>;
+
 /** Injected clock so lifecycle boundaries are deterministic in tests. */
 export type RtcClock = Readonly<{
   now: () => number;
@@ -40,6 +43,7 @@ export type RtcProviderResources = Readonly<{
 }>;
 
 export type RtcSessionIdentity = Readonly<{
+  ownerId: string;
   media: string;
   roomId: string;
   rtcUserId: string;
@@ -51,7 +55,9 @@ export type LiveRtcSession = Readonly<{
   startedAt: Date;
   identity: RtcSessionIdentity;
   readonly closed: boolean;
-  touch: (kind: RtcActivityKind) => void;
+  touch: (kind: RtcActivityKind, detail?: RtcActivityDetail) => void;
+  /** Attaches a second SSE writer (duplicate identical start). */
+  attach: (writer: RtcSseWriter) => () => void;
   close: (reason: RtcCloseReason) => Promise<void>;
 }>;
 
@@ -67,7 +73,7 @@ export type CreateLiveRtcSessionOptions = Readonly<{
 
 const dispose = async (
   resources: RtcProviderResources,
-  writer: RtcSseWriter,
+  writers: readonly RtcSseWriter[],
 ): Promise<unknown> => {
   let failure: unknown;
   for (const step of [
@@ -80,18 +86,20 @@ const dispose = async (
       failure ??= error;
     }
   }
-  try {
-    writer.end();
-  } catch (error) {
-    failure ??= error;
+  for (const writer of writers) {
+    try {
+      writer.end();
+    } catch (error) {
+      failure ??= error;
+    }
   }
   return failure;
 };
 
 /**
  * One live RTC session. Close is exactly-once: a second call returns the same
- * promise, the keepalive stops, provider streams and the SSE writer are disposed
- * once and the close callback runs once.
+ * promise, the keepalive and token-expiry timers stop, provider streams and
+ * every attached SSE writer are disposed once and the close callback runs once.
  */
 export const createLiveRtcSession = (
   options: CreateLiveRtcSessionOptions,
@@ -99,12 +107,21 @@ export const createLiveRtcSession = (
   const { start, clock, writer, resources } = options;
   let closed = false;
   let closePromise: Promise<void> | undefined;
+  const attached = new Set<RtcSseWriter>();
+  let expiryHandle: unknown;
+
+  const writers = (): RtcSseWriter[] => [writer, ...attached];
+
+  const broadcast = (frame: string): void => {
+    if (closed) return;
+    for (const target of writers()) {
+      if (!target.closed) target.write(frame);
+    }
+  };
 
   const watchdog = new InactivityWatchdog({
     clock,
-    writeKeepalive: () => {
-      if (!closed) writer.write(KEEPALIVE_FRAME);
-    },
+    writeKeepalive: () => broadcast(KEEPALIVE_FRAME),
     onInactive: () => {
       void session.close("inactive");
     },
@@ -121,6 +138,7 @@ export const createLiveRtcSession = (
     ownerId: start.ownerSubject,
     startedAt: new Date(clock.now()),
     identity: {
+      ownerId: start.ownerSubject,
       media: start.media,
       roomId: start.roomId,
       rtcUserId: start.rtcUserId,
@@ -128,16 +146,32 @@ export const createLiveRtcSession = (
     get closed() {
       return closed;
     },
-    touch(kind) {
+    touch(kind, detail) {
       if (closed) return;
+      if (kind === "output" && detail?.succeeded !== true) return;
       watchdog.touch(kind);
+    },
+    attach(target) {
+      if (closed) {
+        target.end();
+        return () => undefined;
+      }
+      attached.add(target);
+      return () => {
+        attached.delete(target);
+      };
     },
     close(reason) {
       if (closePromise !== undefined) return closePromise;
       closed = true;
       watchdog.stop();
+      if (expiryHandle !== undefined) {
+        clock.clearTimeout(expiryHandle);
+        expiryHandle = undefined;
+      }
+      const targets = writers();
       closePromise = (async () => {
-        let failure = await dispose(resources, writer);
+        let failure = await dispose(resources, targets);
         try {
           options.onClose?.(reason);
         } catch (error) {
@@ -148,6 +182,18 @@ export const createLiveRtcSession = (
       return closePromise;
     },
   };
+
+  const tokenExpiresAtMs = Date.parse(start.rtcTokenExpiresAt);
+  if (Number.isFinite(tokenExpiresAtMs)) {
+    const remaining = tokenExpiresAtMs - clock.now();
+    expiryHandle = clock.setTimeout(
+      () => {
+        expiryHandle = undefined;
+        void session.close("token_expired");
+      },
+      Math.max(1, remaining),
+    );
+  }
 
   watchdog.start();
   return session;

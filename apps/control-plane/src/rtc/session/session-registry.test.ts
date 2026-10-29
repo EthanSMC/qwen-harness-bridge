@@ -160,7 +160,7 @@ describe("live RTC session keepalive and inactivity", () => {
     session.touch("control");
     advance(60_000);
     expect(session.closed).toBe(false);
-    session.touch("output");
+    session.touch("output", { succeeded: true });
     advance(RTC_INACTIVITY_MS - 1);
     expect(session.closed).toBe(false);
     advance(1);
@@ -305,6 +305,16 @@ describe("bounded RTC session registry", () => {
     ]);
   });
 
+  it("treats the same session id under a different owner as a conflict", async () => {
+    const transports: ReturnType<typeof createTransport>[] = [];
+    const { registry } = optionsFor(transports);
+    await registry.start({ start: start() });
+
+    await expect(
+      registry.start({ start: start({ ownerSubject: "owner-2" }) }),
+    ).rejects.toMatchObject({ code: "RTC_SESSION_CONFLICT" });
+  });
+
   it("closes every session once on server shutdown", async () => {
     const transports: ReturnType<typeof createTransport>[] = [];
     const { registry, disconnects } = optionsFor(transports);
@@ -336,6 +346,99 @@ describe("bounded RTC session registry", () => {
     });
     expect(restarted.size).toBe(0);
     expect(restarted.get("ses_001")).toBeUndefined();
+  });
+});
+
+describe("failed output and token expiry", () => {
+  it("does not extend the session for a failed output", async () => {
+    const { clock, advance } = createFakeClock();
+    const transport = createTransport();
+    const session = createLiveRtcSession({
+      start: start(),
+      clock,
+      writer: transport.writer,
+      resources: transport.resources,
+    });
+
+    advance(80_000);
+    session.touch("output", { succeeded: false });
+    advance(RTC_INACTIVITY_MS - 1);
+    expect(session.closed).toBe(true);
+    await settle();
+  });
+
+  it("closes the session when its RTC token expires", async () => {
+    const { clock, advance } = createFakeClock();
+    const transport = createTransport();
+    const closed: RtcCloseReason[] = [];
+    const session = createLiveRtcSession({
+      start: start({ rtcTokenExpiresAt: new Date(60_000).toISOString() }),
+      clock,
+      writer: transport.writer,
+      resources: transport.resources,
+      onClose: (reason) => closed.push(reason),
+    });
+
+    advance(59_999);
+    expect(session.closed).toBe(false);
+    advance(1);
+    expect(session.closed).toBe(true);
+    await settle();
+    expect(closed).toEqual(["token_expired"]);
+    expect(
+      transport.events.filter((event) => event === "writer.end"),
+    ).toHaveLength(1);
+  });
+});
+
+describe("attached duplicate streams", () => {
+  it("broadcasts keepalive to an attached writer and detaches without closing", async () => {
+    const { clock, advance } = createFakeClock();
+    const primary = createTransport();
+    const secondary = createTransport();
+    const session = createLiveRtcSession({
+      start: start(),
+      clock,
+      writer: primary.writer,
+      resources: primary.resources,
+    });
+
+    const detach = session.attach(secondary.writer);
+    advance(RTC_KEEPALIVE_MS);
+    expect(primary.writes).toEqual([KEEPALIVE_FRAME]);
+    expect(secondary.writes).toEqual([KEEPALIVE_FRAME]);
+
+    detach();
+    advance(RTC_KEEPALIVE_MS);
+    expect(primary.writes).toEqual([KEEPALIVE_FRAME, KEEPALIVE_FRAME]);
+    expect(secondary.writes).toEqual([KEEPALIVE_FRAME]);
+    expect(session.closed).toBe(false);
+
+    const stillAttached = createTransport();
+    session.attach(stillAttached.writer);
+    await session.close("user_exit");
+    expect(
+      stillAttached.events.filter((event) => event === "writer.end"),
+    ).toHaveLength(1);
+    expect(
+      primary.events.filter((event) => event === "writer.end"),
+    ).toHaveLength(1);
+  });
+
+  it("ends a writer that attaches after the session closed", () => {
+    const { clock } = createFakeClock();
+    const primary = createTransport();
+    const late = createTransport();
+    const session = createLiveRtcSession({
+      start: start(),
+      clock,
+      writer: primary.writer,
+      resources: primary.resources,
+    });
+    void session.close("platform_close");
+
+    session.attach(late.writer);
+    expect(late.events).toContain("writer.end");
   });
 });
 

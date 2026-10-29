@@ -186,6 +186,26 @@ describe("rtc callback authentication", () => {
     ).toBe("start");
   });
 
+  it("fails closed when the nonce window is full instead of evicting live entries", () => {
+    const callbacks = authenticatorFor();
+    const first = requestFor({ nonce: "nonce-cap-0000" });
+    expect(callbacks.verify(first as never).kind).toBe("start");
+    for (let index = 1; index < 1024; index += 1) {
+      expect(
+        callbacks.verify(requestFor({ nonce: `nonce-cap-${index}` }) as never)
+          .kind,
+      ).toBe("start");
+    }
+
+    expectRejection(
+      () =>
+        callbacks.verify(requestFor({ nonce: "nonce-cap-overflow" }) as never),
+      "REPLAY_REJECTED",
+    );
+    // The first accepted nonce is still tracked, so it cannot be replayed.
+    expectRejection(() => callbacks.verify(first as never), "REPLAY_REJECTED");
+  });
+
   it("never places the RTC token in an error or rejection", () => {
     const rejections: RtcRejection[] = [];
     const callbacks = authenticatorFor("2026-08-08T00:00:00Z", rejections);

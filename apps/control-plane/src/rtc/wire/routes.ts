@@ -117,11 +117,9 @@ const createNonceStore = (maxEntries = NONCE_STORE_MAX_ENTRIES) => {
     accept(digest: string, expiresAtMs: number, nowMs: number): boolean {
       prune(nowMs);
       if (entries.has(digest)) return false;
-      while (entries.size >= maxEntries) {
-        const oldest = entries.keys().next().value;
-        if (oldest === undefined) break;
-        entries.delete(oldest);
-      }
+      // Never evict an unexpired nonce: dropping a live entry would allow the
+      // original signed request to be replayed inside its timestamp window.
+      if (entries.size >= maxEntries) return false;
       entries.set(digest, expiresAtMs);
       return true;
     },
@@ -241,9 +239,11 @@ const sseHeaders = {
   "x-accel-buffering": "no",
 } as const;
 
-const createHttpTransport = (reply: FastifyReply): RtcSessionTransport => {
+const hijackSse = (reply: FastifyReply): RtcSseWriter => {
   reply.hijack();
   reply.raw.writeHead(200, sseHeaders);
+  reply.raw.flushHeaders();
+  reply.raw.write(": connected\n\n");
   const writer: RtcSseWriter = {
     closed: false,
     write(frame) {
@@ -255,14 +255,16 @@ const createHttpTransport = (reply: FastifyReply): RtcSessionTransport => {
       if (!reply.raw.writableEnded) reply.raw.end();
     },
   };
-  return {
-    writer,
-    resources: {
-      stopOutput: () => undefined,
-      closeProviderStreams: () => undefined,
-    },
-  };
+  return writer;
 };
+
+const createHttpTransport = (reply: FastifyReply): RtcSessionTransport => ({
+  writer: hijackSse(reply),
+  resources: {
+    stopOutput: () => undefined,
+    closeProviderStreams: () => undefined,
+  },
+});
 
 const rawBodyKey = new WeakMap<object, string>();
 
@@ -346,10 +348,13 @@ export const createRtcRouteSet = (
             createTransport: () => createHttpTransport(reply),
           });
           if (!outcome.created) {
-            return reply.code(200).type("application/json").send({
-              status: "already_active",
-              session_id: outcome.session.id,
-            });
+            // A duplicate identical start must receive the existing stream, so
+            // attach a second SSE writer to the live session instead of
+            // answering with a JSON body. Closing this response only detaches
+            // the writer; the original session keeps running.
+            const detached = outcome.session.attach(hijackSse(reply));
+            reply.raw.once("close", detached);
+            return reply;
           }
           reply.raw.once("close", () => {
             void registry.close(outcome.session.id, "user_exit");

@@ -64,6 +64,7 @@ const sameIdentity = (
   session: LiveRtcSession,
   start: NormalizedRtcStart,
 ): boolean =>
+  session.identity.ownerId === start.ownerSubject &&
   session.identity.media === start.media &&
   session.identity.roomId === start.roomId &&
   session.identity.rtcUserId === start.rtcUserId;
