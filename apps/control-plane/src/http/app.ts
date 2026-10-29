@@ -17,6 +17,7 @@ import {
 import { createMcpAuthenticator, McpAuthenticationError } from "../mcp/auth.js";
 import { createMcpServer } from "../mcp/server.js";
 import type { McpCoordinator } from "../mcp/tools.js";
+import type { RtcPlugin } from "../rtc/plugin.js";
 import type { RtcRouteSet } from "../rtc/wire/routes.js";
 import type { ReadinessProbe } from "./health.js";
 import type { MetricsRegistry } from "./metrics.js";
@@ -31,6 +32,7 @@ export type CreateAppOptions = Readonly<{
   isDraining?: () => boolean;
   metrics?: MetricsRegistry;
   rtc?: RtcRouteSet;
+  rtcPlugin?: RtcPlugin;
 }>;
 
 const authenticationFailure = {
@@ -141,8 +143,36 @@ export async function createApp(
     });
   }
 
+  if (options.rtcPlugin !== undefined) {
+    const rtcPlugin = options.rtcPlugin;
+    try {
+      await app.register(async (child) => {
+        await rtcPlugin.mount(child);
+      });
+    } catch {
+      // RTC composition is isolated: a mount failure never fails app startup.
+    }
+    app.addHook("preClose", async () => {
+      await rtcPlugin.drainAndClose();
+    });
+  }
+
   const liveHandler = async (_request: FastifyRequest, reply: FastifyReply) =>
     reply.type("application/json").send({ status: "ok" });
+  app.get("/health/components", async (_request, reply) => {
+    const components: Record<string, unknown> = {
+      core: { status: "ok" },
+    };
+    if (options.rtcPlugin !== undefined) {
+      components.rtc = options.rtcPlugin.component();
+    } else if (options.rtc !== undefined) {
+      components.rtc = { status: "ok" };
+    } else {
+      components.rtc = { status: "disabled", telemetry: { enabled: false } };
+    }
+    return reply.type("application/json").send({ status: "ok", components });
+  });
+
   app.get("/health/live", liveHandler);
   app.get("/healthz", liveHandler);
 

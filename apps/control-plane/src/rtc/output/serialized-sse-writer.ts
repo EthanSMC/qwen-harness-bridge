@@ -52,6 +52,8 @@ export type RtcOutputOptions = Readonly<{
   writer: RtcSseWriter;
   signal?: AbortSignal;
   onSocketError?: (reason: "socket_error") => void;
+  /** Real call site for Task 6 first-output telemetry. */
+  onFirstOutput?: (kind: string) => void;
 }>;
 
 const dataFrame = (event: string, payload: unknown): string =>
@@ -94,6 +96,7 @@ export const createSerializedSseOutput = (
   let ended = false;
   let speechGeneration = 0;
   let drainScheduled = false;
+  let firstOutputNotified = false;
 
   const isStopped = (): boolean =>
     closed || socketFailed || options.signal?.aborted === true;
@@ -139,7 +142,13 @@ export const createSerializedSseOutput = (
       try {
         if (!isStopped() && item.valid()) {
           const frame = item.frame();
-          if (frame !== null) writeFrame(frame);
+          if (frame !== null) {
+            if (!firstOutputNotified) {
+              firstOutputNotified = true;
+              options.onFirstOutput?.(item.kind);
+            }
+            writeFrame(frame);
+          }
         }
       } finally {
         item.resolve();

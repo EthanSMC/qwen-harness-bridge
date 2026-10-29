@@ -21,7 +21,9 @@ import {
   createPostgresMetricsAdapter,
 } from "./http/metrics.js";
 import { closeRuntimeResources } from "./http/shutdown.js";
+import { createRtcProviderComposition } from "./rtc/composition.js";
 import { createRtcModule } from "./rtc/module.js";
+import { createRtcPlugin, type RtcPlugin } from "./rtc/plugin.js";
 import { createRtcRouteSet } from "./rtc/wire/routes.js";
 
 export type RuntimeConfiguration = Readonly<{
@@ -82,15 +84,48 @@ export async function start() {
     now: () => new Date(),
   });
   let draining = false;
+  // Provider composition is resolved once from configuration. A missing
+  // credential set or an unbundled provider transport leaves the module
+  // disabled with a bounded reason instead of throwing at startup.
+  const rtcComposition = createRtcProviderComposition({ config: config.rtc });
+  const rtcEnabled = config.rtc.enabled && rtcComposition.available;
   const metrics = createMetricsRegistry({
     readSnapshot: createPostgresMetricsAdapter(db).readSnapshot,
-    rtcEnabled: config.rtc.enabled,
+    rtcEnabled,
   });
-  const rtcModule = createRtcModule(config.rtc);
-  const rtc =
-    rtcModule === null
-      ? undefined
-      : createRtcRouteSet({ module: rtcModule, metrics });
+  let rtcPlugin: RtcPlugin;
+  rtcPlugin = createRtcPlugin({
+    enabled: rtcEnabled,
+    metrics,
+    ...(rtcComposition.available
+      ? {
+          composition: rtcComposition.composition,
+          settings: rtcComposition.settings,
+        }
+      : {}),
+    build: async () => {
+      if (!rtcComposition.available) return null;
+      const rtcModule = createRtcModule(config.rtc);
+      return rtcModule === null
+        ? null
+        : createRtcRouteSet({
+            module: rtcModule,
+            metrics,
+            lifecycle: {
+              canStart: () => rtcPlugin.canStart(),
+              rejectionReason: () => rtcPlugin.rejectionReason(),
+              sessionStart: (sessionId) => rtcPlugin.startSession(sessionId),
+              sessionRelease: (sessionId) => rtcPlugin.endSession(sessionId),
+              sessionClose: (reason, sessionId) =>
+                rtcPlugin.observeSession(reason, sessionId),
+              sessionRejected: (reason) => rtcPlugin.observeRejected(reason),
+              firstAudio: (sessionId) => rtcPlugin.observeAudio(sessionId),
+              sessionCreated: (sessionId, writer, start) =>
+                rtcPlugin.composeSession(sessionId, writer, start),
+            },
+          });
+    },
+  });
   const readinessProbe = createCancellablePostgresReadinessProbe(
     createReadinessSqlClientFactory(config.databaseUrl, {
       connectTimeoutSeconds: 1,
@@ -105,7 +140,7 @@ export async function start() {
     readinessProbe,
     isDraining: () => draining,
     metrics,
-    ...(rtc === null || rtc === undefined ? {} : { rtc }),
+    rtcPlugin,
     connectorGateway: {
       database: db,
       sessionSigningKey: runtime.connectorSessionSigningKey,

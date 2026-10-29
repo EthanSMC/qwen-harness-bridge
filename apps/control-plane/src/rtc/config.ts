@@ -29,6 +29,18 @@ const enabledConfigSchema = z
   })
   .strict();
 
+/**
+ * Server-side provider credentials. They are read from the environment and are
+ * never returned to Qwen, logged, or embedded in an error or telemetry label.
+ */
+export type RtcProviderSettings = Readonly<{
+  aliyunAppId: string;
+  aliyunAccessKeyId: string;
+  aliyunAccessKeySecret: string;
+  dashscopeApiKey: string;
+  dashscopeAsrModel?: string;
+}>;
+
 export type RtcConfig =
   | Readonly<{ enabled: false }>
   | Readonly<{
@@ -38,6 +50,8 @@ export type RtcConfig =
       callbackUrl: string;
       allowedMedia: readonly RtcMedia[];
       provider: "ALIYUN_RTC";
+      /** Present only when every provider credential is configured. */
+      providers?: RtcProviderSettings;
     }>;
 
 export type RtcRuntime = Readonly<{
@@ -60,6 +74,52 @@ const parseMedia = (value: string | undefined): RtcMedia[] =>
       return entry as RtcMedia;
     });
 
+const optional = (
+  environment: Environment,
+  name: string,
+): string | undefined => {
+  const value = environment[name]?.trim();
+  return value === undefined || value === "" ? undefined : value;
+};
+
+/**
+ * Provider credentials are optional as a group: a deployment either configures
+ * all of them (real provider composition) or none (bounded, disabled module).
+ */
+const loadProviderSettings = (
+  environment: Environment,
+): RtcProviderSettings | undefined => {
+  const aliyunAppId = optional(environment, "QHB_RTC_ALIYUN_APP_ID");
+  const aliyunAccessKeyId = optional(
+    environment,
+    "QHB_RTC_ALIYUN_ACCESS_KEY_ID",
+  );
+  const aliyunAccessKeySecret = optional(
+    environment,
+    "QHB_RTC_ALIYUN_ACCESS_KEY_SECRET",
+  );
+  const dashscopeApiKey = optional(environment, "QHB_RTC_DASHSCOPE_API_KEY");
+  if (
+    aliyunAppId === undefined ||
+    aliyunAccessKeyId === undefined ||
+    aliyunAccessKeySecret === undefined ||
+    dashscopeApiKey === undefined
+  ) {
+    return undefined;
+  }
+  const dashscopeAsrModel = optional(
+    environment,
+    "QHB_RTC_DASHSCOPE_ASR_MODEL",
+  );
+  return {
+    aliyunAppId,
+    aliyunAccessKeyId,
+    aliyunAccessKeySecret,
+    dashscopeApiKey,
+    ...(dashscopeAsrModel === undefined ? {} : { dashscopeAsrModel }),
+  };
+};
+
 export const loadRtcConfig = (environment: Environment): RtcConfig => {
   if (environment.QHB_RTC_ENABLED !== "true") {
     return { enabled: false };
@@ -77,6 +137,7 @@ export const loadRtcConfig = (environment: Environment): RtcConfig => {
       .join("; ");
     throw new Error(`QHB_RTC_ configuration is invalid: ${details}`);
   }
+  const providers = loadProviderSettings(environment);
   return {
     enabled: true,
     ownerSubject: parsed.data.ownerSubject,
@@ -84,6 +145,7 @@ export const loadRtcConfig = (environment: Environment): RtcConfig => {
     callbackUrl: parsed.data.callbackUrl,
     allowedMedia: parsed.data.allowedMedia,
     provider: parsed.data.provider,
+    ...(providers === undefined ? {} : { providers }),
   };
 };
 

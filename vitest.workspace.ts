@@ -19,6 +19,7 @@ export default defineWorkspace([
         "tests/integration/harness-connector-e2e.test.ts",
         "tests/integration/loopback-control-plane.test.ts",
         "tests/integration/rtc-conversation.test.ts",
+        "tests/integration/rtc-session-composition.test.ts",
       ],
     },
   },
@@ -35,6 +36,13 @@ export default defineWorkspace([
         "tests/contract/harness-plugin-shape.test.ts",
         "tests/contract/qwen-rtc-wire.test.ts",
       ],
+    },
+  },
+  {
+    test: {
+      name: "chaos",
+      testTimeout: 15_000,
+      include: ["tests/chaos/rtc-failure-isolation.test.ts"],
     },
   },
   {
