@@ -12,7 +12,7 @@ export type McpServerOptions = Readonly<{
 export function createMcpServer(options: McpServerOptions): McpServer {
   const server = new McpServer({
     name: "qwen-harness-bridge",
-    version: "0.1.0",
+    version: "0.2.0",
   });
   const owner: McpOwnerContext = { id: options.ownerId };
   registerMcpTools(server, options.coordinator, owner, options.metrics);
