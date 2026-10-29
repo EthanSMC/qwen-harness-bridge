@@ -1,0 +1,40 @@
+{
+  "fixture_id": "submit-read-only",
+  "turns": [
+    {
+      "request_id": "99999999-9999-4999-8999-999999999999",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "只看不改，让 DeepSeek 在 Novelty Web 做只读检查"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "submit_task",
+          "request_id": "99999999-9999-4999-8999-999999999999",
+          "arguments": {
+            "client_request_id": "99999999-9999-4999-8999-999999999999",
+            "repository_id": "novelty-web",
+            "request": "只读检查代码风格并报告问题，不修改任何文件",
+            "mode": "read_only"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "submit_task",
+          "request_id": "99999999-9999-4999-8999-999999999999",
+          "ok": true,
+          "text": "已受理任务 QH-4D5E，模式 read_only"
+        },
+        {
+          "kind": "assistant",
+          "text": "已创建只读任务 QH-4D5E，短号 4D5E，连接器在线。"
+        },
+        {
+          "kind": "tts",
+          "text": "只读任务 QH-4D5E 已创建，连接器在线。"
+        }
+      ]
+    }
+  ]
+}
