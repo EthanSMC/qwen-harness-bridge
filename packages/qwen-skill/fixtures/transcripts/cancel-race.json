@@ -1,0 +1,66 @@
+{
+  "fixture_id": "cancel-race",
+  "turns": [
+    {
+      "request_id": "00000017-0000-4000-8000-000000170000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "取消 QH-9F3C"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task",
+          "request_id": "00000017-0000-4000-8000-000000170000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task",
+          "request_id": "00000017-0000-4000-8000-000000170000",
+          "ok": true,
+          "text": "{\"job_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"short_id\":\"QH-9F3C\",\"status\":\"running\",\"revision\":7}"
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-9F3C 正在执行，确定取消吗？"
+        }
+      ]
+    },
+    {
+      "request_id": "00000018-0000-4000-8000-000000180000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "确认取消"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "cancel_task",
+          "request_id": "00000018-0000-4000-8000-000000180000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000",
+            "expected_revision": 7
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "cancel_task",
+          "request_id": "00000018-0000-4000-8000-000000180000",
+          "ok": true,
+          "text": "{\"job_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"short_id\":\"QH-9F3C\",\"status\":\"succeeded\",\"revision\":9}"
+        },
+        {
+          "kind": "assistant",
+          "text": "任务在取消生效前已完成，这次取消未生效。"
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-9F3C 已完成，取消未生效。"
+        }
+      ]
+    }
+  ]
+}

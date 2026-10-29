@@ -1,0 +1,70 @@
+{
+  "fixture_id": "cancel-running",
+  "turns": [
+    {
+      "request_id": "00000015-0000-4000-8000-000000150000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "取消 QH-9F3C"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task",
+          "request_id": "00000015-0000-4000-8000-000000150000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task",
+          "request_id": "00000015-0000-4000-8000-000000150000",
+          "ok": true,
+          "text": "{\"job_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"short_id\":\"QH-9F3C\",\"status\":\"running\",\"revision\":7}"
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-9F3C 正在执行，确定取消吗？"
+        }
+      ]
+    },
+    {
+      "request_id": "00000016-0000-4000-8000-000000160000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "确认取消"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "cancel_task",
+          "request_id": "00000016-0000-4000-8000-000000160000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000",
+            "expected_revision": 7
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "cancel_task",
+          "request_id": "00000016-0000-4000-8000-000000160000",
+          "ok": true,
+          "text": "{\"job_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"short_id\":\"QH-9F3C\",\"status\":\"cancelling\",\"revision\":8}"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.all_text",
+          "request_id": "00000016-0000-4000-8000-000000160000",
+          "payload": {
+            "lines": ["仓库：Novelty API · 短号：QH-9F3C", "状态：正在取消"]
+          }
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-9F3C 正在取消。"
+        }
+      ]
+    }
+  ]
+}

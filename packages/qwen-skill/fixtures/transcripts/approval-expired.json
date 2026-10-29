@@ -1,0 +1,86 @@
+{
+  "fixture_id": "approval-expired",
+  "turns": [
+    {
+      "request_id": "00000011-0000-4000-8000-000000110000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "有哪些待审批"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "list_pending_approvals",
+          "request_id": "00000011-0000-4000-8000-000000110000",
+          "arguments": {
+            "limit": 5
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "list_pending_approvals",
+          "request_id": "00000011-0000-4000-8000-000000110000",
+          "ok": true,
+          "text": "{\"approvals\":[{\"approval_id\":\"00000001-0000-4000-8000-000000010000\",\"short_id\":\"QH-2K7M\",\"action\":\"运行数据库迁移\",\"impact\":\"改动生产库结构\",\"risk\":\"approval_required\",\"expires_at\":\"2026-10-30T10:30:00.000Z\",\"job_revision\":4},{\"approval_id\":\"00000002-0000-4000-8000-000000020000\",\"short_id\":\"QH-8P4C\",\"action\":\"删除构建缓存\",\"impact\":\"需要重新构建\",\"risk\":\"approval_required\",\"expires_at\":\"2026-10-30T09:00:00.000Z\",\"job_revision\":6}]}"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.list",
+          "request_id": "00000011-0000-4000-8000-000000110000",
+          "payload": {
+            "lines": [
+              "1. QH-2K7M · 运行数据库迁移 · 需要确认 · 有效期至 10-30 10:30 UTC",
+              "2. QH-8P4C · 删除构建缓存 · 需要重新发起 · 已过期"
+            ]
+          }
+        },
+        {
+          "kind": "assistant",
+          "text": "第二个审批已过期，这次没有执行批准。"
+        },
+        {
+          "kind": "tts",
+          "text": "该审批已过期，需要重新发起。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000012-0000-4000-8000-000000120000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "刷新待审批"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "list_pending_approvals",
+          "request_id": "00000012-0000-4000-8000-000000120000",
+          "arguments": {
+            "limit": 5
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "list_pending_approvals",
+          "request_id": "00000012-0000-4000-8000-000000120000",
+          "ok": true,
+          "text": "{\"approvals\":[{\"approval_id\":\"00000001-0000-4000-8000-000000010000\",\"short_id\":\"QH-2K7M\",\"action\":\"运行数据库迁移\",\"impact\":\"改动生产库结构\",\"risk\":\"approval_required\",\"expires_at\":\"2026-10-30T10:30:00.000Z\",\"job_revision\":4}]}"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.list",
+          "request_id": "00000012-0000-4000-8000-000000120000",
+          "payload": {
+            "lines": [
+              "1. QH-2K7M · 运行数据库迁移 · 影响：改动生产库结构 · 需要确认 · 有效期至 10-30 10:30 UTC"
+            ]
+          }
+        },
+        {
+          "kind": "tts",
+          "text": "当前只有一个待审批任务。"
+        }
+      ]
+    }
+  ]
+}

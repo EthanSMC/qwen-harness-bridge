@@ -1,0 +1,400 @@
+{
+  "fixture_id": "errors",
+  "turns": [
+    {
+      "request_id": "0000001f-0000-4000-8000-0000001f0000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "我有哪些任务"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "list_tasks",
+          "request_id": "0000001f-0000-4000-8000-0000001f0000",
+          "arguments": {
+            "limit": 5
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "list_tasks",
+          "request_id": "0000001f-0000-4000-8000-0000001f0000",
+          "ok": false,
+          "text": "AUTHENTICATION_FAILED"
+        },
+        {
+          "kind": "tts",
+          "text": "认证失败，请重新连接账号。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000020-0000-4000-8000-000000200000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "看一下 QH-9F3C"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task",
+          "request_id": "00000020-0000-4000-8000-000000200000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task",
+          "request_id": "00000020-0000-4000-8000-000000200000",
+          "ok": false,
+          "text": "RATE_LIMITED"
+        },
+        {
+          "kind": "tts",
+          "text": "请求过多，请稍后再试。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000021-0000-4000-8000-000000210000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "在本地目录跑测试"
+        },
+        {
+          "kind": "assistant",
+          "text": "INVALID_REPOSITORY：本地路径不能作为仓库标识，请从配置的仓库名称中选择。"
+        },
+        {
+          "kind": "tts",
+          "text": "仓库无效，请从配置的列表中选择。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000022-0000-4000-8000-000000220000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "现在有哪些任务"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "list_tasks",
+          "request_id": "00000022-0000-4000-8000-000000220000",
+          "arguments": {
+            "limit": 5
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "list_tasks",
+          "request_id": "00000022-0000-4000-8000-000000220000",
+          "ok": false,
+          "text": "CONNECTOR_OFFLINE"
+        },
+        {
+          "kind": "tts",
+          "text": "连接器离线，任务已保留。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000023-0000-4000-8000-000000230000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "重新提交刚才的任务"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "submit_task",
+          "request_id": "00000023-0000-4000-8000-000000230000",
+          "arguments": {
+            "client_request_id": "00000023-0000-4000-8000-000000230000",
+            "repository_id": "novelty-web",
+            "request": "跑一遍 lint",
+            "mode": "normal"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "submit_task",
+          "request_id": "00000023-0000-4000-8000-000000230000",
+          "ok": false,
+          "text": "IDEMPOTENCY_CONFLICT"
+        },
+        {
+          "kind": "tts",
+          "text": "该请求已提交过，请确认是否新建任务。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000024-0000-4000-8000-000000240000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "看一下 QH-9F3C"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task",
+          "request_id": "00000024-0000-4000-8000-000000240000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task",
+          "request_id": "00000024-0000-4000-8000-000000240000",
+          "ok": false,
+          "text": "JOB_NOT_FOUND"
+        },
+        {
+          "kind": "tts",
+          "text": "没有找到该任务，请核对短号。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000025-0000-4000-8000-000000250000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "看一下 QH-9F3C"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task",
+          "request_id": "00000025-0000-4000-8000-000000250000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task",
+          "request_id": "00000025-0000-4000-8000-000000250000",
+          "ok": true,
+          "text": "{\"job_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"short_id\":\"QH-9F3C\",\"status\":\"running\",\"revision\":6}"
+        },
+        {
+          "kind": "tts",
+          "text": "任务正在执行。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000026-0000-4000-8000-000000260000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "取消 QH-9F3C"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "cancel_task",
+          "request_id": "00000026-0000-4000-8000-000000260000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000",
+            "expected_revision": 6
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "cancel_task",
+          "request_id": "00000026-0000-4000-8000-000000260000",
+          "ok": false,
+          "text": "REVISION_CONFLICT"
+        },
+        {
+          "kind": "assistant",
+          "text": "任务状态已变化，这次取消没有生效，也没有自动重试。"
+        },
+        {
+          "kind": "tts",
+          "text": "任务状态已变化，请刷新后再决定。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000027-0000-4000-8000-000000270000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "刷新 QH-9F3C"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task",
+          "request_id": "00000027-0000-4000-8000-000000270000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task",
+          "request_id": "00000027-0000-4000-8000-000000270000",
+          "ok": true,
+          "text": "{\"job_id\":\"123e4567-e89b-42d3-a456-426614174000\",\"short_id\":\"QH-9F3C\",\"status\":\"running\",\"revision\":7}"
+        },
+        {
+          "kind": "tts",
+          "text": "任务仍在执行，当前版本 7。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000028-0000-4000-8000-000000280000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "有哪些待审批"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "list_pending_approvals",
+          "request_id": "00000028-0000-4000-8000-000000280000",
+          "arguments": {
+            "limit": 5
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "list_pending_approvals",
+          "request_id": "00000028-0000-4000-8000-000000280000",
+          "ok": true,
+          "text": "{\"approvals\":[{\"approval_id\":\"00000001-0000-4000-8000-000000010000\",\"short_id\":\"QH-2K7M\",\"action\":\"运行数据库迁移\",\"impact\":\"改动生产库结构\",\"risk\":\"approval_required\",\"expires_at\":\"2026-10-30T10:30:00.000Z\",\"job_revision\":4},{\"approval_id\":\"00000002-0000-4000-8000-000000020000\",\"short_id\":\"QH-8P4C\",\"action\":\"删除构建缓存\",\"impact\":\"需要重新构建\",\"risk\":\"approval_required\",\"expires_at\":\"2026-10-30T10:40:00.000Z\",\"job_revision\":6}]}"
+        },
+        {
+          "kind": "tts",
+          "text": "第二个审批即将过期。"
+        }
+      ]
+    },
+    {
+      "request_id": "00000029-0000-4000-8000-000000290000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "批准第二个"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "decide_approval",
+          "request_id": "00000029-0000-4000-8000-000000290000",
+          "arguments": {
+            "approval_id": "00000002-0000-4000-8000-000000020000",
+            "decision": "approve",
+            "expected_job_revision": 6
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "decide_approval",
+          "request_id": "00000029-0000-4000-8000-000000290000",
+          "ok": false,
+          "text": "APPROVAL_EXPIRED"
+        },
+        {
+          "kind": "assistant",
+          "text": "该审批已过期，这次没有执行批准。"
+        },
+        {
+          "kind": "tts",
+          "text": "该审批已过期，请刷新后重新发起。"
+        }
+      ]
+    },
+    {
+      "request_id": "0000002a-0000-4000-8000-0000002a0000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "有哪些待审批"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "list_pending_approvals",
+          "request_id": "0000002a-0000-4000-8000-0000002a0000",
+          "arguments": {
+            "limit": 5
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "list_pending_approvals",
+          "request_id": "0000002a-0000-4000-8000-0000002a0000",
+          "ok": false,
+          "text": "APPROVAL_CHANNEL_UNAVAILABLE"
+        },
+        {
+          "kind": "tts",
+          "text": "审批通道当前不可用，请稍后重试。"
+        }
+      ]
+    },
+    {
+      "request_id": "0000002b-0000-4000-8000-0000002b0000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "看一下 QH-9F3C"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task",
+          "request_id": "0000002b-0000-4000-8000-0000002b0000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task",
+          "request_id": "0000002b-0000-4000-8000-0000002b0000",
+          "ok": false,
+          "text": "TRANSPORT_TIMEOUT"
+        },
+        {
+          "kind": "tts",
+          "text": "请求超时，请重新读取任务状态。"
+        }
+      ]
+    },
+    {
+      "request_id": "0000002c-0000-4000-8000-0000002c0000",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "再看一下结果"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task_result",
+          "request_id": "0000002c-0000-4000-8000-0000002c0000",
+          "arguments": {
+            "job_id": "123e4567-e89b-42d3-a456-426614174000"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task_result",
+          "request_id": "0000002c-0000-4000-8000-0000002c0000",
+          "ok": false,
+          "text": "INTERNAL_ERROR"
+        },
+        {
+          "kind": "tts",
+          "text": "服务端内部错误，请稍后再试。"
+        }
+      ]
+    }
+  ]
+}
