@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "release": {
+    "tag_created": false,
+    "github_release_created": false,
+    "changelog_release_entry": false,
+    "note": "No tag, GitHub Release, changelog release entry or published package exists for v0.3.0. CHANGELOG.md is intentionally unchanged by this preparation."
+  },
+  "release_status": "NOT RELEASED",
+  "generated_for_issue": 20,
+  "generated_at": "2026-10-29",
+  "description": "Offline preparation record for the v0.3.0 physical-device acceptance. Every case is NOT EXECUTED because the required device and platform environment are unavailable in the implementation environment. No device or platform result is claimed.",
+  "environment": {
+    "status": "BLOCKED-ENVIRONMENT",
+    "blockers": [
+      {
+        "code": "NO_PHYSICAL_DEVICE",
+        "detail": "No Qwen AI Glasses S1 hardware or paired glasses runtime is available; quiet/noisy voice, display and speech checks cannot run."
+      },
+      {
+        "code": "NO_PLATFORM_ACCOUNT",
+        "detail": "No Qwen platform account with private publish permission exists in this environment; private version ID and access-scope evidence cannot be produced."
+      },
+      {
+        "code": "NO_STAGING_CONTROL_PLANE",
+        "detail": "No reachable staging Control Plane endpoint or Connector build is configured; end-to-end device flows and correlation ids cannot be captured."
+      }
+    ]
+  },
+  "repetitions_required": 3,
+  "cases": [
+    {
+      "id": "D-01",
+      "name": "quiet voice submission",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-02",
+      "name": "noisy voice submission without duplicate task",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-03",
+      "name": "online Mac submission",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-04",
+      "name": "offline Mac queued submission",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-05",
+      "name": "five-row task list",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-06",
+      "name": "first ordinal",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-07",
+      "name": "last ordinal",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-08",
+      "name": "running task detail",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-09",
+      "name": "stale or offline freshness",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-10",
+      "name": "approval approve",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-11",
+      "name": "approval reject",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-12",
+      "name": "expired approval refresh",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-13",
+      "name": "cancellation",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-14",
+      "name": "text result",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-15",
+      "name": "image fallback",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-16",
+      "name": "network interruption",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    },
+    {
+      "id": "D-17",
+      "name": "skill exit and re-entry",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE",
+      "repetitions_completed": 0,
+      "evidence": null
+    }
+  ],
+  "privacy_checks": [
+    {
+      "id": "P-01",
+      "name": "displayed and spoken output is secret-free",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE"
+    },
+    {
+      "id": "P-02",
+      "name": "no offline push claim after skill exit",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE"
+    },
+    {
+      "id": "P-03",
+      "name": "reopened state matches the control plane",
+      "status": "NOT EXECUTED",
+      "blocker": "NO_PHYSICAL_DEVICE"
+    }
+  ],
+  "gate": {
+    "command": "pnpm check && pnpm test && pnpm --filter @qhb/qwen-skill check:package",
+    "status": "NOT EXECUTED",
+    "blocker": "NO_PHYSICAL_DEVICE",
+    "note": "The release gate cannot pass before the physical-device matrix and the platform evidence exist; repository gates are recorded on the closing pull request."
+  }
+}
