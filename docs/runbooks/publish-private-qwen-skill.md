@@ -41,6 +41,11 @@ derives the expected content list again, re-runs the build to prove digest
 reproducibility, and confirms that the seven MCP tools match the protocol schema
 sources. Both commands must exit zero before any platform step.
 
+The repository's recursive build excludes this private Skill package because
+it is not part of the runtime container image; build the artifact explicitly
+with `pnpm --filter @qhb/qwen-skill build` (the command in this runbook) or by
+calling the script with `node`.
+
 The artifact must contain only `SKILL.md`, `skill.json`,
 `mcp.import.example.json`, `config/repositories.json`, the referenced
 Markdown files and the transcript schema mapping. It must never contain

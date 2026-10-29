@@ -409,8 +409,6 @@ const buildEnvironment = (): NodeJS.ProcessEnv => {
     "XDG_CACHE_HOME",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
-    "GITHUB_SHA",
-    "QHB_SOURCE_COMMIT",
   ]) {
     const value = process.env[key];
     if (value !== undefined) environment[key] = value;
