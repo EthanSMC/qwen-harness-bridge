@@ -14,6 +14,7 @@ All notable changes use synchronized Semantic Versioning and are recorded here. 
 - Approved Qwen Harness Bridge product and system Spec.
 - Five detailed test-driven implementation plans and master roadmap.
 - Public-repository governance, issue templates, planning validation, and GitHub synchronization tooling.
+- Prepared (not released) `v0.5.0` experimental RTC acceptance evidence: the ten-cycle physical-device checklist with the exact experimental entry 进入 DeepSeek 实时模式, exit 退出实时模式 and start-failure fallback 实时模式暂不可用，你仍可用任务台查询和操作任务; a per-cycle results schema with ten `NOT EXECUTED` rows and the blocker codes `NO_PHYSICAL_DEVICE` / `NO_PLATFORM_ACCOUNT` / `NO_STAGING_CONTROL_PLANE`; and a PENDING / NOT RELEASED acceptance skeleton stating session-scoped only, no offline push, no replay/reconnect, provider public-beta dependency, best-effort speech, stable query fallback, and exclusion from the `v1.0.0` support SLO. The stable Skill package keeps `rtc_mode: false`; the experimental variant remains a release-process action. Observed gates: `QHB_RTC_ENABLED=true` RTC suites 3 files / 39 tests PASS, and the `QHB_RTC_ENABLED=false` control-plane + qwen-skill + RTC slice 22 files / 321 tests PASS; the full `QHB_RTC_ENABLED=false pnpm test` suite is not executable on the Windows acceptance host (PostgreSQL 16 toolchain, symlink privilege and missing host peers), the ten physical cycles are NOT EXECUTED, and `v0.5.0` is NOT RELEASED.
 
 ## 0.2.0 — pending publication
 

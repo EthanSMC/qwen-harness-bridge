@@ -1,0 +1,373 @@
+{
+  "schema": {
+    "version": 1,
+    "description": "Per-cycle record for the v0.5.0 experimental RTC physical-device acceptance (Plan Task 7). A cycle is evidence only when status is PASS and every required field is populated.",
+    "statuses": [
+      "PASS",
+      "FAIL",
+      "NOT EXECUTED",
+      "BLOCKED-ENVIRONMENT"
+    ],
+    "blocker_codes": {
+      "NO_PHYSICAL_DEVICE": "No Qwen 眼镜 device or firmware available.",
+      "NO_PLATFORM_ACCOUNT": "No private Qwen Skill platform account with private-publish permission.",
+      "NO_STAGING_CONTROL_PLANE": "No staging Control Plane endpoint with RTC enabled and provider credentials.",
+      "NO_ACCEPTANCE_WINDOW": "No named acceptance window, operator and signer."
+    },
+    "required_cycle_fields": [
+      "cycle",
+      "status",
+      "device_firmware",
+      "skill_digest",
+      "session_id_hash",
+      "provider_region",
+      "timings_ms",
+      "commands_observed",
+      "disconnect_reason",
+      "stable_job_ids"
+    ],
+    "privacy": "Session IDs are recorded as sha256 hashes. Tokens, room IDs, user IDs, audio, transcripts and SSE bodies are never recorded."
+  },
+  "meta": {
+    "issue": 34,
+    "plan_task": "docs/superpowers/plans/2026-09-01-experimental-rtc.md#task-7-ten-cycle-physical-device-acceptance-and-experimental-release",
+    "target_release": "v0.5.0",
+    "variant": "experimental Skill package variant (rtc_mode: true) — not built in this change",
+    "stable_package_rtc_mode": false,
+    "artifact": null,
+    "artifact_note": "No experimental artifact digest exists because the variant is not released.",
+    "prepared_at": "2026-10-29T18:53:27.673Z",
+    "executed_at": null,
+    "executor": null,
+    "signer": null
+  },
+  "cycles": [
+    {
+      "cycle": 1,
+      "status": "NOT EXECUTED",
+      "blocker_codes": [
+        "NO_PHYSICAL_DEVICE",
+        "NO_PLATFORM_ACCOUNT",
+        "NO_STAGING_CONTROL_PLANE"
+      ],
+      "coverage": {
+        "special_case": "baseline"
+      },
+      "device_firmware": null,
+      "skill_digest": null,
+      "session_id_hash": null,
+      "provider_region": null,
+      "timings_ms": {
+        "start_ack": null,
+        "first_audio_frame": null,
+        "first_asr_final": null,
+        "first_output": null
+      },
+      "commands_observed": [],
+      "disconnect_reason": null,
+      "stable_job_ids": [],
+      "evidence": null,
+      "note": "Requires the owner-provided physical device, private platform account, staging Control Plane and provider credentials; see tests/e2e/rtc-device-checklist.md."
+    },
+    {
+      "cycle": 2,
+      "status": "NOT EXECUTED",
+      "blocker_codes": [
+        "NO_PHYSICAL_DEVICE",
+        "NO_PLATFORM_ACCOUNT",
+        "NO_STAGING_CONTROL_PLANE"
+      ],
+      "coverage": {
+        "special_case": "baseline"
+      },
+      "device_firmware": null,
+      "skill_digest": null,
+      "session_id_hash": null,
+      "provider_region": null,
+      "timings_ms": {
+        "start_ack": null,
+        "first_audio_frame": null,
+        "first_asr_final": null,
+        "first_output": null
+      },
+      "commands_observed": [],
+      "disconnect_reason": null,
+      "stable_job_ids": [],
+      "evidence": null,
+      "note": "Requires the owner-provided physical device, private platform account, staging Control Plane and provider credentials; see tests/e2e/rtc-device-checklist.md."
+    },
+    {
+      "cycle": 3,
+      "status": "NOT EXECUTED",
+      "blocker_codes": [
+        "NO_PHYSICAL_DEVICE",
+        "NO_PLATFORM_ACCOUNT",
+        "NO_STAGING_CONTROL_PLANE"
+      ],
+      "coverage": {
+        "special_case": "approval"
+      },
+      "device_firmware": null,
+      "skill_digest": null,
+      "session_id_hash": null,
+      "provider_region": null,
+      "timings_ms": {
+        "start_ack": null,
+        "first_audio_frame": null,
+        "first_asr_final": null,
+        "first_output": null
+      },
+      "commands_observed": [],
+      "disconnect_reason": null,
+      "stable_job_ids": [],
+      "evidence": null,
+      "note": "Requires the owner-provided physical device, private platform account, staging Control Plane and provider credentials; see tests/e2e/rtc-device-checklist.md."
+    },
+    {
+      "cycle": 4,
+      "status": "NOT EXECUTED",
+      "blocker_codes": [
+        "NO_PHYSICAL_DEVICE",
+        "NO_PLATFORM_ACCOUNT",
+        "NO_STAGING_CONTROL_PLANE"
+      ],
+      "coverage": {
+        "special_case": "baseline"
+      },
+      "device_firmware": null,
+      "skill_digest": null,
+      "session_id_hash": null,
+      "provider_region": null,
+      "timings_ms": {
+        "start_ack": null,
+        "first_audio_frame": null,
+        "first_asr_final": null,
+        "first_output": null
+      },
+      "commands_observed": [],
+      "disconnect_reason": null,
+      "stable_job_ids": [],
+      "evidence": null,
+      "note": "Requires the owner-provided physical device, private platform account, staging Control Plane and provider credentials; see tests/e2e/rtc-device-checklist.md."
+    },
+    {
+      "cycle": 5,
+      "status": "NOT EXECUTED",
+      "blocker_codes": [
+        "NO_PHYSICAL_DEVICE",
+        "NO_PLATFORM_ACCOUNT",
+        "NO_STAGING_CONTROL_PLANE"
+      ],
+      "coverage": {
+        "special_case": "baseline"
+      },
+      "device_firmware": null,
+      "skill_digest": null,
+      "session_id_hash": null,
+      "provider_region": null,
+      "timings_ms": {
+        "start_ack": null,
+        "first_audio_frame": null,
+        "first_asr_final": null,
+        "first_output": null
+      },
+      "commands_observed": [],
+      "disconnect_reason": null,
+      "stable_job_ids": [],
+      "evidence": null,
+      "note": "Requires the owner-provided physical device, private platform account, staging Control Plane and provider credentials; see tests/e2e/rtc-device-checklist.md."
+    },
+    {
+      "cycle": 6,
+      "status": "NOT EXECUTED",
+      "blocker_codes": [
+        "NO_PHYSICAL_DEVICE",
+        "NO_PLATFORM_ACCOUNT",
+        "NO_STAGING_CONTROL_PLANE"
+      ],
+      "coverage": {
+        "special_case": "cancellation"
+      },
+      "device_firmware": null,
+      "skill_digest": null,
+      "session_id_hash": null,
+      "provider_region": null,
+      "timings_ms": {
+        "start_ack": null,
+        "first_audio_frame": null,
+        "first_asr_final": null,
+        "first_output": null
+      },
+      "commands_observed": [],
+      "disconnect_reason": null,
+      "stable_job_ids": [],
+      "evidence": null,
+      "note": "Requires the owner-provided physical device, private platform account, staging Control Plane and provider credentials; see tests/e2e/rtc-device-checklist.md."
+    },
+    {
+      "cycle": 7,
+      "status": "NOT EXECUTED",
+      "blocker_codes": [
+        "NO_PHYSICAL_DEVICE",
+        "NO_PLATFORM_ACCOUNT",
+        "NO_STAGING_CONTROL_PLANE"
+      ],
+      "coverage": {
+        "special_case": "baseline"
+      },
+      "device_firmware": null,
+      "skill_digest": null,
+      "session_id_hash": null,
+      "provider_region": null,
+      "timings_ms": {
+        "start_ack": null,
+        "first_audio_frame": null,
+        "first_asr_final": null,
+        "first_output": null
+      },
+      "commands_observed": [],
+      "disconnect_reason": null,
+      "stable_job_ids": [],
+      "evidence": null,
+      "note": "Requires the owner-provided physical device, private platform account, staging Control Plane and provider credentials; see tests/e2e/rtc-device-checklist.md."
+    },
+    {
+      "cycle": 8,
+      "status": "NOT EXECUTED",
+      "blocker_codes": [
+        "NO_PHYSICAL_DEVICE",
+        "NO_PLATFORM_ACCOUNT",
+        "NO_STAGING_CONTROL_PLANE"
+      ],
+      "coverage": {
+        "special_case": "rtc_disconnect"
+      },
+      "device_firmware": null,
+      "skill_digest": null,
+      "session_id_hash": null,
+      "provider_region": null,
+      "timings_ms": {
+        "start_ack": null,
+        "first_audio_frame": null,
+        "first_asr_final": null,
+        "first_output": null
+      },
+      "commands_observed": [],
+      "disconnect_reason": null,
+      "stable_job_ids": [],
+      "evidence": null,
+      "note": "Requires the owner-provided physical device, private platform account, staging Control Plane and provider credentials; see tests/e2e/rtc-device-checklist.md."
+    },
+    {
+      "cycle": 9,
+      "status": "NOT EXECUTED",
+      "blocker_codes": [
+        "NO_PHYSICAL_DEVICE",
+        "NO_PLATFORM_ACCOUNT",
+        "NO_STAGING_CONTROL_PLANE"
+      ],
+      "coverage": {
+        "special_case": "asr_noise"
+      },
+      "device_firmware": null,
+      "skill_digest": null,
+      "session_id_hash": null,
+      "provider_region": null,
+      "timings_ms": {
+        "start_ack": null,
+        "first_audio_frame": null,
+        "first_asr_final": null,
+        "first_output": null
+      },
+      "commands_observed": [],
+      "disconnect_reason": null,
+      "stable_job_ids": [],
+      "evidence": null,
+      "note": "Requires the owner-provided physical device, private platform account, staging Control Plane and provider credentials; see tests/e2e/rtc-device-checklist.md."
+    },
+    {
+      "cycle": 10,
+      "status": "NOT EXECUTED",
+      "blocker_codes": [
+        "NO_PHYSICAL_DEVICE",
+        "NO_PLATFORM_ACCOUNT",
+        "NO_STAGING_CONTROL_PLANE"
+      ],
+      "coverage": {
+        "special_case": "baseline"
+      },
+      "device_firmware": null,
+      "skill_digest": null,
+      "session_id_hash": null,
+      "provider_region": null,
+      "timings_ms": {
+        "start_ack": null,
+        "first_audio_frame": null,
+        "first_asr_final": null,
+        "first_output": null
+      },
+      "commands_observed": [],
+      "disconnect_reason": null,
+      "stable_job_ids": [],
+      "evidence": null,
+      "note": "Requires the owner-provided physical device, private platform account, staging Control Plane and provider credentials; see tests/e2e/rtc-device-checklist.md."
+    }
+  ],
+  "required_coverage": {
+    "approval": {
+      "expected_cycle": 3,
+      "status": "NOT EXECUTED"
+    },
+    "cancellation": {
+      "expected_cycle": 6,
+      "status": "NOT EXECUTED"
+    },
+    "rtc_disconnect": {
+      "expected_cycle": 8,
+      "status": "NOT EXECUTED"
+    },
+    "asr_noise": {
+      "expected_cycle": 9,
+      "status": "NOT EXECUTED"
+    }
+  },
+  "gates": [
+    {
+      "gate": "rtc_release_suites",
+      "command": "QHB_RTC_ENABLED=true vitest run tests/contract/qwen-rtc-wire.test.ts tests/integration/rtc-conversation.test.ts tests/chaos/rtc-failure-isolation.test.ts",
+      "status": "PASS",
+      "observed_at": "2026-10-29T18:53:27.673Z",
+      "detail": "3 test files passed, 39 tests passed, exit 0."
+    },
+    {
+      "gate": "stable_disabled_slice",
+      "command": "QHB_RTC_ENABLED=false vitest run apps/control-plane/src packages/qwen-skill/src tests/contract/qwen-rtc-wire.test.ts tests/integration/rtc-conversation.test.ts tests/chaos/rtc-failure-isolation.test.ts",
+      "status": "PASS",
+      "observed_at": "2026-10-29T18:53:27.673Z",
+      "detail": "22 test files passed, 321 tests passed, exit 0."
+    },
+    {
+      "gate": "stable_full_suite",
+      "command": "QHB_RTC_ENABLED=false pnpm test",
+      "status": "BLOCKED-ENVIRONMENT",
+      "observed_at": "2026-10-29T18:53:27.673Z",
+      "detail": "Attempted; the suite cannot run on this Windows host. 38 suites failed only on environment prerequisites: PostgreSQL integration tests require initdb/pg_ctl/createdb (install PostgreSQL 16 or set PG_BINDIR); Windows refused symlink creation (EPERM) in redaction/prune tests; the reused dependency junction lacks host peers and packages (@deepseek-ai/*, better-sqlite3, yaml, zod at package scope); `which` and `pnpm` spawns returned ENOENT. This run is not stable-mode evidence; the Linux CI runtime job runs the full suite."
+    },
+    {
+      "gate": "ten_physical_cycles",
+      "command": "tests/e2e/rtc-device-checklist.md",
+      "status": "NOT EXECUTED",
+      "observed_at": null,
+      "detail": "Ten consecutive enter/multi-turn/exit/re-enter cycles were not executed: NO_PHYSICAL_DEVICE, NO_PLATFORM_ACCOUNT, NO_STAGING_CONTROL_PLANE."
+    }
+  ],
+  "release": {
+    "version": "v0.5.0",
+    "status": "NOT RELEASED",
+    "tag": null,
+    "github_release": null,
+    "changelog": "Unreleased entry only; no version bump, tag, GitHub Release or platform publication.",
+    "release_actions_by": "accountable owner",
+    "not_released_reason": "Ten physical cycles are NOT EXECUTED and the experimental variant is not built; the release gate is closed."
+  }
+}
