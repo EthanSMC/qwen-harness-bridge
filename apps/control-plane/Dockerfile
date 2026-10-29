@@ -15,6 +15,7 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY apps/control-plane/package.json apps/control-plane/package.json
 COPY packages/protocol/package.json packages/protocol/package.json
 COPY packages/harness-plugin/package.json packages/harness-plugin/package.json
+COPY packages/qwen-skill/package.json packages/qwen-skill/package.json
 RUN pnpm install --frozen-lockfile
 COPY . .
 RUN pnpm build
