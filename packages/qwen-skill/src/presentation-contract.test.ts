@@ -6,6 +6,8 @@ import {
   EMPTY_EVENTS_TEXT,
   FRESHNESS_TEXT,
   formatListLine,
+  IMAGE_FALLBACK_TTS,
+  LIST_TTS_EMPTY,
   MAX_DETAIL_CHARACTERS,
   MAX_DETAIL_LINES,
   MAX_EVENT_SUMMARIES,
@@ -14,6 +16,7 @@ import {
   renderDetailLines,
   renderEventSummaries,
   renderListRows,
+  renderListTts,
   renderResult,
   renderTts,
   resolveOrdinal,
@@ -358,13 +361,13 @@ describe("speech presentation", () => {
 
   it("uses deterministic templates instead of free-form paraphrases", () => {
     expect(renderTts({ shortId: "QH-7M2P", status: "queued" })).toBe(
-      "任务 QH-7M2P 已创建，等待 Mac 接单",
+      "任务 QH-7M2P 已创建，等待 Mac 接单。",
     );
     expect(
       renderTts({ shortId: "QH-7M2P", status: "running", stage: "运行测试" }),
-    ).toBe("任务 QH-7M2P 正在执行，阶段：运行测试");
+    ).toBe("任务 QH-7M2P 正在执行，阶段：运行测试。");
     expect(renderTts({ shortId: "QH-7M2P", status: "succeeded" })).toBe(
-      "任务 QH-7M2P 已完成，结果已显示",
+      "任务 QH-7M2P 已完成，结果已显示。",
     );
     for (const status of Object.keys(STATUS_TEXT) as Array<
       keyof typeof STATUS_TEXT
@@ -393,21 +396,22 @@ const fixtureTasks = () => [
   },
   {
     shortId: "QH-8K4D",
-    title: "已完成",
+    title: "回归测试",
     status: "succeeded" as const,
     freshness: "fresh" as const,
     updatedAt: "2026-10-29T09:00:00.000Z",
   },
   {
     shortId: "QH-2B7E",
-    title: "待审批",
+    title: "数据库迁移",
     status: "waiting_approval" as const,
     freshness: "fresh" as const,
+    unread: true,
     updatedAt: "2026-10-29T08:30:00.000Z",
   },
   {
     shortId: "QH-6C1F",
-    title: "离线任务",
+    title: "登录缺陷",
     status: "running" as const,
     freshness: "offline" as const,
     updatedAt: "2026-10-29T08:15:00.000Z",
@@ -425,11 +429,19 @@ const fixtureUiLines = (
 };
 
 describe("fixture and renderer parity", () => {
-  it("renders the exact list fixture rows", () => {
+  it("renders the exact list fixture rows with title, unread marker and relative time", () => {
     const rows = renderListRows(fixtureTasks(), { now: NOW });
-    expect(rows.map(formatListLine)).toEqual(
+    const lines = rows.map(formatListLine);
+    expect(lines).toEqual(
       fixtureUiLines(load("list-tasks.json"), 0, "UiTool.list"),
     );
+    expect(lines[0]).toContain("· 运行测试 ·");
+    expect(lines[0]).toContain("3 分钟前");
+    expect(lines[3]).toContain("未读");
+    expect(lines[4]).toContain("连接中断，正在协调");
+    expect(
+      lines.every((line) => line.startsWith("1. ") || /^[2-5]\. /u.test(line)),
+    ).toBe(true);
   });
 
   it("renders the exact running detail fixture body in contract order", () => {
@@ -581,5 +593,41 @@ describe("fixture and renderer parity", () => {
     expect([...long].length).toBeLessThanOrEqual(MAX_TTS_CHARACTERS);
     expect(long).not.toContain("阶段：");
     expect(long).toContain("连接中断，正在协调");
+  });
+});
+
+describe("fixture speech parity", () => {
+  const ttsOf = (fixture: TranscriptFixture, turn: number): string => {
+    const step = fixture.turns[turn]?.steps.find(
+      (candidate) => candidate.kind === "tts",
+    );
+    return step?.kind === "tts" ? step.text : "";
+  };
+
+  it("generates every fixture TTS from the templates or the fixed fallbacks", () => {
+    expect(ttsOf(load("list-tasks.json"), 0)).toBe(renderListTts(5));
+    expect(ttsOf(load("inspect-running.json"), 0)).toBe(
+      renderTts({ shortId: "QH-7M2P", status: "running", stage: "运行测试" }),
+    );
+    expect(ttsOf(load("inspect-offline.json"), 0)).toBe(
+      renderTts({
+        shortId: "QH-6C1F",
+        status: "running",
+        freshness: "offline",
+      }),
+    );
+    expect(ttsOf(load("result-text.json"), 0)).toBe(
+      renderTts({ shortId: "QH-8K4D", status: "succeeded" }),
+    );
+    expect(ttsOf(load("result-image.json"), 0)).toBe(
+      renderTts({ shortId: "QH-4D5E", status: "succeeded" }),
+    );
+    expect(ttsOf(load("result-image.json"), 1)).toBe(IMAGE_FALLBACK_TTS);
+  });
+
+  it("documents the list and image fallback templates", () => {
+    expect(renderListTts(5)).toBe("任务列表已显示，共五个。");
+    expect(renderListTts(0)).toBe(LIST_TTS_EMPTY);
+    expect(IMAGE_FALLBACK_TTS).toBe("图片不可用，已显示文本信息。");
   });
 });

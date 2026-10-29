@@ -141,9 +141,16 @@ export const formatListLine = (row: TaskRow): string =>
   ". " +
   row.shortId +
   " · " +
+  row.title +
+  " · " +
   row.statusText +
   (row.stageText === "" ? "" : ` · 阶段：${row.stageText}`) +
-  (row.freshnessText === FRESHNESS_TEXT.fresh ? "" : ` · ${row.freshnessText}`);
+  (row.freshnessText === FRESHNESS_TEXT.fresh
+    ? ""
+    : ` · ${row.freshnessText}`) +
+  (row.unreadMarker ? " · 未读" : "") +
+  " · " +
+  row.lastUpdateText;
 
 export const renderListRows = (
   tasks: readonly TaskSummary[],
@@ -343,11 +350,10 @@ export const renderTts = (input: TtsInput): string => {
     const sentence = detail
       ? statusSentence(input)
       : statusSentence({ ...input, stage: undefined });
-    const suffix =
-      connection && input.freshness !== undefined
-        ? `，${FRESHNESS_TEXT[input.freshness]}。`
-        : "";
-    return sentence + suffix;
+    const bare = sentence.endsWith("。") ? sentence.slice(0, -1) : sentence;
+    return connection && input.freshness !== undefined
+      ? `${bare}，${FRESHNESS_TEXT[input.freshness]}。`
+      : `${bare}。`;
   };
   for (const [detail, connection] of [
     [true, true],
@@ -359,4 +365,14 @@ export const renderTts = (input: TtsInput): string => {
     if (characters(candidate) <= MAX_TTS_CHARACTERS) return candidate;
   }
   return bounded(withDetail(false, false), MAX_TTS_CHARACTERS);
+};
+
+export const LIST_TTS_NUMERALS = ["零", "一", "二", "三", "四", "五"] as const;
+export const LIST_TTS_EMPTY = "暂无可显示的任务。";
+export const IMAGE_FALLBACK_TTS = "图片不可用，已显示文本信息。";
+
+export const renderListTts = (count: number): string => {
+  const boundedCount = Math.max(0, Math.min(TASK_LIST_LIMIT, count));
+  if (boundedCount === 0) return LIST_TTS_EMPTY;
+  return `任务列表已显示，共${LIST_TTS_NUMERALS[boundedCount] ?? "五"}个。`;
 };
