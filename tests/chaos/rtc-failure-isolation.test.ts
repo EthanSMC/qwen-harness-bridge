@@ -560,6 +560,32 @@ describe("real rtc lifecycle telemetry", () => {
     expect(plugin.component().status).toBe("closed");
   });
 
+  it("keeps active counts correct for concurrent and untracked closes", () => {
+    const plugin = createRtcPlugin({
+      enabled: true,
+      build: async () => fakeRouteSet(),
+      drainMs: 5,
+      maxConcurrentSessions: 2,
+    });
+    expect(plugin.startSession("session-a")).toBe(true);
+    expect(plugin.startSession("session-b")).toBe(true);
+    expect(plugin.component().telemetry.active_sessions).toBe(2);
+
+    plugin.observeSession("user_exit", "session-a");
+    expect(plugin.component().telemetry.active_sessions).toBe(1);
+
+    plugin.observeSession("provider_disconnect", "unknown-session");
+    expect(plugin.component().telemetry.active_sessions).toBe(1);
+    expect(plugin.component().telemetry.disconnects.provider_disconnect).toBe(
+      1,
+    );
+
+    plugin.observeSession("user_exit", "session-b");
+    expect(plugin.component().telemetry.active_sessions).toBe(0);
+    plugin.observeSession("user_exit", "session-b");
+    expect(plugin.component().telemetry.active_sessions).toBe(0);
+  });
+
   it("drives plugin counters from the real RTC route lifecycle wiring", async () => {
     const plugin = createRtcPlugin({
       enabled: true,
