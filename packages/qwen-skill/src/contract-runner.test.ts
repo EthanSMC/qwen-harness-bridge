@@ -44,8 +44,8 @@ describe("skill submission contract fixtures", () => {
     const suite = runContractSuite(fixturesDirectory);
 
     expect(suite.violations).toEqual([]);
-    expect(suite.fixtureCount).toBe(4);
-    expect(suite.turnCount).toBeGreaterThanOrEqual(4);
+    expect(suite.fixtureCount).toBe(6);
+    expect(suite.turnCount).toBeGreaterThanOrEqual(6);
   });
 
   it("keeps every turn at zero or one mutation", () => {
@@ -56,7 +56,9 @@ describe("skill submission contract fixtures", () => {
       "repository-ambiguous": 0,
       "submit-offline": 1,
       "submit-online": 1,
+      "submit-read-only": 1,
       "submit-retry": 1,
+      "submit-second-request": 1,
     });
   });
 
@@ -136,6 +138,96 @@ describe("skill submission contract fixtures", () => {
       }),
     );
     expect(disorder.join("\n")).toMatch(/order/i);
+  });
+
+  it("keeps an explicit read-only submission in read_only mode", () => {
+    const fixture = fixtureJson("submit-read-only.json");
+    const submit = fixture.turns[0].steps.find(
+      (step) => step.kind === "mcp_call" && step.tool === "submit_task",
+    );
+    expect(submit).toBeDefined();
+    expect(argumentsOf(submit ?? {})).toMatchObject({
+      mode: "read_only",
+      repository_id: "novelty-web",
+    });
+    const suite = runContractSuite(fixturesDirectory);
+    expect(suite.mutationsByFixture["submit-read-only"]).toBe(1);
+  });
+
+  it("executes only the first task request and asks about the second", () => {
+    const fixture = fixtureJson("submit-second-request.json");
+    const steps = fixture.turns[0].steps;
+    const submissions = steps.filter(
+      (step) => step.kind === "mcp_call" && step.tool === "submit_task",
+    );
+    expect(submissions).toHaveLength(1);
+    const assistant = steps
+      .filter((step) => step.kind === "assistant")
+      .map((step) => String(step.text))
+      .join(" ");
+    expect(assistant).toMatch(/另起|新回合|second/i);
+    const suite = runContractSuite(fixturesDirectory);
+    expect(suite.mutationsByFixture["submit-second-request"]).toBe(1);
+    expect(suite.maxMutationsPerTurn).toBe(1);
+  });
+
+  it("requires the client_request_id UUID on every submission", () => {
+    const violation = validateFixture(
+      "submit-online",
+      mutate("submit-online.json", (fixture) => {
+        delete argumentsOf(fixture.turns[0].steps[1]).client_request_id;
+      }),
+      { repositoryIds: ["novelty-web", "novelty-api"] },
+    );
+    expect(violation.join("\n")).toMatch(/client_request_id UUID/);
+  });
+
+  it("rejects path-like and unconfigured repository ids", () => {
+    const pathLike = validateFixture(
+      "submit-online",
+      mutate("submit-online.json", (fixture) => {
+        argumentsOf(fixture.turns[0].steps[1]).repository_id = "novelty/web";
+      }),
+      { repositoryIds: ["novelty-web", "novelty-api"] },
+    );
+    expect(pathLike.join("\n")).toMatch(/never a path-like string/);
+
+    const unconfigured = validateFixture(
+      "submit-online",
+      mutate("submit-online.json", (fixture) => {
+        argumentsOf(fixture.turns[0].steps[1]).repository_id = "prod-db";
+      }),
+      { repositoryIds: ["novelty-web", "novelty-api"] },
+    );
+    expect(unconfigured.join("\n")).toMatch(
+      /not present in the Skill configuration/,
+    );
+  });
+
+  it("rejects a retry that changes the client_request_id", () => {
+    const violation = validateFixture(
+      "submit-retry",
+      mutate("submit-retry.json", (fixture) => {
+        argumentsOf(fixture.turns[1].steps[0]).client_request_id =
+          "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      }),
+      { repositoryIds: ["novelty-web", "novelty-api"] },
+    );
+    expect(violation.join("\n")).toMatch(
+      /retry payload changed|client_request_id/,
+    );
+  });
+
+  it("keeps the offline queue on one UUID and does not retry", () => {
+    const suite = runContractSuite(fixturesDirectory);
+    expect(suite.retriesByFixture["submit-offline"]).toBe(0);
+    const fixture = fixtureJson("submit-offline.json");
+    const submit = fixture.turns[0].steps.find(
+      (step) => step.kind === "mcp_call" && step.tool === "submit_task",
+    );
+    expect(argumentsOf(submit ?? {}).client_request_id).toBe(
+      fixture.turns[0].request_id,
+    );
   });
 
   it("keeps ambiguous repository and path-like turns mutation-free", () => {

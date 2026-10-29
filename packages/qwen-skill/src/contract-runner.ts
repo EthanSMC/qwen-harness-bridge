@@ -146,7 +146,11 @@ const parseFixtureValue = (
   return { fixture: parsed.data, violations: [] };
 };
 
-export const validateFixture = (name: string, input: unknown): string[] => {
+export const validateFixture = (
+  name: string,
+  input: unknown,
+  { repositoryIds }: { repositoryIds?: readonly string[] } = {},
+): string[] => {
   let value = input;
   if (typeof value === "string") {
     try {
@@ -185,12 +189,33 @@ export const validateFixture = (name: string, input: unknown): string[] => {
         expectedResults.set(key, (expectedResults.get(key) ?? 0) + 1);
         if (!MUTATION_TOOL_NAMES.has(step.tool)) continue;
         const clientRequestId = step.arguments.client_request_id;
-        if (
-          typeof clientRequestId === "string" &&
-          clientRequestId !== step.request_id
-        ) {
+        if (typeof clientRequestId !== "string") {
+          violations.push(
+            `${where}: submit_task must carry the client_request_id UUID`,
+          );
+        } else if (clientRequestId !== step.request_id) {
           violations.push(
             `${where}: client_request_id must match the turn request_id`,
+          );
+        }
+        const repositoryId = step.arguments.repository_id;
+        if (typeof repositoryId !== "string" || repositoryId.trim() === "") {
+          violations.push(
+            `${where}: submit_task must carry a configured repository_id`,
+          );
+        } else if (
+          !REPOSITORY_ID.test(repositoryId) ||
+          PATH_LIKE.test(repositoryId)
+        ) {
+          violations.push(
+            `${where}: repository_id must be a repository id, never a path-like string`,
+          );
+        } else if (
+          repositoryIds !== undefined &&
+          !repositoryIds.includes(repositoryId)
+        ) {
+          violations.push(
+            `${where}: repository_id ${repositoryId} is not present in the Skill configuration`,
           );
         }
         const payload = submissionPayload(step);
@@ -255,6 +280,10 @@ export const validateFixture = (name: string, input: unknown): string[] => {
     }
   }
 
+  // Every fixture models one user task per conversation. A follow-up task in the
+  // same conversation belongs to a separate fixture with its own turn, so more
+  // than one distinct submission in one fixture is a contract violation rather
+  // than a legitimate multi-task dialogue.
   if (submissions > 1) {
     violations.push(
       `${name}: expected zero or one submitted task, found ${submissions}`,
@@ -289,6 +318,14 @@ export const runContractSuite = (directory: string): ContractSuiteResult => {
     ),
   );
   violations.push(...validateRepositoryConfiguration(configuration));
+  const configurationRepositories = (
+    configuration as { repositories?: { id?: unknown }[] }
+  ).repositories;
+  const repositoryIds = Array.isArray(configurationRepositories)
+    ? configurationRepositories
+        .map((entry) => entry.id)
+        .filter((id): id is string => typeof id === "string")
+    : [];
 
   const entries = readdirSync(directory)
     .filter((entry) => entry.endsWith(".json"))
@@ -296,7 +333,7 @@ export const runContractSuite = (directory: string): ContractSuiteResult => {
   for (const entry of entries) {
     const name = basename(entry, ".json");
     const value = JSON.parse(readFileSync(join(directory, entry), "utf8"));
-    const fixtureViolations = validateFixture(name, value);
+    const fixtureViolations = validateFixture(name, value, { repositoryIds });
     violations.push(...fixtureViolations);
     const { fixture } = parseFixtureValue(name, value);
     if (!fixture) continue;
