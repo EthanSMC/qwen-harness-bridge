@@ -233,11 +233,11 @@ export type RtcLifecycleObserver = Readonly<{
   ) => void;
   rejectionReason?: () => "concurrency_limit" | "circuit_open" | undefined;
   firstAudio?: (sessionId: string) => void;
-  firstOutput?: (sessionId: string) => void;
   /** Composition hook: construct provider adapters for the admitted session. */
   sessionCreated?: (
     sessionId: string,
     writer: import("../session/rtc-session.js").RtcSseWriter,
+    start: NormalizedRtcStart,
   ) => void;
 }>;
 
@@ -326,9 +326,6 @@ export const createRtcRouteSet = (
     ...(options.lifecycle?.firstAudio === undefined
       ? {}
       : { onFirstAudio: options.lifecycle.firstAudio }),
-    ...(options.lifecycle?.firstOutput === undefined
-      ? {}
-      : { onFirstOutput: options.lifecycle.firstOutput }),
   });
 
   const register = (app: FastifyInstance): void => {
@@ -425,6 +422,7 @@ export const createRtcRouteSet = (
             options.lifecycle?.sessionCreated?.(
               outcome.session.id,
               sessionWriter,
+              verified.start,
             );
           }
           reply.raw.once("close", () => {

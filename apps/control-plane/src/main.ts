@@ -21,6 +21,7 @@ import {
   createPostgresMetricsAdapter,
 } from "./http/metrics.js";
 import { closeRuntimeResources } from "./http/shutdown.js";
+import { createRtcProviderComposition } from "./rtc/composition.js";
 import { createRtcModule } from "./rtc/module.js";
 import { createRtcPlugin, type RtcPlugin } from "./rtc/plugin.js";
 import { createRtcRouteSet } from "./rtc/wire/routes.js";
@@ -83,15 +84,27 @@ export async function start() {
     now: () => new Date(),
   });
   let draining = false;
+  // Provider composition is resolved once from configuration. A missing
+  // credential set or an unbundled provider transport leaves the module
+  // disabled with a bounded reason instead of throwing at startup.
+  const rtcComposition = createRtcProviderComposition({ config: config.rtc });
+  const rtcEnabled = config.rtc.enabled && rtcComposition.available;
   const metrics = createMetricsRegistry({
     readSnapshot: createPostgresMetricsAdapter(db).readSnapshot,
-    rtcEnabled: config.rtc.enabled,
+    rtcEnabled,
   });
   let rtcPlugin: RtcPlugin;
   rtcPlugin = createRtcPlugin({
-    enabled: config.rtc.enabled,
+    enabled: rtcEnabled,
     metrics,
+    ...(rtcComposition.available
+      ? {
+          composition: rtcComposition.composition,
+          settings: rtcComposition.settings,
+        }
+      : {}),
     build: async () => {
+      if (!rtcComposition.available) return null;
       const rtcModule = createRtcModule(config.rtc);
       return rtcModule === null
         ? null
@@ -107,10 +120,8 @@ export async function start() {
                 rtcPlugin.observeSession(reason, sessionId),
               sessionRejected: (reason) => rtcPlugin.observeRejected(reason),
               firstAudio: (sessionId) => rtcPlugin.observeAudio(sessionId),
-              firstOutput: (sessionId) =>
-                rtcPlugin.observeOutput("speak", sessionId),
-              sessionCreated: (sessionId, writer) =>
-                rtcPlugin.composeSession(sessionId, writer),
+              sessionCreated: (sessionId, writer, start) =>
+                rtcPlugin.composeSession(sessionId, writer, start),
             },
           });
     },

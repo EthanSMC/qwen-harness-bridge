@@ -1,10 +1,12 @@
 import type { FastifyInstance } from "fastify";
+import type { RtcProviderSettings } from "./config.js";
 import type {
   RTC_TELEMETRY_COMMAND_TYPES,
   RtcTelemetrySnapshot,
 } from "./observability.js";
 import { RtcTelemetry } from "./observability.js";
-import type { RtcCloseReason } from "./session/rtc-session.js";
+import type { RtcCloseReason, RtcSseWriter } from "./session/rtc-session.js";
+import type { NormalizedRtcStart } from "./wire/qwen-rtc-schema.js";
 import type { RtcRouteSet } from "./wire/routes.js";
 
 export type RtcComponentStatus = "disabled" | "ok" | "degraded" | "closed";
@@ -38,6 +40,51 @@ export type RtcSessionDisconnectReason =
   | "inactive"
   | "server_shutdown";
 
+/** Output command kinds a real writer may occupy first-output with. */
+export type RtcOutputKind = (typeof RTC_TELEMETRY_COMMAND_TYPES)[number];
+
+/** Session-scoped input every provider factory receives. */
+export type RtcCompositionInput = Readonly<{
+  start: NormalizedRtcStart;
+  settings?: RtcProviderSettings;
+}>;
+
+/** Provider handle disposed exactly once when its session closes. */
+export type RtcCompositionHandle = Readonly<{
+  close: () => Promise<void>;
+}>;
+
+type MaybeHandle =
+  | RtcCompositionHandle
+  | Promise<RtcCompositionHandle | undefined>
+  | undefined;
+
+/**
+ * Real provider composition: per-session consumer, ASR and output factories
+ * built from server configuration. Factories may be asynchronous; every
+ * returned handle is closed exactly once on session close or force-close, and
+ * a handle that resolves only after the session is gone is closed immediately
+ * instead of leaking a provider stream.
+ */
+export type RtcProviderComposition = Readonly<{
+  consumer?: (
+    sessionId: string,
+    input: RtcCompositionInput,
+    callbacks: Readonly<{ onFirstAudio: () => void }>,
+  ) => MaybeHandle;
+  asr?: (
+    sessionId: string,
+    input: RtcCompositionInput,
+    callbacks: Readonly<{ onFinal: () => void; onFailure: () => void }>,
+  ) => MaybeHandle;
+  output?: (
+    sessionId: string,
+    writer: RtcSseWriter,
+    input: RtcCompositionInput,
+    callbacks: Readonly<{ onFirstOutput: (kind: RtcOutputKind) => void }>,
+  ) => MaybeHandle;
+}>;
+
 export type RtcPluginOptions = Readonly<{
   enabled: boolean;
   build: () => Promise<RtcRouteSet | null>;
@@ -46,23 +93,9 @@ export type RtcPluginOptions = Readonly<{
     recordRtcDisconnect?: (reason: string) => void;
   }>;
   telemetry?: RtcTelemetry;
-  /** Injectable composition entry points (fake providers in tests; real
-   * Task 3/5 adapters are constructed here when configured). */
-  composition?: Readonly<{
-    consumer?: (
-      sessionId: string,
-      callbacks: { onFirstAudio: () => void; close: () => Promise<void> },
-    ) => { close: () => Promise<void> };
-    asr?: (
-      sessionId: string,
-      callbacks: { onFinal: () => void; onFailure: () => void },
-    ) => { close?: () => Promise<void> };
-    output?: (
-      sessionId: string,
-      writer: import("./session/rtc-session.js").RtcSseWriter,
-      callbacks: { onFirstOutput: (kind: string) => void },
-    ) => { close?: () => Promise<void> };
-  }>;
+  composition?: RtcProviderComposition;
+  /** Provider credentials/model settings handed to the composition factories. */
+  settings?: RtcProviderSettings;
   now?: () => number;
   drainMs?: number;
   maxConcurrentSessions?: number;
@@ -94,7 +127,8 @@ export type RtcPlugin = Readonly<{
   observeAsr: (outcome: "failure" | "final", sessionId?: string) => void;
   composeSession: (
     sessionId: string,
-    writer: import("./session/rtc-session.js").RtcSseWriter,
+    writer: RtcSseWriter,
+    start: NormalizedRtcStart,
   ) => void;
   forceClose: (reason?: RtcCloseReason) => Promise<void>;
   drainAndClose: () => Promise<void>;
@@ -160,6 +194,57 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
   let routeSet: RtcRouteSet | undefined;
   let anonymous = 0;
   const sessions = new Map<string, SessionRecord>();
+  const handles = new Map<string, RtcCompositionHandle[]>();
+
+  /** Dispose a handle once; provider close failures never escape the boundary. */
+  const closeHandle = (handle: RtcCompositionHandle): void => {
+    try {
+      void Promise.resolve(handle.close()).catch(() => undefined);
+    } catch {
+      // A provider close failure must not affect the session close path.
+    }
+  };
+
+  /** Dispose every composed provider handle for one tracked session. */
+  const closeSessionHandles = (sessionId: string): void => {
+    const owned = handles.get(sessionId);
+    if (owned === undefined) return;
+    handles.delete(sessionId);
+    for (const handle of owned) closeHandle(handle);
+  };
+
+  /** A composed handle whose session already closed must not leak. */
+  const trackHandle = (
+    sessionId: string,
+    candidate: RtcCompositionHandle | undefined,
+  ): void => {
+    if (candidate === undefined) return;
+    if (aborted || !sessions.has(sessionId)) {
+      closeHandle(candidate);
+      return;
+    }
+    const owned = handles.get(sessionId);
+    if (owned === undefined) handles.set(sessionId, [candidate]);
+    else owned.push(candidate);
+  };
+
+  const runFactory = (
+    sessionId: string,
+    factory: (() => MaybeHandle) | undefined,
+  ): void => {
+    if (factory === undefined) return;
+    let result: MaybeHandle;
+    try {
+      result = factory();
+    } catch {
+      degrade("module_exception");
+      return;
+    }
+    if (result === undefined) return;
+    Promise.resolve(result)
+      .then((handle) => trackHandle(sessionId, handle))
+      .catch(() => degrade("module_exception"));
+  };
 
   const component = (): RtcComponentHealth => ({
     status,
@@ -262,7 +347,10 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
       if (record === undefined) return;
       const [id] =
         [...sessions.entries()].find(([, value]) => value === record) ?? [];
-      if (id !== undefined) sessions.delete(id);
+      if (id !== undefined) {
+        sessions.delete(id);
+        closeSessionHandles(id);
+      }
       telemetry.endSession();
     },
     observeSession(disconnectReason, sessionId) {
@@ -315,31 +403,50 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
       }
       this.observeAsrFinal(sessionId);
     },
-    composeSession(sessionId, writer) {
+    composeSession(sessionId, writer, start) {
       const record = sessions.get(sessionId);
-      if (record === undefined) return;
-      try {
-        options.composition?.consumer?.(sessionId, {
-          onFirstAudio: () => this.observeAudio(sessionId),
-          close: async () => undefined,
-        });
-        options.composition?.asr?.(sessionId, {
-          onFinal: () => this.observeAsrFinal(sessionId),
-          onFailure: () => this.observeAsr("failure", sessionId),
-        });
-        options.composition?.output?.(sessionId, writer, {
-          onFirstOutput: (kind) =>
-            this.observeOutput(
-              kind as (typeof RTC_TELEMETRY_COMMAND_TYPES)[number],
-              sessionId,
-            ),
-        });
-      } catch {
-        degrade("module_exception");
-      }
+      const composition = options.composition;
+      if (record === undefined || composition === undefined) return;
+      const input: RtcCompositionInput = {
+        start,
+        ...(options.settings === undefined
+          ? {}
+          : { settings: options.settings }),
+      };
+      runFactory(
+        sessionId,
+        composition.consumer === undefined
+          ? undefined
+          : () =>
+              composition.consumer?.(sessionId, input, {
+                onFirstAudio: () => this.observeAudio(sessionId),
+              }),
+      );
+      runFactory(
+        sessionId,
+        composition.asr === undefined
+          ? undefined
+          : () =>
+              composition.asr?.(sessionId, input, {
+                onFinal: () => this.observeAsrFinal(sessionId),
+                onFailure: () => this.observeAsr("failure", sessionId),
+              }),
+      );
+      runFactory(
+        sessionId,
+        composition.output === undefined
+          ? undefined
+          : () =>
+              composition.output?.(sessionId, writer, input, {
+                onFirstOutput: (kind) => this.observeOutput(kind, sessionId),
+              }),
+      );
     },
     async forceClose(closeReason = "server_shutdown") {
       aborted = true;
+      for (const sessionId of [...handles.keys()]) {
+        closeSessionHandles(sessionId);
+      }
       sessions.clear();
       telemetry.resetActive();
       const current = routeSet;

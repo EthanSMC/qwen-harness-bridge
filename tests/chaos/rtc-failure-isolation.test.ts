@@ -424,7 +424,7 @@ describe("real rtc lifecycle telemetry", () => {
         firstOutput: () =>
           plugin.observeOutput("speak", "session-lifecycle", 400),
       },
-      onClose: (reason) => plugin.observeSession(reason),
+      onClose: (reason) => plugin.observeSession(reason, "session-lifecycle"),
     });
 
     session.touch("audio");
@@ -432,8 +432,7 @@ describe("real rtc lifecycle telemetry", () => {
     await session.close("user_exit");
 
     const snapshot = plugin.component().telemetry;
-    onClose: (reason) => plugin.observeSession(reason, "session-lifecycle"),
-      expect(snapshot.first_output_bucket_ms["500"]).toBe(1);
+    expect(snapshot.first_output_bucket_ms["500"]).toBe(1);
     expect(snapshot.output_commands.speak).toBe(1);
     expect(snapshot.active_sessions).toBe(0);
     expect(snapshot.disconnects.user_exit).toBe(1);
@@ -592,18 +591,27 @@ describe("real rtc lifecycle telemetry", () => {
       drainMs: 5,
       maxConcurrentSessions: 1,
       composition: {
-        consumer: (_sessionId, callbacks) => {
+        consumer: (_sessionId, input, callbacks) => {
+          expect(input.start.rtcUserId).toBe(sessionStart.rtcUserId);
+          expect(input.settings?.dashscopeApiKey).toBe("fake-api-key");
           callbacks.onFirstAudio();
           return { close: async () => undefined };
         },
-        asr: (_sessionId, callbacks) => {
+        asr: (_sessionId, input, callbacks) => {
+          expect(input.start.rtcToken).toBe(sessionStart.rtcToken);
           callbacks.onFinal();
           return { close: async () => undefined };
         },
-        output: (_sessionId, _writer, callbacks) => {
+        output: (_sessionId, _writer, _input, callbacks) => {
           callbacks.onFirstOutput("progress");
           return { close: async () => undefined };
         },
+      },
+      settings: {
+        aliyunAppId: "fake-app",
+        aliyunAccessKeyId: "fake-key-id",
+        aliyunAccessKeySecret: "fake-key-secret",
+        dashscopeApiKey: "fake-api-key",
       },
       build: async () => null,
     });
@@ -625,9 +633,8 @@ describe("real rtc lifecycle telemetry", () => {
           plugin.observeSession(reason, sessionId),
         sessionRejected: (reason) => plugin.observeRejected(reason),
         firstAudio: (sessionId) => plugin.observeAudio(sessionId),
-        firstOutput: (sessionId) => plugin.observeOutput("speak", sessionId),
-        sessionCreated: (sessionId, writer) =>
-          plugin.composeSession(sessionId, writer),
+        sessionCreated: (sessionId, writer, start) =>
+          plugin.composeSession(sessionId, writer, start),
       },
     });
     if (routeSet === null) throw new Error("route set is disabled");
@@ -648,11 +655,15 @@ describe("real rtc lifecycle telemetry", () => {
     });
     expect(outcome.created).toBe(true);
     expect(routeSet.lifecycle?.sessionStart?.(outcome.session.id)).toBe(true);
-    routeSet.lifecycle?.sessionCreated?.(outcome.session.id, {
-      closed: false,
-      write: () => undefined,
-      end: () => undefined,
-    });
+    routeSet.lifecycle?.sessionCreated?.(
+      outcome.session.id,
+      {
+        closed: false,
+        write: () => undefined,
+        end: () => undefined,
+      },
+      sessionStart,
+    );
     expect(plugin.component().telemetry.active_sessions).toBe(1);
 
     outcome.session.touch("audio");

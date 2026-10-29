@@ -19,6 +19,7 @@ export default defineWorkspace([
         "tests/integration/harness-connector-e2e.test.ts",
         "tests/integration/loopback-control-plane.test.ts",
         "tests/integration/rtc-conversation.test.ts",
+        "tests/integration/rtc-session-composition.test.ts",
       ],
     },
   },
