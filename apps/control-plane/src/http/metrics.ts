@@ -46,6 +46,15 @@ const ERROR_CODES = [
   "HELLO_ALREADY_INITIALIZED",
 ] as const;
 
+const RTC_DISCONNECT_REASONS = [
+  "platform_close",
+  "user_exit",
+  "inactive",
+  "token_expired",
+  "provider_error",
+  "server_shutdown",
+] as const;
+
 const HISTOGRAM_BUCKETS = [
   0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
 ] as const;
@@ -78,6 +87,11 @@ const METRIC_HELP = [
     "Whether the experimental RTC module is enabled.",
     "gauge",
   ],
+  [
+    "qhb_rtc_disconnects_total",
+    "RTC session disconnects grouped by bounded close reason.",
+    "counter",
+  ],
 ] as const;
 
 export type MetricsSnapshot = Readonly<{
@@ -91,6 +105,7 @@ export type MetricsRegistry = Readonly<{
   observeMcpSubmit(durationSeconds: number): void;
   recordConnectorMessage(messageType: string): void;
   recordError(errorCode: string): void;
+  recordRtcDisconnect?(reason: string): void;
   render(): Promise<string>;
 }>;
 
@@ -137,6 +152,9 @@ export function createMetricsRegistry(
   const errorCounts = new Map<string, number>(
     ERROR_CODES.map((errorCode) => [errorCode, 0]),
   );
+  const disconnectCounts = new Map<string, number>(
+    RTC_DISCONNECT_REASONS.map((reason) => [reason, 0]),
+  );
   const histogramCounts = HISTOGRAM_BUCKETS.map(() => 0);
   let histogramCount = 0;
   let histogramSum = 0;
@@ -171,6 +189,10 @@ export function createMetricsRegistry(
     recordError(errorCode) {
       requireAllowed(errorCode, ERROR_CODES, "Metric error code");
       errorCounts.set(errorCode, (errorCounts.get(errorCode) ?? 0) + 1);
+    },
+    recordRtcDisconnect(reason) {
+      requireAllowed(reason, RTC_DISCONNECT_REASONS, "RTC disconnect reason");
+      disconnectCounts.set(reason, (disconnectCounts.get(reason) ?? 0) + 1);
     },
     async render() {
       const snapshot = await options.readSnapshot();
@@ -218,6 +240,12 @@ export function createMetricsRegistry(
           }
         } else if (name === "qhb_rtc_enabled") {
           lines.push(`${name} ${options.rtcEnabled === true ? 1 : 0}`);
+        } else if (name === "qhb_rtc_disconnects_total") {
+          for (const reason of RTC_DISCONNECT_REASONS) {
+            lines.push(
+              `${name}{reason="${escapeLabelValue(reason)}"} ${disconnectCounts.get(reason) ?? 0}`,
+            );
+          }
         } else if (name === "qhb_errors_total") {
           for (const errorCode of ERROR_CODES) {
             lines.push(

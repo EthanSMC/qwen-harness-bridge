@@ -42,6 +42,7 @@ export default defineWorkspace([
       include: [
         "tests/security/local-policy.test.ts",
         "tests/security/connector-redaction.test.ts",
+        "tests/security/rtc-authentication.test.ts",
       ],
     },
   },

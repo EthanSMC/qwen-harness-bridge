@@ -21,6 +21,8 @@ import {
   createPostgresMetricsAdapter,
 } from "./http/metrics.js";
 import { closeRuntimeResources } from "./http/shutdown.js";
+import { createRtcModule } from "./rtc/module.js";
+import { createRtcRouteSet } from "./rtc/wire/routes.js";
 
 export type RuntimeConfiguration = Readonly<{
   ownerId: string;
@@ -84,6 +86,11 @@ export async function start() {
     readSnapshot: createPostgresMetricsAdapter(db).readSnapshot,
     rtcEnabled: config.rtc.enabled,
   });
+  const rtcModule = createRtcModule(config.rtc);
+  const rtc =
+    rtcModule === null
+      ? undefined
+      : createRtcRouteSet({ module: rtcModule, metrics });
   const readinessProbe = createCancellablePostgresReadinessProbe(
     createReadinessSqlClientFactory(config.databaseUrl, {
       connectTimeoutSeconds: 1,
@@ -98,6 +105,7 @@ export async function start() {
     readinessProbe,
     isDraining: () => draining,
     metrics,
+    ...(rtc === null || rtc === undefined ? {} : { rtc }),
     connectorGateway: {
       database: db,
       sessionSigningKey: runtime.connectorSessionSigningKey,
