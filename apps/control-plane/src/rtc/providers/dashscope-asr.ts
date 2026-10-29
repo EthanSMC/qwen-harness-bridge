@@ -33,6 +33,9 @@ export type DashScopeAsrOptions = Readonly<{
   apiKey: string;
   model?: string;
   maxOpenAttempts?: number;
+  /** Real call sites for Task 6 bounded telemetry. */
+  onFinal?: () => void;
+  onFailure?: () => void;
 }>;
 
 const DEFAULT_MODEL = "paraformer-realtime-v2";
@@ -113,7 +116,13 @@ export const createDashScopeAsr = (
       signal: AbortSignal,
     ): AsyncGenerator<AsrHypothesis> {
       if (signal.aborted) return;
-      const stream = await openStream(signal);
+      let stream: DashScopeAsrStream;
+      try {
+        stream = await openStream(signal);
+      } catch (error) {
+        options.onFailure?.();
+        throw error;
+      }
       const failure = new AbortController();
       let pumpFailure: unknown;
       const pump = (async () => {
@@ -156,6 +165,7 @@ export const createDashScopeAsr = (
               continue;
             }
             lastFinalText = text;
+            options.onFinal?.();
             yield { ...event, text };
           } else {
             yield { ...event };
@@ -168,7 +178,11 @@ export const createDashScopeAsr = (
           throw new RtcProviderError("RTC_ASR_FAILED");
         }
       } catch (error) {
-        if (error instanceof RtcProviderError) throw error;
+        if (error instanceof RtcProviderError) {
+          options.onFailure?.();
+          throw error;
+        }
+        options.onFailure?.();
         throw new RtcProviderError("RTC_ASR_FAILED");
       } finally {
         try {

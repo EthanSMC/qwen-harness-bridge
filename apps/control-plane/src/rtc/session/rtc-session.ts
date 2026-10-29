@@ -67,6 +67,11 @@ export type CreateLiveRtcSessionOptions = Readonly<{
   writer: RtcSseWriter;
   resources: RtcProviderResources;
   onClose?: (reason: RtcCloseReason) => void;
+  /** First real audio/output activity from the provider composition. */
+  lifecycle?: Readonly<{
+    firstAudio?: () => void;
+    firstOutput?: () => void;
+  }>;
   keepaliveMs?: number;
   inactivityMs?: number;
 }>;
@@ -108,6 +113,8 @@ export const createLiveRtcSession = (
   let closed = false;
   let closePromise: Promise<void> | undefined;
   const attached = new Set<RtcSseWriter>();
+  let firstAudioNotified = false;
+  let firstOutputNotified = false;
   let expiryHandle: unknown;
 
   const writers = (): RtcSseWriter[] => [writer, ...attached];
@@ -154,6 +161,14 @@ export const createLiveRtcSession = (
     touch(kind, detail) {
       if (closed) return;
       if (kind === "output" && detail?.succeeded !== true) return;
+      if (kind === "audio" && !firstAudioNotified) {
+        firstAudioNotified = true;
+        options.lifecycle?.firstAudio?.();
+      }
+      if (kind === "output" && !firstOutputNotified) {
+        firstOutputNotified = true;
+        options.lifecycle?.firstOutput?.();
+      }
       watchdog.touch(kind);
     },
     attach(target) {

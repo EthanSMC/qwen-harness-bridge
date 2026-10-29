@@ -7,11 +7,20 @@ import {
 } from "../../apps/control-plane/src/http/app.js";
 import { createMcpServer } from "../../apps/control-plane/src/mcp/server.js";
 import type { McpCoordinator } from "../../apps/control-plane/src/mcp/tools.js";
+import { createSerializedSseOutput } from "../../apps/control-plane/src/rtc/output/serialized-sse-writer.js";
 import {
   createRtcPlugin,
   type RtcPlugin,
 } from "../../apps/control-plane/src/rtc/plugin.js";
-import type { RtcRouteSet } from "../../apps/control-plane/src/rtc/wire/routes.js";
+import { createDashScopeAsr } from "../../apps/control-plane/src/rtc/providers/dashscope-asr.js";
+import {
+  createLiveRtcSession,
+  createSystemClock,
+} from "../../apps/control-plane/src/rtc/session/rtc-session.js";
+import {
+  createRtcRouteSet,
+  type RtcRouteSet,
+} from "../../apps/control-plane/src/rtc/wire/routes.js";
 import { LOCALHOST_TLS } from "../integration/support/tls.js";
 
 const OWNER = "chaos-owner";
@@ -357,5 +366,259 @@ describe("rtc failure isolation", () => {
     expect(rtcRoute.statusCode).toBe(404);
     await expectStableAppHealthy(app);
     await assertStableMcpHealthy();
+  });
+});
+
+const SIGNING_SECRET = "rtc-adapter-signing-secret-value-0123456789";
+const OWNER_SUBJECT = "owner-subject-1";
+const CALLBACK_URL = "https://control-plane.example.com/rtc/session";
+
+const rtcModule = {
+  ownerSubject: OWNER_SUBJECT,
+  signingSecret: SIGNING_SECRET,
+  callbackUrl: CALLBACK_URL,
+  allowedMedia: ["audio"] as const,
+  provider: "ALIYUN_RTC" as const,
+};
+
+const FIXED_NOW = Date.parse("2026-08-06T10:00:00+08:00");
+const sessionStart = {
+  platformSessionId: "ses_rtc_lifecycle",
+  ownerSubject: OWNER_SUBJECT,
+  media: "audio" as const,
+  roomId: "channel_lifecycle",
+  rtcUserId: "consumer_lifecycle",
+  rtcToken: "short-lived-token-value",
+  rtcTokenExpiresAt: "2099-01-01T00:00:00.000Z",
+  callbackIssuedAt: "2026-08-06T10:00:00.000Z",
+};
+
+describe("real rtc lifecycle telemetry", () => {
+  afterEach(async () => {
+    await Promise.allSettled(activeApps.splice(0).map((app) => app.close()));
+  });
+
+  it("drives start, close and latency telemetry from real session call sites", async () => {
+    const plugin = createRtcPlugin({
+      enabled: true,
+      build: async () => fakeRouteSet(),
+      now: () => 1_000,
+      drainMs: 5,
+    });
+    expect(plugin.startSession()).toBe(true);
+    const writer = {
+      closed: false,
+      write: () => undefined,
+      end: () => undefined,
+    };
+    const session = createLiveRtcSession({
+      start: sessionStart,
+      clock: createSystemClock(),
+      writer,
+      resources: {
+        stopOutput: async () => undefined,
+        closeProviderStreams: async () => undefined,
+      },
+      lifecycle: {
+        firstAudio: () => plugin.observeAudio(250),
+        firstOutput: () => plugin.observeOutput("speak", 400),
+      },
+      onClose: (reason) => plugin.observeSession(reason),
+    });
+
+    session.touch("audio");
+    session.touch("output", { succeeded: true });
+    await session.close("user_exit");
+
+    const snapshot = plugin.component().telemetry;
+    expect(snapshot.first_audio_bucket_ms["250"]).toBe(1);
+    expect(snapshot.first_output_bucket_ms["500"]).toBe(1);
+    expect(snapshot.output_commands.speak).toBe(1);
+    expect(snapshot.active_sessions).toBe(0);
+    expect(snapshot.disconnects.user_exit).toBe(1);
+  });
+
+  it("records ASR first-final latency and failure from the real adapter", async () => {
+    const plugin = createRtcPlugin({
+      enabled: true,
+      build: async () => fakeRouteSet(),
+      drainMs: 5,
+    });
+    expect(plugin.startSession()).toBe(true);
+    const asr = createDashScopeAsr({
+      apiKey: "server-secret-api-key",
+      onFinal: () => plugin.observeAsrFinal(1_500),
+      onFailure: () => plugin.observeAsr("failure"),
+      client: {
+        async open() {
+          return {
+            async send() {},
+            async finish() {},
+            async abort() {},
+            events: {
+              async *[Symbol.asyncIterator]() {
+                yield {
+                  kind: "final" as const,
+                  text: "已完成",
+                  startedAtMs: 0,
+                  endedAtMs: 1_500,
+                  id: "final-1",
+                };
+              },
+            },
+          };
+        },
+      },
+    });
+    const frames = {
+      async *[Symbol.asyncIterator]() {
+        yield {
+          pcm16le: new Uint8Array(6_400),
+          sampleRateHz: 16_000 as const,
+          channels: 1 as const,
+          sequence: 0,
+        };
+      },
+    };
+    for await (const _event of asr.recognize(
+      frames,
+      new AbortController().signal,
+    )) {
+      // drain the final
+    }
+    expect(plugin.component().telemetry.first_asr_final_bucket_ms["2000"]).toBe(
+      1,
+    );
+
+    const failingAsr = createDashScopeAsr({
+      apiKey: "server-secret-api-key",
+      onFailure: () => plugin.observeAsr("failure"),
+      client: {
+        async open() {
+          throw new Error("provider unavailable");
+        },
+      },
+    });
+    try {
+      for await (const _event of failingAsr.recognize(
+        frames,
+        new AbortController().signal,
+      )) {
+        // unreachable
+      }
+    } catch {
+      // expected RTC_ASR_FAILED
+    }
+    expect(plugin.component().telemetry.asr_failures).toBe(1);
+  });
+
+  it("records output first-frame telemetry from the real serialized writer", async () => {
+    const plugin = createRtcPlugin({
+      enabled: true,
+      build: async () => fakeRouteSet(),
+      drainMs: 5,
+    });
+    expect(plugin.startSession()).toBe(true);
+    const frames: string[] = [];
+    const output = createSerializedSseOutput({
+      writer: {
+        closed: false,
+        write: (frame: string) => frames.push(frame),
+        end: () => undefined,
+      },
+      onFirstOutput: (kind) => plugin.observeOutput(kind as "speak", 1_200),
+    });
+    await output.speak("你好。");
+    expect(frames.length).toBeGreaterThan(0);
+    expect(plugin.component().telemetry.output_commands.speak).toBe(1);
+    expect(plugin.component().telemetry.first_output_bucket_ms["2000"]).toBe(1);
+  });
+
+  it("keeps active sessions consistent across start, close and force-close", async () => {
+    const closeAll = vi.fn(async () => undefined);
+    const plugin = createRtcPlugin({
+      enabled: true,
+      build: async () => fakeRouteSet({ closeAll }),
+      drainMs: 5,
+      maxConcurrentSessions: 1,
+    });
+    expect(plugin.startSession()).toBe(true);
+    expect(plugin.startSession()).toBe(false);
+    expect(plugin.component().telemetry.rejects.concurrency_limit).toBe(1);
+    plugin.observeSession("user_exit");
+    expect(plugin.component().telemetry.active_sessions).toBe(0);
+    plugin.observeSession("user_exit");
+    expect(plugin.component().telemetry.active_sessions).toBe(0);
+    expect(plugin.component().telemetry.disconnects.user_exit).toBe(2);
+
+    expect(plugin.startSession()).toBe(true);
+    await plugin.forceClose();
+    expect(plugin.component().telemetry.active_sessions).toBe(0);
+    expect(plugin.component().status).toBe("closed");
+  });
+
+  it("drives plugin counters from the real RTC route lifecycle wiring", async () => {
+    const plugin = createRtcPlugin({
+      enabled: true,
+      drainMs: 5,
+      maxConcurrentSessions: 1,
+      build: async () => null,
+    });
+    const routeSet = createRtcRouteSet({
+      module: rtcModule,
+      clock: {
+        now: () => FIXED_NOW,
+        setTimeout: (callback: () => void, ms: number) =>
+          setTimeout(callback, ms),
+        clearTimeout: (handle: unknown) =>
+          clearTimeout(handle as ReturnType<typeof setTimeout>),
+      },
+      lifecycle: {
+        canStart: () => plugin.canStart(),
+        sessionStart: () => plugin.startSession(),
+        sessionRelease: () => plugin.endSession(),
+        sessionClose: (reason) => plugin.observeSession(reason),
+      },
+    });
+    if (routeSet === null) throw new Error("route set is disabled");
+    expect(routeSet.lifecycle?.canStart?.()).toBe(true);
+    const outcome = await routeSet.registry.start({
+      start: sessionStart,
+      createTransport: () => ({
+        writer: {
+          closed: false,
+          write: () => undefined,
+          end: () => undefined,
+        },
+        resources: {
+          stopOutput: async () => undefined,
+          closeProviderStreams: async () => undefined,
+        },
+      }),
+    });
+    expect(outcome.created).toBe(true);
+    expect(routeSet.lifecycle?.sessionStart?.()).toBe(true);
+    expect(plugin.component().telemetry.active_sessions).toBe(1);
+
+    const duplicate = await routeSet.registry.start({
+      start: sessionStart,
+      createTransport: () => ({
+        writer: {
+          closed: false,
+          write: () => undefined,
+          end: () => undefined,
+        },
+        resources: {
+          stopOutput: async () => undefined,
+          closeProviderStreams: async () => undefined,
+        },
+      }),
+    });
+    expect(duplicate.created).toBe(false);
+    expect(plugin.component().telemetry.active_sessions).toBe(1);
+
+    await routeSet.registry.close(outcome.session.id, "user_exit");
+    expect(plugin.component().telemetry.active_sessions).toBe(0);
+    expect(plugin.component().telemetry.disconnects.user_exit).toBe(1);
   });
 });

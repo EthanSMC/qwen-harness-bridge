@@ -100,7 +100,10 @@ export class RtcTelemetry {
 
   disconnect(reason: (typeof RTC_TELEMETRY_CLOSE_REASONS)[number]): void {
     this.#disconnects[reason] += 1;
-    this.endSession();
+  }
+
+  resetActive(): void {
+    this.#active = 0;
   }
 
   firstAudio(ms: number): void {

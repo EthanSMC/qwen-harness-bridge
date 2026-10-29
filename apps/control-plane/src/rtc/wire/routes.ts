@@ -218,12 +218,24 @@ export const createRtcAuthenticator = (
   };
 };
 
+export type RtcLifecycleObserver = Readonly<{
+  /** Cheap capacity/breaker admission check before a start is attempted. */
+  canStart?: () => boolean;
+  /** Called before a new session is created; false rejects the start. */
+  sessionStart?: () => boolean;
+  /** Called when an admitted start turns out to be a duplicate or fails. */
+  sessionRelease?: () => void;
+  /** Called exactly once when a real session closes. */
+  sessionClose?: (reason: RtcCloseReason) => void;
+}>;
+
 export type RtcRouteOptions = Readonly<{
   module: RtcModule | null;
   clock?: RtcClock;
   metrics?: Pick<MetricsRegistry, "recordError"> & {
     recordRtcDisconnect?: (reason: string) => void;
   };
+  lifecycle?: RtcLifecycleObserver;
 }>;
 
 export type RtcRouteSet = Readonly<{
@@ -232,6 +244,8 @@ export type RtcRouteSet = Readonly<{
   registry: RtcSessionRegistry;
   register: (app: FastifyInstance) => void;
   closeAll: (reason?: RtcCloseReason) => Promise<void>;
+  /** Exposed for composition tests; the route adapter calls these. */
+  lifecycle?: RtcLifecycleObserver;
 }>;
 
 const sseHeaders = {
@@ -290,7 +304,10 @@ export const createRtcRouteSet = (
   });
   const registry = createRtcSessionRegistry({
     clock,
-    onDisconnect: (reason) => options.metrics?.recordRtcDisconnect?.(reason),
+    onDisconnect: (reason) => {
+      options.lifecycle?.sessionClose?.(reason);
+      options.metrics?.recordRtcDisconnect?.(reason);
+    },
   });
 
   const register = (app: FastifyInstance): void => {
@@ -344,6 +361,13 @@ export const createRtcRouteSet = (
           }
           return reply.code(204).send();
         }
+        const admitted = options.lifecycle?.canStart?.() ?? true;
+        if (!admitted) {
+          return reply
+            .code(429)
+            .type("application/json")
+            .send({ error: { code: "RTC_CAPACITY" } });
+        }
         try {
           const outcome = await registry.start({
             start: verified.start,
@@ -358,11 +382,16 @@ export const createRtcRouteSet = (
             reply.raw.once("close", detached);
             return reply;
           }
+          if (!(options.lifecycle?.sessionStart?.() ?? true)) {
+            await registry.close(outcome.session.id, "provider_error");
+            return reply;
+          }
           reply.raw.once("close", () => {
             void registry.close(outcome.session.id, "user_exit");
           });
           return reply;
         } catch (error) {
+          options.lifecycle?.sessionRelease?.();
           if (error instanceof RtcSessionConflictError) {
             return reply
               .code(409)
@@ -385,5 +414,8 @@ export const createRtcRouteSet = (
     registry,
     register,
     closeAll: (reason = "server_shutdown") => registry.closeAll(reason),
+    ...(options.lifecycle === undefined
+      ? {}
+      : { lifecycle: options.lifecycle }),
   };
 };
