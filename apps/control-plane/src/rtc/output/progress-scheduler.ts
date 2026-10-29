@@ -39,7 +39,10 @@ export type RtcJobEvent =
   | RtcTerminalEvent;
 
 export type ProgressSink = Readonly<
-  Pick<RtcOutput, "progress" | "approval" | "terminal">
+  Pick<RtcOutput, "progress" | "approval" | "terminal"> & {
+    /** Optional hook to drop progress still queued in the SSE writer. */
+    cancelPendingProgress?: () => void;
+  }
 >;
 
 export type ProgressSchedulerOptions = Readonly<{
@@ -68,8 +71,10 @@ const silence = (promise: Promise<unknown>): void => {
 export const createProgressScheduler = (
   options: ProgressSchedulerOptions,
 ): ProgressScheduler => {
+  const clock = options.now ?? (() => Date.now());
   const pending = new Map<string, RtcProgressPayload & { atMs: number }>();
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let windowStart: number | undefined;
   let closed = false;
 
   const subscription = new JobEventSubscription(options.source, (event) =>
@@ -84,6 +89,7 @@ export const createProgressScheduler = (
 
   const flushPending = async (): Promise<void> => {
     clearTimer();
+    windowStart = undefined;
     if (pending.size === 0) return;
     const batch = [...pending.values()];
     pending.clear();
@@ -103,10 +109,15 @@ export const createProgressScheduler = (
 
   const scheduleFlush = (): void => {
     if (timer !== undefined || closed) return;
+    windowStart ??= clock();
+    const remaining = Math.max(
+      0,
+      PROGRESS_COALESCE_MS - (clock() - windowStart),
+    );
     timer = setTimeout(() => {
       timer = undefined;
       void flushPending();
-    }, PROGRESS_COALESCE_MS);
+    }, remaining);
   };
 
   const handle = (event: RtcJobEvent): void => {
@@ -122,6 +133,7 @@ export const createProgressScheduler = (
       scheduleFlush();
       return;
     }
+    options.sink.cancelPendingProgress?.();
     const jobId = event.jobId;
     if (jobId !== undefined) {
       pending.delete(jobId);
@@ -129,6 +141,7 @@ export const createProgressScheduler = (
     } else {
       pending.clear();
       clearTimer();
+      windowStart = undefined;
     }
     if (event.kind === "approval") {
       silence(

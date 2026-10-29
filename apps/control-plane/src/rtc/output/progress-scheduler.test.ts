@@ -133,6 +133,43 @@ describe("progress scheduler", () => {
     expect(h.records).toHaveLength(1);
   });
 
+  it("asks the output to cancel queued progress before emitting approval", () => {
+    const h = createHarness();
+    const order: string[] = [];
+    const sink: ProgressSink = {
+      async progress() {
+        order.push("progress");
+      },
+      async approval() {
+        order.push("approval");
+      },
+      async terminal() {
+        order.push("terminal");
+      },
+      cancelPendingProgress() {
+        order.push("cancel");
+      },
+    };
+    const scheduler = createProgressScheduler({
+      sink,
+      source: h.source,
+      now: () => h.now(),
+    });
+    scheduler.touchJob("job-a");
+    scheduler.handle(progressEvent("job-a", "editing", 0));
+    scheduler.handle({
+      kind: "approval",
+      jobId: "job-a",
+      approvalId: "approval-1",
+      jobShortId: "QH-AAA1",
+      jobRevision: 2,
+      summary: "修改两个文件",
+      atMs: 0,
+    });
+
+    expect(order).toEqual(["cancel", "approval"]);
+  });
+
   it("emits terminal immediately and drops the queued progress", () => {
     const h = createHarness();
     h.scheduler.touchJob("job-a");

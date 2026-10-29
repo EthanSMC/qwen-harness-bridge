@@ -151,6 +151,61 @@ describe("serialized sse output", () => {
     expect(output.closed).toBe(false);
   });
 
+  it("preempts queued progress with urgent approval and terminal frames", async () => {
+    const { writer, frames } = createWriter();
+    const output = createSerializedSseOutput({ writer });
+
+    const progress = output.progress({ jobId: "job-1", stage: "editing" });
+    const approval = output.approval({
+      approvalId: "approval-1",
+      jobShortId: "QH-AAA1",
+      jobRevision: 2,
+      summary: "修改两个文件",
+    });
+    const terminal = output.terminal({
+      jobId: "job-1",
+      status: "succeeded",
+      summary: "测试已通过",
+    });
+    await Promise.all([progress, approval, terminal]);
+
+    const events = frames.map((frame) => parseFrame(frame.raw).event);
+    expect(events).toContain("progress");
+    expect(events.indexOf("approval")).toBeLessThan(events.indexOf("progress"));
+    expect(events.indexOf("terminal")).toBeLessThan(events.indexOf("progress"));
+  });
+
+  it("drops queued progress when the output cancels stale progress", async () => {
+    const { writer, frames } = createWriter();
+    const output = createSerializedSseOutput({ writer });
+    const progress = output.progress({ jobId: "job-1", stage: "editing" });
+    output.cancelPendingProgress();
+    await progress;
+
+    const events = frames.map((frame) => parseFrame(frame.raw).event);
+    expect(events).not.toContain("progress");
+  });
+
+  it("pairs the spoken highlight with the same bounded summary", async () => {
+    const { writer, frames } = createWriter();
+    const output = createSerializedSseOutput({ writer });
+    await output.speak("一句话。", { highlight: "同一摘要" });
+
+    const parsed = frames.map((frame) => parseFrame(frame.raw));
+    const speaks = parsed.filter((frame) => frame.event === "speak");
+    const highlight = parsed.find(
+      (frame) => frame.event === "append_highlight",
+    );
+    expect(speaks.length).toBeGreaterThan(0);
+    expect(speaks.every((frame) => frame.data?.highlight === "同一摘要")).toBe(
+      true,
+    );
+    expect(highlight?.data?.summary).toBe("同一摘要");
+    expect(parsed.indexOf(highlight as never)).toBeGreaterThan(
+      parsed.lastIndexOf(speaks.at(-1) as never),
+    );
+  });
+
   it("bounds appended highlights to the same factual summary limit", async () => {
     const { writer, frames } = createWriter();
     const output = createSerializedSseOutput({ writer });
