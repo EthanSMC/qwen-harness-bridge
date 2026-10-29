@@ -15,11 +15,14 @@ All notable changes use synchronized Semantic Versioning and are recorded here. 
 - Five detailed test-driven implementation plans and master roadmap.
 - Public-repository governance, issue templates, planning validation, and GitHub synchronization tooling.
 
-## 0.2.0 — pending publication
+## 0.2.0 — release candidate
 
-This entry describes the prepared M1 connector-installation scope; it does not assert that a release tag, GitHub Release, or package publication exists. Package versions, the tag, and the GitHub Release remain release-process actions.
+This entry records the M1 stable asynchronous task-loop scope now that the package versions are synchronized to `0.2.0`. The `v0.2.0` annotated tag, the GitHub Release and the platform publication **do not exist yet**: they remain owner-authorized release actions and this entry does not claim that `v0.2.0` is published.
 
 ### Added
+
+- The M1 stable asynchronous task loop end to end: Qwen submits, lists, inspects, cancels, approves/rejects and reads results through the seven MCP tools; the Control Plane persists jobs, events, leases, approvals and terminal results; the Harness Connector journals commands durably, replays after reconnect and applies repository-scoped policy before dispatch.
+- Approval decisions resume work exactly once: when an `approval.decision` is delivered for an owned job waiting for approval, the recorded decision validates the expected job revision and returns the job to `running`; stale or duplicate decisions fail closed without changing job state.
 
 - Deterministic, self-contained packaged Harness Connector artifact built by `pnpm --filter @qhb/harness-plugin pack`: compiled code with self-contained source maps, the SQLite schema and its digest, the license when present, a credential-free sample Cordis wiring, and the vendored runtime closure (the private workspace package `@qhb/protocol`, `zod`, and `ws`). Host-provided `@deepseek-ai/*` peers stay external, and the artifact vendors no native module.
 - Packaged smoke test (`pnpm --filter @qhb/harness-plugin pack:test`) that installs the artifact into a clean temporary root outside the repository with no monorepo `node_modules` in its ancestry, links only the host peers, imports the packaged entry in a separate process, validates the sample wiring against the packaged config schema, opens the journal, fails packaging when a credential value or credential-looking assignment would be included, and asserts that removing the vendored protocol makes the same import fail closed.
@@ -37,6 +40,7 @@ This entry describes the prepared M1 connector-installation scope; it does not a
 
 ### Fixed
 
+- An approval decision delivered over the durable outbox no longer leaves the job in `waiting_approval`: the terminal decision is recorded once, the expected revision is revalidated, and the job returns to `running` or fails closed for an expired, stale or already-decided approval.
 - The receive pump no longer deadlocks when a command handler awaits a Coordination `job.state` response that only the pump can deliver: a response answering a request published by the command handler the pump is awaiting is recorded and delivered ahead of the pump, while replays, replacements, gaps and every other frame keep the strictly ordered validation path.
 
 ## 0.1.0 — pending publication

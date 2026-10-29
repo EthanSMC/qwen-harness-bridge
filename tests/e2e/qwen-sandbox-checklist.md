@@ -51,7 +51,7 @@ repository the Changesets-managed version source for the private package is
 `skill.json.version` with that value (never a hardcoded number and not only one
 side). The monorepo version from the root `package.json` is recorded separately
 as `monorepo_version` for traceability and legitimately differs today
-(`0.3.0` for the package, `0.1.0` for the monorepo), so it is not the equality
+(`0.3.0` for the package, `0.2.0` for the monorepo), so it is not the equality
 target. A build outside a git checkout takes the commit from `GITHUB_SHA`,
 `QHB_SOURCE_COMMIT` or `SOURCE_COMMIT`, and fails when none is available. The
 repository's recursive build excludes this private package, so the runtime image
