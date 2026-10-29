@@ -39,6 +39,13 @@ export default defineWorkspace([
   },
   {
     test: {
+      name: "chaos",
+      testTimeout: 15_000,
+      include: ["tests/chaos/rtc-failure-isolation.test.ts"],
+    },
+  },
+  {
+    test: {
       name: "security",
       include: [
         "tests/security/local-policy.test.ts",
