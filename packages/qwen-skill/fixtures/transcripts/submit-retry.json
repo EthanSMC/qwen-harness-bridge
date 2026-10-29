@@ -1,0 +1,63 @@
+{
+  "fixture_id": "submit-retry",
+  "turns": [
+    {
+      "request_id": "66666666-6666-4666-8666-666666666666",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "让 DeepSeek 在 Novelty Web 跑 lint"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "submit_task",
+          "request_id": "66666666-6666-4666-8666-666666666666",
+          "arguments": {
+            "client_request_id": "66666666-6666-4666-8666-666666666666",
+            "repository_id": "novelty-web",
+            "request": "运行 lint 并汇总问题",
+            "mode": "normal"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "submit_task",
+          "request_id": "66666666-6666-4666-8666-666666666666",
+          "ok": false,
+          "text": "TEMPORARY_UNAVAILABLE: transport timeout before acknowledgement"
+        }
+      ]
+    },
+    {
+      "request_id": "66666666-6666-4666-8666-666666666666",
+      "steps": [
+        {
+          "kind": "mcp_call",
+          "tool": "submit_task",
+          "request_id": "66666666-6666-4666-8666-666666666666",
+          "arguments": {
+            "client_request_id": "66666666-6666-4666-8666-666666666666",
+            "repository_id": "novelty-web",
+            "request": "运行 lint 并汇总问题",
+            "mode": "normal"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "submit_task",
+          "request_id": "66666666-6666-4666-8666-666666666666",
+          "ok": true,
+          "text": "已受理任务 QH-1A2B，状态 queued"
+        },
+        {
+          "kind": "assistant",
+          "text": "重试成功，短号 QH-1A2B。"
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-1A2B 已创建。"
+        }
+      ]
+    }
+  ]
+}

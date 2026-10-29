@@ -1,0 +1,40 @@
+{
+  "fixture_id": "submit-second-request",
+  "turns": [
+    {
+      "request_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "让 DeepSeek 在 Novelty Web 跑测试，再在 Novelty API 跑 lint"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "submit_task",
+          "request_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "arguments": {
+            "client_request_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "repository_id": "novelty-web",
+            "request": "运行完整测试套件并给出失败摘要",
+            "mode": "normal"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "submit_task",
+          "request_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          "ok": true,
+          "text": "已受理任务 QH-7C8D，状态 queued"
+        },
+        {
+          "kind": "assistant",
+          "text": "已创建任务 QH-7C8D（Novelty Web 测试）。第二个请求（Novelty API lint）要另起一个新回合再提交吗？"
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-7C8D 已创建。第二个任务要另起回合提交吗？"
+        }
+      ]
+    }
+  ]
+}
