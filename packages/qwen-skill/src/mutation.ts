@@ -98,16 +98,13 @@ const oneLine = (value: string, limit: number): string =>
   bounded(value.replace(/\s+/gu, " ").trim(), limit);
 
 const expiryText = (expiresAt: string, now: number): string => {
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/u.exec(expiresAt);
-  const label =
-    match === null
-      ? "有效期未知"
-      : `${match[2]}-${match[3]} ${match[4]}:${match[5]} UTC`;
   const expiresAtMs = Date.parse(expiresAt);
-  if (Number.isFinite(expiresAtMs) && expiresAtMs <= now) {
-    return `已过期（${label}）`;
-  }
-  return `有效期至 ${label}`;
+  if (!Number.isFinite(expiresAtMs)) return "有效期未知";
+  // Normalize every ISO offset to UTC so a +08:00 expiry is not shown as a
+  // different wall-clock time than the server recorded.
+  const iso = new Date(expiresAtMs).toISOString();
+  const label = `${iso.slice(5, 10)} ${iso.slice(11, 16)} UTC`;
+  return expiresAtMs <= now ? `已过期（${label}）` : `有效期至 ${label}`;
 };
 
 const rowOf = (
@@ -220,7 +217,11 @@ export const planOrdinalDecision = (
       rows: rendered.rows,
     };
   }
-  const item = snapshot.items[ordinal - 1];
+  // The ordinal must address a row the user can actually see: approvals beyond
+  // the five rendered rows are hidden, so deciding on them would target a row
+  // the user never confirmed.
+  const item =
+    ordinal <= rendered.rows.length ? snapshot.items[ordinal - 1] : undefined;
   if (item === undefined) {
     return {
       kind: "clarify",
@@ -228,7 +229,15 @@ export const planOrdinalDecision = (
       rows: rendered.rows,
     };
   }
-  if (Date.parse(item.expiresAt) <= now) {
+  const expiresAtMs = Date.parse(item.expiresAt);
+  if (!Number.isFinite(expiresAtMs)) {
+    return {
+      kind: "clarify",
+      reason: "该审批的有效期无法确认，正在刷新待审批列表。",
+      rows: rendered.rows,
+    };
+  }
+  if (expiresAtMs <= now) {
     return {
       kind: "clarify",
       reason: "该审批已过期，正在刷新待审批列表。",
@@ -257,8 +266,8 @@ export type ApprovalRefreshCode = (typeof APPROVAL_REFRESH_CODES)[number];
 
 export type DecisionObservation = Readonly<{
   shortId: string;
+  /** Current task status exactly as the MCP tool returned it. */
   status: string;
-  jobRevision: number;
 }>;
 
 export type DecisionRefresh = Readonly<{
@@ -275,9 +284,13 @@ const REFRESH_REASON: Record<ApprovalRefreshCode, string> = {
   APPROVAL_SUPERSEDED: "该审批已被新的操作取代",
 };
 
+const localizedStatus = (status: string): string =>
+  (STATUS_TEXT as Readonly<Record<string, string>>)[status] ?? "状态未知";
+
 /**
- * Turns a decision conflict into a refresh plus an explanation of the current
- * state. The result never carries tool arguments, so the mutation cannot be
+ * Turns a decision conflict into a refresh plus a Chinese explanation of the
+ * current state. The status is localized instead of leaking a raw domain value,
+ * and the result never carries tool arguments, so the mutation cannot be
  * replayed silently.
  */
 export const refreshAfterDecisionError = (
@@ -286,7 +299,7 @@ export const refreshAfterDecisionError = (
 ): DecisionRefresh => ({
   code,
   explanation: oneLine(
-    `${observed.shortId} ${REFRESH_REASON[code]}；当前状态 ${observed.status}，revision ${observed.jobRevision}。请刷新待审批列表后再决定。`,
+    `任务 ${observed.shortId} 当前状态：${localizedStatus(observed.status)}；${REFRESH_REASON[code]}。请刷新待审批列表后重新决定。`,
     160,
   ),
   refresh: "list_pending_approvals",

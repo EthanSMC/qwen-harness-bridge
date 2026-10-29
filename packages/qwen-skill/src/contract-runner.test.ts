@@ -45,7 +45,7 @@ describe("skill submission contract fixtures", () => {
 
     expect(suite.violations).toEqual([]);
     expect(suite.fixtureCount).toBe(19);
-    expect(suite.turnCount).toBeGreaterThanOrEqual(11);
+    expect(suite.turnCount).toBeGreaterThanOrEqual(19);
   });
 
   it("keeps every turn at zero or one mutation", () => {

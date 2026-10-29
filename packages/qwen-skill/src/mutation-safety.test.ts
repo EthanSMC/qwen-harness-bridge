@@ -146,6 +146,15 @@ describe("approval list rendering", () => {
       "QH-BBBB",
     ]);
   });
+
+  it("renders any ISO offset in UTC instead of trusting the raw wall clock", () => {
+    const rendered = renderApprovalList(
+      snapshot([approval({ expiresAt: "2026-10-30T18:30:00+08:00" })]),
+      NOW,
+    );
+
+    expect(rendered.rows[0].expiryText).toContain("10-30 10:30 UTC");
+  });
 });
 
 describe("ordinal approval decisions", () => {
@@ -244,6 +253,50 @@ describe("ordinal approval decisions", () => {
     expect(plan).not.toHaveProperty("arguments");
   });
 
+  it("refuses an ordinal that only addresses a hidden approval row", () => {
+    const items = Array.from({ length: MAX_APPROVAL_ROWS + 1 }, (_, index) =>
+      approval({
+        approvalId: `0000000${index}-0000-4000-8000-00000000000${index}`,
+        shortId: `QH-H1D${index}`,
+        jobRevision: index + 1,
+      }),
+    );
+    const hidden = planOrdinalDecision({
+      utterance: "批准第六个",
+      decision: "approve",
+      now: NOW,
+      snapshot: snapshot(items),
+    });
+    const visible = planOrdinalDecision({
+      utterance: "批准第五个",
+      decision: "approve",
+      now: NOW,
+      snapshot: snapshot(items),
+    });
+
+    expect(hidden.kind).toBe("clarify");
+    expect(hidden).not.toHaveProperty("arguments");
+    expect(visible.kind).toBe("decide");
+    if (visible.kind !== "decide") return;
+    expect(visible.arguments.approval_id).toBe(
+      items[MAX_APPROVAL_ROWS - 1].approvalId,
+    );
+    expect(visible.arguments.expected_job_revision).toBe(MAX_APPROVAL_ROWS);
+  });
+
+  it("refuses an approval whose expiry cannot be parsed", () => {
+    const plan = planOrdinalDecision({
+      utterance: "批准第一个",
+      decision: "approve",
+      now: NOW,
+      snapshot: snapshot([approval({ expiresAt: "not-a-timestamp" })]),
+    });
+
+    expect(plan.kind).toBe("clarify");
+    expect(plan).not.toHaveProperty("arguments");
+    if (plan.kind === "clarify") expect(plan.reason).toContain("有效期");
+  });
+
   it("refuses an expired approval and requires a fresh list", () => {
     const plan = planOrdinalDecision({
       utterance: "批准第一个",
@@ -289,15 +342,29 @@ describe("decision conflict recovery", () => {
       const refresh = refreshAfterDecisionError(code, {
         shortId: "QH-2K7M",
         status: "waiting_approval",
-        jobRevision: 9,
+      });
+      const runningRefresh = refreshAfterDecisionError(code, {
+        shortId: "QH-2K7M",
+        status: "running",
       });
 
       expect(refresh.retried).toBe(false);
       expect(refresh.refresh).toBe("list_pending_approvals");
       expect(refresh.explanation).toContain("QH-2K7M");
+      expect(refresh.explanation).toContain("等待你的批准");
+      expect(runningRefresh.explanation).toContain("正在执行");
       expect(refresh.explanation).not.toMatch(/重试/iu);
+      for (const explanation of [
+        refresh.explanation,
+        runningRefresh.explanation,
+      ]) {
+        expect(explanation).toContain("状态");
+        expect(explanation).not.toMatch(
+          /waiting_approval|running|succeeded|failed|cancelled|expired|revision/iu,
+        );
+        expect(UNREPRESENTABLE(explanation)).toBe(false);
+      }
       expect(refresh).not.toHaveProperty("arguments");
-      expect(UNREPRESENTABLE(refresh.explanation)).toBe(false);
     },
   );
 });
