@@ -575,9 +575,13 @@ describe("real rtc lifecycle telemetry", () => {
       },
       lifecycle: {
         canStart: () => plugin.canStart(),
+        rejectionReason: () => plugin.rejectionReason(),
         sessionStart: () => plugin.startSession(),
         sessionRelease: () => plugin.endSession(),
         sessionClose: (reason) => plugin.observeSession(reason),
+        sessionRejected: (reason) => plugin.observeRejected(reason),
+        firstAudio: () => plugin.observeAudio(),
+        firstOutput: () => plugin.observeOutput("speak"),
       },
     });
     if (routeSet === null) throw new Error("route set is disabled");
@@ -598,6 +602,22 @@ describe("real rtc lifecycle telemetry", () => {
     });
     expect(outcome.created).toBe(true);
     expect(routeSet.lifecycle?.sessionStart?.()).toBe(true);
+    expect(plugin.component().telemetry.active_sessions).toBe(1);
+
+    outcome.session.touch("audio");
+    outcome.session.touch("output", { succeeded: true });
+    expect(
+      Object.values(plugin.component().telemetry.first_audio_bucket_ms),
+    ).toContain(1);
+    expect(
+      Object.values(plugin.component().telemetry.first_output_bucket_ms),
+    ).toContain(1);
+
+    expect(routeSet.lifecycle?.canStart?.()).toBe(false);
+    routeSet.lifecycle?.sessionRejected?.(
+      routeSet.lifecycle.rejectionReason?.() ?? "concurrency_limit",
+    );
+    expect(plugin.component().telemetry.rejects.concurrency_limit).toBe(1);
     expect(plugin.component().telemetry.active_sessions).toBe(1);
 
     const duplicate = await routeSet.registry.start({

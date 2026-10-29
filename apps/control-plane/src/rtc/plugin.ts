@@ -58,6 +58,7 @@ export type RtcPlugin = Readonly<{
   component: () => RtcComponentHealth;
   mount: (app: FastifyInstance) => Promise<void>;
   canStart: () => boolean;
+  rejectionReason: () => "concurrency_limit" | "circuit_open" | undefined;
   startSession: () => boolean;
   endSession: () => void;
   observeSession: (reason: RtcSessionDisconnectReason) => void;
@@ -157,6 +158,7 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
   const consumeActive = (): boolean => {
     if (active === 0) return false;
     active -= 1;
+    startedAt.pop();
     telemetry.endSession();
     return true;
   };
@@ -209,6 +211,11 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
         failures < failureThreshold &&
         active < maxConcurrent
       );
+    },
+    rejectionReason() {
+      if (failures >= failureThreshold) return "circuit_open";
+      if (active >= maxConcurrent) return "concurrency_limit";
+      return undefined;
     },
     startSession() {
       if (!options.enabled || aborted) return false;

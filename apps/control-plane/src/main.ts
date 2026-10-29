@@ -99,9 +99,14 @@ export async function start() {
             module: rtcModule,
             metrics,
             lifecycle: {
+              canStart: () => rtcPlugin.canStart(),
+              rejectionReason: () => rtcPlugin.rejectionReason(),
               sessionStart: () => rtcPlugin.startSession(),
               sessionRelease: () => rtcPlugin.endSession(),
               sessionClose: (reason) => rtcPlugin.observeSession(reason),
+              sessionRejected: (reason) => rtcPlugin.observeRejected(reason),
+              firstAudio: () => rtcPlugin.observeAudio(),
+              firstOutput: () => rtcPlugin.observeOutput("speak"),
             },
           });
     },

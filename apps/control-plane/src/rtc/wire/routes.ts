@@ -227,6 +227,16 @@ export type RtcLifecycleObserver = Readonly<{
   sessionRelease?: () => void;
   /** Called exactly once when a real session closes. */
   sessionClose?: (reason: RtcCloseReason) => void;
+  /** Rejected start telemetry for admission or registry refusals. */
+  sessionRejected?: (
+    reason: "registry_full" | "concurrency_limit" | "circuit_open",
+  ) => void;
+  rejectionReason?: () =>
+    | "concurrency_limit"
+    | "circuit_open"
+    | undefined;
+  firstAudio?: () => void;
+  firstOutput?: () => void;
 }>;
 
 export type RtcRouteOptions = Readonly<{
@@ -305,9 +315,18 @@ export const createRtcRouteSet = (
   const registry = createRtcSessionRegistry({
     clock,
     onDisconnect: (reason) => {
-      options.lifecycle?.sessionClose?.(reason);
-      options.metrics?.recordRtcDisconnect?.(reason);
+      if (options.lifecycle?.sessionClose !== undefined) {
+        options.lifecycle.sessionClose(reason);
+      } else {
+        options.metrics?.recordRtcDisconnect?.(reason);
+      }
     },
+    ...(options.lifecycle?.firstAudio === undefined
+      ? {}
+      : { onFirstAudio: options.lifecycle.firstAudio }),
+    ...(options.lifecycle?.firstOutput === undefined
+      ? {}
+      : { onFirstOutput: options.lifecycle.firstOutput }),
   });
 
   const register = (app: FastifyInstance): void => {
@@ -363,11 +382,15 @@ export const createRtcRouteSet = (
         }
         const admitted = options.lifecycle?.canStart?.() ?? true;
         if (!admitted) {
+          options.lifecycle?.sessionRejected?.(
+            options.lifecycle.rejectionReason?.() ?? "concurrency_limit",
+          );
           return reply
             .code(429)
             .type("application/json")
             .send({ error: { code: "RTC_CAPACITY" } });
         }
+        let sessionStarted = false;
         try {
           const outcome = await registry.start({
             start: verified.start,
@@ -386,13 +409,15 @@ export const createRtcRouteSet = (
             await registry.close(outcome.session.id, "provider_error");
             return reply;
           }
+          sessionStarted = true;
           reply.raw.once("close", () => {
             void registry.close(outcome.session.id, "user_exit");
           });
           return reply;
         } catch (error) {
-          options.lifecycle?.sessionRelease?.();
+          if (sessionStarted) options.lifecycle?.sessionRelease?.();
           if (error instanceof RtcSessionConflictError) {
+            options.lifecycle?.sessionRejected?.("registry_full");
             return reply
               .code(409)
               .type("application/json")
