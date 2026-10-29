@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   formatReviewReport,
@@ -278,4 +279,44 @@ test("independent v1 reports stay independent and never parse as self-review", (
   assert.equal(verified.schema_version, 1);
   assert.equal(verified.mode, undefined);
   assert.throws(() => parseSelfReviewReport(body), /self-review/i);
+});
+
+const runCli = (args) =>
+  spawnSync(
+    process.execPath,
+    [resolve(import.meta.dirname, "review-report.mjs"), ...args],
+    { encoding: "utf8" },
+  );
+
+test("self-review CLI writes a v2 report and rejects misuse", () => {
+  const dir = mkdtempSync(join(tmpdir(), "review-cli-"));
+  try {
+    const input = join(dir, "report.json");
+    const output = join(dir, "comment.md");
+    writeFileSync(input, JSON.stringify(selfReviewReport()));
+    const formatted = runCli(["--self-review", input, output]);
+    assert.equal(formatted.status, 0, formatted.stderr);
+    assert.deepEqual(
+      parseSelfReviewReport(readFileSync(output, "utf8")),
+      selfReviewReport(),
+    );
+
+    const missingFile = runCli(["--self-review", input]);
+    assert.equal(missingFile.status, 1);
+    assert.match(
+      missingFile.stderr,
+      /Usage: node scripts\/github\/review-report\.mjs \[--self-review\] INPUT\.json OUTPUT\.md/,
+    );
+
+    const wrongMode = runCli([input, output]);
+    assert.equal(wrongMode.status, 1);
+    assert.match(wrongMode.stderr, /formatting failed/);
+
+    writeFileSync(input, " ".repeat(16385));
+    const oversized = runCli(["--self-review", input, output]);
+    assert.equal(oversized.status, 1);
+    assert.match(oversized.stderr, /formatting failed/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

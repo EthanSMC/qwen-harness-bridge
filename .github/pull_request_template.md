@@ -17,7 +17,7 @@
 
 ## Review evidence
 
-<!-- Complete exactly one review mode. Do not check both boxes. The solo fallback is valid when no distinct eligible direct GitHub collaborator exists, regardless of repository visibility. -->
+<!-- Complete exactly one review mode. Do not check more than one box. The solo fallback is valid when no distinct eligible direct GitHub collaborator exists, regardless of repository visibility. -->
 <!-- CI evidence must be this PR's https://github.com/<owner>/<repo>/pull/<number>/checks URL. The PR number is unavailable before creation, so create the PR, immediately edit this body with the current checks URL, and rerun the edited gate. A first opened run may fail; the final merge gate must be green, and the controller re-verifies the GitHub checks API before merge. -->
 
 ### Review mode (check exactly one)
@@ -75,8 +75,8 @@
 - [ ] Branch, primary Issue, `Closes` reference, and claim receipt identify the same Issue.
 - [ ] Tests were written or updated before implementation behavior.
 - [ ] Relevant checks pass.
-- [ ] Exactly one review mode is selected; the other mode is not used.
-- [ ] Reviewer is different from the implementer and reviewed the complete diff and commit range.
+- [ ] Exactly one review mode is selected; no other mode is selected.
+- [ ] In the formal or independent mode the reviewer is different from the implementer and reviewed the complete diff and commit range; same-thread self-review is labelled as such.
 - [ ] If a distinct eligible direct GitHub collaborator is available, that collaborator gave a formal GitHub Approve; the solo fallback was not used.
 - [ ] If no distinct eligible direct GitHub collaborator exists, a fresh independent subagent reviewer returned PASS and all required GitHub checks succeeded.
 - [ ] If same-thread self-review is selected, it is labelled weaker than independent review, never claims independent review or a GitHub approval, and all required current-head checks succeeded.

@@ -365,26 +365,34 @@ export const verifySelfReviewReportComment = ({
 };
 
 export const main = (args = process.argv.slice(2)) => {
-  if (args.length !== 2)
+  const selfReview = args[0] === "--self-review";
+  const files = selfReview ? args.slice(1) : args;
+  if (files.length !== 2)
     throw new Error(
-      "Usage: node scripts/github/review-report.mjs INPUT.json OUTPUT.md",
+      "Usage: node scripts/github/review-report.mjs [--self-review] INPUT.json OUTPUT.md",
     );
-  if (statSync(args[0]).size > MAX_REPORT_BYTES)
+  if (statSync(files[0]).size > MAX_REPORT_BYTES)
     throw new Error("Review report input exceeds byte bound");
   let report;
   try {
-    report = JSON.parse(readFileSync(args[0], "utf8"));
+    report = JSON.parse(readFileSync(files[0], "utf8"));
   } catch {
     throw new Error("Invalid local review report JSON");
   }
-  writeFileSync(args[1], formatReviewReport(report));
+  writeFileSync(
+    files[1],
+    selfReview ? formatSelfReviewReport(report) : formatReviewReport(report),
+  );
 };
 if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
   try {
     main();
-  } catch {
+  } catch (error) {
+    const detail =
+      error instanceof Error && error.message ? `${error.message} ` : "";
     console.error(
-      "Review report formatting failed; check input schema, bounds and safe public summaries.",
+      `Review report formatting failed; ${detail}` +
+        "check the selected mode, input schema, bounds and safe public summaries.",
     );
     process.exitCode = 1;
   }

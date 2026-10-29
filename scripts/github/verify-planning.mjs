@@ -253,7 +253,10 @@ requireSourceField(
 
 const prTemplate = ".github/pull_request_template.md";
 for (const [pattern, message] of [
-  [/Do not check both boxes/, "the prohibition on selecting both review modes"],
+  [
+    /Do not check more than one box/,
+    "the prohibition on selecting both review modes",
+  ],
   [
     /Review mode \(check exactly one\)/,
     "an explicit mutually-exclusive review mode selector",

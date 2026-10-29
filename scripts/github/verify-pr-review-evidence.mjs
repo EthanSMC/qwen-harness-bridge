@@ -42,14 +42,12 @@ const SELF_REVIEW_DISCLOSURE_LABEL =
   "Self-review is explicitly weaker than independent review and is not a GitHub approval";
 
 const optionalFieldValue = (body, label) => {
-  const pattern = new RegExp(
-    "^\\s*-\\s*" + escapeRegExp(label) + ":\\s*(.*?)\\s*$",
-  );
+  const pattern = new RegExp(`^\\s*-\\s*${escapeRegExp(label)}:\\s*(.*?)\\s*$`);
   const matches = linesOf(body)
     .map((line) => line.match(pattern))
     .filter(Boolean);
   if (matches.length > 1)
-    throw new Error(label + " must not appear more than once");
+    throw new Error(`${label} must not appear more than once`);
   return matches.length === 1 ? matches[0][1].trim() : "";
 };
 
@@ -101,37 +99,37 @@ const checkboxAnswer = (body, label) => {
 
 const checkboxAnswerNo = (body, label) => {
   const pattern = new RegExp(
-    "^\\s*-\\s*" + escapeRegExp(label) + ":\\s*\\[([ xX])\\]\\s*(Yes|No)\\s*$",
+    `^\\s*-\\s*${escapeRegExp(label)}:\\s*\\[([ xX])\\]\\s*(Yes|No)\\s*$`,
     "i",
   );
   const matches = linesOf(body)
     .map((line) => line.match(pattern))
     .filter(Boolean);
   if (matches.length !== 1)
-    throw new Error(label + " must be answered with [x] Yes or [x] No");
+    throw new Error(`${label} must be answered with [x] Yes or [x] No`);
   if (
     matches[0][1].toLowerCase() !== "x" ||
     matches[0][2].toLowerCase() !== "no"
   ) {
     throw new Error(
-      label + " must be checked [x] No for a same-thread self-review",
+      `${label} must be checked [x] No for a same-thread self-review`,
     );
   }
 };
 
 const checkboxDeclaredUnchecked = (body, label) => {
   const pattern = new RegExp(
-    "^\\s*-\\s*" + escapeRegExp(label) + ":\\s*\\[([ xX])\\]\\s*(Yes|No)\\s*$",
+    `^\\s*-\\s*${escapeRegExp(label)}:\\s*\\[([ xX])\\]\\s*(Yes|No)\\s*$`,
     "i",
   );
   const matches = linesOf(body)
     .map((line) => line.match(pattern))
     .filter(Boolean);
   if (matches.length > 1)
-    throw new Error(label + " must not appear more than once");
+    throw new Error(`${label} must not appear more than once`);
   if (matches.length === 1 && matches[0][1].toLowerCase() === "x") {
     throw new Error(
-      label + " must stay unchecked outside the explicit self-review mode",
+      `${label} must stay unchecked outside the explicit self-review mode`,
     );
   }
 };
