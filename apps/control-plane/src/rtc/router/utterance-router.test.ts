@@ -379,6 +379,22 @@ describe("final utterance router", () => {
     );
     expect(terminal.speech).toContain("取消未生效");
     expect(terminal.speech).toContain(STATUS_TEXT.succeeded);
+
+    fake.setCancelStatus("cancelled");
+    await router.handleFinal(final("evt-c-list3", "列出最近的任务"));
+    const cancelled = await router.handleFinal(
+      final("evt-cancel3", "取消 QH-BBB2"),
+    );
+    expect(cancelled.speech).toContain("任务已取消");
+    expect(cancelled.speech).not.toContain("取消未生效");
+
+    fake.setCancelStatus("failed");
+    await router.handleFinal(final("evt-c-list4", "列出最近的任务"));
+    const failed = await router.handleFinal(
+      final("evt-cancel4", "取消 QH-BBB2"),
+    );
+    expect(failed.speech).toContain("取消未生效");
+    expect(failed.speech).toContain(STATUS_TEXT.failed);
   });
 
   it("reads the focused task result with its refreshed status", async () => {
@@ -521,6 +537,27 @@ describe("final utterance router", () => {
     }
     const again = await router.handleFinal(
       final("evt-dup-approve", "批准第一个"),
+    );
+
+    expect(again.speech).toBe(approve.speech);
+    expect(fake.calls.filter((call) => call.method === "decide")).toHaveLength(
+      1,
+    );
+  });
+
+  it("keeps duplicate finals idempotent after hundreds of later finals", async () => {
+    const { router, fake } = makeRouter();
+    await router.handleFinal(final("evt-300-ap-list", "看一下待审批"));
+    const approve = await router.handleFinal(
+      final("evt-300-approve", "批准第一个"),
+    );
+    for (let index = 0; index < 300; index += 1) {
+      await router.handleFinal(
+        final(`evt-300-bulk-${index}`, "列出最近的任务"),
+      );
+    }
+    const again = await router.handleFinal(
+      final("evt-300-approve", "批准第一个"),
     );
 
     expect(again.speech).toBe(approve.speech);

@@ -52,14 +52,11 @@ const RESULT_PATTERN = /结果|读一下|总结|进展|完成没有/u;
 const PRONOUN_PATTERN = /^(?:它|这个|那个|他)/u;
 const SUBMIT_PATTERN = /跑|执行|测试|修|改|提交|检查|打开/u;
 const READ_ONLY_PATTERN = /只读|别改|不要修改|不改代码/u;
-const TERMINAL_STATUSES = new Set([
-  "succeeded",
-  "failed",
-  "cancelled",
-  "expired",
-]);
+const TERMINAL_STATUSES = new Set(["succeeded", "failed", "expired"]);
 
-const MAX_TRACKED_RECEIPTS = 256;
+// Final-ASR idempotency is guaranteed for the most recent 1024 finals of a
+// session; submit additionally keeps a server-side client_request_id.
+const MAX_TRACKED_RECEIPTS = 1_024;
 
 const parseOrdinal = (text: string): number | undefined => {
   const match = ORDINAL_PATTERN.exec(text);
@@ -202,11 +199,13 @@ export const createLiveUtteranceRouter = (
       if (isAborted()) return stopped();
       const status = result.status;
       const speech =
-        status !== undefined && TERMINAL_STATUSES.has(status)
-          ? `取消未生效，任务${statusOf(status)}。`
-          : status !== undefined
-            ? `已请求取消 ${entry.shortId}，当前${statusOf(status)}。`
-            : `已请求取消 ${entry.shortId}。`;
+        status === "cancelled"
+          ? `任务已取消（${entry.shortId}）。`
+          : status !== undefined && TERMINAL_STATUSES.has(status)
+            ? `取消未生效，任务${statusOf(status)}。`
+            : status !== undefined
+              ? `已请求取消 ${entry.shortId}，当前${statusOf(status)}。`
+              : `已请求取消 ${entry.shortId}。`;
       return respond(
         {
           kind: "cancel",
