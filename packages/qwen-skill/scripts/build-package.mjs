@@ -126,16 +126,24 @@ const assertInsideRoot = (root, path) => {
 
 const resolveSourceCommit = (root) => {
   try {
-    return execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
+    const commit = execFileSync("git", ["-C", root, "rev-parse", "HEAD"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
+    if (/^[0-9a-f]{7,64}$/u.test(commit)) return commit;
   } catch {
-    fail(
-      "SOURCE_COMMIT_UNAVAILABLE",
-      "run inside the repository or pass --source-commit",
-    );
+    // Fall through to the documented CI environment variables: the runtime
+    // container builds a copied tree without repository objects.
   }
+  for (const key of ["GITHUB_SHA", "QHB_SOURCE_COMMIT", "SOURCE_COMMIT"]) {
+    const value = process.env[key];
+    if (typeof value === "string" && /^[0-9a-f]{7,64}$/u.test(value.trim()))
+      return value.trim();
+  }
+  fail(
+    "SOURCE_COMMIT_UNAVAILABLE",
+    "no git checkout; set GITHUB_SHA, QHB_SOURCE_COMMIT or --source-commit",
+  );
 };
 
 const monorepoVersion = (root) => {

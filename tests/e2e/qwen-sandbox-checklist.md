@@ -39,10 +39,21 @@ Related runbooks: `docs/runbooks/publish-private-qwen-skill.md`,
 | P-10 | Seven tools match the protocol schema sources | `node packages/qwen-skill/scripts/check-package.mjs` (protocol surface phase) | PASS: every tool maps to an existing protocol file and exported schema |
 | P-11 | Package protocol suite | `vitest run packages/protocol/src` | PASS: 3 files, 144 tests |
 | P-12 | Static skill lint, typecheck, formatting | `node packages/qwen-skill/scripts/lint-skill.mjs`; `tsc -p packages/qwen-skill/tsconfig.json --noEmit`; `biome check packages/qwen-skill` | PASS: lint and typecheck exit 0; biome reports no fixes |
+| P-13 | Source commit outside a git checkout | `src/package-build.test.ts` no-git cases | PASS: a copied tree with no `.git` builds when `GITHUB_SHA` (or `QHB_SOURCE_COMMIT` / `SOURCE_COMMIT`) is set and records that commit; with none set the build exits non-zero and writes no manifest |
 
 The digest is recorded in `dist/manifest.json` next to the version and source
 commit. The checklist is not the digest authority: read the manifest produced by
 the build under test.
+
+Version terminology: the Task 5 text says "root Changeset version". In this
+repository the Changesets-managed version source for the private package is
+`packages/qwen-skill/package.json`; the build compares
+`skill.json.version` with that value (never a hardcoded number and not only one
+side). The monorepo version from the root `package.json` is recorded separately
+as `monorepo_version` for traceability and legitimately differs today
+(`0.3.0` for the package, `0.1.0` for the monorepo), so it is not the equality
+target. A build outside a git checkout takes the commit from `GITHUB_SHA`,
+`QHB_SOURCE_COMMIT` or `SOURCE_COMMIT`, and fails when none is available.
 
 ## B. Official Qwen sandbox matrix (NOT EXECUTED — BLOCKED-ENVIRONMENT)
 

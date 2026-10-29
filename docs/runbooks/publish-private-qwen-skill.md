@@ -30,6 +30,11 @@ node packages/qwen-skill/scripts/build-package.mjs
 node packages/qwen-skill/scripts/check-package.mjs
 ```
 
+When the build runs outside a git checkout (for example in a container), it
+takes the source commit from `GITHUB_SHA`, `QHB_SOURCE_COMMIT` or
+`SOURCE_COMMIT`, in that order; `--source-commit <sha>` overrides it. The build
+fails when no commit can be resolved, and it never invents one.
+
 The build writes `dist/qwen-skill-<version>.zip`, `dist/manifest.json` and
 `dist/SHA256SUMS`. The check re-reads the archive, recomputes every checksum,
 derives the expected content list again, re-runs the build to prove digest

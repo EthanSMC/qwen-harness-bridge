@@ -48,13 +48,26 @@ const sourceCommit = (): string =>
 
 type RunResult = { code: number; output: string };
 
-const run = (script: string, args: string[]): RunResult => {
+const cleanEnvironment = (): NodeJS.ProcessEnv => {
+  const environment = { ...process.env };
+  for (const key of ["GITHUB_SHA", "QHB_SOURCE_COMMIT", "SOURCE_COMMIT"]) {
+    delete environment[key];
+  }
+  return environment;
+};
+
+const run = (
+  script: string,
+  args: string[],
+  environment: NodeJS.ProcessEnv = cleanEnvironment(),
+): RunResult => {
   try {
     return {
       code: 0,
       output: execFileSync(process.execPath, [script, ...args], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
+        env: environment,
       }),
     };
   } catch (error) {
@@ -79,8 +92,13 @@ const copyPackage = (label: string): string => {
   return root;
 };
 
-const build = (root: string, out: string, extra: string[] = []): RunResult =>
-  run(buildScript, ["--root", root, "--out", out, ...extra]);
+const build = (
+  root: string,
+  out: string,
+  extra: string[] = [],
+  environment: NodeJS.ProcessEnv = cleanEnvironment(),
+): RunResult =>
+  run(buildScript, ["--root", root, "--out", out, ...extra], environment);
 
 const check = (root: string, packageDirectory: string): RunResult =>
   run(checkScript, ["--root", root, "--package", packageDirectory]);
@@ -191,6 +209,31 @@ describe("reproducible private package build", () => {
 
     expect(result.code).not.toBe(0);
     expect(result.output).toMatch(/VERSION_MISMATCH|version/iu);
+  });
+
+  it("builds outside a git checkout when the environment provides the commit", () => {
+    const root = copyPackage("no-git-env");
+    const out = join(temporaryDirectory("no-git-env-out"), "dist");
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+
+    const result = build(root, out, [], {
+      ...cleanEnvironment(),
+      GITHUB_SHA: commit,
+    });
+
+    expect(result.code).toBe(0);
+    expect(readManifest(out).source_commit).toBe(commit);
+  });
+
+  it("fails outside a git checkout without a source commit", () => {
+    const root = copyPackage("no-git");
+    const out = join(temporaryDirectory("no-git-out"), "dist");
+
+    const result = build(root, out);
+
+    expect(result.code).not.toBe(0);
+    expect(result.output).toMatch(/SOURCE_COMMIT|source commit/iu);
+    expect(existsSync(join(out, "manifest.json"))).toBe(false);
   });
 
   it("refuses an MCP import that contains a literal credential", () => {
