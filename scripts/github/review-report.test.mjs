@@ -1,13 +1,17 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   formatReviewReport,
+  formatSelfReviewReport,
   main,
   parseReviewReport,
+  parseSelfReviewReport,
   verifyReviewReportComment,
+  verifySelfReviewReportComment,
 } from "./review-report.mjs";
 
 const report = () => ({
@@ -138,6 +142,180 @@ test("formatter CLI preserves supplied facts and rejects oversized input", () =>
     assert.deepEqual(parseReviewReport(readFileSync(output, "utf8")), report());
     writeFileSync(input, " ".repeat(16385));
     assert.throws(() => main([input, output]), /bound/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const selfReviewReport = () => ({
+  schema_version: 2,
+  mode: "self-review",
+  repository: "Owner/repo",
+  issue_number: 62,
+  base_sha: "a".repeat(40),
+  head_sha: "b".repeat(40),
+  implementer_id: "other",
+  reviewer_id: "other",
+  reviewer_identity: "other",
+  verdict: "PASS",
+  findings: [],
+  fix_rounds: 0,
+  verification: ["observed evidence"],
+});
+
+const selfReviewContext = () => ({
+  repository: "Owner/repo",
+  pullRequestNumber: 63,
+  issueNumber: 62,
+  authorLogin: "Owner",
+  baseSha: "a".repeat(40),
+  headSha: "b".repeat(40),
+  implementer: "other",
+  reviewer: "other",
+  reviewerIdentity: "other",
+});
+
+const selfReviewComment = () => ({
+  ...comment(),
+  body: formatSelfReviewReport(selfReviewReport()),
+});
+
+test("self-review report round-trips with the explicit v2 marker", () => {
+  const body = formatSelfReviewReport(selfReviewReport());
+  assert.match(body, /^<!-- qhb-self-review:v2 sha256:[a-f0-9]{64} -->/);
+  assert.doesNotMatch(body, /qhb-independent-review/);
+  assert.deepEqual(parseSelfReviewReport(body), selfReviewReport());
+});
+
+test("self-review report rejects an independent marker or mismatched identities", () => {
+  const independent = formatReviewReport(report());
+  assert.throws(() => parseSelfReviewReport(independent), /self-review/i);
+  assert.throws(
+    () =>
+      formatSelfReviewReport({
+        ...selfReviewReport(),
+        reviewer_id: "another-agent",
+      }),
+    /same-thread/i,
+  );
+  assert.throws(
+    () =>
+      formatSelfReviewReport({ ...selfReviewReport(), mode: "independent" }),
+    /mode/i,
+  );
+  assert.throws(
+    () => formatSelfReviewReport({ ...selfReviewReport(), extra: true }),
+    /unknown fields|missing or unknown/i,
+  );
+});
+
+test("self-review report rejects a tampered body and an open blocker", () => {
+  const body = formatSelfReviewReport(selfReviewReport());
+  assert.throws(
+    () => parseSelfReviewReport(body.replace("observed evidence", "edited")),
+    /digest|canonical/i,
+  );
+  assert.throws(
+    () =>
+      formatSelfReviewReport({
+        ...selfReviewReport(),
+        findings: [
+          { severity: "blocker", status: "open", summary: "still open" },
+        ],
+      }),
+    /unresolved blocker/i,
+  );
+});
+
+test("self-review report comment binds mode, PR, Issue and commit range", () => {
+  const verified = verifySelfReviewReportComment({
+    url,
+    comment: selfReviewComment(),
+    ...selfReviewContext(),
+  });
+  assert.equal(verified.mode, "self-review");
+  assert.equal(verified.reviewer_id, "other");
+  assert.throws(
+    () =>
+      verifySelfReviewReportComment({
+        url,
+        comment: selfReviewComment(),
+        ...selfReviewContext(),
+        headSha: "c".repeat(40),
+      }),
+    /head_sha mismatch/i,
+  );
+  assert.throws(
+    () =>
+      verifySelfReviewReportComment({
+        url,
+        comment: selfReviewComment(),
+        ...selfReviewContext(),
+        reviewer: "another-agent",
+      }),
+    /reviewer_id mismatch/i,
+  );
+  assert.throws(
+    () =>
+      verifySelfReviewReportComment({
+        url,
+        comment: {
+          ...selfReviewComment(),
+          updated_at: "2026-09-01T01:00:01Z",
+        },
+        ...selfReviewContext(),
+      }),
+    /unedited timestamps/i,
+  );
+});
+
+test("independent v1 reports stay independent and never parse as self-review", () => {
+  const body = formatReviewReport(report());
+  const verified = verifyReviewReportComment({
+    url,
+    comment: { ...comment(), body },
+    ...context(),
+  });
+  assert.equal(verified.schema_version, 1);
+  assert.equal(verified.mode, undefined);
+  assert.throws(() => parseSelfReviewReport(body), /self-review/i);
+});
+
+const runCli = (args) =>
+  spawnSync(
+    process.execPath,
+    [resolve(import.meta.dirname, "review-report.mjs"), ...args],
+    { encoding: "utf8" },
+  );
+
+test("self-review CLI writes a v2 report and rejects misuse", () => {
+  const dir = mkdtempSync(join(tmpdir(), "review-cli-"));
+  try {
+    const input = join(dir, "report.json");
+    const output = join(dir, "comment.md");
+    writeFileSync(input, JSON.stringify(selfReviewReport()));
+    const formatted = runCli(["--self-review", input, output]);
+    assert.equal(formatted.status, 0, formatted.stderr);
+    assert.deepEqual(
+      parseSelfReviewReport(readFileSync(output, "utf8")),
+      selfReviewReport(),
+    );
+
+    const missingFile = runCli(["--self-review", input]);
+    assert.equal(missingFile.status, 1);
+    assert.match(
+      missingFile.stderr,
+      /Usage: node scripts\/github\/review-report\.mjs \[--self-review\] INPUT\.json OUTPUT\.md/,
+    );
+
+    const wrongMode = runCli([input, output]);
+    assert.equal(wrongMode.status, 1);
+    assert.match(wrongMode.stderr, /formatting failed/);
+
+    writeFileSync(input, " ".repeat(16385));
+    const oversized = runCli(["--self-review", input, output]);
+    assert.equal(oversized.status, 1);
+    assert.match(oversized.stderr, /formatting failed/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -188,6 +188,40 @@ The formatter writes canonical Markdown with SHA256, performs no network/write a
 
 The authenticated validator checks the same repository/PR association, accountable author, creation/update timestamps, schema, canonical content, digest, Issue and identity match, exact current base/head and PASS with no unresolved blockers. The controller attests that it captured the real independent review. This is controller-attested traceability, not cryptographic proof of independent AI execution; a digest does not establish who ran a local agent. Formal review retains the eligible collaborator's actual current-head approval and permits an empty report URL. Historical merged evidence remains valid. Never disable validation to bootstrap this requirement.
 
+### Same-thread self-review report
+
+Same-thread self-review is the explicitly weakest solo mode: it is available only
+when no distinct eligible direct GitHub collaborator exists and no independent
+reviewer is available, and the pull-request body must select it explicitly and
+state that it is weaker than independent review. The formatter and validator keep
+it structurally separate from independent review:
+
+| Field | Contract |
+|---|---|
+| marker | `<!-- qhb-self-review:v2 sha256:<digest> -->`; the independent `qhb-independent-review:v1` marker is rejected |
+| `schema_version` | `2` |
+| `mode` | Exactly `self-review` |
+| `implementer_id`, `reviewer_id`, `reviewer_identity` | One identical public slug: the same thread reviews its own work |
+| every other key | Same bounds, digest, unedited-timestamp, Issue, exact `base.sha..head.sha` and PASS-with-no-open-blocker rules as the independent report |
+
+Format it with the same command:
+
+```sh
+node scripts/github/review-report.mjs --self-review reviewer-report.json reviewer-comment.md
+```
+
+The body must also select only the same-thread self-review mode line, answer
+`Reviewer is distinct from implementer: [x] No` and `Independent review ...: [x] No`,
+answer `Self-review is explicitly weaker than independent review and is not a GitHub approval: [x] Yes`,
+leave the independent report URL and formal fields empty, and carry the solo
+eligibility reference and verification date. A self-review report is never
+described as independent review, a subagent reviewer, or a GitHub approval.
+
+Historical compatibility is strict: reports written before this contract keep the
+v1 marker and remain independent evidence, nothing is relabelled, and pull
+requests that only know the formal and solo lines keep validating because the
+third mode line is optional outside self-review mode.
+
 ## Stalled-work report and recovery
 
 The hourly scheduled or manual **AI Issue Lifecycle** workflow exposes a separate **stalled-work visibility** job with an Actions summary and `stalled-work-report` artifact retained for 14 days. It shows zero actionable results explicitly. Review work is flagged at 48 hours and blocked work at 24 hours since the latest public human checkpoint (Issue/linked open PR creation, new Issue/PR comments, submitted reviews). Generic `updated_at`, bot housekeeping, local work and branch pushes do not refresh this clock. This measures stalled collaboration, not proof that no local work occurred.

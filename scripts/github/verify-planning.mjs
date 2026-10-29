@@ -236,9 +236,27 @@ for (const [file, pattern] of [
   }
 }
 
+requireGovernanceField(
+  "docs/github/ai-collaboration.md",
+  /qhb-self-review:v2/,
+  "the same-thread self-review report marker",
+);
+requireSourceField(
+  readFileSync(
+    resolve(root, "docs/github/solo-self-review-contract.md"),
+    "utf8",
+  ),
+  "docs/github/solo-self-review-contract.md",
+  /same-thread self-review/i,
+  "the written same-thread self-review design",
+);
+
 const prTemplate = ".github/pull_request_template.md";
 for (const [pattern, message] of [
-  [/Do not check both boxes/, "the prohibition on selecting both review modes"],
+  [
+    /Do not check more than one box/,
+    "the prohibition on selecting both review modes",
+  ],
   [
     /Review mode \(check exactly one\)/,
     "an explicit mutually-exclusive review mode selector",
@@ -288,6 +306,18 @@ for (const [pattern, message] of [
     "the CI or PR checks URL field",
   ],
   [
+    /Solo-maintainer same-thread self-review/,
+    "the explicitly labelled same-thread self-review mode",
+  ],
+  [
+    /explicitly weaker than independent review/,
+    "the self-review weakness declaration",
+  ],
+  [
+    /Same-thread self-review report URL \(required for self-review mode\)/,
+    "the same-thread self-review report URL field",
+  ],
+  [
     /Exactly one review mode is selected/,
     "the exactly-one-mode checklist gate",
   ],
@@ -310,6 +340,14 @@ for (const [pattern, message] of [
   ],
   [/different from the implementer/i, "reviewer/implementer separation"],
   [/must not self-approve/i, "the no-self-approval rule"],
+  [
+    /Solo-maintainer same-thread self-review/,
+    "the explicitly labelled same-thread self-review mode",
+  ],
+  [
+    /never independent review and never a GitHub approval/,
+    "the honest self-review labelling rule",
+  ],
 ])
   requireGovernanceField("CONTRIBUTING.md", pattern, message);
 

@@ -45,6 +45,7 @@ const bodyFor = ({
     "",
     `- [${mode === "formal" ? "x" : " "}] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.`,
     `- [${mode === "solo" ? "x" : " "}] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.`,
+    "- [ ] Solo-maintainer same-thread self-review — the implementer records its own review on this same thread; it is explicitly weaker than independent review and is never a GitHub approval.",
     "",
     `- Formal GitHub review URL (required for formal mode): ${formalUrl}`,
     `- Formal reviewer GitHub identity (required for formal mode): ${formalIdentity}`,
@@ -335,4 +336,124 @@ test("solo report URL is required exactly once and must identify a PR comment", 
     `${body}\n${label} https://github.com/Owner/repo/pull/37#issuecomment-1`,
   ])
     assert.throws(() => validatePullRequestBody(value));
+});
+const selfReviewBodyFor = ({
+  selfReviewUrl = "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#issuecomment-456",
+  reportUrl = "",
+  formalUrl = "",
+  soloRef = "docs/github/repository-status.md#review-gate-status",
+  soloDate = "2026-09-01",
+  implementer = "other",
+  reviewer = "other",
+  reviewerIdentity = "other",
+  distinct = "[x] No",
+  fresh = "[x] Yes",
+  independent = "[x] No",
+  disclosure = "[x] Yes",
+  commitRange = "8c4bfcd0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0..HEAD",
+  verdict = "PASS",
+  ciEvidence = "https://github.com/EthanSMC/qwen-harness-bridge/pull/37/checks",
+} = {}) =>
+  [
+    "- [ ] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.",
+    "- [ ] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.",
+    "- [x] Solo-maintainer same-thread self-review — the implementer records its own review on this same thread; it is explicitly weaker than independent review and is never a GitHub approval.",
+    "",
+    `- Independent review report URL (required for solo mode): ${reportUrl}`,
+    `- Same-thread self-review report URL (required for self-review mode): ${selfReviewUrl}`,
+    `- Formal GitHub review URL (required for formal mode): ${formalUrl}`,
+    "- Formal reviewer GitHub identity (required for formal mode):",
+    `- Solo eligibility evidence URL or repository-status reference (required for solo mode): ${soloRef}`,
+    `- Solo eligibility verification date (required for solo mode): ${soloDate}`,
+    "",
+    `- Implementer agent ID: ${implementer}`,
+    `- Reviewer agent ID: ${reviewer}`,
+    `- Reviewer identity (agent/account): ${reviewerIdentity}`,
+    `- Reviewer is distinct from implementer: ${distinct}`,
+    `- Fresh review of this exact commit range: ${fresh}`,
+    `- Independent review (no author self-approval or fabricated evidence): ${independent}`,
+    `- Self-review is explicitly weaker than independent review and is not a GitHub approval: ${disclosure}`,
+    "",
+    `- Commit range reviewed (base..head; use the exact event base.sha..head.sha): ${commitRange}`,
+    "- Findings: None",
+    "- Fix rounds: Round 1: addressed all findings",
+    `- Final verdict: ${verdict}`,
+    `- CI run URL(s) / PR checks URL(s) and required-check results: ${ciEvidence}`,
+  ].join("\n");
+
+test("accepts an explicit same-thread self-review body", () => {
+  const result = validatePullRequestEvent(eventWithBody(selfReviewBodyFor()));
+
+  assert.equal(result.mode, "self-review");
+  assert.equal(result.fields.implementer, "other");
+  assert.equal(result.fields.reviewer, "other");
+});
+
+test("rejects a self-review body that claims independence or a distinct reviewer", () => {
+  for (const overrides of [
+    { independent: "[x] Yes" },
+    { distinct: "[x] Yes" },
+    { disclosure: "[ ] Yes" },
+  ]) {
+    assert.throws(
+      () =>
+        validatePullRequestEvent(eventWithBody(selfReviewBodyFor(overrides))),
+      /self-review|independent|distinct|explicitly weaker/i,
+    );
+  }
+});
+
+test("rejects a self-review body that also carries independent report or formal evidence", () => {
+  assert.throws(
+    () =>
+      validatePullRequestEvent(
+        eventWithBody(
+          selfReviewBodyFor({
+            reportUrl:
+              "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#issuecomment-123",
+          }),
+        ),
+      ),
+    /self-review mode must not include independent|must not include/i,
+  );
+  assert.throws(
+    () =>
+      validatePullRequestEvent(
+        eventWithBody(
+          selfReviewBodyFor({
+            formalUrl:
+              "https://github.com/EthanSMC/qwen-harness-bridge/pull/37#pullrequestreview-123",
+          }),
+        ),
+      ),
+    /self-review mode must not include formal/i,
+  );
+});
+
+test("rejects a self-review body without solo eligibility evidence", () => {
+  assert.throws(
+    () =>
+      validatePullRequestEvent(
+        eventWithBody(selfReviewBodyFor({ soloRef: "" })),
+      ),
+    /Solo eligibility evidence.*requires a non-empty/i,
+  );
+  assert.throws(
+    () =>
+      validatePullRequestEvent(
+        eventWithBody(selfReviewBodyFor({ soloDate: "" })),
+      ),
+    /Solo eligibility verification date.*requires a non-empty/i,
+  );
+});
+
+test("rejects selecting the self-review mode together with another mode", () => {
+  const body = selfReviewBodyFor().replace(
+    "- [ ] Solo-maintainer fallback",
+    "- [x] Solo-maintainer fallback",
+  );
+  assert.throws(
+    () => validatePullRequestEvent(eventWithBody(body)),
+    /exactly one review mode/i,
+  );
 });

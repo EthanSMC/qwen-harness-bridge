@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { formatReviewReport, parseReviewReport } from "./review-report.mjs";
+import {
+  formatReviewReport,
+  formatSelfReviewReport,
+  parseReviewReport,
+} from "./review-report.mjs";
 import { validatePullRequestState } from "./verify-pr-review-evidence.mjs";
 
 const REPOSITORY = "EthanSMC/qwen-harness-bridge";
@@ -28,6 +32,7 @@ const bodyFor = ({
     `- Independent review report URL (required for solo mode): ${mode === "solo" ? `https://github.com/${REPOSITORY}/pull/${PR_NUMBER}#issuecomment-123` : ""}`,
     `- [${mode === "formal" ? "x" : " "}] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.`,
     `- [${mode === "solo" ? "x" : " "}] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.`,
+    "- [ ] Solo-maintainer same-thread self-review — the implementer records its own review on this same thread; it is explicitly weaker than independent review and is never a GitHub approval.",
     `- Formal GitHub review URL (required for formal mode): ${formalUrl}`,
     `- Formal reviewer GitHub identity (required for formal mode): ${formalIdentity}`,
     `- Solo eligibility evidence URL or repository-status reference (required for solo mode): ${soloRef}`,
@@ -38,6 +43,7 @@ const bodyFor = ({
     "- Reviewer is distinct from implementer: [x] Yes",
     "- Fresh review of this exact commit range: [x] Yes",
     "- Independent review (no author self-approval or fabricated evidence): [x] Yes",
+    "- Self-review is explicitly weaker than independent review and is not a GitHub approval: [ ] Yes",
     `- Commit range reviewed (base..head; use the exact event base.sha..head.sha): ${commitRange}`,
     "- Findings: None",
     "- Fix rounds: Round 1: addressed all findings",
@@ -879,4 +885,137 @@ test("live solo validator rejects stale range, identity mismatch and actual FAIL
     });
     await assert.rejects(stateFor(eventFor(), fixtures), /report.*mismatch/);
   }
+});
+const selfReviewReportFor = (overrides = {}) =>
+  formatSelfReviewReport({
+    schema_version: 2,
+    mode: "self-review",
+    repository: REPOSITORY,
+    issue_number: 62,
+    base_sha: BASE_SHA,
+    head_sha: HEAD_SHA,
+    implementer_id: "other",
+    reviewer_id: "other",
+    reviewer_identity: "other",
+    verdict: "PASS",
+    findings: [],
+    fix_rounds: 0,
+    verification: ["Governance tests passed"],
+    ...overrides,
+  });
+
+const selfReviewBodyFor = ({
+  commitRange = `${BASE_SHA}..${HEAD_SHA}`,
+  selfReviewUrl = `https://github.com/${REPOSITORY}/pull/${PR_NUMBER}#issuecomment-123`,
+} = {}) =>
+  [
+    "Closes #62",
+    "## Review evidence",
+    "- [ ] Formal GitHub review — a distinct eligible direct GitHub collaborator gave an Approve.",
+    "- [ ] Solo-maintainer fallback — eligibility evidence shows no distinct eligible direct GitHub collaborator, regardless of repository visibility.",
+    "- [x] Solo-maintainer same-thread self-review — the implementer records its own review on this same thread; it is explicitly weaker than independent review and is never a GitHub approval.",
+    "- Independent review report URL (required for solo mode):",
+    `- Same-thread self-review report URL (required for self-review mode): ${selfReviewUrl}`,
+    "- Formal GitHub review URL (required for formal mode):",
+    "- Formal reviewer GitHub identity (required for formal mode):",
+    "- Solo eligibility evidence URL or repository-status reference (required for solo mode): docs/github/repository-status.md#review-gate-status",
+    "- Solo eligibility verification date (required for solo mode): 2026-09-01",
+    "- Implementer agent ID: other",
+    "- Reviewer agent ID: other",
+    "- Reviewer identity (agent/account): other",
+    "- Reviewer is distinct from implementer: [x] No",
+    "- Fresh review of this exact commit range: [x] Yes",
+    "- Independent review (no author self-approval or fabricated evidence): [x] No",
+    "- Self-review is explicitly weaker than independent review and is not a GitHub approval: [x] Yes",
+    `- Commit range reviewed (base..head; use the exact event base.sha..head.sha): ${commitRange}`,
+    "- Findings: None",
+    "- Fix rounds: Round 1: addressed all findings",
+    "- Final verdict: PASS",
+    `- CI run URL(s) / PR checks URL(s) and required-check results: https://github.com/${REPOSITORY}/pull/${PR_NUMBER}/checks`,
+  ].join("\n");
+
+const selfReviewFixtures = (overrides = {}) => {
+  const body = overrides.body ?? selfReviewBodyFor();
+  const fixtures = fixturesFor({
+    secondReviewer: overrides.secondReviewer ?? false,
+    pullRequest: pullRequestFor({ body }),
+  });
+  fixtures[`/repos/${REPOSITORY}/issues/comments/123`] = {
+    ...fixtures[`/repos/${REPOSITORY}/issues/comments/123`],
+    body: overrides.reportBody ?? selfReviewReportFor(),
+    ...(overrides.commentOverrides ?? {}),
+  };
+  return fixtures;
+};
+
+test("accepts an explicit same-thread self-review when no eligible collaborator exists", async () => {
+  const event = eventFor({ body: selfReviewBodyFor() });
+
+  const result = await stateFor(
+    event,
+    selfReviewFixtures({ body: event.pull_request.body }),
+  );
+
+  assert.equal(result.mode, "self-review");
+});
+
+test("rejects self-review while a distinct eligible collaborator exists", async () => {
+  const event = eventFor({ body: selfReviewBodyFor() });
+
+  await assert.rejects(
+    stateFor(
+      event,
+      selfReviewFixtures({
+        body: event.pull_request.body,
+        secondReviewer: true,
+      }),
+    ),
+    /solo mode is invalid while an eligible reviewer exists/i,
+  );
+});
+
+test("rejects self-review bound to an independent v1 report comment", async () => {
+  const event = eventFor({ body: selfReviewBodyFor() });
+  const fixtures = selfReviewFixtures({ body: event.pull_request.body });
+  fixtures[`/repos/${REPOSITORY}/issues/comments/123`].body =
+    formatReviewReport({
+      schema_version: 1,
+      repository: REPOSITORY,
+      issue_number: 62,
+      base_sha: BASE_SHA,
+      head_sha: HEAD_SHA,
+      implementer_id: "agent-implementer-37",
+      reviewer_id: "agent-reviewer-37",
+      reviewer_identity: "reviewer-agent-37",
+      verdict: "PASS",
+      findings: [],
+      fix_rounds: 1,
+      verification: ["Governance tests passed"],
+    });
+
+  await assert.rejects(stateFor(event, fixtures), /self-review/i);
+});
+
+test("rejects a stale or edited self-review report comment", async () => {
+  const event = eventFor({ body: selfReviewBodyFor() });
+  await assert.rejects(
+    stateFor(
+      event,
+      selfReviewFixtures({
+        body: event.pull_request.body,
+        reportBody: selfReviewReportFor({ head_sha: "c".repeat(40) }),
+      }),
+    ),
+    /head_sha mismatch/i,
+  );
+  await assert.rejects(
+    stateFor(
+      event,
+      selfReviewFixtures({
+        body: event.pull_request.body,
+        commentOverrides: { updated_at: "2026-09-05T01:00:01Z" },
+      }),
+    ),
+    /unedited timestamps/i,
+  );
 });
