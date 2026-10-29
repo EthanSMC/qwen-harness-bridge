@@ -154,6 +154,15 @@ const verifySignature = (request: RtcWireRequest): void => {
   }
 };
 
+/**
+ * Verifies the adapter envelope on the exact raw request bytes before any
+ * business field is parsed. Exported so the session layer can authenticate a
+ * callback once and then dispatch on its envelope type.
+ */
+export const verifyQwenRtcSignature = (request: RtcWireRequest): void => {
+  verifySignature(request);
+};
+
 type Envelope = Readonly<{
   specVersion: string;
   requestId: string;

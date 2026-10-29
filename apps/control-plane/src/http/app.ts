@@ -17,6 +17,7 @@ import {
 import { createMcpAuthenticator, McpAuthenticationError } from "../mcp/auth.js";
 import { createMcpServer } from "../mcp/server.js";
 import type { McpCoordinator } from "../mcp/tools.js";
+import type { RtcRouteSet } from "../rtc/wire/routes.js";
 import type { ReadinessProbe } from "./health.js";
 import type { MetricsRegistry } from "./metrics.js";
 
@@ -29,6 +30,7 @@ export type CreateAppOptions = Readonly<{
   readinessProbe?: ReadinessProbe;
   isDraining?: () => boolean;
   metrics?: MetricsRegistry;
+  rtc?: RtcRouteSet;
 }>;
 
 const authenticationFailure = {
@@ -130,6 +132,13 @@ export async function createApp(
       await connectorGateway.close(app.server as unknown as HttpsServer);
     };
     app.addHook("preClose", closeConnectorGateway);
+  }
+
+  if (options.rtc !== undefined) {
+    options.rtc.register(app);
+    app.addHook("preClose", async () => {
+      await options.rtc?.closeAll("server_shutdown");
+    });
   }
 
   const liveHandler = async (_request: FastifyRequest, reply: FastifyReply) =>
