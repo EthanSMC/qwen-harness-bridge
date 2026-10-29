@@ -82,6 +82,7 @@ export async function start() {
   let draining = false;
   const metrics = createMetricsRegistry({
     readSnapshot: createPostgresMetricsAdapter(db).readSnapshot,
+    rtcEnabled: config.rtc.enabled,
   });
   const readinessProbe = createCancellablePostgresReadinessProbe(
     createReadinessSqlClientFactory(config.databaseUrl, {

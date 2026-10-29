@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { loadRtcConfig, type RtcConfig } from "./rtc/config.js";
 
 type Environment = Readonly<Record<string, string | undefined>>;
 
@@ -95,6 +96,7 @@ export type AppConfig = {
   connectorSessionSigningKey?: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
+  rtc: RtcConfig;
 };
 
 export type TlsPathConfig = Readonly<{
@@ -134,6 +136,7 @@ export function loadConfig(
     ...(parsed.QHB_TLS_KEY_PATH === undefined
       ? {}
       : { tlsKeyPath: parsed.QHB_TLS_KEY_PATH }),
+    rtc: loadRtcConfig(environment),
   };
 }
 

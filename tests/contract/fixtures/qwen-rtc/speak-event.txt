@@ -1,0 +1,5 @@
+event: output
+data: {"specVersion":"1.0","sessionId":"ses_001","actions":[{"type":"SPEAK","payload":{"speechId":"speech_001","index":1,"hasNext":true,"text":"李白是唐代诗人，","textDisplayMode":"APPEND_HIGHLIGHT"}}],"final":false}
+
+event: output
+data: {"specVersion":"1.0","sessionId":"ses_001","actions":[{"type":"SPEAK","payload":{"speechId":"speech_001","index":2,"hasNext":false,"text":"以浪漫奔放的诗风闻名。","textDisplayMode":"APPEND_HIGHLIGHT"}}],"final":false}

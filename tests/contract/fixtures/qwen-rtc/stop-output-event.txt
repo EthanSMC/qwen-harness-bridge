@@ -1,0 +1,2 @@
+event: output
+data: {"specVersion":"1.0","sessionId":"ses_001","actions":[{"type":"STOP_OUTPUT","payload":{"scope":"SPEAK","reason":"BARGE_IN"}},{"type":"SPEAK","payload":{"speechId":"speech_002","index":1,"hasNext":false,"text":"三加三等于六。"}}],"final":false}

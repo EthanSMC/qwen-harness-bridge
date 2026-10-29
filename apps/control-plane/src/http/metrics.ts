@@ -73,6 +73,11 @@ const METRIC_HELP = [
     "counter",
   ],
   ["qhb_errors_total", "Errors grouped by bounded error code.", "counter"],
+  [
+    "qhb_rtc_enabled",
+    "Whether the experimental RTC module is enabled.",
+    "gauge",
+  ],
 ] as const;
 
 export type MetricsSnapshot = Readonly<{
@@ -92,6 +97,7 @@ export type MetricsRegistry = Readonly<{
 type MetricsRegistryOptions = Readonly<{
   readSnapshot(): Promise<MetricsSnapshot>;
   monotonicNow?: () => number;
+  rtcEnabled?: boolean;
 }>;
 
 const asFiniteNonNegative = (value: number, label: string): number => {
@@ -210,6 +216,8 @@ export function createMetricsRegistry(
               `${name}{message_type="${escapeLabelValue(messageType)}"} ${messageCounts.get(messageType) ?? 0}`,
             );
           }
+        } else if (name === "qhb_rtc_enabled") {
+          lines.push(`${name} ${options.rtcEnabled === true ? 1 : 0}`);
         } else if (name === "qhb_errors_total") {
           for (const errorCode of ERROR_CODES) {
             lines.push(
