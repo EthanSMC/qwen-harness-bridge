@@ -1,0 +1,50 @@
+{
+  "fixture_id": "result-text",
+  "turns": [
+    {
+      "request_id": "44444444-4444-4444-8444-444444444444",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "读出 QH-8K4D 的结果"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task_result",
+          "request_id": "44444444-4444-4444-8444-444444444444",
+          "arguments": {
+            "job_id": "323e4567-e89b-42d3-a456-426614174222"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task_result",
+          "request_id": "44444444-4444-4444-8444-444444444444",
+          "ok": true,
+          "text": "已完成：测试通过"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.all_text",
+          "request_id": "44444444-4444-4444-8444-444444444444",
+          "payload": {
+            "lines": [
+              "结果：任务已完成。",
+              "改动文件：src/app.ts、src/app.test.ts",
+              "测试：42 项通过",
+              "产物：无"
+            ]
+          }
+        },
+        {
+          "kind": "assistant",
+          "text": "结果已显示。"
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-8K4D 已完成，结果已显示。"
+        }
+      ]
+    }
+  ]
+}

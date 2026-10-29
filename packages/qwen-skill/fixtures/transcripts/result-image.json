@@ -1,0 +1,89 @@
+{
+  "fixture_id": "result-image",
+  "turns": [
+    {
+      "request_id": "55555555-5555-4555-8555-555555555555",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "看一下 QH-4D5E 的截图"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task_result",
+          "request_id": "55555555-5555-4555-8555-555555555555",
+          "arguments": {
+            "job_id": "423e4567-e89b-42d3-a456-426614174333"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task_result",
+          "request_id": "55555555-5555-4555-8555-555555555555",
+          "ok": true,
+          "text": "1 张图片"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.pic_and_text",
+          "request_id": "55555555-5555-4555-8555-555555555555",
+          "payload": {
+            "lines": ["运行截图已生成", "有效期至 2026-11-01"]
+          }
+        },
+        {
+          "kind": "assistant",
+          "text": "截图已显示，有效期至 2026-11-01。"
+        },
+        {
+          "kind": "tts",
+          "text": "任务 QH-4D5E 已完成，结果已显示。"
+        }
+      ]
+    },
+    {
+      "request_id": "66666666-6666-4666-8666-666666666666",
+      "steps": [
+        {
+          "kind": "user",
+          "text": "再看 QH-9Z8Y 的图片"
+        },
+        {
+          "kind": "mcp_call",
+          "tool": "get_task_result",
+          "request_id": "66666666-6666-4666-8666-666666666666",
+          "arguments": {
+            "job_id": "523e4567-e89b-42d3-a456-426614174444"
+          }
+        },
+        {
+          "kind": "mcp_result",
+          "tool": "get_task_result",
+          "request_id": "66666666-6666-4666-8666-666666666666",
+          "ok": true,
+          "text": "3 张图片（超出单图限制）"
+        },
+        {
+          "kind": "ui_call",
+          "tool": "UiTool.all_text",
+          "request_id": "66666666-6666-4666-8666-666666666666",
+          "payload": {
+            "lines": [
+              "结果：3 张图片，仅支持单图展示",
+              "已回退为文本元数据",
+              "图片链接不可用：仅允许 HTTPS"
+            ]
+          }
+        },
+        {
+          "kind": "assistant",
+          "text": "图片不可用，已显示文本信息。"
+        },
+        {
+          "kind": "tts",
+          "text": "图片不可用，已显示文本信息。"
+        }
+      ]
+    }
+  ]
+}
