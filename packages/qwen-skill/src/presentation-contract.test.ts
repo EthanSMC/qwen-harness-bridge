@@ -5,10 +5,13 @@ import { describe, expect, it } from "vitest";
 import {
   EMPTY_EVENTS_TEXT,
   FRESHNESS_TEXT,
+  formatListLine,
   MAX_DETAIL_CHARACTERS,
+  MAX_DETAIL_LINES,
   MAX_EVENT_SUMMARIES,
   MAX_TTS_CHARACTERS,
   renderDetail,
+  renderDetailLines,
   renderEventSummaries,
   renderListRows,
   renderResult,
@@ -369,5 +372,214 @@ describe("speech presentation", () => {
       const speech = renderTts({ shortId: "QH-7M2P", status });
       expect([...speech].length).toBeLessThanOrEqual(MAX_TTS_CHARACTERS);
     }
+  });
+});
+
+const fixtureTasks = () => [
+  {
+    shortId: "QH-7M2P",
+    title: "运行测试",
+    status: "running" as const,
+    stage: "运行测试",
+    freshness: "fresh" as const,
+    updatedAt: "2026-10-29T09:57:00.000Z",
+  },
+  {
+    shortId: "QH-3A9C",
+    title: "等待接单",
+    status: "queued" as const,
+    freshness: "fresh" as const,
+    updatedAt: "2026-10-29T09:55:00.000Z",
+  },
+  {
+    shortId: "QH-8K4D",
+    title: "已完成",
+    status: "succeeded" as const,
+    freshness: "fresh" as const,
+    updatedAt: "2026-10-29T09:00:00.000Z",
+  },
+  {
+    shortId: "QH-2B7E",
+    title: "待审批",
+    status: "waiting_approval" as const,
+    freshness: "fresh" as const,
+    updatedAt: "2026-10-29T08:30:00.000Z",
+  },
+  {
+    shortId: "QH-6C1F",
+    title: "离线任务",
+    status: "running" as const,
+    freshness: "offline" as const,
+    updatedAt: "2026-10-29T08:15:00.000Z",
+  },
+];
+const fixtureUiLines = (
+  fixture: TranscriptFixture,
+  turn: number,
+  tool: string,
+): string[] => {
+  const step = fixture.turns[turn]?.steps.find(
+    (candidate) => candidate.kind === "ui_call" && candidate.tool === tool,
+  );
+  return step?.kind === "ui_call" ? (step.payload.lines ?? []) : [];
+};
+
+describe("fixture and renderer parity", () => {
+  it("renders the exact list fixture rows", () => {
+    const rows = renderListRows(fixtureTasks(), { now: NOW });
+    expect(rows.map(formatListLine)).toEqual(
+      fixtureUiLines(load("list-tasks.json"), 0, "UiTool.list"),
+    );
+  });
+
+  it("renders the exact running detail fixture body in contract order", () => {
+    const lines = renderDetailLines(
+      {
+        repositoryDisplayName: "Novelty Web",
+        shortId: "QH-7M2P",
+        status: "running",
+        stage: "运行测试",
+        freshness: "fresh",
+        updatedAt: "2026-10-29T09:57:00.000Z",
+        events: [
+          { summary: "已拉取最新代码", occurredAt: "2026-10-29T09:58:00.000Z" },
+          {
+            summary: "正在运行测试套件",
+            occurredAt: "2026-10-29T09:59:00.000Z",
+          },
+        ],
+      },
+      { now: NOW },
+    );
+    expect(lines).toEqual(
+      fixtureUiLines(load("inspect-running.json"), 0, "UiTool.all_text"),
+    );
+    expect(lines.length).toBeLessThanOrEqual(MAX_DETAIL_LINES);
+  });
+
+  it("renders the exact offline detail fixture body", () => {
+    const lines = renderDetailLines(
+      {
+        repositoryDisplayName: "Novelty API",
+        shortId: "QH-6C1F",
+        status: "running",
+        freshness: "offline",
+        updatedAt: "2026-10-29T09:48:00.000Z",
+        events: [],
+      },
+      { now: NOW },
+    );
+    expect(lines).toEqual(
+      fixtureUiLines(load("inspect-offline.json"), 0, "UiTool.all_text"),
+    );
+  });
+
+  it("places approval and terminal summary after progress and keeps the head intact", () => {
+    const lines = renderDetailLines(
+      {
+        repositoryDisplayName: "Novelty Web",
+        shortId: "QH-7M2P",
+        status: "running",
+        stage: "运行测试",
+        freshness: "fresh",
+        updatedAt: "2026-10-29T09:57:00.000Z",
+        events: [
+          { summary: "已拉取最新代码", occurredAt: "2026-10-29T09:58:00.000Z" },
+        ],
+        pendingApproval: "批准运行数据库迁移",
+        terminalSummary: "测试全部通过",
+      },
+      { now: NOW },
+    );
+    const joined = lines.join("\n");
+    expect(joined.indexOf("进度：")).toBeGreaterThan(joined.indexOf("连接："));
+    expect(joined.indexOf("待审批：")).toBeGreaterThan(
+      joined.indexOf("进度："),
+    );
+    expect(joined.indexOf("结论：")).toBeGreaterThan(
+      joined.indexOf("待审批："),
+    );
+    expect(lines.length).toBeLessThanOrEqual(MAX_DETAIL_LINES);
+  });
+
+  it("keeps the short id and status when long fields would overflow", () => {
+    const longText = "非常长的说明".repeat(80);
+    const lines = renderDetailLines(
+      {
+        repositoryDisplayName: longText,
+        shortId: "QH-7M2P",
+        status: "running",
+        stage: longText,
+        freshness: "fresh",
+        updatedAt: "2026-10-29T09:57:00.000Z",
+        events: [],
+        pendingApproval: longText,
+      },
+      { now: NOW },
+    );
+    const body = lines.join("\n");
+    expect([...body].length).toBeLessThanOrEqual(MAX_DETAIL_CHARACTERS);
+    expect(body).toContain("短号：QH-7M2P");
+    expect(body).toContain("状态：正在执行");
+  });
+
+  it("renders the exact text result without an image fallback line", () => {
+    const rendered = renderResult(
+      {
+        summary: "任务已完成。",
+        changedFiles: ["src/app.ts", "src/app.test.ts"],
+        testSummary: "42 项通过",
+        artifactsNote: "无",
+      },
+      { now: NOW },
+    );
+    expect(rendered.kind).toBe("text");
+    if (rendered.kind !== "text") return;
+    expect(rendered.fallbackReason).toBeUndefined();
+    expect(rendered.lines.join("\n")).not.toContain("图片不可用");
+    expect(rendered.lines).toEqual(
+      fixtureUiLines(load("result-text.json"), 0, "UiTool.all_text"),
+    );
+  });
+
+  it("renders the exact multi-image fallback fixture body", () => {
+    const rendered = renderResult(
+      {
+        summary: "3 张图片，仅支持单图展示",
+        images: [1, 2, 3].map((index) => ({
+          url: `https://artifacts.example.com/run/${index}.png`,
+          mediaType: "image/png",
+          expiresAt: "2026-11-01T00:00:00.000Z",
+        })),
+      },
+      { now: NOW },
+    );
+    expect(rendered.kind).toBe("text");
+    if (rendered.kind !== "text") return;
+    expect(rendered.lines).toEqual(
+      fixtureUiLines(load("result-image.json"), 1, "UiTool.all_text"),
+    );
+  });
+
+  it("generates the offline fixture TTS and drops the stage before the connection state", () => {
+    const fixture = load("inspect-offline.json");
+    const tts = fixture.turns[0]?.steps.find((step) => step.kind === "tts");
+    expect(
+      renderTts({
+        shortId: "QH-6C1F",
+        status: "running",
+        freshness: "offline",
+      }),
+    ).toBe(tts?.kind === "tts" ? tts.text : "");
+
+    const long = renderTts({
+      shortId: "QH-7M2P",
+      status: "running",
+      stage: "运行".repeat(100),
+      freshness: "offline",
+    });
+    expect([...long].length).toBeLessThanOrEqual(MAX_TTS_CHARACTERS);
+    expect(long).not.toContain("阶段：");
+    expect(long).toContain("连接中断，正在协调");
   });
 });

@@ -1,5 +1,6 @@
 export const TASK_LIST_LIMIT = 5;
 export const MAX_DETAIL_CHARACTERS = 600;
+export const MAX_DETAIL_LINES = 5;
 export const MAX_TTS_CHARACTERS = 120;
 export const MAX_EVENT_SUMMARIES = 5;
 export const EMPTY_EVENTS_TEXT = "暂无进度详情";
@@ -28,13 +29,12 @@ export const FRESHNESS_TEXT = {
 } as const;
 
 export type TaskStatus = keyof typeof STATUS_TEXT;
-export type TaskStatusValue = TaskStatus;
 export type Freshness = keyof typeof FRESHNESS_TEXT;
 
 export type TaskSummary = Readonly<{
   shortId: string;
   title: string;
-  status: TaskStatusValue;
+  status: TaskStatus;
   stage?: string;
   freshness: Freshness;
   unread?: boolean;
@@ -61,7 +61,7 @@ export type TaskEvent = Readonly<{
 export type TaskDetailInput = Readonly<{
   repositoryDisplayName: string;
   shortId: string;
-  status: TaskStatusValue;
+  status: TaskStatus;
   stage?: string;
   freshness: Freshness;
   updatedAt: string;
@@ -96,12 +96,15 @@ const UUID_PATTERN =
   /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/giu;
 const URL_PATTERN = /https?:\/\/[^\s)]+/giu;
 const TOKEN_PATTERN = /Bearer\s+\S+/giu;
+const SECRET_PATTERN = /\b(?:sk|ghp)_[A-Za-z0-9_-]{8,}/gu;
 const PERCENT_PATTERN = /\d+(?:\.\d+)?\s*[%％]/gu;
 
+const characters = (value: string): number => [...value].length;
+
 const bounded = (value: string, limit: number): string => {
-  const characters = [...value];
-  if (characters.length <= limit) return value;
-  return `${characters.slice(0, Math.max(1, limit - 1)).join("")}…`;
+  const parts = [...value];
+  if (parts.length <= limit) return value;
+  return `${parts.slice(0, Math.max(1, limit - 1)).join("")}…`;
 };
 
 export const redactSummary = (value: string): string =>
@@ -110,6 +113,7 @@ export const redactSummary = (value: string): string =>
       .replace(UUID_PATTERN, "任务")
       .replace(URL_PATTERN, "链接")
       .replace(TOKEN_PATTERN, "凭据")
+      .replace(SECRET_PATTERN, "凭据")
       .replace(PERCENT_PATTERN, "")
       .replace(/\s+/gu, " ")
       .trim(),
@@ -132,6 +136,15 @@ export const relativeUpdateText = (updatedAt: string, now: string): string => {
   return `${Math.floor(hours / 24)} 天前`;
 };
 
+export const formatListLine = (row: TaskRow): string =>
+  row.ordinal +
+  ". " +
+  row.shortId +
+  " · " +
+  row.statusText +
+  (row.stageText === "" ? "" : ` · 阶段：${row.stageText}`) +
+  (row.freshnessText === FRESHNESS_TEXT.fresh ? "" : ` · ${row.freshnessText}`);
+
 export const renderListRows = (
   tasks: readonly TaskSummary[],
   options: { now?: string } = {},
@@ -150,7 +163,7 @@ export const renderListRows = (
     shortId: task.shortId,
     title: bounded(task.title, 24),
     statusText: STATUS_TEXT[task.status],
-    stageText: task.stage ?? "",
+    stageText: task.stage === undefined ? "" : bounded(task.stage, 20),
     freshnessText: FRESHNESS_TEXT[task.freshness],
     unreadMarker: task.unread === true,
     lastUpdateText: relativeUpdateText(task.updatedAt, now),
@@ -179,49 +192,66 @@ export const renderEventSummaries = (
   return ordered.map(({ event }) => redactSummary(event.summary));
 };
 
+export const renderDetailLines = (
+  input: TaskDetailInput,
+  options: { now?: string } = {},
+): readonly string[] => {
+  const now = options.now ?? new Date().toISOString();
+  const repository = bounded(input.repositoryDisplayName, 24);
+  const stage =
+    input.stage === undefined ? undefined : bounded(input.stage, 20);
+  const approval =
+    input.pendingApproval === undefined
+      ? undefined
+      : bounded(redactSummary(input.pendingApproval), 60);
+  const terminal =
+    input.terminalSummary === undefined
+      ? undefined
+      : bounded(redactSummary(input.terminalSummary), 80);
+  const head = [
+    `仓库：${repository} · 短号：${input.shortId}`,
+    "状态：" +
+      STATUS_TEXT[input.status] +
+      (stage === undefined ? "" : ` · 阶段：${stage}`),
+    "连接：" +
+      FRESHNESS_TEXT[input.freshness] +
+      " · 最近更新：" +
+      relativeUpdateText(input.updatedAt, now),
+  ];
+  const tailLine = [
+    ...(approval === undefined ? [] : [`待审批：${approval}`]),
+    ...(terminal === undefined ? [] : [`结论：${terminal}`]),
+  ].join(" · ");
+  const tail = tailLine === "" ? [] : [tailLine];
+  let summaries = renderEventSummaries(input.events);
+  const progress = (items: readonly string[]): string =>
+    `进度：${items.length === 0 ? EMPTY_EVENTS_TEXT : items.join("；")}`;
+  let lines = [...head, progress(summaries), ...tail];
+  while (
+    characters(lines.join("\n")) > MAX_DETAIL_CHARACTERS &&
+    summaries.length > 0
+  ) {
+    summaries = summaries.slice(1);
+    lines = [...head, progress(summaries), ...tail];
+  }
+  if (characters(lines.join("\n")) > MAX_DETAIL_CHARACTERS) {
+    lines = [...head, progress([]), ...tail];
+  }
+  if (characters(lines.join("\n")) > MAX_DETAIL_CHARACTERS) {
+    lines = [...head, progress([])];
+  }
+  return lines.slice(0, MAX_DETAIL_LINES);
+};
+
 export const renderDetail = (
   input: TaskDetailInput,
   options: { now?: string } = {},
-): string => {
-  const now = options.now ?? new Date().toISOString();
-  const head = [
-    `仓库：${input.repositoryDisplayName}`,
-    `短号：${input.shortId}`,
-    `状态：${STATUS_TEXT[input.status]}`,
-    ...(input.stage === undefined ? [] : [`阶段：${input.stage}`]),
-    `连接：${FRESHNESS_TEXT[input.freshness]}`,
-    `最近更新：${relativeUpdateText(input.updatedAt, now)}`,
-    ...(input.pendingApproval === undefined
-      ? []
-      : [`待审批：${redactSummary(input.pendingApproval)}`]),
-    ...(input.terminalSummary === undefined
-      ? []
-      : [`结论：${redactSummary(input.terminalSummary)}`]),
-  ];
-  const summaries = renderEventSummaries(input.events);
-  const render = (items: readonly string[]): string =>
-    [
-      ...head,
-      "进度：",
-      ...(items.length === 0 ? [EMPTY_EVENTS_TEXT] : items),
-    ].join("\n");
-  let items = summaries;
-  let body = render(items);
-  while ([...body].length > MAX_DETAIL_CHARACTERS && items.length > 0) {
-    items = items.slice(1);
-    body = render(items);
-  }
-  if ([...body].length > MAX_DETAIL_CHARACTERS) {
-    body = bounded(body, MAX_DETAIL_CHARACTERS);
-  }
-  return body;
-};
+): string => renderDetailLines(input, options).join("\n");
 
 const imageFallbackReason = (
   images: readonly ArtifactImage[],
   now: string,
-): string | null => {
-  if (images.length === 0) return "没有可展示的图片";
+): string => {
   if (images.length > 1) return "仅支持单图展示，已回退为文本";
   const image = images[0] as ArtifactImage;
   if (!/^https:\/\//u.test(image.url))
@@ -235,7 +265,7 @@ const imageFallbackReason = (
   if (Date.parse(image.expiresAt) <= Date.parse(now)) {
     return "图片已过期，已回退为文本";
   }
-  return null;
+  return "";
 };
 
 export const renderResult = (
@@ -244,15 +274,6 @@ export const renderResult = (
 ): RenderedResult => {
   const now = options.now ?? new Date().toISOString();
   const images = input.images ?? [];
-  const reason = imageFallbackReason(images, now);
-  if (reason === null) {
-    const image = images[0] as ArtifactImage;
-    return {
-      kind: "image",
-      url: image.url,
-      caption: bounded(input.summary, 200),
-    };
-  }
   const lines = [
     `结果：${bounded(input.summary, 240)}`,
     ...(input.changedFiles === undefined || input.changedFiles.length === 0
@@ -262,42 +283,80 @@ export const renderResult = (
     ...(input.artifactsNote === undefined
       ? []
       : [`产物：${input.artifactsNote}`]),
-    `图片不可用：${reason}`,
   ];
-  return { kind: "text", lines, fallbackReason: reason };
+  if (images.length === 0) {
+    return { kind: "text", lines };
+  }
+  const reason = imageFallbackReason(images, now);
+  if (reason === "") {
+    const image = images[0] as ArtifactImage;
+    return {
+      kind: "image",
+      url: image.url,
+      caption: bounded(input.summary, 200),
+    };
+  }
+  return {
+    kind: "text",
+    lines: [...lines, `图片不可用：${reason}`],
+    fallbackReason: reason,
+  };
 };
 
-export const renderTts = (input: {
+export type TtsInput = Readonly<{
   shortId: string;
-  status: TaskStatusValue;
+  status: TaskStatus;
   stage?: string;
-}): string => {
+  freshness?: Freshness;
+}>;
+
+const statusSentence = (input: TtsInput): string => {
   const base = `任务 ${input.shortId}`;
-  const speech = (() => {
-    switch (input.status) {
-      case "queued":
-        return `${base} 已创建，等待 Mac 接单`;
-      case "dispatched":
-        return `${base} Mac 已接单`;
-      case "running":
-        return input.stage === undefined
-          ? `${base} 正在执行`
-          : `${base} 正在执行，阶段：${input.stage}`;
-      case "waiting_approval":
-        return `${base} 等待你的批准`;
-      case "cancelling":
-        return `${base} 正在取消`;
-      case "succeeded":
-        return `${base} 已完成，结果已显示`;
-      case "failed":
-        return `${base} 执行失败`;
-      case "cancelled":
-        return `${base} 已取消`;
-      case "expired":
-        return `${base} 已过期`;
-      default:
-        return `${base} 状态已更新`;
-    }
-  })();
-  return bounded(speech, MAX_TTS_CHARACTERS);
+  switch (input.status) {
+    case "queued":
+      return `${base} 已创建，等待 Mac 接单`;
+    case "dispatched":
+      return `${base} Mac 已接单`;
+    case "running":
+      return input.stage === undefined
+        ? `${base} 正在执行`
+        : `${base} 正在执行，阶段：${input.stage}`;
+    case "waiting_approval":
+      return `${base} 等待你的批准`;
+    case "cancelling":
+      return `${base} 正在取消`;
+    case "succeeded":
+      return `${base} 已完成，结果已显示`;
+    case "failed":
+      return `${base} 执行失败`;
+    case "cancelled":
+      return `${base} 已取消`;
+    case "expired":
+      return `${base} 已过期`;
+    default:
+      return `${base} 状态已更新`;
+  }
+};
+
+export const renderTts = (input: TtsInput): string => {
+  const withDetail = (detail: boolean, connection: boolean): string => {
+    const sentence = detail
+      ? statusSentence(input)
+      : statusSentence({ ...input, stage: undefined });
+    const suffix =
+      connection && input.freshness !== undefined
+        ? `，${FRESHNESS_TEXT[input.freshness]}。`
+        : "";
+    return sentence + suffix;
+  };
+  for (const [detail, connection] of [
+    [true, true],
+    [false, true],
+    [true, false],
+    [false, false],
+  ] as const) {
+    const candidate = withDetail(detail, connection);
+    if (characters(candidate) <= MAX_TTS_CHARACTERS) return candidate;
+  }
+  return bounded(withDetail(false, false), MAX_TTS_CHARACTERS);
 };
