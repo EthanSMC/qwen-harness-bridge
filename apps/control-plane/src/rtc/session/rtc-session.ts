@@ -115,7 +115,12 @@ export const createLiveRtcSession = (
   const broadcast = (frame: string): void => {
     if (closed) return;
     for (const target of writers()) {
-      if (!target.closed) target.write(frame);
+      if (target.closed) continue;
+      try {
+        target.write(frame);
+      } catch {
+        // A broken subscriber must not stop keepalive for the others.
+      }
     }
   };
 

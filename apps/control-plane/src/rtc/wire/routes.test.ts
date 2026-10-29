@@ -158,3 +158,110 @@ describe("rtc callback routes over HTTP", () => {
     );
   });
 });
+
+const waitFor = async (predicate: () => boolean): Promise<void> => {
+  const deadline = Date.now() + 2_000;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("condition timeout");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+};
+
+describe("rtc client disconnect", () => {
+  const moduleFor = {
+    ownerSubject: OWNER,
+    signingSecret: SECRET,
+    callbackUrl: CALLBACK_URL,
+    allowedMedia: ["audio"] as const,
+    provider: "ALIYUN_RTC" as const,
+  };
+
+  it("closes the session once with user_exit when the client disconnects", async () => {
+    const { clock } = createFakeClock();
+    const disconnects: string[] = [];
+    const routes = createRtcRouteSet({
+      module: moduleFor,
+      clock,
+      metrics: {
+        recordError: () => undefined,
+        recordRtcDisconnect: (reason) => disconnects.push(reason),
+      },
+    });
+    if (routes === null) throw new Error("routes must be enabled");
+    const app = Fastify();
+    openApps.push(app);
+    routes.register(app);
+    await app.ready();
+    const base = await app.listen({ port: 0, host: "127.0.0.1" });
+
+    const controller = new AbortController();
+    const response = await fetch(`${base}${RTC_CALLBACK_PATH}`, {
+      method: "POST",
+      headers: headersFor("nonce-disconnect-1"),
+      body: startBody,
+      signal: controller.signal,
+    });
+    expect(response.status).toBe(200);
+    expect(routes.registry.size).toBe(1);
+
+    controller.abort();
+    await waitFor(() => routes.registry.size === 0);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(disconnects).toEqual(["user_exit"]);
+    await app.close();
+    expect(routes.registry.size).toBe(0);
+  });
+
+  it("detaches a duplicate stream without closing the original session", async () => {
+    const { clock, advance } = createFakeClock();
+    const disconnects: string[] = [];
+    const routes = createRtcRouteSet({
+      module: moduleFor,
+      clock,
+      metrics: {
+        recordError: () => undefined,
+        recordRtcDisconnect: (reason) => disconnects.push(reason),
+      },
+    });
+    if (routes === null) throw new Error("routes must be enabled");
+    const app = Fastify();
+    openApps.push(app);
+    routes.register(app);
+    await app.ready();
+    const base = await app.listen({ port: 0, host: "127.0.0.1" });
+    const url = `${base}${RTC_CALLBACK_PATH}`;
+
+    const firstController = new AbortController();
+    const first = await fetch(url, {
+      method: "POST",
+      headers: headersFor("nonce-detach-1"),
+      body: startBody,
+      signal: firstController.signal,
+    });
+    const duplicateController = new AbortController();
+    const duplicate = await fetch(url, {
+      method: "POST",
+      headers: headersFor("nonce-detach-2"),
+      body: startBody,
+      signal: duplicateController.signal,
+    });
+    expect(first.status).toBe(200);
+    expect(duplicate.status).toBe(200);
+    expect(routes.registry.size).toBe(1);
+
+    duplicateController.abort();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(routes.registry.size).toBe(1);
+    expect(disconnects).toEqual([]);
+
+    advance(30_000);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(await readUntil(first, ": keep-alive")).toContain(": keep-alive");
+
+    firstController.abort();
+    await waitFor(() => routes.registry.size === 0);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(disconnects).toEqual(["user_exit"]);
+  });
+});

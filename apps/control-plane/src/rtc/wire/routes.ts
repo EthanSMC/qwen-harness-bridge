@@ -172,6 +172,8 @@ export const createRtcAuthenticator = (
         );
       }
 
+      // The owner header is checked against the single configured owner after
+      // the HMAC check; it is not part of the Task 1 adapter signature scheme.
       const owner = headerValue(request.headers, "x-qhb-owner-subject");
       if (owner === undefined || owner !== options.ownerSubject) {
         return reject(options, "UNKNOWN_OWNER", owner ?? null);
