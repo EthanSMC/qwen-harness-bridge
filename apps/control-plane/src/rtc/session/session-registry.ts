@@ -38,10 +38,10 @@ export type RtcSessionRegistryOptions = Readonly<{
   createTransport?: (input: {
     start: NormalizedRtcStart;
   }) => RtcSessionTransport;
-  onDisconnect?: (reason: RtcCloseReason) => void;
+  onDisconnect?: (reason: RtcCloseReason, sessionId: string) => void;
   onSessionClosed?: (sessionId: string) => void;
-  onFirstAudio?: () => void;
-  onFirstOutput?: () => void;
+  onFirstAudio?: (sessionId: string) => void;
+  onFirstOutput?: (sessionId: string) => void;
 }>;
 
 export type RtcStartRequest = Readonly<{
@@ -121,14 +121,20 @@ export const createRtcSessionRegistry = (
       lifecycle: {
         ...(options.onFirstAudio === undefined
           ? {}
-          : { firstAudio: options.onFirstAudio }),
+          : {
+              firstAudio: () =>
+                options.onFirstAudio?.(startValue.platformSessionId),
+            }),
         ...(options.onFirstOutput === undefined
           ? {}
-          : { firstOutput: options.onFirstOutput }),
+          : {
+              firstOutput: () =>
+                options.onFirstOutput?.(startValue.platformSessionId),
+            }),
       },
       onClose: (reason) => {
         remove(startValue.platformSessionId, startValue.ownerSubject);
-        options.onDisconnect?.(reason);
+        options.onDisconnect?.(reason, startValue.platformSessionId);
         options.onSessionClosed?.(startValue.platformSessionId);
       },
       ...(options.keepaliveMs === undefined

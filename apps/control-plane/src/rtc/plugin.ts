@@ -47,7 +47,6 @@ export type RtcPluginOptions = Readonly<{
   }>;
   telemetry?: RtcTelemetry;
   now?: () => number;
-  /** Maximum graceful drain before a forced close. */
   drainMs?: number;
   maxConcurrentSessions?: number;
   failureThreshold?: number;
@@ -59,19 +58,23 @@ export type RtcPlugin = Readonly<{
   mount: (app: FastifyInstance) => Promise<void>;
   canStart: () => boolean;
   rejectionReason: () => "concurrency_limit" | "circuit_open" | undefined;
-  startSession: () => boolean;
-  endSession: () => void;
-  observeSession: (reason: RtcSessionDisconnectReason) => void;
+  startSession: (sessionId?: string) => boolean;
+  endSession: (sessionId?: string) => void;
+  observeSession: (
+    reason: RtcSessionDisconnectReason,
+    sessionId?: string,
+  ) => void;
   observeRejected: (
     reason: "registry_full" | "concurrency_limit" | "circuit_open",
   ) => void;
-  observeAudio: (msSinceStart?: number) => void;
-  observeAsrFinal: (msSinceStart?: number) => void;
+  observeAudio: (sessionId?: string, msSinceStart?: number) => void;
+  observeAsrFinal: (sessionId?: string, msSinceStart?: number) => void;
   observeOutput: (
     kind: (typeof RTC_TELEMETRY_COMMAND_TYPES)[number],
+    sessionId?: string,
     msSinceStart?: number,
   ) => void;
-  observeAsr: (outcome: "failure" | "final") => void;
+  observeAsr: (outcome: "failure" | "final", sessionId?: string) => void;
   forceClose: (reason?: RtcCloseReason) => Promise<void>;
   drainAndClose: () => Promise<void>;
   readonly aborted: boolean;
@@ -108,12 +111,17 @@ const DEFAULT_DRAIN_MS = 90_000;
 const DEFAULT_MAX_CONCURRENT = 4;
 const DEFAULT_FAILURE_THRESHOLD = 3;
 
+type SessionRecord = {
+  startedAt: number;
+  firstAudio: boolean;
+  firstAsrFinal: boolean;
+  firstOutput: boolean;
+};
+
 /**
- * Optional RTC module composition: mounted only when enabled, in a child scope,
- * with its own abort controller, bounded concurrency and an independent circuit
- * breaker. Real session/ASR/output call sites drive start, close and first
- * latency telemetry; RTC failures only degrade the RTC component and bounded
- * telemetry, never startup or core readiness, and force-close is a real path.
+ * Optional RTC module composition. Sessions are tracked by id so active counts,
+ * first-latency buckets and start timestamps cannot leak between concurrent
+ * sessions; a close only decrements the session that is actually tracked.
  */
 export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
   const telemetry = options.telemetry ?? new RtcTelemetry();
@@ -127,13 +135,10 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
   let status: RtcComponentStatus = options.enabled ? "ok" : "disabled";
   let reason: RtcDegradedReason | undefined;
   let failures = 0;
-  let active = 0;
   let aborted = false;
   let routeSet: RtcRouteSet | undefined;
-  const startedAt: number[] = [];
-  let firstAudioRecorded = false;
-  let firstAsrFinalRecorded = false;
-  let firstOutputRecorded = false;
+  let anonymous = 0;
+  const sessions = new Map<string, SessionRecord>();
 
   const component = (): RtcComponentHealth => ({
     status,
@@ -155,18 +160,18 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
       : "module_exception";
   };
 
-  const consumeActive = (): boolean => {
-    if (active === 0) return false;
-    active -= 1;
-    startedAt.pop();
-    telemetry.endSession();
-    return true;
+  const recordFor = (sessionId?: string): SessionRecord | undefined => {
+    if (sessionId !== undefined) return sessions.get(sessionId);
+    if (sessions.size === 0) return undefined;
+    return sessions.values().next().value;
   };
 
-  const elapsed = (override?: number): number => {
+  const elapsed = (
+    record: SessionRecord | undefined,
+    override?: number,
+  ): number => {
     if (override !== undefined) return Math.max(0, override);
-    const started = startedAt.at(-1);
-    return started === undefined ? 0 : Math.max(0, now() - started);
+    return record === undefined ? 0 : Math.max(0, now() - record.startedAt);
   };
 
   return {
@@ -209,40 +214,38 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
         options.enabled &&
         !aborted &&
         failures < failureThreshold &&
-        active < maxConcurrent
+        sessions.size < maxConcurrent
       );
     },
     rejectionReason() {
       if (failures >= failureThreshold) return "circuit_open";
-      if (active >= maxConcurrent) return "concurrency_limit";
+      if (sessions.size >= maxConcurrent) return "concurrency_limit";
       return undefined;
     },
-    startSession() {
-      if (!options.enabled || aborted) return false;
-      if (failures >= failureThreshold) {
-        reason = "circuit_open";
-        status = "degraded";
-        telemetry.reject("circuit_open");
-        return false;
-      }
-      if (active >= maxConcurrent) {
-        telemetry.reject("concurrency_limit");
-        degrade("concurrency_limit");
-        return false;
-      }
-      active += 1;
-      startedAt.push(now());
-      firstAudioRecorded = false;
-      firstAsrFinalRecorded = false;
-      firstOutputRecorded = false;
+    startSession(sessionId) {
+      if (!this.canStart()) return false;
+      anonymous += 1;
+      const id = sessionId ?? `anonymous-${anonymous}`;
+      if (sessions.has(id)) return true;
+      sessions.set(id, {
+        startedAt: now(),
+        firstAudio: false,
+        firstAsrFinal: false,
+        firstOutput: false,
+      });
       telemetry.start("started");
       return true;
     },
-    endSession() {
-      consumeActive();
+    endSession(sessionId) {
+      const record = recordFor(sessionId);
+      if (record === undefined) return;
+      const [id] =
+        [...sessions.entries()].find(([, value]) => value === record) ?? [];
+      if (id !== undefined) sessions.delete(id);
+      telemetry.endSession();
     },
-    observeSession(disconnectReason) {
-      consumeActive();
+    observeSession(disconnectReason, sessionId) {
+      this.endSession(sessionId);
       telemetry.disconnect(disconnectReason);
       try {
         options.metrics?.recordRtcDisconnect?.(
@@ -264,35 +267,37 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
             : "circuit_open",
       );
     },
-    observeAudio(msSinceStart) {
-      if (firstAudioRecorded) return;
-      firstAudioRecorded = true;
-      telemetry.firstAudio(elapsed(msSinceStart));
+    observeAudio(sessionId, msSinceStart) {
+      const record = recordFor(sessionId);
+      if (record === undefined || record.firstAudio) return;
+      record.firstAudio = true;
+      telemetry.firstAudio(elapsed(record, msSinceStart));
     },
-    observeAsrFinal(msSinceStart) {
-      if (firstAsrFinalRecorded) return;
-      firstAsrFinalRecorded = true;
-      telemetry.firstAsrFinal(elapsed(msSinceStart));
+    observeAsrFinal(sessionId, msSinceStart) {
+      const record = recordFor(sessionId);
+      if (record === undefined || record.firstAsrFinal) return;
+      record.firstAsrFinal = true;
+      telemetry.firstAsrFinal(elapsed(record, msSinceStart));
     },
-    observeOutput(kind, msSinceStart) {
+    observeOutput(kind, sessionId, msSinceStart) {
       telemetry.outputCommand(kind);
-      if (firstOutputRecorded) return;
-      firstOutputRecorded = true;
-      telemetry.firstOutput(elapsed(msSinceStart));
+      const record = recordFor(sessionId);
+      if (record === undefined || record.firstOutput) return;
+      record.firstOutput = true;
+      telemetry.firstOutput(elapsed(record, msSinceStart));
     },
-    observeAsr(outcome) {
+    observeAsr(outcome, sessionId) {
       if (outcome === "failure") {
         telemetry.asrFailure();
         degrade("asr_failure");
         return;
       }
-      this.observeAsrFinal();
+      this.observeAsrFinal(sessionId);
     },
     async forceClose(closeReason = "server_shutdown") {
       aborted = true;
-      active = 0;
+      sessions.clear();
       telemetry.resetActive();
-      startedAt.length = 0;
       const current = routeSet;
       if (current !== undefined) {
         try {
@@ -306,13 +311,13 @@ export const createRtcPlugin = (options: RtcPluginOptions): RtcPlugin => {
     async drainAndClose() {
       if (!options.enabled || aborted) return;
       const deadline = now() + drainMs;
-      while (active > 0 && now() < deadline) {
+      while (sessions.size > 0 && now() < deadline) {
         const remaining = deadline - now();
         await new Promise<void>((resolve) => {
           setTimeout(resolve, Math.min(250, Math.max(0, remaining)));
         });
       }
-      if (active > 0) degrade("drain_timeout");
+      if (sessions.size > 0) degrade("drain_timeout");
       await this.forceClose("server_shutdown");
     },
     get aborted() {

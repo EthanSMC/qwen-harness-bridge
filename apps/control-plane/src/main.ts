@@ -101,12 +101,14 @@ export async function start() {
             lifecycle: {
               canStart: () => rtcPlugin.canStart(),
               rejectionReason: () => rtcPlugin.rejectionReason(),
-              sessionStart: () => rtcPlugin.startSession(),
-              sessionRelease: () => rtcPlugin.endSession(),
-              sessionClose: (reason) => rtcPlugin.observeSession(reason),
+              sessionStart: (sessionId) => rtcPlugin.startSession(sessionId),
+              sessionRelease: (sessionId) => rtcPlugin.endSession(sessionId),
+              sessionClose: (reason, sessionId) =>
+                rtcPlugin.observeSession(reason, sessionId),
               sessionRejected: (reason) => rtcPlugin.observeRejected(reason),
-              firstAudio: () => rtcPlugin.observeAudio(),
-              firstOutput: () => rtcPlugin.observeOutput("speak"),
+              firstAudio: (sessionId) => rtcPlugin.observeAudio(sessionId),
+              firstOutput: (sessionId) =>
+                rtcPlugin.observeOutput("speak", sessionId),
             },
           });
     },

@@ -221,19 +221,19 @@ export const createRtcAuthenticator = (
 export type RtcLifecycleObserver = Readonly<{
   /** Cheap capacity/breaker admission check before a start is attempted. */
   canStart?: () => boolean;
-  /** Called before a new session is created; false rejects the start. */
-  sessionStart?: () => boolean;
+  /** Called after a session is created; false rejects the start. */
+  sessionStart?: (sessionId: string) => boolean;
   /** Called when an admitted start turns out to be a duplicate or fails. */
-  sessionRelease?: () => void;
+  sessionRelease?: (sessionId?: string) => void;
   /** Called exactly once when a real session closes. */
-  sessionClose?: (reason: RtcCloseReason) => void;
+  sessionClose?: (reason: RtcCloseReason, sessionId: string) => void;
   /** Rejected start telemetry for admission or registry refusals. */
   sessionRejected?: (
     reason: "registry_full" | "concurrency_limit" | "circuit_open",
   ) => void;
   rejectionReason?: () => "concurrency_limit" | "circuit_open" | undefined;
-  firstAudio?: () => void;
-  firstOutput?: () => void;
+  firstAudio?: (sessionId: string) => void;
+  firstOutput?: (sessionId: string) => void;
 }>;
 
 export type RtcRouteOptions = Readonly<{
@@ -311,9 +311,9 @@ export const createRtcRouteSet = (
   });
   const registry = createRtcSessionRegistry({
     clock,
-    onDisconnect: (reason) => {
+    onDisconnect: (reason, sessionId) => {
       if (options.lifecycle?.sessionClose !== undefined) {
-        options.lifecycle.sessionClose(reason);
+        options.lifecycle.sessionClose(reason, sessionId);
       } else {
         options.metrics?.recordRtcDisconnect?.(reason);
       }
@@ -402,7 +402,9 @@ export const createRtcRouteSet = (
             reply.raw.once("close", detached);
             return reply;
           }
-          if (!(options.lifecycle?.sessionStart?.() ?? true)) {
+          if (
+            !(options.lifecycle?.sessionStart?.(outcome.session.id) ?? true)
+          ) {
             await registry.close(outcome.session.id, "provider_error");
             return reply;
           }

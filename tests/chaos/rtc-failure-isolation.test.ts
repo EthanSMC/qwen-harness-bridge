@@ -405,7 +405,7 @@ describe("real rtc lifecycle telemetry", () => {
       now: () => 1_000,
       drainMs: 5,
     });
-    expect(plugin.startSession()).toBe(true);
+    expect(plugin.startSession("session-lifecycle")).toBe(true);
     const writer = {
       closed: false,
       write: () => undefined,
@@ -420,8 +420,9 @@ describe("real rtc lifecycle telemetry", () => {
         closeProviderStreams: async () => undefined,
       },
       lifecycle: {
-        firstAudio: () => plugin.observeAudio(250),
-        firstOutput: () => plugin.observeOutput("speak", 400),
+        firstAudio: () => plugin.observeAudio("session-lifecycle", 250),
+        firstOutput: () =>
+          plugin.observeOutput("speak", "session-lifecycle", 400),
       },
       onClose: (reason) => plugin.observeSession(reason),
     });
@@ -431,8 +432,8 @@ describe("real rtc lifecycle telemetry", () => {
     await session.close("user_exit");
 
     const snapshot = plugin.component().telemetry;
-    expect(snapshot.first_audio_bucket_ms["250"]).toBe(1);
-    expect(snapshot.first_output_bucket_ms["500"]).toBe(1);
+    onClose: (reason) => plugin.observeSession(reason, "session-lifecycle"),
+      expect(snapshot.first_output_bucket_ms["500"]).toBe(1);
     expect(snapshot.output_commands.speak).toBe(1);
     expect(snapshot.active_sessions).toBe(0);
     expect(snapshot.disconnects.user_exit).toBe(1);
@@ -444,10 +445,10 @@ describe("real rtc lifecycle telemetry", () => {
       build: async () => fakeRouteSet(),
       drainMs: 5,
     });
-    expect(plugin.startSession()).toBe(true);
+    expect(plugin.startSession("asr-session")).toBe(true);
     const asr = createDashScopeAsr({
       apiKey: "server-secret-api-key",
-      onFinal: () => plugin.observeAsrFinal(1_500),
+      onFinal: () => plugin.observeAsrFinal("asr-session", 1_500),
       onFailure: () => plugin.observeAsr("failure"),
       client: {
         async open() {
@@ -518,7 +519,7 @@ describe("real rtc lifecycle telemetry", () => {
       build: async () => fakeRouteSet(),
       drainMs: 5,
     });
-    expect(plugin.startSession()).toBe(true);
+    expect(plugin.startSession("out-session")).toBe(true);
     const frames: string[] = [];
     const output = createSerializedSseOutput({
       writer: {
@@ -526,7 +527,8 @@ describe("real rtc lifecycle telemetry", () => {
         write: (frame: string) => frames.push(frame),
         end: () => undefined,
       },
-      onFirstOutput: (kind) => plugin.observeOutput(kind as "speak", 1_200),
+      onFirstOutput: (kind) =>
+        plugin.observeOutput(kind as "speak", "out-session", 1_200),
     });
     await output.speak("你好。");
     expect(frames.length).toBeGreaterThan(0);
@@ -544,6 +546,7 @@ describe("real rtc lifecycle telemetry", () => {
     });
     expect(plugin.startSession()).toBe(true);
     expect(plugin.startSession()).toBe(false);
+    plugin.observeRejected("concurrency_limit");
     expect(plugin.component().telemetry.rejects.concurrency_limit).toBe(1);
     plugin.observeSession("user_exit");
     expect(plugin.component().telemetry.active_sessions).toBe(0);
@@ -576,12 +579,13 @@ describe("real rtc lifecycle telemetry", () => {
       lifecycle: {
         canStart: () => plugin.canStart(),
         rejectionReason: () => plugin.rejectionReason(),
-        sessionStart: () => plugin.startSession(),
-        sessionRelease: () => plugin.endSession(),
-        sessionClose: (reason) => plugin.observeSession(reason),
+        sessionStart: (sessionId) => plugin.startSession(sessionId),
+        sessionRelease: (sessionId) => plugin.endSession(sessionId),
+        sessionClose: (reason, sessionId) =>
+          plugin.observeSession(reason, sessionId),
         sessionRejected: (reason) => plugin.observeRejected(reason),
-        firstAudio: () => plugin.observeAudio(),
-        firstOutput: () => plugin.observeOutput("speak"),
+        firstAudio: (sessionId) => plugin.observeAudio(sessionId),
+        firstOutput: (sessionId) => plugin.observeOutput("speak", sessionId),
       },
     });
     if (routeSet === null) throw new Error("route set is disabled");
@@ -601,7 +605,7 @@ describe("real rtc lifecycle telemetry", () => {
       }),
     });
     expect(outcome.created).toBe(true);
-    expect(routeSet.lifecycle?.sessionStart?.()).toBe(true);
+    expect(routeSet.lifecycle?.sessionStart?.(outcome.session.id)).toBe(true);
     expect(plugin.component().telemetry.active_sessions).toBe(1);
 
     outcome.session.touch("audio");
