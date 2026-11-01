@@ -127,7 +127,9 @@ describe("reproducible private package build", () => {
     expect(result.code).toBe(0);
     const manifest = readManifest(out);
     expect(manifest.version).toBe("0.3.0");
-    expect(manifest.monorepo_version).toBe("0.1.0");
+    expect(manifest.monorepo_version).toBe(
+      readJson<{ version: string }>(join(repoRoot, "package.json")).version,
+    );
     expect(manifest.source_commit).toBe(sourceCommit());
     expect(manifest.archive).toBe("qwen-skill-0.3.0.zip");
     expect(manifest.archive_sha256).toMatch(/^[0-9a-f]{64}$/u);
