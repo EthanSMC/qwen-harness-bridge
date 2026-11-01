@@ -1,0 +1,56 @@
+name: Release artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit to build the release artifact from
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build release artifact
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the requested ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build the harness plugin
+        run: pnpm --filter @qhb/harness-plugin build
+      - name: Package the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/artifact"
+          mkdir -p "$out"
+          node packages/harness-plugin/scripts/package.mjs "$out"
+          file=$(find "$out" -maxdepth 1 -type f | head -n 1)
+          test -n "$file"
+          digest=$(sha256sum "$file" | awk '{print $1}')
+          size=$(stat -c%s "$file")
+          printf 'artifact=%s\nsha256=%s\nbytes=%s\n' "$(basename "$file")" "$digest" "$size"
+          {
+            printf '### Release artifact\n\n'
+            printf -- '- artifact: `%s`\n' "$(basename "$file")"
+            printf -- '- sha256: `%s`\n' "$digest"
+            printf -- '- bytes: `%s`\n' "$size"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifact
+          path: ${{ runner.temp }}/artifact/*
+          if-no-files-found: error
+          retention-days: 7
